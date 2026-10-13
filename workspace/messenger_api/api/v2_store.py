@@ -20,6 +20,7 @@ from workspace.messenger_api.api import sql_canonical_store
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.dm import base
 from workspace.messenger_api.dm import helpers
+from workspace.messenger_api.dm import message_payloads
 from workspace.messenger_api.dm import read_state
 from workspace.messenger_api.dm import v2_models
 
@@ -913,9 +914,14 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         values: dict[str, typing.Any],
     ) -> dict[str, typing.Any]:
         session = contexts.Context().get_session()
-        stream = self._stream(values["stream_uuid"])
         canonical_payload = resource_projection.simple(values["payload"])
-        stream.validate_message_kind(stream.source_name, canonical_payload["kind"])
+        announced = (
+            canonical_payload["kind"] == message_payloads.KeyAnnouncedPayload.KIND
+        )
+        if announced:
+            self._lock_key_announcement(values["stream_uuid"], session)
+        stream = self._stream(values["stream_uuid"])
+        stream.validate_message_creation(canonical_payload["kind"])
         topic_uuid = values.get("topic_uuid") or stream.default_topic_uuid
         if topic_uuid is None:
             raise ra_exceptions.ValidationErrorException()
@@ -1041,6 +1047,15 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 provider_targets,
             )
             return row
+        if announced:
+            self._apply_key_announcement(
+                stream.uuid,
+                canonical_uuid,
+                placement_uuid,
+                canonical_payload["key_uuid"],
+                session,
+            )
+            self._enqueue_stream_snapshot(stream.uuid, source_kind="stream.updated")
         content = str(canonical_payload.get("content", ""))
         mentioned = f"](urn:user:{str(self.user_uuid).lower()})" in content.lower()
         binding_uuid = sys_uuid.uuid5(placement_uuid, str(self.user_uuid))

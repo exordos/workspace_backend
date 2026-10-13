@@ -244,6 +244,7 @@ class WorkspaceUserMessage(
     def validate_payload_update(
         self, payload: typing.Mapping[str, typing.Any], session: typing.Any
     ) -> None:
+        self.validate_key_announcement_update(payload["kind"])
         if payload["kind"] != message_payloads.E2EEPayload.KIND:
             return
         streams = session.execute(
