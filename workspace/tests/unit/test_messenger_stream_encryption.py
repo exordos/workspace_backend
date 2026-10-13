@@ -25,12 +25,13 @@ KEY_UUID = sys_uuid.UUID("80bc4f0b-87ac-4d8d-9350-e5f88f61ca20")
 @pytest.fixture(params=[models.WorkspaceUserStream, v2_models.WorkspaceUserStream])
 def stream_factory(request):
     def create(**metadata):
+        role = metadata.pop("role", "owner")
         return request.param(
             uuid=sys_uuid.uuid4(),
             project_id=PROJECT_UUID,
             user_uuid=USER_UUID,
             owner=USER_UUID,
-            role="owner",
+            role=role,
             name="Encryption metadata",
             source_name="native",
             source=models.NativeSource(),
@@ -159,3 +160,40 @@ def test_markdown_messages_remain_allowed_in_both_stream_sources(source_name):
     payload = message_payloads.MarkdownPayload(content="Message")
 
     base.WorkspaceUserStreamBase.validate_message_kind(source_name, payload.KIND)
+
+
+@pytest.mark.parametrize("role", ["owner", "administrator", "moderator", "member"])
+def test_only_stream_owners_can_announce_keys(stream_factory, role):
+    stream = stream_factory(role=role)
+
+    if role == "owner":
+        stream.validate_message_creation("key_announced")
+    else:
+        with pytest.raises(ra_exc.ValidationErrorException):
+            stream.validate_message_creation("key_announced")
+
+
+@pytest.mark.parametrize("role", ["owner", "administrator", "moderator", "member"])
+def test_key_announcement_permission_does_not_restrict_markdown(stream_factory, role):
+    stream_factory(role=role).validate_message_creation("markdown")
+
+
+@pytest.mark.parametrize(
+    "original,new_kind",
+    [
+        (message_payloads.KeyAnnouncedPayload(key_uuid=KEY_UUID), "key_announced"),
+        (message_payloads.KeyAnnouncedPayload(key_uuid=KEY_UUID), "markdown"),
+        (message_payloads.MarkdownPayload(content="Text"), "key_announced"),
+    ],
+)
+def test_key_announcements_cannot_be_created_or_changed_by_editing(original, new_kind):
+    message = base.WorkspaceMessageFieldsBase(
+        stream_uuid=sys_uuid.uuid4(),
+        topic_uuid=sys_uuid.uuid4(),
+        source_name="native",
+        source=models.NativeSource(),
+        payload=original,
+    )
+
+    with pytest.raises(ra_exc.ValidationErrorException):
+        message.validate_key_announcement_update(new_kind)

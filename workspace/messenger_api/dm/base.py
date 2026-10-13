@@ -135,6 +135,10 @@ class WorkspaceMessageFieldsBase(WorkspaceSourceBase):
         required=True,
     )
 
+    def validate_key_announcement_update(self, kind: str) -> None:
+        if message_payloads.KeyAnnouncedPayload.KIND in (self.payload.KIND, kind):
+            raise ra_exc.ValidationErrorException()
+
 
 class WorkspaceMessageBase(
     models.ModelWithProject,
@@ -406,5 +410,13 @@ class WorkspaceUserStreamBase(
         if (
             source_name == SourceName.ZULIP.value
             and kind == message_payloads.E2EEPayload.KIND
+        ):
+            raise ra_exc.ValidationErrorException()
+
+    def validate_message_creation(self, kind: str) -> None:
+        self.validate_message_kind(self.source_name, kind)
+        if (
+            kind == message_payloads.KeyAnnouncedPayload.KIND
+            and self.role != WorkspaceStreamRole.OWNER.value
         ):
             raise ra_exc.ValidationErrorException()

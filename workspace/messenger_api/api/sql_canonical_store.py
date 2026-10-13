@@ -2567,6 +2567,49 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             raise ValueError(f"Unsupported Messenger delete resource {resource}")
         return None
 
+    def _lock_key_announcement(self, stream_uuid: object, session: typing.Any) -> None:
+        session.execute(
+            """
+            SELECT stream.uuid
+            FROM messenger_streams AS stream
+            JOIN messenger_stream_bindings AS binding
+              ON binding.project_id = stream.project_id
+             AND binding.stream_uuid = stream.uuid
+            WHERE stream.project_id = %s AND stream.uuid = %s
+              AND binding.user_uuid = %s AND binding.active
+            FOR NO KEY UPDATE OF stream, binding
+            """,
+            (self.project_uuid, stream_uuid, self.user_uuid),
+        )
+
+    def _apply_key_announcement(
+        self,
+        stream_uuid: object,
+        canonical_uuid: object,
+        placement_uuid: object,
+        key_uuid: object,
+        session: typing.Any,
+    ) -> None:
+        previous = session.execute(
+            """
+            SELECT 1 FROM messenger_message_placements
+            WHERE project_id = %s AND stream_uuid = %s
+              AND message_uuid = %s AND uuid <> %s
+            LIMIT 1
+            """,
+            (self.project_uuid, stream_uuid, canonical_uuid, placement_uuid),
+        ).fetchone()
+        if previous is not None:
+            raise ra_exceptions.ValidationErrorException()
+        session.execute(
+            """
+            UPDATE messenger_streams
+            SET current_encryption_key_uuid = %s, updated_at = NOW()
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (key_uuid, self.project_uuid, stream_uuid),
+        )
+
     def create_message(
         self,
         values: dict[str, typing.Any],
@@ -2574,11 +2617,41 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
         values = self._projection_values(values)
         values["uuid"] = values.get("uuid") or sys_uuid.uuid4()
         payload = resource_projection.simple(values["payload"])
-        if payload["kind"] == message_payloads.E2EEPayload.KIND:
+        announced = payload["kind"] == message_payloads.KeyAnnouncedPayload.KIND
+        if announced:
+            session = contexts.Context().get_session()
+            self._lock_key_announcement(values["stream_uuid"], session)
+        if payload["kind"] in (
+            message_payloads.E2EEPayload.KIND,
+            message_payloads.KeyAnnouncedPayload.KIND,
+        ):
             stream = helpers.get_workspace_user_stream(
                 self.project_uuid, self.user_uuid, values["stream_uuid"]
             )
-            stream.validate_message_kind(stream.source_name, payload["kind"])
+            stream.validate_message_creation(payload["kind"])
+        if announced:
+            existing = models.WorkspaceMessage.objects.get_one_or_none(
+                filters={
+                    "project_id": dm_filters.EQ(self.project_uuid),
+                    "uuid": dm_filters.EQ(values["uuid"]),
+                },
+                session=session,
+            )
+            if existing is not None:
+                if (
+                    existing.user_uuid != self.user_uuid
+                    or existing.stream_uuid != stream.uuid
+                    or existing.topic_uuid
+                    != (values.get("topic_uuid") or stream.default_topic_uuid)
+                    or resource_projection.simple(existing.payload) != payload
+                ):
+                    raise ra_exceptions.ValidationErrorException()
+                return _public_dict(
+                    helpers.get_workspace_user_message(
+                        self.project_uuid, self.user_uuid, existing.uuid
+                    ),
+                    "messages",
+                )
         provider_targets = self._provider_targets_for_message(
             values["stream_uuid"],
             values.get("topic_uuid"),
@@ -2593,6 +2666,25 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             compact_events=True,
             **values,
         )
+        if announced:
+            placement = session.execute(
+                """
+                SELECT uuid, message_uuid FROM messenger_message_placements
+                WHERE project_id = %s AND stream_uuid = %s AND topic_uuid = %s
+                  AND legacy_public_uuid = %s
+                """,
+                (self.project_uuid, row.stream_uuid, row.topic_uuid, row.uuid),
+            ).fetchone()
+            self._apply_key_announcement(
+                row.stream_uuid,
+                placement["message_uuid"],
+                placement["uuid"],
+                payload["key_uuid"],
+                session,
+            )
+            helpers._create_workspace_stream_updated_events(
+                self.project_uuid, row.stream_uuid, session=session
+            )
         for provider_target in provider_targets:
             self._queue_provider_operation(
                 operation_kind="message.create",
@@ -2615,6 +2707,7 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             message_uuid,
         )
         payload = resource_projection.simple(values["payload"])
+        message.validate_key_announcement_update(payload["kind"])
         if payload["kind"] == message_payloads.E2EEPayload.KIND:
             stream = helpers.get_workspace_user_stream(
                 self.project_uuid, self.user_uuid, message.stream_uuid
