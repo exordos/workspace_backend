@@ -216,6 +216,8 @@ only references the user through an indexed external key
 
 ### `WorkspaceUserStream`
 
+The shared canonical `WorkspaceStream` stores `encryption` and nullable `current_encryption_key_uuid`; these values are identical for all members and appear in public stream responses and events. The flag is immutable after creation. An `owner` message with `kind: key_announced` atomically stores the announcement and changes the current symmetric key UUID. `source_name` is shared for the entire stream: `zulip` forbids `encryption: true` and `e2ee`. The six payload structures and opaque-content limits are defined in [the public API contract](workspace_api.md#message-payloads).
+
 `WorkspaceUserStream` keeps the current public fields, but the target representation
 builds from the physical `WorkspaceStreamBinding` current user:
 

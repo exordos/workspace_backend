@@ -6,6 +6,7 @@
 import json
 from unittest import mock
 
+import pytest
 import webob
 from restalchemy.api import applications
 from restalchemy.api import constants
@@ -158,7 +159,7 @@ def _assert_topic_summary_contract(paths, topic_path):
     prompt = paths[f"{topic_path}/actions/set_summary_prompt/invoke"]["post"]
     assert "owner or administrator" in prompt["description"]
     prompt_schema = prompt["requestBody"]["content"]["application/json"]["schema"]
-    assert prompt_schema["required"] == []
+    assert "required" not in prompt_schema
     assert prompt_schema["minProperties"] == 1
     assert prompt_schema["additionalProperties"] is False
     assert prompt_schema["properties"]["summary_system_prompt"]["maxLength"] == 16384
@@ -260,6 +261,8 @@ def _assert_all_local_references_resolve(specification):
     while pending:
         value = pending.pop()
         if isinstance(value, dict):
+            if isinstance(value.get("required"), list):
+                assert value["required"], "OpenAPI 3.0 forbids an empty required array"
             reference = value.get("$ref")
             if reference is not None:
                 assert reference.startswith("#/")
@@ -308,6 +311,106 @@ def test_generated_openapi_message_payload_uses_markdown_content_limit():
     )["properties"]["payload"]
 
     assert payload_schema["oneOf"][0]["properties"]["content"]["maxLength"] == 40000
+
+
+@pytest.mark.parametrize(
+    "app_module,root",
+    [(messenger_app, "/v1/"), (workspace_app, "/v1/messenger/")],
+)
+def test_generated_openapi_describes_encryption_requests_and_fixed_payloads(
+    app_module, root
+):
+    specification = _build_openapi(app_module)
+    paths = specification["paths"]
+    expected_fields = {
+        "markdown": {"kind", "content"},
+        "e2ee": {"kind", "key_uuid", "content"},
+        "key_request": {"kind", "key_uuid", "device_id", "device_name", "public_key"},
+        "key_grant": {
+            "kind",
+            "key_uuid",
+            "request_message_uuid",
+            "sender_device_id",
+            "recipient_device_id",
+            "content",
+        },
+        "key_reject": {
+            "kind",
+            "key_uuid",
+            "request_message_uuid",
+            "sender_device_id",
+            "recipient_device_id",
+        },
+        "key_announced": {"kind", "key_uuid"},
+    }
+    for name in (
+        "WorkspaceUserMessage_Filter",
+        "WorkspaceUserMessage_Get",
+        "WorkspaceUserMessage_Create",
+        "WorkspaceUserMessage_Update",
+    ):
+        payload = _component_schema(specification, name)["properties"]["payload"]
+        variants = {
+            variant["properties"]["kind"]["enum"][0]: variant
+            for variant in payload["oneOf"]
+        }
+        assert set(variants) == set(expected_fields)
+        for kind, fields in expected_fields.items():
+            assert set(variants[kind]["required"]) == fields
+            assert set(variants[kind]["properties"]) == fields
+            assert variants[kind]["additionalProperties"] is False
+        assert variants["e2ee"]["properties"]["content"]["maxLength"] == 213336
+        assert variants["key_request"]["properties"]["public_key"]["maxLength"] == 2048
+        assert variants["key_grant"]["properties"]["content"]["maxLength"] == 40000
+    create_stream = paths[f"{root}streams/"]["post"]["requestBody"]["content"][
+        "application/json"
+    ]["schema"]
+    assert create_stream["required"] == ["name"]
+    assert not any(
+        field.get("readOnly") for field in create_stream["properties"].values()
+    )
+    assert create_stream["properties"]["encryption"]["default"] is False
+    assert "readOnly" not in create_stream["properties"]["encryption"]
+    assert create_stream["oneOf"][0]["properties"]["current_encryption_key_uuid"][
+        "enum"
+    ] == [None]
+    assert create_stream["oneOf"][1]["required"] == [
+        "encryption",
+        "current_encryption_key_uuid",
+    ]
+    update_stream = paths[f"{root}streams/{{WorkspaceUserStreamUuid}}"]["put"][
+        "requestBody"
+    ]["content"]["application/json"]["schema"]
+    assert "encryption" not in update_stream["properties"]
+    assert "current_encryption_key_uuid" not in update_stream["properties"]
+    for name in (
+        "WorkspaceUserStream_Filter",
+        "WorkspaceUserStream_Get",
+        "WorkspaceUserStream_Create",
+        "WorkspaceUserStream_Update",
+    ):
+        schema = _component_schema(specification, name)
+        assert {"encryption", "current_encryption_key_uuid"} <= set(schema["required"])
+        assert schema["properties"]["encryption"]["readOnly"] is True
+        assert schema["properties"]["current_encryption_key_uuid"]["nullable"] is True
+        assert "current_encryption_key" not in schema["properties"]
+    create_message = paths[f"{root}messages/"]["post"]["requestBody"]["content"][
+        "application/json"
+    ]["schema"]
+    assert create_message["required"] == ["stream_uuid", "payload"]
+    assert not any(
+        field.get("readOnly") for field in create_message["properties"].values()
+    )
+    assert create_message["properties"]["topic_uuid"]["nullable"] is True
+    update_message = paths[f"{root}messages/{{WorkspaceUserMessageUuid}}"]["put"][
+        "requestBody"
+    ]["content"]["application/json"]["schema"]
+    assert update_message["required"] == ["payload"]
+    assert {
+        variant["properties"]["kind"]["enum"][0]
+        for variant in update_message["properties"]["payload"]["oneOf"]
+    } == set(expected_fields) - {"key_announced"}
+    _assert_draft_contract(paths, f"{root}drafts/")
 
 
 def test_generated_openapi_exposes_persisted_complete_reaction_user_lists():

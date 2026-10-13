@@ -71,6 +71,23 @@ also defines rebuild, recovery, scale, and load acceptance.
 | MSG-DB-006 | Attempt to act without membership or with another project's token. | IAM authorization rejects the request and canonical state remains unchanged. |
 | MSG-DB-007 | Submit the same retryable request after an ambiguous response failure. | Idempotency is preserved and duplicate user-visible messages or events are not created. |
 
+## Symmetric stream keys and encrypted messages
+
+These scenarios extend the baseline with the agreed six-kind payload contract. Run both the canonical v2 writer and the retained legacy writer where applicable, using a dedicated migrated PostgreSQL database.
+
+| ID | Scenario | Expected result |
+| --- | --- | --- |
+| MSG-E2EE-001 | Create streams with absent, false, true and invalid encryption metadata. | `encryption` defaults to `false`; `true` requires `current_encryption_key_uuid`, and `false` only allows an absent or `null` key. Invalid data rolls back without stream or outbox rows. |
+| MSG-E2EE-002 | Read streams through both API entry points and realtime snapshots. | All snapshots include `encryption` and nullable `current_encryption_key_uuid`; metadata and source are shared across members. |
+| MSG-E2EE-003 | Send all six kinds with valid, missing and extra payload fields. | Fixed schemas reject missing/unknown fields. All kinds are allowed regardless of encryption, subject to the Zulip `e2ee` restriction. |
+| MSG-E2EE-004 | Try enabling encryption or sending `e2ee` in a shared Zulip stream as different users. | HTTP `400`; no message or provider operation is created. The shared `source_name` controls the decision. |
+| MSG-E2EE-005 | Send `key_announced` with every stream role and update metadata through `PUT`. | Only `owner` may announce; `PUT` cannot change encryption fields or create/edit announcements. |
+| MSG-E2EE-006 | Inject failure after key rotation and send concurrent owner announcements or a concurrent demotion. | Message, key and outbox commit atomically; failures roll back, owner checks use locked current membership and concurrent rotations serialize. |
+| MSG-E2EE-007 | Retry an old announcement after a newer one, reuse it in another topic and send `e2ee` with an old key. | Retries do not rewind the current UUID; another topic in the same stream is rejected; old `e2ee` key UUIDs remain accepted. |
+| MSG-E2EE-008 | Use mention/image-like text in opaque payloads, edit between Markdown and opaque content, and rebuild read state. | History/events preserve payloads; only `markdown` produces mentions. Editing to opaque content removes old mentions and corrects counters. |
+| MSG-E2EE-009 | Summarize an opaque-only or mixed topic, including more opaque messages than the batch limit. | Opaque-only topics produce no LLM work; only Markdown counts toward the batch and its image references are loaded. |
+| MSG-E2EE-010 | Generate both OpenAPI documents and compare localized documentation. | POST/PUT and response schemas match runtime rules, six payloads have required fields and no extra fields, and all four languages share exact examples and limits. |
+
 ## Drafts
 
 | ID | Scenario | Expected result |

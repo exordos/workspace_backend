@@ -60,6 +60,11 @@ class MessengerOpenApiPaths(openapi_structures.OpenApiPaths):
             "/v1/messages/",
             components,
         )
+        specification = openapi_contract.add_message_encryption_contract(
+            specification,
+            "/v1/",
+            components,
+        )
         specification = openapi_contract.add_draft_contract(
             specification,
             "/v1/drafts/",

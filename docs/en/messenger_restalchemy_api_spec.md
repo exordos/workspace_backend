@@ -1287,8 +1287,7 @@ Active membership in the stream plus applicable visible binding; unavailable
 The message returns `404`.
 After this rights check , editing and deleting content are canonical operations.
 Placement It specifies the answer line and the state of the personal action..
-Field `payload` with markup Markdown
-Limited to 140,000 characters after removing the marginal spaces, as in the current contract.
+The six fixed `payload` structures are described in [the public API contract](workspace_api.md#message-payloads). `markdown.content` is limited to 40,000 characters, `e2ee.content` to 213,336 and device `public_key` to 2048. Only `markdown` participates in mentions and summaries. Stream encryption metadata and owner-only `key_announced` updates are described in [stream encryption](workspace_api.md#stream-encryption).
 
 ## Reactions to messages
 

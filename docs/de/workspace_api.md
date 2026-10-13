@@ -770,6 +770,8 @@ Roh-Providerprotokoll-Identifikatoren, Anmeldeinformationen und Synchronisations
 | `owner` | UUID | - Nein. | - Ja, das ist es. | Eigentümer aus der Benutzer-Stream-Ansicht. |
 | `user_uuid` | UUID | - Nein. | - Ja, das ist es. | Der aktuelle Benutzer in der Benutzer-Stream-Ansicht. |
 | `role` | `guest`, `member`, `moderator`, `administrator`, `owner` | - Nein. | - Ja, das ist es. | Die Rolle des aktuellen Benutzers. |
+| `encryption` | boolean | nein | nur beim Erstellen | Gemeinsames Flag; standardmäßig `false`, nur beim Erstellen festgelegt und danach unveränderlich. |
+| `current_encryption_key_uuid` | UUID oder `null` | bedingt | über Ankündigung | Beim Erstellen mit `encryption: true` erforderlich; sonst fehlend oder `null`. Danach nur durch `key_announced` geändert. |
 | `notification_mode` | `mentions_only`, `muted`, `all_messages` | - Nein. | von Benutzern gesteuerte Aktionen | Der aktuelle Nutzer ist in einem Stream-Benachrichtigungsmodus; Standardwert ist `all_messages`. |
 | `unread_count` | ganzzahl | - Nein. | - Ja, das ist es. | Die ungelesenen Daten des aktuellen Benutzers. |
 | `active_unread_count` | ganzzahl | - Nein. | - Ja, das ist es. | Die Anzahl der nicht gelesenen Daten des aktuellen Benutzers, die unter den Notifizierungsmodi effektiver Streams /topic zulässig ist. |
@@ -902,6 +904,25 @@ Für direkte private Streams wird für jeden `stream.created` Ereignis geschrieb
 Die Erstellung des Streams schreibt auch `folder.updated` Ereignisse für jede
 Teilnehmerordner `All chats` und für `Personal`, wenn der Stream privat ist,
 oder `Channels`, wenn es nicht privat ist.
+
+### Stream-Verschlüsselung {#stream-encryption}
+
+`encryption` ist standardmäßig `false`. Beim Erstellen erfordert `true` eine nicht leere `current_encryption_key_uuid`; bei `false` muss die Schlüssel-UUID fehlen oder `null` sein. Beide Felder erscheinen in Stream-Listen, Einzelantworten und Echtzeit-Snapshots. Der Stream-Schlüssel ist symmetrisch: Das Backend speichert nur die UUID, weder den Klartextschlüssel noch einen öffentlichen Teil.
+
+```http
+POST /api/workspace/v1/messenger/streams/
+Content-Type: application/json
+
+{
+  "name": "Secret chat",
+  "encryption": true,
+  "current_encryption_key_uuid": "80bc4f0b-87ac-4d8d-9350-e5f88f61ca20"
+}
+```
+
+`source_name` hat für den gesamten Stream einen gemeinsamen Wert, `native` oder `zulip`, der für alle Teilnehmer identisch ist. Ein Zulip-Stream erlaubt weder `encryption: true` noch `e2ee`-Nachrichten. Die öffentliche API erstellt nur native Streams; Zulip-Streams werden vom Provider verwaltet und behalten `encryption: false`.
+
+Nach dem Erstellen ist `encryption` unveränderlich. `PUT` lehnt `encryption` und `current_encryption_key_uuid` auch bei unveränderten Werten ab. Nur ein `owner` darf `key_announced` senden; Nachricht und aktuelle UUID werden atomar gespeichert. Die Ankündigung ist auch bei `encryption: false` erlaubt und ändert nur die UUID, nicht das Flag. Ein neuer unverschlüsselter Stream liefert `current_encryption_key_uuid: null`.
 
 ## Strömungsbindungen
 
@@ -1185,12 +1206,7 @@ Die Generations-Einstellungen haben folgende Standardeinstellungen und akzeptier
 | `presence_penalty` | `0.0` | `-2.0..2.0` |
 | `frequency_penalty` | `0.0` | `-2.0..2.0` |
 
-Der Messenger-Arbeiter fordert ein veraltetes Thema und höchstens 100 neue Nachrichten in einem
-Schritt, schnappt sich die Grenze und effektive Aufforderung, verpflichtet den Anspruch, führt
-die LLM Anfrage außerhalb jeder Datenbanktransaktion, und das Ergebnis bleibt in
-eine neue Transaktion über den bestehenden internen Zusammenfassungshelfer.
-Wiederholungsverzögerungen, Endpunktleasing und Anspruchsverfall werden gespeichert, so dass Wiederholungsversuche erhalten bleiben
-begrenzt und beobachtbar.
+Der Messenger-Worker beansprucht ein Thema und höchstens 100 neue `markdown`-Nachrichten pro Schritt. Andere Arten werden vor Anwendung des Limits ausgeschlossen und lösen weder Bildladen noch LLM-Anfragen aus. Er speichert die Grenze und den effektiven Prompt, bestätigt die Transaktion, ruft das LLM außerhalb jeder Datenbanktransaktion auf und speichert das Ergebnis über den internen Zusammenfassungs-Helper. Fehler, Wiederholungsverzögerungen, Endpoint-Leases und Ablaufzeiten bleiben gespeichert.
 
 Die langen Argumente sind eine normale Reaktion des Anbieters, nicht ein Versagen des Arbeitnehmers.
 Die Verbindungsaufzeit beträgt 30 Sekunden, während die Antwortsaufzeit 25 Minuten beträgt, so dass ein
@@ -1258,13 +1274,15 @@ Nebenwirkungen in Echtzeit:
 
 ## Nachrichten {#messages}
 
-`POST /api/workspace/v1/messenger/messages/` validiert den aktuellen PostgreSQL-Stream
-Mitglieder und verpflichtet sich die kanonischen UTF-8 Markdown-Nachricht, Flaggen, eine gemeinsame
-Die Daten werden in einem "Snapshot" von der Zielgruppe des Empfängers und in einem "Compact Message" /topic/stream aufgenommen.
-Es erstellt nicht eine kanonische Ereigniszeile pro Empfänger.
-Die Lesungen bleiben dem aktuellen IAM Benutzer vorbehalten und behalten die vorhandene Antwort.
+`POST /api/workspace/v1/messenger/messages/` prüft die aktuelle PostgreSQL-Stream-Mitgliedschaft und speichert die typisierte JSON-Payload, Flags, gemeinsamen Empfänger und kompakten message/topic/stream-Ereignisse in der Anfrage-Transaktion. Lesezugriffe bleiben auf den aktuellen IAM-Benutzer und das Projekt begrenzt. Fehlt `topic_uuid` oder ist es `null`, wird das Standardthema des Streams verwendet.
 
-Die einzige unterstützte Nachrichtenlast in v1 ist Markdown:
+### Nachrichtenformate {#message-payloads}
+
+Alle sechs `kind`-Werte sind unabhängig vom Verschlüsselungsflag erlaubt, außer `e2ee` in einem Zulip-Stream. Alle in den Beispielen gezeigten Payload-Felder sind erforderlich; unbekannte Felder werden abgelehnt. `key_uuid` und `request_message_uuid` müssen UUIDs sein. Gerätekennungen und Namen sind undurchsichtige Zeichenfolgen mit höchstens 255 Zeichen.
+
+Markdown-`content` ist eine nicht leere Zeichenfolge mit höchstens 40.000 Zeichen. `e2ee.content` erlaubt bis zu 213.336 Zeichen: ausreichend für Base64 nach einer längenerhaltenden Verschlüsselung von 40.000 UTF-8-Zeichen mit jeweils bis zu vier Bytes. `key_grant.content` ist nicht leer und auf 40.000 Zeichen begrenzt. `key_request.public_key` ist der öffentliche Schlüssel des anfragenden Geräts, nicht der symmetrische Stream-Schlüssel; er ist nicht leer und auf 2048 Zeichen begrenzt. Inhalte und öffentliche Schlüssel werden unverändert übertragen; das Backend entfernt keine Leerzeichen, prüft kein Base64, ver- oder entschlüsselt nicht und speichert keine geheimen Schlüssel im Klartext.
+
+#### Markdown-Nachricht
 
 ```json
 {
@@ -1272,6 +1290,66 @@ Die einzige unterstützte Nachrichtenlast in v1 ist Markdown:
   "content": "Hello, workspace"
 }
 ```
+
+#### Verschlüsselte Nachricht
+
+```json
+{
+  "kind": "e2ee",
+  "key_uuid": "80bc4f0b-87ac-4d8d-9350-e5f88f61ca20",
+  "content": "<encrypted-envelope-base64>"
+}
+```
+
+#### Schlüsselanfrage
+
+```json
+{
+  "kind": "key_request",
+  "key_uuid": "80bc4f0b-87ac-4d8d-9350-e5f88f61ca20",
+  "device_id": "requesting-device",
+  "device_name": "Requesting device",
+  "public_key": "<device-public-key-base64>"
+}
+```
+
+#### Verschlüsselte Schlüsselübergabe
+
+```json
+{
+  "kind": "key_grant",
+  "key_uuid": "80bc4f0b-87ac-4d8d-9350-e5f88f61ca20",
+  "request_message_uuid": "a93dca35-3061-4748-bda4-7f6f8c660ea5",
+  "sender_device_id": "sender-device",
+  "recipient_device_id": "requesting-device",
+  "content": "<encrypted-symmetric-key-base64>"
+}
+```
+
+#### Ablehnung einer Schlüsselanfrage
+
+```json
+{
+  "kind": "key_reject",
+  "key_uuid": "80bc4f0b-87ac-4d8d-9350-e5f88f61ca20",
+  "request_message_uuid": "a93dca35-3061-4748-bda4-7f6f8c660ea5",
+  "sender_device_id": "sender-device",
+  "recipient_device_id": "requesting-device"
+}
+```
+
+#### Ankündigung des aktuellen Schlüssels
+
+```json
+{
+  "kind": "key_announced",
+  "key_uuid": "80bc4f0b-87ac-4d8d-9350-e5f88f61ca20"
+}
+```
+
+Nur `markdown` wird als Markdown verarbeitet und für serverseitige Erwähnungen oder Themenzusammenfassungen verwendet. Andere Payloads bleiben in Verlauf und Echtzeit undurchsichtig; erwähnungsähnlicher Text und Bild-URNs haben keine serverseitige Bedeutung. Solche Nachrichten zählen nicht zum Zusammenfassungslimit und ihre Anhänge werden nicht für ein LLM geladen. Es gibt derzeit keinen separaten Endpunkt für serverseitige Textsuche. Alte `key_uuid`-Werte in `e2ee` werden ohne Vergleich mit dem aktuellen Schlüssel akzeptiert.
+
+`key_announced` enthält nur `kind` und `key_uuid`, weder Inhalt noch Schlüsselmaterial. Nur die Stream-Bindungsrolle `owner` darf es senden; `administrator`, `moderator` und `member` erhalten HTTP `400`. Verwende für eine neue Ankündigung eine neue Nachrichten-UUID. Eine Wiederholung setzt einen neueren aktuellen Schlüssel nicht zurück; dieselbe kanonische Nachricht in einem anderen Thema desselben Streams wird abgelehnt. `PUT` kann eine Ankündigung weder erstellen noch bearbeiten. Das Löschen setzt die aktuelle Schlüssel-UUID nicht zurück. `request_message_uuid` bezeichnet die öffentliche `uuid` aus der Antwort auf die Schlüsselanfrage.
 
 Workspace Entitätsverweise innerhalb von Markdown-Inhalten verwenden einen regelmäßigen Markdown-Link
 Die URL Teil ist ein Workspace URN:
@@ -1294,7 +1372,7 @@ Die URL Teil ist ein Workspace URN:
 | `stream_uuid` | UUID | - Ja, das ist es. | - Nein. | Strom UUID. |
 | `topic_uuid` | UUID | - Nein. | - Nein. | Thema UUID; ausgelassen oder `null` verwendet das Stream-Standardthema. Die Anfrage scheitert mit Code `400001007`, wenn der Stream keine Standardfunktion hat. |
 | `author_uuid` | UUID | - Nein. | - Ja, das ist es. | Nachrichtenautor. |
-| `payload` | Gegenstand | - Ja, das ist es. | - Nein. | Markdown-Nachrichten-Nutzlast; beschnittener Inhalt muss 1..40.000 Zeichen betragen. |
+| `payload` | Gegenstand | - Ja, das ist es. | - Nein. | Typisierte Nachrichten-Payload; feste Strukturen und Grenzen sind oben beschrieben. |
 | `user_uuid` | UUID | - Nein. | - Ja, das ist es. | Der aktuelle Benutzer in der Benutzernachrichtansicht. |
 | `read` | Boolean | - Nein. | - Ja, das ist es. | Der aktuelle Benutzer hat eine Leseflagge. |
 | `pinned` | Boolean | - Nein. | - Ja, das ist es. | Die eingeschlossene Flagge des aktuellen Benutzers. |
@@ -1817,9 +1895,7 @@ von der sichtbaren Ereignisfläche PostgreSQL des aktuellen Benutzers.
 Die obersten Felder beschreiben nur die Ereigniszeile. `payload.kind` ist die einzige `kind`.
 Erwarten Sie nicht, dass die Spitzenstufe `type`, `kind`, `stream_uuid` oder `topic_uuid`
 
-Nachrichten erstellen/update Ereignisse tragen die gleiche Markdown-Nutzlast auf dem
-Entity-Verbindungen bleiben regelmäßige Markdown-Verbindungen mit `urn:user`,
-`urn:message`, `urn:stream`, `urn:topic`, Datei/media, Avatar oder URL URNs.
+Erstellungs- und Änderungsereignisse enthalten dieselbe typisierte Payload wie die gespeicherte Nachricht. Nur `markdown` verwendet Entitätsverweise wie `urn:user`, `urn:message`, `urn:stream`, `urn:topic`, Datei-/Medien-, Avatar- oder URL-URNs; andere Arten bleiben undurchsichtig.
 
 Messenger Entity-Erstellung, Aktualisierung, Lesung und Aktionsereignisse tragen die gleiche vollständige
 Objekt-Snapshot, den der aktuelle Benutzer vom entsprechenden REST erhält

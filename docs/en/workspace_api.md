@@ -770,6 +770,8 @@ raw provider protocol identifiers, credentials, and synchronization state.
 | `owner` | UUID | no | yes | Owner from the user stream view. |
 | `user_uuid` | UUID | no | yes | Current user in the user stream view. |
 | `role` | `guest`, `member`, `moderator`, `administrator`, `owner` | no | yes | Current user's role. |
+| `encryption` | boolean | no | creation-only | Shared flag; defaults to `false`, set only at creation and immutable afterwards. |
+| `current_encryption_key_uuid` | UUID or `null` | conditional | announcement-managed | Required at creation when `encryption` is `true`; otherwise absent or `null`. Later changed only by `key_announced`. |
 | `notification_mode` | `mentions_only`, `muted`, `all_messages` | no | user-scoped action-managed | Current user's stream notification mode; defaults to `all_messages`. |
 | `unread_count` | integer | no | yes | Current user's raw unread count. |
 | `active_unread_count` | integer | no | yes | Current user's unread count eligible under the effective stream/topic notification modes. |
@@ -902,6 +904,25 @@ For direct private streams, one `stream.created` event is written for each
 participant. Stream creation also writes `folder.updated` events for each
 participant's `All chats` folder and for `Personal` when the stream is private,
 or `Channels` when it is not private.
+
+### Stream encryption {#stream-encryption}
+
+`encryption` defaults to `false`. On creation, `true` requires a non-null `current_encryption_key_uuid`; `false` permits only an absent or `null` key UUID. Both fields are returned in stream list/get responses and stream snapshots in realtime events. The stream key is symmetric: the backend stores its UUID, never its plaintext or a public part.
+
+```http
+POST /api/workspace/v1/messenger/streams/
+Content-Type: application/json
+
+{
+  "name": "Secret chat",
+  "encryption": true,
+  "current_encryption_key_uuid": "80bc4f0b-87ac-4d8d-9350-e5f88f61ca20"
+}
+```
+
+`source_name` is one shared `native` or `zulip` value for the whole stream, identical for all participants. A Zulip stream cannot enable `encryption: true`, and cannot accept `e2ee` messages. Public stream creation is native-only; provider-managed Zulip streams retain `encryption: false`.
+
+After creation, `encryption` is immutable. `PUT` rejects both `encryption` and `current_encryption_key_uuid`, including unchanged values. Only an `owner` may send `key_announced`; the message and new current UUID commit atomically. An announcement is allowed even when `encryption` is `false` and changes only the current UUID, not the flag. A newly created unencrypted stream returns `current_encryption_key_uuid: null`.
 
 ## Stream Bindings
 
@@ -1185,12 +1206,7 @@ Generation settings have these defaults and accepted ranges:
 | `presence_penalty` | `0.0` | `-2.0..2.0` |
 | `frequency_penalty` | `0.0` | `-2.0..2.0` |
 
-The Messenger worker claims one stale topic and at most 100 new messages in a
-step, snapshots the boundary and effective prompt, commits the claim, performs
-the LLM request outside every database transaction, and persists the result in
-a new transaction through the existing internal summary helper. Failed jobs,
-retry delays, endpoint leases, and claim expiry are stored so retries remain
-bounded and observable.
+The Messenger worker claims one topic and at most 100 new `markdown` messages per step. Other kinds are skipped before the batch limit and do not trigger image loading or an LLM request. It snapshots the boundary and effective prompt, commits the claim, performs the LLM request outside every database transaction, and persists the result through the internal summary helper. Failed jobs, retry delays, endpoint leases and claim expiry remain stored.
 
 Long reasoning is a normal provider response, not a worker failure. The default
 connection timeout is 30 seconds, while the response timeout is 25 minutes so a
@@ -1258,13 +1274,15 @@ Realtime side effects:
 
 ## Messages {#messages}
 
-`POST /api/workspace/v1/messenger/messages/` validates current PostgreSQL stream
-membership and commits the canonical UTF-8 markdown message, flags, one shared
-recipient-audience snapshot, and compact message/topic/stream events in the
-request transaction. It does not create one canonical event row per recipient.
-Reads remain scoped to the current IAM user and keep the existing response.
+`POST /api/workspace/v1/messenger/messages/` validates current PostgreSQL stream membership and commits the canonical typed JSON payload, flags, shared recipient audience and compact message/topic/stream events in the request transaction. Reads remain scoped to the current IAM user and project. An absent or `null` `topic_uuid` selects the stream default topic.
 
-The only supported message payload in v1 is markdown:
+### Message payloads {#message-payloads}
+
+All six `kind` values are allowed regardless of the stream encryption flag, except `e2ee` is forbidden in a Zulip stream. Every field shown in a payload example is required; unknown fields are rejected. `key_uuid` and `request_message_uuid` must be UUIDs. Device identifiers and names are opaque strings of at most 255 characters.
+
+Markdown `content` is a non-empty string of at most 40,000 characters. `e2ee.content` allows up to 213,336 characters: enough for Base64 of a length-preserving cipher applied to 40,000 characters encoded with up to four UTF-8 bytes each. `key_grant.content` is non-empty and limited to 40,000 characters. `key_request.public_key` is the requesting device public key, not the symmetric stream key; it is non-empty and limited to 2048 characters. Content and public keys pass through unchanged; the backend does not trim, validate Base64, encrypt, decrypt or store plaintext secret keys.
+
+#### Markdown message
 
 ```json
 {
@@ -1272,6 +1290,66 @@ The only supported message payload in v1 is markdown:
   "content": "Hello, workspace"
 }
 ```
+
+#### Encrypted message
+
+```json
+{
+  "kind": "e2ee",
+  "key_uuid": "80bc4f0b-87ac-4d8d-9350-e5f88f61ca20",
+  "content": "<encrypted-envelope-base64>"
+}
+```
+
+#### Key request
+
+```json
+{
+  "kind": "key_request",
+  "key_uuid": "80bc4f0b-87ac-4d8d-9350-e5f88f61ca20",
+  "device_id": "requesting-device",
+  "device_name": "Requesting device",
+  "public_key": "<device-public-key-base64>"
+}
+```
+
+#### Encrypted key grant
+
+```json
+{
+  "kind": "key_grant",
+  "key_uuid": "80bc4f0b-87ac-4d8d-9350-e5f88f61ca20",
+  "request_message_uuid": "a93dca35-3061-4748-bda4-7f6f8c660ea5",
+  "sender_device_id": "sender-device",
+  "recipient_device_id": "requesting-device",
+  "content": "<encrypted-symmetric-key-base64>"
+}
+```
+
+#### Key rejection
+
+```json
+{
+  "kind": "key_reject",
+  "key_uuid": "80bc4f0b-87ac-4d8d-9350-e5f88f61ca20",
+  "request_message_uuid": "a93dca35-3061-4748-bda4-7f6f8c660ea5",
+  "sender_device_id": "sender-device",
+  "recipient_device_id": "requesting-device"
+}
+```
+
+#### Current key announcement
+
+```json
+{
+  "kind": "key_announced",
+  "key_uuid": "80bc4f0b-87ac-4d8d-9350-e5f88f61ca20"
+}
+```
+
+Only `markdown` is processed as Markdown or used for server-side mentions and topic summaries. Other payloads remain opaque in history and realtime; text resembling a mention or image URN has no server-side meaning. Non-Markdown messages do not consume the summary batch limit and their attachments are not loaded for an LLM. There is currently no standalone server-side text-search endpoint. Old `key_uuid` values in `e2ee` messages are accepted without comparison to the current key.
+
+`key_announced` carries only `kind` and `key_uuid`, with no content or key material. Only the stream binding role `owner` may send it; `administrator`, `moderator` and `member` are rejected with HTTP `400`. Use a new message UUID for a new announcement. Retrying the same announcement does not rewind a newer current key; reusing its canonical message in another topic of the same stream is rejected. `PUT` cannot create or edit an announcement. Deleting it does not rewind the current key UUID. `request_message_uuid` refers to the public `uuid` returned for the key-request message.
 
 Workspace entity references inside markdown content use regular markdown link
 syntax. The URL part is a Workspace URN:
@@ -1294,7 +1372,7 @@ syntax. The URL part is a Workspace URN:
 | `stream_uuid` | UUID | yes | no | Stream UUID. |
 | `topic_uuid` | UUID | no | no | Topic UUID; omitted or `null` uses the stream default topic. The request fails with code `400001007` when the stream has no default. |
 | `author_uuid` | UUID | no | yes | Message author. |
-| `payload` | object | yes | no | Markdown message payload; trimmed content must be 1..40,000 characters. |
+| `payload` | object | yes | no | Typed message payload; see the fixed structures and limits above. |
 | `user_uuid` | UUID | no | yes | Current user in the user message view. |
 | `read` | boolean | no | yes | Current user's read flag. Authors are created as read. |
 | `pinned` | boolean | no | yes | Current user's pinned flag. |
@@ -1817,9 +1895,7 @@ from the current user's visible PostgreSQL event surface.
 Top-level fields describe the event row only. `payload.kind` is the only `kind`.
 Do not expect top-level `type`, `kind`, `stream_uuid`, or `topic_uuid`.
 
-Message create/update events carry the same markdown payload stored on the
-message. Entity links remain regular markdown links with `urn:user`,
-`urn:message`, `urn:stream`, `urn:topic`, file/media, avatar, or URL URNs.
+Message create/update events carry the same typed payload stored on the message. Only `markdown` content uses entity links such as `urn:user`, `urn:message`, `urn:stream`, `urn:topic`, file/media, avatar or URL URNs; other kinds remain opaque.
 
 Messenger entity create, update, read, and action events carry the same full
 object snapshot that the current user receives from the corresponding REST

@@ -1287,8 +1287,7 @@ direct/self chat.
 返回消息 `404`.
 在此权限检查后,编辑和删除内容是正规操作.
 Placement 单独指定答案行和个人操作状态.
-标记的 `payload` 字段 Markdown
-限制在14万个字符, 删除边缘空格,.
+六种固定 `payload` 结构见[公共 API 契约](workspace_api.md#message-payloads)。`markdown.content` 最多 40,000 个字符，`e2ee.content` 最多 213,336 个字符，设备公钥 `public_key` 最多 2048 个字符。只有 `markdown` 参与提及和摘要。加密元数据及仅所有者可发送的 `key_announced` 更新见[频道加密](workspace_api.md#stream-encryption)。
 
 ## 对于消息的反应
 

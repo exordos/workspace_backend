@@ -222,6 +222,8 @@ comparison 在上面.
 
 ### `WorkspaceUserStream`
 
+共享的规范 `WorkspaceStream` 保存 `encryption` 和可为 `null` 的 `current_encryption_key_uuid`；所有成员看到相同值，这些字段也返回在频道响应和事件中。标志在创建后不可更改。`owner` 发送 `kind: key_announced` 消息时，公告保存和当前对称密钥 UUID 更新原子完成。`source_name` 对整个频道共享：`zulip` 禁止 `encryption: true` 和 `e2ee`。六种 payload 结构及不透明内容限制见[公共 API 契约](workspace_api.md#message-payloads)。
+
 `WorkspaceUserStream` 保持当前的公共领域,但目标表示
 由现有用户`WorkspaceStreamBinding`构建:
 

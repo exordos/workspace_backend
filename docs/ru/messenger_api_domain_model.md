@@ -222,6 +222,8 @@ comparison выше.
 
 ### `WorkspaceUserStream`
 
+Общий канонический `WorkspaceStream` хранит `encryption` и допускающий `null` `current_encryption_key_uuid`; эти значения одинаковы для всех участников и возвращаются в ответах и событиях стрима. Флаг неизменен после создания. Сообщение `owner` с `kind: key_announced` атомарно сохраняет объявление и меняет текущий UUID симметричного ключа. `source_name` един для всего стрима: `zulip` запрещает `encryption: true` и `e2ee`. Шесть структур payload и ограничения непрозрачного контента заданы в [публичном API-контракте](workspace_api.md#message-payloads).
+
 `WorkspaceUserStream` сохраняет текущие публичные поля, но целевое представление
 строится от физической `WorkspaceStreamBinding` текущего пользователя:
 
