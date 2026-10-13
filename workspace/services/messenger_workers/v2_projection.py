@@ -2425,7 +2425,8 @@ def _process_folder_projection(
         emitted,
         project_id=project_id,
         stream_uuid=stream_uuid,
-        control_effect=stream_uuid is None or source_kind == "stream.deleted",
+        control_effect=stream_uuid is None
+        or source_kind in {"message.deleted", "topic.deleted", "stream.deleted"},
     )
 
 

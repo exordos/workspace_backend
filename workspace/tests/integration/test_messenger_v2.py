@@ -81,6 +81,7 @@ COMPACT_TOPIC_MESSAGE_STAT_REPAIR_MIGRATION = (
 )
 PROVIDER_CHAT_LABEL_PREFERENCE_MIGRATION = "0169-prefer-provider-chat-labels-485d62.py"
 PROVIDER_CHAT_OWNER_LABEL_MIGRATION = "0170-accept-provider-chat-owner-labels-90d43c.py"
+TOMBSTONE_MIRROR_MIGRATION = "0188-Skip-tombstoned-streams-in-binding-mirrors-fd5982.py"
 
 
 def _truncate_messenger_test_data():
@@ -1687,8 +1688,7 @@ def test_native_v2_topic_deletion_drains_derived_projections(api, db):
 
     with db.cursor() as cursor:
         cursor.execute(
-            "SELECT count(*) FROM messenger_topics "
-            "WHERE project_id = %s AND uuid = %s",
+            "SELECT count(*) FROM messenger_topics WHERE project_id = %s AND uuid = %s",
             (api.project_id, topic_uuid),
         )
         assert cursor.fetchone() == (0,)
@@ -1698,6 +1698,117 @@ def test_native_v2_topic_deletion_drains_derived_projections(api, db):
             (api.project_id,),
         )
         assert cursor.fetchone() == (0,)
+
+
+@pytest.mark.parametrize("resource", ("message", "topic"))
+@pytest.mark.parametrize("repair_pending", (False, True))
+def test_native_v2_deletion_before_stream_purge_drains_snapshots(
+    api, workspace_api, db, resource, repair_pending, migration_engine
+):
+    if repair_pending:
+        migration_engine.rollback_migration(TOMBSTONE_MIRROR_MIGRATION)
+    response = api.post(
+        STREAMS, json={"name": "Delivery snapshot deletion", "private": True}
+    )
+    assert response.status_code == 201, response.text
+    stream = response.json()
+    topic_uuid = stream["default_topic_uuid"]
+    assert _drain() >= 1
+    response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream["uuid"],
+            "payload": {"kind": "markdown", "content": "Synthetic last message"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    message_uuid = response.json()["uuid"]
+    assert _drain() >= 1
+    with db.cursor() as cursor:
+        cursor.execute(
+            "SELECT last_message_uuid FROM messenger_stream_bindings "
+            "WHERE project_id = %s AND stream_uuid = %s AND user_uuid = %s",
+            (api.project_id, stream["uuid"], api.user_uuid),
+        )
+        assert cursor.fetchone() == (sys_uuid.UUID(message_uuid),)
+    if resource == "message":
+        with db.cursor() as cursor:
+            cursor.execute(
+                "UPDATE messenger_topics SET summary = 'Synthetic summary', "
+                "summary_last_message_uuid = %s WHERE project_id = %s AND uuid = %s",
+                (message_uuid, api.project_id, topic_uuid),
+            )
+
+    target = (
+        f"{MESSAGES}{message_uuid}"
+        if resource == "message"
+        else f"{STREAM_TOPICS}{topic_uuid}"
+    )
+    response = api.delete(target)
+    assert response.status_code == 204, response.text
+    response = api.delete(f"{STREAMS}{stream['uuid']}")
+    assert response.status_code == 204, response.text
+    assert api.get(target).status_code == 404
+    assert api.get(f"{STREAMS}{stream['uuid']}").status_code == 404
+
+    if repair_pending:
+        with db.cursor() as cursor:
+            cursor.execute(
+                "SELECT uuid, status, attempts, created_at, updated_at "
+                "FROM messenger_projection_tasks WHERE project_id = %s "
+                "AND status = 'pending' ORDER BY uuid",
+                (api.project_id,),
+            )
+            pending = cursor.fetchall()
+        assert len(pending) >= 2
+        assert all(row[1] == "pending" and row[2] == 0 for row in pending)
+        with pytest.raises(psycopg.errors.InFailedSqlTransaction) as failure:
+            _drain()
+        assert isinstance(failure.value.__context__, psycopg.errors.ForeignKeyViolation)
+        with db.cursor() as cursor:
+            cursor.execute(
+                "SELECT uuid, status, attempts, created_at, updated_at "
+                "FROM messenger_projection_tasks WHERE project_id = %s "
+                "AND status = 'pending' ORDER BY uuid",
+                (api.project_id,),
+            )
+            assert cursor.fetchall() == pending
+        migration_engine.apply_migration(TOMBSTONE_MIRROR_MIGRATION)
+
+    assert _drain() >= 1
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT task_kind, payload->>'source_kind', status, attempts,
+                   next_retry_at, lease_expires_at, last_error
+            FROM messenger_projection_tasks
+            WHERE project_id = %s AND status <> 'completed'
+            ORDER BY created_at, uuid
+            """,
+            (api.project_id,),
+        )
+        assert cursor.fetchall() == []
+        cursor.execute(
+            """
+            SELECT
+                (SELECT count(*) FROM messenger_streams WHERE project_id = %s),
+                (SELECT count(*) FROM messenger_topics WHERE project_id = %s),
+                (SELECT count(*) FROM messenger_messages WHERE project_id = %s),
+                (SELECT count(*) FROM m_workspace_streams WHERE project_id = %s),
+                (SELECT count(*) FROM m_workspace_stream_bindings
+                 WHERE project_id = %s),
+                (SELECT count(*) FROM m_workspace_stream_topics
+                 WHERE project_id = %s)
+            """,
+            (api.project_id,) * 6,
+        )
+        assert cursor.fetchone() == (0, 0, 0, 0, 0, 0)
+
+    response = workspace_api.get(EVENTS, user=api.user_uuid, project=api.project_id)
+    assert response.status_code == 200, response.text
+    kinds = {event["payload"]["kind"] for event in response.json()}
+    assert {"stream.deleted", "folder.updated"} <= kinds
 
 
 def test_native_v2_deleted_message_supersedes_pending_projection_work(api, db):
