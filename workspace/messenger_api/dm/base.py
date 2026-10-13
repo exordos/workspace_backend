@@ -378,10 +378,7 @@ class WorkspaceUserStreamBase(
 
     @staticmethod
     def validate_message_kind(source_name: str, kind: str) -> None:
-        if (
-            source_name == "zulip"
-            and kind == message_payloads.E2EEPayload.KIND
-        ):
+        if source_name == "zulip" and kind == message_payloads.E2EEPayload.KIND:
             raise ra_exc.ValidationErrorException()
 
     def validate_message_creation(self, kind: str) -> None:

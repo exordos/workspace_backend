@@ -109,7 +109,7 @@ def test_cleanup_preserves_imported_content_and_generic_accounts():
                 "SELECT uuid,project_id,user_uuid,topic_uuid,payload,ingest_sequence FROM m_workspace_messages WHERE uuid=%s",
                 (message_uuid,),
             ).fetchone()
-        engine.apply_migration("0186-remove-external-provider-processing-6e254a.py")
+        engine.apply_migration("0189-remove-external-provider-processing-6e254a.py")
         with psycopg.connect(test_url) as database:
             assert database.execute(
                 "SELECT source,email FROM m_workspace_users WHERE uuid=%s",

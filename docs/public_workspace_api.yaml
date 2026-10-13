@@ -192,72 +192,111 @@ components:
                 maxLength: 40000
             example:
               key: value
-          example:
-            key: value
-        revision:
-          type: integer
-          example: 1
-          minimum: 1
-          readOnly: true
-          default: 1
-      required:
-      - user_uuid
-      - project_id
-      - stream_uuid
-      - topic_uuid
-      - payload
-    WorkspaceDraft_Create:
-      type: object
-      properties:
-        uuid:
-          type: string
-          example: 00000000-0000-0000-0000-000000000000
-          format: uuid
-          readOnly: true
-        user_uuid:
-          type: string
-          example: 00000000-0000-0000-0000-000000000000
-          format: uuid
-        project_id:
-          type: string
-          example: 00000000-0000-0000-0000-000000000000
-          format: uuid
-        created_at:
-          type: string
-          x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
-          example: '2006-01-02T15:04:05.000576Z'
-          format: date-time
-          readOnly: true
-          default: '2006-01-02T15:04:05.000576Z'
-        updated_at:
-          type: string
-          x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
-          example: '2006-01-02T15:04:05.000576Z'
-          format: date-time
-          readOnly: true
-          default: '2006-01-02T15:04:05.000576Z'
-        stream_uuid:
-          type: string
-          example: 00000000-0000-0000-0000-000000000000
-          format: uuid
-        topic_uuid:
-          type: string
-          example: 00000000-0000-0000-0000-000000000000
-          format: uuid
-        payload:
-          type: object
-          oneOf:
           - type: object
             properties:
               kind:
                 type: string
                 enum:
-                - markdown
+                - e2ee
+              key_uuid:
+                type: string
+                example: 00000000-0000-0000-0000-000000000000
+                format: uuid
+              content:
+                type: string
+                example: any_string
+                minLength: 1
+                maxLength: 213336
+            example:
+              key: value
+          - type: object
+            properties:
+              kind:
+                type: string
+                enum:
+                - key_request
+              key_uuid:
+                type: string
+                example: 00000000-0000-0000-0000-000000000000
+                format: uuid
+              device_id:
+                type: string
+                example: any_string
+                maxLength: 255
+              device_name:
+                type: string
+                example: any_string
+                maxLength: 255
+              public_key:
+                type: string
+                example: any_string
+                minLength: 1
+                maxLength: 2048
+            example:
+              key: value
+          - type: object
+            properties:
+              kind:
+                type: string
+                enum:
+                - key_grant
+              key_uuid:
+                type: string
+                example: 00000000-0000-0000-0000-000000000000
+                format: uuid
+              request_message_uuid:
+                type: string
+                example: 00000000-0000-0000-0000-000000000000
+                format: uuid
+              sender_device_id:
+                type: string
+                example: any_string
+                maxLength: 255
+              recipient_device_id:
+                type: string
+                example: any_string
+                maxLength: 255
               content:
                 type: string
                 example: any_string
                 minLength: 1
                 maxLength: 40000
+            example:
+              key: value
+          - type: object
+            properties:
+              kind:
+                type: string
+                enum:
+                - key_reject
+              key_uuid:
+                type: string
+                example: 00000000-0000-0000-0000-000000000000
+                format: uuid
+              request_message_uuid:
+                type: string
+                example: 00000000-0000-0000-0000-000000000000
+                format: uuid
+              sender_device_id:
+                type: string
+                example: any_string
+                maxLength: 255
+              recipient_device_id:
+                type: string
+                example: any_string
+                maxLength: 255
+            example:
+              key: value
+          - type: object
+            properties:
+              kind:
+                type: string
+                enum:
+                - key_announced
+              key_uuid:
+                type: string
+                example: 00000000-0000-0000-0000-000000000000
+                format: uuid
             example:
               key: value
           example:
@@ -274,6 +313,8 @@ components:
       - stream_uuid
       - topic_uuid
       - payload
+    WorkspaceDraft_Create:
+      $ref: '#/components/schemas/WorkspaceDraft_Get'
     WorkspaceDraft_Update:
       $ref: '#/components/schemas/WorkspaceDraft_Get'
     WorkspaceDraft_Filter:
@@ -317,6 +358,20 @@ components:
               items: {}
           example:
             key: value
+        status:
+          type: string
+          enum:
+          - active
+          - backfill
+          - error
+          - fast_backfill
+          - new
+          example: new
+          default: new
+        error_description:
+          type: string
+          example: any_string
+          nullable: true
         revision:
           type: integer
           example: 1
@@ -477,82 +532,7 @@ components:
       - stream_uuid
       - chat_type
     UserFolderItem_Create:
-      type: object
-      properties:
-        uuid:
-          type: string
-          example: 00000000-0000-0000-0000-000000000000
-          format: uuid
-          readOnly: true
-        user_uuid:
-          type: string
-          example: 00000000-0000-0000-0000-000000000000
-          format: uuid
-        project_id:
-          type: string
-          example: 00000000-0000-0000-0000-000000000000
-          format: uuid
-        created_at:
-          type: string
-          x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
-          example: '2006-01-02T15:04:05.000576Z'
-          format: date-time
-          readOnly: true
-          default: '2006-01-02T15:04:05.000576Z'
-        updated_at:
-          type: string
-          x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
-          example: '2006-01-02T15:04:05.000576Z'
-          format: date-time
-          readOnly: true
-          default: '2006-01-02T15:04:05.000576Z'
-        folder_uuid:
-          type: string
-          example: 00000000-0000-0000-0000-000000000000
-          format: uuid
-        stream_uuid:
-          type: string
-          example: 00000000-0000-0000-0000-000000000000
-          format: uuid
-        order_index:
-          type: integer
-          example: 2147483647
-          maximum: 2147483647
-          nullable: true
-        pinned_at:
-          type: string
-          x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
-          example: '2006-01-02T15:04:05.000576Z'
-          format: date-time
-          nullable: true
-        chat_type:
-          type: string
-          enum:
-          - group
-          - private
-          - stream
-          example: stream
-        unread_count:
-          type: integer
-          example: 0
-          minimum: 0
-          default: 0
-        active_unread_count:
-          type: integer
-          example: 0
-          minimum: 0
-          default: 0
-        passive_unread_count:
-          type: integer
-          example: 0
-          minimum: 0
-          default: 0
-      required:
-      - user_uuid
-      - project_id
-      - folder_uuid
-      - stream_uuid
-      - chat_type
+      $ref: '#/components/schemas/UserFolderItem_Get'
     UserFolderItem_Filter:
       $ref: '#/components/schemas/UserFolderItem_Get'
     UserFolder_Get:
@@ -663,48 +643,7 @@ components:
       - user_uuid
       - emoji_name
     WorkspaceMessageReactions_Create:
-      type: object
-      properties:
-        uuid:
-          type: string
-          example: 00000000-0000-0000-0000-000000000000
-          format: uuid
-          readOnly: true
-        project_id:
-          type: string
-          example: 00000000-0000-0000-0000-000000000000
-          format: uuid
-        created_at:
-          type: string
-          x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
-          example: '2006-01-02T15:04:05.000576Z'
-          format: date-time
-          readOnly: true
-          default: '2006-01-02T15:04:05.000576Z'
-        updated_at:
-          type: string
-          x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
-          example: '2006-01-02T15:04:05.000576Z'
-          format: date-time
-          readOnly: true
-          default: '2006-01-02T15:04:05.000576Z'
-        message_uuid:
-          type: string
-          example: 00000000-0000-0000-0000-000000000000
-          format: uuid
-        user_uuid:
-          type: string
-          example: 00000000-0000-0000-0000-000000000000
-          format: uuid
-        emoji_name:
-          type: string
-          example: any_string
-          maxLength: 128
-      required:
-      - project_id
-      - message_uuid
-      - user_uuid
-      - emoji_name
+      $ref: '#/components/schemas/WorkspaceMessageReactions_Get'
     WorkspaceMessageReactions_Update:
       $ref: '#/components/schemas/WorkspaceMessageReactions_Get'
     WorkspaceMessageReactions_Filter:
@@ -783,10 +722,141 @@ components:
                 example: any_string
                 minLength: 1
                 maxLength: 40000
-            example:
-              key: value
-          example:
-            key: value
+            required:
+            - kind
+            - content
+            additionalProperties: false
+          - type: object
+            properties:
+              kind:
+                type: string
+                enum:
+                - e2ee
+              key_uuid:
+                type: string
+                example: 00000000-0000-0000-0000-000000000000
+                format: uuid
+              content:
+                type: string
+                example: any_string
+                minLength: 1
+                maxLength: 213336
+            required:
+            - kind
+            - key_uuid
+            - content
+            additionalProperties: false
+          - type: object
+            properties:
+              kind:
+                type: string
+                enum:
+                - key_request
+              key_uuid:
+                type: string
+                example: 00000000-0000-0000-0000-000000000000
+                format: uuid
+              device_id:
+                type: string
+                example: any_string
+                maxLength: 255
+              device_name:
+                type: string
+                example: any_string
+                maxLength: 255
+              public_key:
+                type: string
+                example: any_string
+                minLength: 1
+                maxLength: 2048
+            required:
+            - kind
+            - key_uuid
+            - device_id
+            - device_name
+            - public_key
+            additionalProperties: false
+          - type: object
+            properties:
+              kind:
+                type: string
+                enum:
+                - key_grant
+              key_uuid:
+                type: string
+                example: 00000000-0000-0000-0000-000000000000
+                format: uuid
+              request_message_uuid:
+                type: string
+                example: 00000000-0000-0000-0000-000000000000
+                format: uuid
+              sender_device_id:
+                type: string
+                example: any_string
+                maxLength: 255
+              recipient_device_id:
+                type: string
+                example: any_string
+                maxLength: 255
+              content:
+                type: string
+                example: any_string
+                minLength: 1
+                maxLength: 40000
+            required:
+            - kind
+            - key_uuid
+            - request_message_uuid
+            - sender_device_id
+            - recipient_device_id
+            - content
+            additionalProperties: false
+          - type: object
+            properties:
+              kind:
+                type: string
+                enum:
+                - key_reject
+              key_uuid:
+                type: string
+                example: 00000000-0000-0000-0000-000000000000
+                format: uuid
+              request_message_uuid:
+                type: string
+                example: 00000000-0000-0000-0000-000000000000
+                format: uuid
+              sender_device_id:
+                type: string
+                example: any_string
+                maxLength: 255
+              recipient_device_id:
+                type: string
+                example: any_string
+                maxLength: 255
+            required:
+            - kind
+            - key_uuid
+            - request_message_uuid
+            - sender_device_id
+            - recipient_device_id
+            additionalProperties: false
+          - type: object
+            properties:
+              kind:
+                type: string
+                enum:
+                - key_announced
+              key_uuid:
+                type: string
+                example: 00000000-0000-0000-0000-000000000000
+                format: uuid
+            required:
+            - kind
+            - key_uuid
+            additionalProperties: false
+          description: Fixed message payload selected by kind. Only markdown is interpreted
+            as Markdown and used for mentions and summaries. Other kinds remain opaque
+            in history and realtime.
         author_uuid:
           type: string
           example: 00000000-0000-0000-0000-000000000000
@@ -850,144 +920,7 @@ components:
       - payload
       - author_uuid
     WorkspaceUserMessage_Create:
-      type: object
-      properties:
-        uuid:
-          type: string
-          example: 00000000-0000-0000-0000-000000000000
-          format: uuid
-          readOnly: true
-        user_uuid:
-          type: string
-          example: 00000000-0000-0000-0000-000000000000
-          format: uuid
-        project_id:
-          type: string
-          example: 00000000-0000-0000-0000-000000000000
-          format: uuid
-        created_at:
-          type: string
-          x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
-          example: '2006-01-02T15:04:05.000576Z'
-          format: date-time
-          readOnly: true
-          default: '2006-01-02T15:04:05.000576Z'
-        updated_at:
-          type: string
-          x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
-          example: '2006-01-02T15:04:05.000576Z'
-          format: date-time
-          readOnly: true
-          default: '2006-01-02T15:04:05.000576Z'
-        source_name:
-          type: string
-          enum:
-          - native
-          example: native
-          default: native
-        source:
-          type: object
-          oneOf:
-          - type: object
-            properties:
-              kind:
-                type: string
-                enum:
-                - native
-            example:
-              key: value
-          example:
-            key: value
-          default:
-            kind: native
-        stream_uuid:
-          type: string
-          example: 00000000-0000-0000-0000-000000000000
-          format: uuid
-        topic_uuid:
-          type: string
-          example: 00000000-0000-0000-0000-000000000000
-          format: uuid
-        payload:
-          type: object
-          oneOf:
-          - type: object
-            properties:
-              kind:
-                type: string
-                enum:
-                - markdown
-              content:
-                type: string
-                example: any_string
-                minLength: 1
-                maxLength: 40000
-            example:
-              key: value
-          example:
-            key: value
-        author_uuid:
-          type: string
-          example: 00000000-0000-0000-0000-000000000000
-          format: uuid
-        read:
-          type: boolean
-          example: true
-          default: false
-        pinned:
-          type: boolean
-          example: true
-          default: false
-        starred:
-          type: boolean
-          example: true
-          default: false
-        is_own:
-          type: boolean
-          example: true
-          default: false
-        mentioned:
-          type: boolean
-          example: true
-          readOnly: true
-          default: false
-        reactions:
-          type: object
-          additionalProperties:
-            oneOf:
-            - type: string
-            - type: integer
-            - type: boolean
-            - type: object
-            - type: array
-              items: {}
-          example:
-            key: value
-          default: {}
-        reaction_users:
-          type: object
-          readOnly: true
-          default: {}
-          description: Complete user UUID lists persisted on reaction writes. An empty
-            object or missing emoji key means count-only; lists are never partial.
-          example:
-            heart:
-            - 11111111-1111-1111-1111-111111111111
-            - 33333333-3333-3333-3333-333333333333
-          additionalProperties:
-            type: array
-            minItems: 1
-            uniqueItems: true
-            items:
-              type: string
-              format: uuid
-      required:
-      - user_uuid
-      - project_id
-      - stream_uuid
-      - topic_uuid
-      - payload
-      - author_uuid
+      $ref: '#/components/schemas/WorkspaceUserMessage_Get'
     WorkspaceUserMessage_Update:
       $ref: '#/components/schemas/WorkspaceUserMessage_Get'
     WorkspaceUserMessage_Filter:
@@ -1215,154 +1148,7 @@ components:
       - name
       - stream_uuid
     WorkspaceUserTopic_Create:
-      type: object
-      properties:
-        uuid:
-          type: string
-          example: 00000000-0000-0000-0000-000000000000
-          format: uuid
-          readOnly: true
-        user_uuid:
-          type: string
-          example: 00000000-0000-0000-0000-000000000000
-          format: uuid
-        project_id:
-          type: string
-          example: 00000000-0000-0000-0000-000000000000
-          format: uuid
-        created_at:
-          type: string
-          x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
-          example: '2006-01-02T15:04:05.000576Z'
-          format: date-time
-          readOnly: true
-          default: '2006-01-02T15:04:05.000576Z'
-        updated_at:
-          type: string
-          x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
-          example: '2006-01-02T15:04:05.000576Z'
-          format: date-time
-          readOnly: true
-          default: '2006-01-02T15:04:05.000576Z'
-        source_name:
-          type: string
-          enum:
-          - native
-          example: native
-          default: native
-        source:
-          type: object
-          oneOf:
-          - type: object
-            properties:
-              kind:
-                type: string
-                enum:
-                - native
-            example:
-              key: value
-          example:
-            key: value
-          default:
-            kind: native
-        name:
-          type: string
-          example: any_string
-          maxLength: 128
-        stream_uuid:
-          type: string
-          example: 00000000-0000-0000-0000-000000000000
-          format: uuid
-        color:
-          type: integer
-          example: 8388607
-          minimum: 0
-          maximum: 16777215
-        last_message_uuid:
-          type: string
-          example: 00000000-0000-0000-0000-000000000000
-          format: uuid
-          nullable: true
-        unread_count:
-          type: integer
-          example: 0
-          minimum: 0
-          default: 0
-        active_unread_count:
-          type: integer
-          example: 0
-          minimum: 0
-          default: 0
-        passive_unread_count:
-          type: integer
-          example: 0
-          minimum: 0
-          default: 0
-        is_default:
-          type: boolean
-          example: true
-          default: false
-        is_done:
-          type: boolean
-          example: true
-          default: false
-        notification_mode:
-          type: string
-          enum:
-          - default
-          - follow
-          - mute
-          - unmute
-          example: mute
-          default: default
-        summary:
-          type: string
-          minLength: 1
-          maxLength: 4096
-          nullable: true
-          readOnly: true
-          description: Latest LLM-generated topic summary.
-        summary_last_message_uuid:
-          type: string
-          format: uuid
-          nullable: true
-          readOnly: true
-          description: Latest topic message included in the summary.
-        summary_has_new_messages:
-          type: boolean
-          nullable: true
-          readOnly: true
-          description: Null without a summary; otherwise whether the current latest
-            message differs from the stored summary boundary.
-        summary_enabled:
-          type: boolean
-          readOnly: true
-          description: Whether the server-side worker may generate summaries for this
-            topic. Existing summary text remains readable when false.
-        summary_system_prompt:
-          type: string
-          minLength: 1
-          maxLength: 16384
-          nullable: true
-          readOnly: true
-          description: Topic-specific LLM system prompt, or null for the default.
-        summary_reasoning_effort:
-          type: string
-          enum:
-          - 'off'
-          - minimal
-          - low
-          - medium
-          - high
-          nullable: true
-          readOnly: true
-          description: Per-summary reasoning choice. Off explicitly disables reasoning;
-            null omits the provider option.
-      required:
-      - user_uuid
-      - project_id
-      - name
-      - stream_uuid
+      $ref: '#/components/schemas/WorkspaceUserTopic_Get'
     WorkspaceUserTopic_Update:
       $ref: '#/components/schemas/WorkspaceUserTopic_Get'
     WorkspaceUserTopic_Filter:
@@ -1420,6 +1206,22 @@ components:
           - moderator
           - owner
           example: guest
+        encryption:
+          type: boolean
+          example: true
+          default: false
+          readOnly: true
+          description: Shared stream encryption flag, immutable after creation. Zulip
+            streams cannot enable encryption.
+        current_encryption_key_uuid:
+          type: string
+          example: 00000000-0000-0000-0000-000000000000
+          format: uuid
+          nullable: true
+          readOnly: true
+          description: Current symmetric key UUID, or null before a key is set. Changes
+            only through an owner key_announced message; no stream key material is
+            stored.
         notification_mode:
           type: string
           enum:
@@ -1506,144 +1308,10 @@ components:
       - role
       - source_name
       - source
+      - encryption
+      - current_encryption_key_uuid
     WorkspaceUserStream_Create:
-      type: object
-      properties:
-        uuid:
-          type: string
-          example: 00000000-0000-0000-0000-000000000000
-          format: uuid
-          readOnly: true
-        user_uuid:
-          type: string
-          example: 00000000-0000-0000-0000-000000000000
-          format: uuid
-        name:
-          type: string
-          example: any_string
-          maxLength: 255
-        description:
-          type: string
-          example: any_string
-          maxLength: 255
-          default: ''
-        project_id:
-          type: string
-          example: 00000000-0000-0000-0000-000000000000
-          format: uuid
-        created_at:
-          type: string
-          x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
-          example: '2006-01-02T15:04:05.000576Z'
-          format: date-time
-          readOnly: true
-          default: '2006-01-02T15:04:05.000576Z'
-        updated_at:
-          type: string
-          x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
-          example: '2006-01-02T15:04:05.000576Z'
-          format: date-time
-          readOnly: true
-          default: '2006-01-02T15:04:05.000576Z'
-        owner:
-          type: string
-          example: 00000000-0000-0000-0000-000000000000
-          format: uuid
-        role:
-          type: string
-          enum:
-          - administrator
-          - guest
-          - member
-          - moderator
-          - owner
-          example: guest
-        notification_mode:
-          type: string
-          enum:
-          - all_messages
-          - mentions_only
-          - muted
-          example: mentions_only
-          default: all_messages
-        unread_count:
-          type: integer
-          example: 0
-          minimum: 0
-          default: 0
-        active_unread_count:
-          type: integer
-          example: 0
-          minimum: 0
-          default: 0
-        passive_unread_count:
-          type: integer
-          example: 0
-          minimum: 0
-          default: 0
-        source_name:
-          type: string
-          enum:
-          - native
-          example: native
-        source:
-          type: object
-          oneOf:
-          - type: object
-            properties:
-              kind:
-                type: string
-                enum:
-                - native
-            example:
-              key: value
-          example:
-            key: value
-        invite_only:
-          type: boolean
-          example: true
-          default: false
-        announce:
-          type: boolean
-          example: true
-          default: false
-        private:
-          type: boolean
-          example: true
-          default: false
-        is_archived:
-          type: boolean
-          example: true
-          default: false
-        direct_user_uuid:
-          type: string
-          example: 00000000-0000-0000-0000-000000000000
-          format: uuid
-          nullable: true
-        color:
-          type: integer
-          example: 8388607
-          minimum: 0
-          maximum: 16777215
-        last_message_uuid:
-          type: string
-          example: 00000000-0000-0000-0000-000000000000
-          format: uuid
-          nullable: true
-        default_topic_uuid:
-          type: string
-          example: 00000000-0000-0000-0000-000000000000
-          format: uuid
-          readOnly: true
-          nullable: true
-      required:
-      - user_uuid
-      - name
-      - project_id
-      - owner
-      - role
-      - source_name
-      - source
+      $ref: '#/components/schemas/WorkspaceUserStream_Get'
     WorkspaceUserStream_Update:
       $ref: '#/components/schemas/WorkspaceUserStream_Get'
     WorkspaceUserStream_Filter:
@@ -2421,6 +2089,113 @@ components:
               maxLength: 40000
           example:
             key: value
+        - type: object
+          properties:
+            kind:
+              type: string
+              enum:
+              - e2ee
+            key_uuid:
+              type: string
+              example: 00000000-0000-0000-0000-000000000000
+              format: uuid
+            content:
+              type: string
+              example: any_string
+              minLength: 1
+              maxLength: 213336
+          example:
+            key: value
+        - type: object
+          properties:
+            kind:
+              type: string
+              enum:
+              - key_request
+            key_uuid:
+              type: string
+              example: 00000000-0000-0000-0000-000000000000
+              format: uuid
+            device_id:
+              type: string
+              example: any_string
+              maxLength: 255
+            device_name:
+              type: string
+              example: any_string
+              maxLength: 255
+            public_key:
+              type: string
+              example: any_string
+              minLength: 1
+              maxLength: 2048
+          example:
+            key: value
+        - type: object
+          properties:
+            kind:
+              type: string
+              enum:
+              - key_grant
+            key_uuid:
+              type: string
+              example: 00000000-0000-0000-0000-000000000000
+              format: uuid
+            request_message_uuid:
+              type: string
+              example: 00000000-0000-0000-0000-000000000000
+              format: uuid
+            sender_device_id:
+              type: string
+              example: any_string
+              maxLength: 255
+            recipient_device_id:
+              type: string
+              example: any_string
+              maxLength: 255
+            content:
+              type: string
+              example: any_string
+              minLength: 1
+              maxLength: 40000
+          example:
+            key: value
+        - type: object
+          properties:
+            kind:
+              type: string
+              enum:
+              - key_reject
+            key_uuid:
+              type: string
+              example: 00000000-0000-0000-0000-000000000000
+              format: uuid
+            request_message_uuid:
+              type: string
+              example: 00000000-0000-0000-0000-000000000000
+              format: uuid
+            sender_device_id:
+              type: string
+              example: any_string
+              maxLength: 255
+            recipient_device_id:
+              type: string
+              example: any_string
+              maxLength: 255
+          example:
+            key: value
+        - type: object
+          properties:
+            kind:
+              type: string
+              enum:
+              - key_announced
+            key_uuid:
+              type: string
+              example: 00000000-0000-0000-0000-000000000000
+              format: uuid
+          example:
+            key: value
         example:
           key: value
     WorkspaceDraft_revision:
@@ -2500,6 +2275,26 @@ components:
             items: {}
         example:
           key: value
+    ExternalAccount_status:
+      name: status
+      in: query
+      schema:
+        type: string
+        enum:
+        - active
+        - backfill
+        - error
+        - fast_backfill
+        - new
+        example: new
+        default: new
+    ExternalAccount_error_description:
+      name: error_description
+      in: query
+      schema:
+        type: string
+        example: any_string
+        nullable: true
     ExternalAccount_revision:
       name: revision
       in: query
@@ -3063,6 +2858,113 @@ components:
               maxLength: 40000
           example:
             key: value
+        - type: object
+          properties:
+            kind:
+              type: string
+              enum:
+              - e2ee
+            key_uuid:
+              type: string
+              example: 00000000-0000-0000-0000-000000000000
+              format: uuid
+            content:
+              type: string
+              example: any_string
+              minLength: 1
+              maxLength: 213336
+          example:
+            key: value
+        - type: object
+          properties:
+            kind:
+              type: string
+              enum:
+              - key_request
+            key_uuid:
+              type: string
+              example: 00000000-0000-0000-0000-000000000000
+              format: uuid
+            device_id:
+              type: string
+              example: any_string
+              maxLength: 255
+            device_name:
+              type: string
+              example: any_string
+              maxLength: 255
+            public_key:
+              type: string
+              example: any_string
+              minLength: 1
+              maxLength: 2048
+          example:
+            key: value
+        - type: object
+          properties:
+            kind:
+              type: string
+              enum:
+              - key_grant
+            key_uuid:
+              type: string
+              example: 00000000-0000-0000-0000-000000000000
+              format: uuid
+            request_message_uuid:
+              type: string
+              example: 00000000-0000-0000-0000-000000000000
+              format: uuid
+            sender_device_id:
+              type: string
+              example: any_string
+              maxLength: 255
+            recipient_device_id:
+              type: string
+              example: any_string
+              maxLength: 255
+            content:
+              type: string
+              example: any_string
+              minLength: 1
+              maxLength: 40000
+          example:
+            key: value
+        - type: object
+          properties:
+            kind:
+              type: string
+              enum:
+              - key_reject
+            key_uuid:
+              type: string
+              example: 00000000-0000-0000-0000-000000000000
+              format: uuid
+            request_message_uuid:
+              type: string
+              example: 00000000-0000-0000-0000-000000000000
+              format: uuid
+            sender_device_id:
+              type: string
+              example: any_string
+              maxLength: 255
+            recipient_device_id:
+              type: string
+              example: any_string
+              maxLength: 255
+          example:
+            key: value
+        - type: object
+          properties:
+            kind:
+              type: string
+              enum:
+              - key_announced
+            key_uuid:
+              type: string
+              example: 00000000-0000-0000-0000-000000000000
+              format: uuid
+          example:
+            key: value
         example:
           key: value
     WorkspaceUserMessage_author_uuid:
@@ -3560,6 +3462,21 @@ components:
         - moderator
         - owner
         example: guest
+    WorkspaceUserStream_encryption:
+      name: encryption
+      in: query
+      schema:
+        type: boolean
+        example: true
+        default: false
+    WorkspaceUserStream_current_encryption_key_uuid:
+      name: current_encryption_key_uuid
+      in: query
+      schema:
+        type: string
+        example: 00000000-0000-0000-0000-000000000000
+        format: uuid
+        nullable: true
     WorkspaceUserStream_notification_mode:
       name: notification_mode
       in: query
@@ -4911,10 +4828,12 @@ paths:
         example: name = "vm1"
         x-ra-filter-fields:
         - created_at
+        - error_description
         - owner_user_uuid
         - provider
         - revision
         - settings
+        - status
         - updated_at
         - uuid
       - $ref: '#/components/parameters/ExternalAccount_uuid'
@@ -4922,6 +4841,8 @@ paths:
       - $ref: '#/components/parameters/ExternalAccount_updated_at'
       - $ref: '#/components/parameters/ExternalAccount_owner_user_uuid'
       - $ref: '#/components/parameters/ExternalAccount_provider'
+      - $ref: '#/components/parameters/ExternalAccount_status'
+      - $ref: '#/components/parameters/ExternalAccount_error_description'
       - $ref: '#/components/parameters/ExternalAccount_revision'
       - name: page_limit
         in: query
@@ -5935,16 +5856,193 @@ paths:
                 $ref: '#/components/schemas/WorkspaceUserMessage_Create'
         default:
           $ref: '#/components/responses/Error'
+        '400':
+          description: Invalid payload, encryption metadata, kind, or stream role.
       operationId: Create_v1_messenger_messages
       requestBody:
-        description: WorkspaceUserMessage_Create
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/WorkspaceUserMessage_Create'
+              type: object
+              additionalProperties: false
+              properties:
+                uuid:
+                  type: string
+                  example: 00000000-0000-0000-0000-000000000000
+                  format: uuid
+                  description: Optional canonical creation UUID for retries; the response
+                    UUID identifies the placement.
+                stream_uuid:
+                  type: string
+                  example: 00000000-0000-0000-0000-000000000000
+                  format: uuid
+                topic_uuid:
+                  type: string
+                  example: 00000000-0000-0000-0000-000000000000
+                  format: uuid
+                  nullable: true
+                  description: An absent or null topic UUID selects the default topic.
+                payload:
+                  type: object
+                  oneOf:
+                  - type: object
+                    properties:
+                      kind:
+                        type: string
+                        enum:
+                        - markdown
+                      content:
+                        type: string
+                        example: any_string
+                        minLength: 1
+                        maxLength: 40000
+                    required:
+                    - kind
+                    - content
+                    additionalProperties: false
+                  - type: object
+                    properties:
+                      kind:
+                        type: string
+                        enum:
+                        - e2ee
+                      key_uuid:
+                        type: string
+                        example: 00000000-0000-0000-0000-000000000000
+                        format: uuid
+                      content:
+                        type: string
+                        example: any_string
+                        minLength: 1
+                        maxLength: 213336
+                    required:
+                    - kind
+                    - key_uuid
+                    - content
+                    additionalProperties: false
+                  - type: object
+                    properties:
+                      kind:
+                        type: string
+                        enum:
+                        - key_request
+                      key_uuid:
+                        type: string
+                        example: 00000000-0000-0000-0000-000000000000
+                        format: uuid
+                      device_id:
+                        type: string
+                        example: any_string
+                        maxLength: 255
+                      device_name:
+                        type: string
+                        example: any_string
+                        maxLength: 255
+                      public_key:
+                        type: string
+                        example: any_string
+                        minLength: 1
+                        maxLength: 2048
+                    required:
+                    - kind
+                    - key_uuid
+                    - device_id
+                    - device_name
+                    - public_key
+                    additionalProperties: false
+                  - type: object
+                    properties:
+                      kind:
+                        type: string
+                        enum:
+                        - key_grant
+                      key_uuid:
+                        type: string
+                        example: 00000000-0000-0000-0000-000000000000
+                        format: uuid
+                      request_message_uuid:
+                        type: string
+                        example: 00000000-0000-0000-0000-000000000000
+                        format: uuid
+                      sender_device_id:
+                        type: string
+                        example: any_string
+                        maxLength: 255
+                      recipient_device_id:
+                        type: string
+                        example: any_string
+                        maxLength: 255
+                      content:
+                        type: string
+                        example: any_string
+                        minLength: 1
+                        maxLength: 40000
+                    required:
+                    - kind
+                    - key_uuid
+                    - request_message_uuid
+                    - sender_device_id
+                    - recipient_device_id
+                    - content
+                    additionalProperties: false
+                  - type: object
+                    properties:
+                      kind:
+                        type: string
+                        enum:
+                        - key_reject
+                      key_uuid:
+                        type: string
+                        example: 00000000-0000-0000-0000-000000000000
+                        format: uuid
+                      request_message_uuid:
+                        type: string
+                        example: 00000000-0000-0000-0000-000000000000
+                        format: uuid
+                      sender_device_id:
+                        type: string
+                        example: any_string
+                        maxLength: 255
+                      recipient_device_id:
+                        type: string
+                        example: any_string
+                        maxLength: 255
+                    required:
+                    - kind
+                    - key_uuid
+                    - request_message_uuid
+                    - sender_device_id
+                    - recipient_device_id
+                    additionalProperties: false
+                  - type: object
+                    properties:
+                      kind:
+                        type: string
+                        enum:
+                        - key_announced
+                      key_uuid:
+                        type: string
+                        example: 00000000-0000-0000-0000-000000000000
+                        format: uuid
+                    required:
+                    - kind
+                    - key_uuid
+                    additionalProperties: false
+                  description: Fixed message payload selected by kind. Only markdown
+                    is interpreted as Markdown and used for mentions and summaries.
+                    Other kinds remain opaque in history and realtime.
+              required:
+              - stream_uuid
+              - payload
       security:
       - bearerAuth: []
+      description: Send a message; an absent or null topic_uuid selects the stream's
+        default topic. All six payload kinds are allowed regardless of encryption,
+        except e2ee is forbidden for a shared Zulip stream. Only the owner role may
+        send key_announced; saving the message and updating current_encryption_key_uuid
+        is atomic. Old e2ee key UUIDs are accepted. The backend does not validate
+        Base64, encrypt, or store plaintext private or symmetric keys.
   /v1/messenger/messages/{WorkspaceUserMessageUuid}:
     get:
       summary: Get WorkspaceUserMessage
@@ -5979,16 +6077,159 @@ paths:
                 $ref: '#/components/schemas/WorkspaceUserMessage_Update'
         default:
           $ref: '#/components/responses/Error'
+        '400':
+          description: Invalid payload, encryption metadata, kind, or stream role.
       operationId: Update_v1_messenger_messages_WorkspaceUserMessageUuid
       requestBody:
-        description: WorkspaceUserMessage_Update
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/WorkspaceUserMessage_Update'
+              type: object
+              additionalProperties: false
+              properties:
+                payload:
+                  type: object
+                  oneOf:
+                  - type: object
+                    properties:
+                      kind:
+                        type: string
+                        enum:
+                        - markdown
+                      content:
+                        type: string
+                        example: any_string
+                        minLength: 1
+                        maxLength: 40000
+                    required:
+                    - kind
+                    - content
+                    additionalProperties: false
+                  - type: object
+                    properties:
+                      kind:
+                        type: string
+                        enum:
+                        - e2ee
+                      key_uuid:
+                        type: string
+                        example: 00000000-0000-0000-0000-000000000000
+                        format: uuid
+                      content:
+                        type: string
+                        example: any_string
+                        minLength: 1
+                        maxLength: 213336
+                    required:
+                    - kind
+                    - key_uuid
+                    - content
+                    additionalProperties: false
+                  - type: object
+                    properties:
+                      kind:
+                        type: string
+                        enum:
+                        - key_request
+                      key_uuid:
+                        type: string
+                        example: 00000000-0000-0000-0000-000000000000
+                        format: uuid
+                      device_id:
+                        type: string
+                        example: any_string
+                        maxLength: 255
+                      device_name:
+                        type: string
+                        example: any_string
+                        maxLength: 255
+                      public_key:
+                        type: string
+                        example: any_string
+                        minLength: 1
+                        maxLength: 2048
+                    required:
+                    - kind
+                    - key_uuid
+                    - device_id
+                    - device_name
+                    - public_key
+                    additionalProperties: false
+                  - type: object
+                    properties:
+                      kind:
+                        type: string
+                        enum:
+                        - key_grant
+                      key_uuid:
+                        type: string
+                        example: 00000000-0000-0000-0000-000000000000
+                        format: uuid
+                      request_message_uuid:
+                        type: string
+                        example: 00000000-0000-0000-0000-000000000000
+                        format: uuid
+                      sender_device_id:
+                        type: string
+                        example: any_string
+                        maxLength: 255
+                      recipient_device_id:
+                        type: string
+                        example: any_string
+                        maxLength: 255
+                      content:
+                        type: string
+                        example: any_string
+                        minLength: 1
+                        maxLength: 40000
+                    required:
+                    - kind
+                    - key_uuid
+                    - request_message_uuid
+                    - sender_device_id
+                    - recipient_device_id
+                    - content
+                    additionalProperties: false
+                  - type: object
+                    properties:
+                      kind:
+                        type: string
+                        enum:
+                        - key_reject
+                      key_uuid:
+                        type: string
+                        example: 00000000-0000-0000-0000-000000000000
+                        format: uuid
+                      request_message_uuid:
+                        type: string
+                        example: 00000000-0000-0000-0000-000000000000
+                        format: uuid
+                      sender_device_id:
+                        type: string
+                        example: any_string
+                        maxLength: 255
+                      recipient_device_id:
+                        type: string
+                        example: any_string
+                        maxLength: 255
+                    required:
+                    - kind
+                    - key_uuid
+                    - request_message_uuid
+                    - sender_device_id
+                    - recipient_device_id
+                    additionalProperties: false
+                  description: Fixed message payload selected by kind. Only markdown
+                    is interpreted as Markdown and used for mentions and summaries.
+                    Other kinds remain opaque in history and realtime.
+              required:
+              - payload
       security:
       - bearerAuth: []
+      description: Replace a message payload as its author. PUT cannot create or edit
+        key_announced messages. e2ee is rejected if any placement of the canonical
+        message belongs to a shared Zulip stream.
     delete:
       summary: Delete WorkspaceUserMessage
       tags:
@@ -6581,7 +6822,6 @@ paths:
           application/json:
             schema:
               type: object
-              required: []
               additionalProperties: false
               properties:
                 summary_system_prompt:
@@ -6659,9 +6899,11 @@ paths:
         - announce
         - color
         - created_at
+        - current_encryption_key_uuid
         - default_topic_uuid
         - description
         - direct_user_uuid
+        - encryption
         - invite_only
         - is_archived
         - last_message_uuid
@@ -6688,6 +6930,8 @@ paths:
       - $ref: '#/components/parameters/WorkspaceUserStream_updated_at'
       - $ref: '#/components/parameters/WorkspaceUserStream_owner'
       - $ref: '#/components/parameters/WorkspaceUserStream_role'
+      - $ref: '#/components/parameters/WorkspaceUserStream_encryption'
+      - $ref: '#/components/parameters/WorkspaceUserStream_current_encryption_key_uuid'
       - $ref: '#/components/parameters/WorkspaceUserStream_notification_mode'
       - $ref: '#/components/parameters/WorkspaceUserStream_unread_count'
       - $ref: '#/components/parameters/WorkspaceUserStream_active_unread_count'
@@ -6753,16 +6997,114 @@ paths:
                 $ref: '#/components/schemas/WorkspaceUserStream_Create'
         default:
           $ref: '#/components/responses/Error'
+        '400':
+          description: Invalid payload, encryption metadata, kind, or stream role.
       operationId: Create_v1_messenger_streams
       requestBody:
-        description: WorkspaceUserStream_Create
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/WorkspaceUserStream_Create'
+              type: object
+              additionalProperties: false
+              properties:
+                uuid:
+                  type: string
+                  example: 00000000-0000-0000-0000-000000000000
+                  format: uuid
+                name:
+                  type: string
+                  example: any_string
+                  maxLength: 255
+                description:
+                  type: string
+                  example: any_string
+                  maxLength: 255
+                  default: ''
+                source_name:
+                  type: string
+                  enum:
+                  - native
+                  example: native
+                  default: native
+                source:
+                  type: object
+                  oneOf:
+                  - type: object
+                    properties:
+                      kind:
+                        type: string
+                        enum:
+                        - native
+                    example:
+                      key: value
+                  example:
+                    key: value
+                invite_only:
+                  type: boolean
+                  example: true
+                  default: false
+                announce:
+                  type: boolean
+                  example: true
+                  default: false
+                direct_user_uuid:
+                  type: string
+                  example: 00000000-0000-0000-0000-000000000000
+                  format: uuid
+                  nullable: true
+                private:
+                  type: boolean
+                  example: true
+                  default: false
+                color:
+                  type: integer
+                  example: 8388607
+                  minimum: 0
+                  maximum: 16777215
+                encryption:
+                  type: boolean
+                  example: true
+                  default: false
+                  description: Shared stream encryption flag, immutable after creation.
+                    Zulip streams cannot enable encryption.
+                current_encryption_key_uuid:
+                  type: string
+                  example: 00000000-0000-0000-0000-000000000000
+                  format: uuid
+                  nullable: true
+                  description: Current symmetric key UUID, or null before a key is
+                    set. Changes only through an owner key_announced message; no stream
+                    key material is stored.
+              required:
+              - name
+              oneOf:
+              - properties:
+                  encryption:
+                    enum:
+                    - false
+                  current_encryption_key_uuid:
+                    type: string
+                    nullable: true
+                    enum:
+                    - null
+              - required:
+                - encryption
+                - current_encryption_key_uuid
+                properties:
+                  encryption:
+                    enum:
+                    - true
+                  current_encryption_key_uuid:
+                    type: string
+                    format: uuid
+                    nullable: false
       security:
       - bearerAuth: []
+      description: Create a native stream. encryption defaults to false and cannot
+        change after creation. True requires current_encryption_key_uuid; false accepts
+        only an absent or null key UUID. Zulip streams are provider-managed and cannot
+        enable encryption.
   /v1/messenger/streams/{WorkspaceUserStreamUuid}:
     get:
       summary: Get WorkspaceUserStream
@@ -6797,16 +7139,45 @@ paths:
                 $ref: '#/components/schemas/WorkspaceUserStream_Update'
         default:
           $ref: '#/components/responses/Error'
+        '400':
+          description: Invalid payload, encryption metadata, kind, or stream role.
       operationId: Update_v1_messenger_streams_WorkspaceUserStreamUuid
       requestBody:
-        description: WorkspaceUserStream_Update
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/WorkspaceUserStream_Update'
+              type: object
+              additionalProperties: false
+              properties:
+                name:
+                  type: string
+                  example: any_string
+                  maxLength: 255
+                description:
+                  type: string
+                  example: any_string
+                  maxLength: 255
+                  default: ''
+                invite_only:
+                  type: boolean
+                  example: true
+                  default: false
+                announce:
+                  type: boolean
+                  example: true
+                  default: false
+                color:
+                  type: integer
+                  example: 8388607
+                  minimum: 0
+                  maximum: 16777215
+              minProperties: 1
       security:
       - bearerAuth: []
+      description: Update stream metadata. encryption and current_encryption_key_uuid
+        are forbidden, including unchanged values. Only an owner key_announced message
+        may change the current key UUID.
     delete:
       summary: Delete WorkspaceUserStream
       tags:
@@ -7030,12 +7401,6 @@ paths:
           application/json:
             schema:
               type: object
-              required:
-              - uuid
-              - name
-              - base_url
-              - model
-              - api_key
               additionalProperties: false
               properties:
                 uuid:
@@ -7101,6 +7466,12 @@ paths:
                   writeOnly: true
                   description: Stored encrypted by the server and never returned by
                     any API.
+              required:
+              - uuid
+              - name
+              - base_url
+              - model
+              - api_key
       security:
       - bearerAuth: []
       description: Create a global OpenAI-compatible LLM endpoint. Requires workspace.topic_summary_endpoint.manage.
@@ -7146,7 +7517,6 @@ paths:
           application/json:
             schema:
               type: object
-              required: []
               additionalProperties: false
               properties:
                 name:
@@ -7283,15 +7653,15 @@ paths:
           application/json:
             schema:
               type: object
-              required:
-              - global_enabled
-              - project_enabled
               additionalProperties: false
               properties:
                 global_enabled:
                   type: boolean
                 project_enabled:
                   type: boolean
+              required:
+              - global_enabled
+              - project_enabled
       security:
       - bearerAuth: []
       description: Set both topic summarization gates. The worker runs only when both

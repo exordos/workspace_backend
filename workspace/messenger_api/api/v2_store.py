@@ -880,6 +880,49 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             return row
         return super().create_resource(resource, values)
 
+    def _lock_key_announcement(self, stream_uuid: object, session: typing.Any) -> None:
+        session.execute(
+            """
+            SELECT stream.uuid
+            FROM messenger_streams AS stream
+            JOIN messenger_stream_bindings AS binding
+              ON binding.project_id = stream.project_id
+             AND binding.stream_uuid = stream.uuid
+            WHERE stream.project_id = %s AND stream.uuid = %s
+              AND binding.user_uuid = %s AND binding.active
+            FOR NO KEY UPDATE OF stream, binding
+            """,
+            (self.project_uuid, stream_uuid, self.user_uuid),
+        )
+
+    def _apply_key_announcement(
+        self,
+        stream_uuid: object,
+        canonical_uuid: object,
+        placement_uuid: object,
+        key_uuid: object,
+        session: typing.Any,
+    ) -> None:
+        previous = session.execute(
+            """
+            SELECT 1 FROM messenger_message_placements
+            WHERE project_id = %s AND stream_uuid = %s
+              AND message_uuid = %s AND uuid <> %s
+            LIMIT 1
+            """,
+            (self.project_uuid, stream_uuid, canonical_uuid, placement_uuid),
+        ).fetchone()
+        if previous is not None:
+            raise ra_exceptions.ValidationErrorException()
+        session.execute(
+            """
+            UPDATE messenger_streams
+            SET current_encryption_key_uuid = %s, updated_at = NOW()
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (key_uuid, self.project_uuid, stream_uuid),
+        )
+
     def create_message(
         self,
         values: dict[str, typing.Any],

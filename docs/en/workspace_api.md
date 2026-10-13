@@ -21,6 +21,7 @@ Messenger REST API:  http://127.0.0.1:21084/v1/messenger
 Events WebSocket:    ws://127.0.0.1:21082/v1/events/ws
 Workspace REST API:  http://127.0.0.1:21084/v1
 Worker:              workspace-messenger-worker
+History importer:    workspace-history-import
 Workspace OpenAPI:   http://127.0.0.1:21084/specifications/3.0.3
 ```
 
@@ -2145,7 +2146,10 @@ separately in
 `workspace_provider_api_v1.yaml`.
 
 The Workspace backend element installs `workspace-api`,
-`workspace-messenger-events`, and `workspace-messenger-worker`. The REST API
+`workspace-messenger-events`, `workspace-messenger-worker`, and
+`workspace-history-import`. The history importer is a scaffold with an empty
+`step()` method, called every three seconds by default; configure its minimum
+period with `[history_import] step_interval`. The REST API
 uses two HTTP workers by default. DBaaS provides PostgreSQL storage, and
 S3aaS stores file bytes and JSON sidecars. The separately versioned
 `workspace_ui` element serves the web UI and proxies API requests to the

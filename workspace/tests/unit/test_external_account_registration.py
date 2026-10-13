@@ -5,6 +5,9 @@
 
 import uuid as sys_uuid
 
+import pytest
+from restalchemy.common import exceptions as ra_exc
+
 from workspace.messenger_api import application_services
 from workspace.messenger_api.dm import external_models
 
@@ -40,7 +43,45 @@ def test_registration_accepts_a_provider_without_an_enrolled_bridge(monkeypatch)
     assert account.uuid == account_uuid
     assert account.owner_user_uuid == owner_uuid
     assert account.provider == "example"
+    assert account.status == external_models.ExternalAccountStatus.NEW.value
+    assert account.error_description is None
     assert account.settings == {"account_name": "External account"}
     assert writes == [(account, session)]
     assert events[0][0][:3] == (project_uuid, owner_uuid, account)
     assert events[0][1]["session"] is session
+
+
+@pytest.mark.parametrize("status", list(external_models.ExternalAccountStatus))
+def test_external_account_accepts_status(status):
+    account = external_models.ExternalAccount(
+        owner_user_uuid=sys_uuid.uuid4(),
+        provider="example",
+        settings={},
+        status=status.value,
+    )
+
+    assert account.status == status.value
+
+
+@pytest.mark.parametrize("status", ["connecting", "NEW"])
+def test_external_account_rejects_invalid_status(status):
+    with pytest.raises(ra_exc.TypeError):
+        external_models.ExternalAccount(
+            owner_user_uuid=sys_uuid.uuid4(),
+            provider="example",
+            settings={},
+            status=status,
+        )
+
+
+def test_external_account_stores_error_description():
+    account = external_models.ExternalAccount(
+        owner_user_uuid=sys_uuid.uuid4(),
+        provider="example",
+        settings={},
+        status=external_models.ExternalAccountStatus.ERROR.value,
+        error_description="Authentication failed",
+    )
+
+    assert account.status == "error"
+    assert account.error_description == "Authentication failed"

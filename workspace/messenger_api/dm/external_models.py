@@ -3,10 +3,20 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
+import enum
+
 from restalchemy.dm import models
 from restalchemy.dm import properties
 from restalchemy.dm import types
 from restalchemy.storage.sql import orm
+
+
+class ExternalAccountStatus(str, enum.Enum):
+    NEW = "new"
+    BACKFILL = "backfill"
+    FAST_BACKFILL = "fast_backfill"
+    ACTIVE = "active"
+    ERROR = "error"
 
 
 class ExternalAccount(
@@ -22,6 +32,14 @@ class ExternalAccount(
         required=True,
     )
     settings = properties.property(types.Dict(), required=True)
+    status = properties.property(
+        types.Enum([status.value for status in ExternalAccountStatus]),
+        default=ExternalAccountStatus.NEW.value,
+    )
+    error_description = properties.property(
+        types.AllowNone(types.String()),
+        default=None,
+    )
     revision = properties.property(
         types.Integer(min_value=1),
         default=1,

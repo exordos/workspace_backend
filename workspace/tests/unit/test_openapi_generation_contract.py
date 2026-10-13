@@ -313,7 +313,7 @@ def test_generated_openapi_message_payload_uses_markdown_content_limit():
 
 @pytest.mark.parametrize(
     "app_module,root",
-    [(messenger_app, "/v1/"), (workspace_app, "/v1/messenger/")],
+    [(workspace_app, "/v1/messenger/")],
 )
 def test_generated_openapi_describes_encryption_requests_and_fixed_payloads(
     app_module, root
@@ -627,3 +627,20 @@ def test_workspace_openapi_exposes_messenger_and_rest_events():
         "topic",
         "user",
     ]
+
+
+def test_external_account_status_contract():
+    specification = _build_openapi(workspace_app)
+    schema = _component_schema(specification, "ExternalAccount_Get")
+
+    assert set(schema["properties"]["status"]["enum"]) == {
+        "new",
+        "backfill",
+        "fast_backfill",
+        "active",
+        "error",
+    }
+    assert schema["properties"]["status"]["default"] == "new"
+    assert "status" not in schema["required"]
+    assert schema["properties"]["error_description"]["type"] == "string"
+    assert schema["properties"]["error_description"]["nullable"] is True

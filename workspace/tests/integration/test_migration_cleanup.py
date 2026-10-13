@@ -409,7 +409,7 @@ def test_current_migrations_have_a_single_head(_database, db):
 
     assert (
         engine.get_latest_migration()
-        == "0186-remove-external-provider-processing-6e254a.py"
+        == "0193-Add-Zulip-task-retries-57691c.py"
     )
     with db.cursor() as cur:
         cur.execute(

@@ -22,6 +22,8 @@ def test_generic_account_crud_is_owner_scoped(api):
     assert created.status_code == 201, created.text
     body = created.json()
     assert body["provider"] == "example"
+    assert body["status"] == "new"
+    assert body["error_description"] is None
     assert body["settings"] == spec["settings"]
     assert "credential_present" not in body
     assert "capabilities" not in body
@@ -34,13 +36,32 @@ def test_generic_account_crud_is_owner_scoped(api):
     )
     updated = api.put(
         path,
-        json={"settings": {"label": "Renamed"}},
+        json={"settings": {"label": "Renamed"}, "status": "fast_backfill"},
         headers={"If-Match": read.headers["ETag"]},
         permissions=permissions,
     )
     assert updated.status_code == 200, updated.text
     assert updated.json()["settings"] == {"label": "Renamed"}
+    assert updated.json()["status"] == "fast_backfill"
     assert updated.headers["ETag"] != read.headers["ETag"]
+    failed = api.put(
+        path,
+        json={"status": "error", "error_description": "Authentication failed"},
+        headers={"If-Match": updated.headers["ETag"]},
+        permissions=permissions,
+    )
+    assert failed.status_code == 200, failed.text
+    assert failed.json()["status"] == "error"
+    assert failed.json()["error_description"] == "Authentication failed"
+    recovered = api.put(
+        path,
+        json={"status": "active", "error_description": None},
+        headers={"If-Match": failed.headers["ETag"]},
+        permissions=permissions,
+    )
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json()["status"] == "active"
+    assert recovered.json()["error_description"] is None
     assert api.delete(path, permissions=permissions).status_code == 204
     assert api.get(path, permissions=permissions).status_code == 404
 

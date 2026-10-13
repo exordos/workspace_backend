@@ -360,6 +360,10 @@ resources:
           poll_interval = 3
 
 
+          [history_import]
+          step_interval = 3
+
+
           [messenger_worker_agent]
           event_retention_seconds = 259200
           event_prune_interval_seconds = 300
@@ -503,6 +507,21 @@ resources:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       name: workspace-api
       path: /usr/bin/workspace-api --config-file /etc/workspace/workspace.conf
+      user: root
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_backend:uuid
+      service_type:
+        kind: simple
+        count: 1
+      target_status: enabled
+      before:
+        - kind: shell
+          command: /usr/local/bin/workspace-bootstrap
+    workspace_history_import:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace-history-import
+      path: /usr/bin/workspace-history-import --config-file /etc/workspace/workspace.conf
       user: root
       target:
         kind: node

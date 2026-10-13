@@ -424,8 +424,10 @@ def test_native_v2_topic_deletion_drains_derived_projections(api, db):
 def test_native_v2_deletion_before_stream_purge_drains_snapshots(
     api, workspace_api, db, resource, repair_pending, migration_engine
 ):
+    migration = migration_engine._load_migrations()[TOMBSTONE_MIRROR_MIGRATION]
     if repair_pending:
-        migration_engine.rollback_migration(TOMBSTONE_MIRROR_MIGRATION)
+        with contexts.Context().session_manager() as session:
+            migration.downgrade(session)
     response = api.post(
         STREAMS, json={"name": "Delivery snapshot deletion", "private": True}
     )
@@ -492,7 +494,8 @@ def test_native_v2_deletion_before_stream_purge_drains_snapshots(
                 (api.project_id,),
             )
             assert cursor.fetchall() == pending
-        migration_engine.apply_migration(TOMBSTONE_MIRROR_MIGRATION)
+        with contexts.Context().session_manager() as session:
+            migration.upgrade(session)
 
     assert _drain() >= 1
 

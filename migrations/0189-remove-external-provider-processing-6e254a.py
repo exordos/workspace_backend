@@ -38,6 +38,7 @@ DROP VIEW IF EXISTS "m_workspace_projects_view" CASCADE;
 DROP VIEW IF EXISTS "m_workspace_topic_summary_settings_view" CASCADE;
 DROP VIEW IF EXISTS "m_workspace_user_messages_view" CASCADE;
 DROP VIEW IF EXISTS "m_workspace_user_streams" CASCADE;
+DROP VIEW IF EXISTS "m_workspace_user_streams_base_v1" CASCADE;
 DROP VIEW IF EXISTS "m_workspace_user_topic_unread_counts_v1" CASCADE;
 DROP VIEW IF EXISTS "m_workspace_user_topics_view" CASCADE;
 DROP VIEW IF EXISTS "m_workspace_user_unread_messages_base_v1" CASCADE;
@@ -542,7 +543,12 @@ BEGIN
         DELETE FROM m_workspace_stream_topics WHERE uuid = OLD.uuid;
         RETURN OLD;
     END IF;
-    IF NEW.deleted_at IS NOT NULL THEN
+    IF NEW.deleted_at IS NOT NULL OR EXISTS (
+        SELECT 1 FROM messenger_streams AS stream
+        WHERE stream.project_id = NEW.project_id
+          AND stream.uuid = NEW.stream_uuid
+          AND stream.deleted_at IS NOT NULL
+    ) THEN
         DELETE FROM m_workspace_stream_topics WHERE uuid = NEW.uuid;
         RETURN NEW;
     END IF;
@@ -1496,6 +1502,8 @@ CREATE VIEW messenger_api_user_streams_v1
           , stream.default_topic_uuid
           , stream.deleted_at
           , stream.deleted_at IS NULL AS visible
+          , stream.encryption
+          , stream.current_encryption_key_uuid
      FROM messenger_stream_bindings AS binding
           INNER JOIN messenger_streams AS stream ON stream.project_id = binding.project_id
                                                 AND stream.uuid = binding.stream_uuid
@@ -1710,7 +1718,11 @@ CREATE VIEW m_workspace_user_streams
           , stream.default_topic_uuid
           , COALESCE(unread.active_unread_count, 0) AS active_unread_count
           , COALESCE(unread.passive_unread_count, 0) AS passive_unread_count
+          , canonical.encryption
+          , canonical.current_encryption_key_uuid
      FROM m_workspace_streams AS stream
+          INNER JOIN messenger_streams AS canonical ON canonical.project_id = stream.project_id
+                                                  AND canonical.uuid = stream.uuid
           INNER JOIN m_workspace_stream_bindings AS binding ON binding.stream_uuid = stream.uuid
                                                            AND binding.project_id = stream.project_id
           LEFT JOIN m_unread_user_messages AS unread ON unread.uuid = stream.uuid
@@ -2133,7 +2145,7 @@ CREATE VIEW m_folder_personal_view
 class MigrationStep(migrations.AbstractMigrationStep):
     def __init__(self):
         self._depends = [
-            "0185-Repair-per-user-operation-delivery-projections-e1f5ca.py"
+            "0188-Skip-tombstoned-streams-in-binding-mirrors-fd5982.py"
         ]
 
     @property

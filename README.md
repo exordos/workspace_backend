@@ -36,10 +36,16 @@ Direct local services:
 - WebSocket API: `ws://127.0.0.1:21082/v1/events/ws`
 - Workspace REST API: `http://127.0.0.1:21084/v1`
 - Messenger worker: `workspace-messenger-worker`
+- History import service: `workspace-history-import`
 - Workspace OpenAPI spec: `http://127.0.0.1:21084/specifications/3.0.3`
 
 The single `workspace-api` process serves all REST resources, including Messenger,
 with two HTTP workers by default.
+
+The history import service calls `HistoryImportService.step()` on each iteration.
+The scaffold has an empty step method; import logic will be added there. The
+`[history_import] step_interval` option sets the minimum period, defaulting to
+three seconds.
 
 Nginx exposes:
 
