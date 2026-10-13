@@ -32,6 +32,7 @@ from restalchemy.common import contexts
 from restalchemy.dm import filters as dm_filters
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.dm import event_payloads
+from workspace.messenger_api.dm import message_payloads
 from workspace.messenger_api.dm import models
 
 
@@ -586,7 +587,7 @@ def create_message_events(
         )
     recipients = sorted({sys_uuid.UUID(str(value)) for value in recipients}, key=str)
     author_uuid = sys_uuid.UUID(str(message.user_uuid))
-    content = _event_payload_get(message.payload, "content")
+    content = message_payloads.markdown_content(message.payload)
     normalized_content = str(content or "").lower()
     shared = {
         "uuid": message.uuid,

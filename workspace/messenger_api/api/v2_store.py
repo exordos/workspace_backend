@@ -1056,7 +1056,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 session,
             )
             self._enqueue_stream_snapshot(stream.uuid, source_kind="stream.updated")
-        content = str(canonical_payload.get("content", ""))
+        content = message_payloads.markdown_content(canonical_payload)
         mentioned = f"](urn:user:{str(self.user_uuid).lower()})" in content.lower()
         binding_uuid = sys_uuid.uuid5(placement_uuid, str(self.user_uuid))
         session.execute(

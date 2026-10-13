@@ -1632,11 +1632,16 @@ WITH requested_users AS MATERIALIZED (
 ), scoped AS MATERIALIZED (
     SELECT
         stream.*,
+        canonical.encryption,
+        canonical.current_encryption_key_uuid,
         binding.user_uuid AS scoped_user_uuid,
         binding.role AS scoped_role,
         binding.notification_mode AS stream_notification_mode,
         COALESCE(project.mode, 'legacy') AS read_state_mode
     FROM m_workspace_streams AS stream
+    JOIN messenger_streams AS canonical
+      ON canonical.project_id = stream.project_id
+     AND canonical.uuid = stream.uuid
     JOIN requested_users AS requested ON TRUE
     JOIN m_workspace_stream_bindings AS binding
       ON binding.project_id = stream.project_id
@@ -1722,7 +1727,9 @@ SELECT
             ELSE legacy_counts.unread_count - legacy_counts.active_unread_count
         END,
         0
-    )::integer AS passive_unread_count
+    )::integer AS passive_unread_count,
+    scoped.encryption,
+    scoped.current_encryption_key_uuid
 FROM scoped
 LEFT JOIN LATERAL (
     SELECT message.uuid
@@ -1813,14 +1820,22 @@ LEFT JOIN LATERAL (
                 WHEN 'unmute' THEN POSITION(
                     '](' || 'urn:user:' ||
                     LOWER(scoped.scoped_user_uuid::text) || ')'
-                    IN LOWER(COALESCE(message.payload->>'content', ''))
+                    IN LOWER(CASE
+                        WHEN message.payload->>'kind' = 'markdown'
+                            THEN COALESCE(message.payload->>'content', '')
+                        ELSE ''
+                    END)
                 ) > 0
                 ELSE CASE scoped.stream_notification_mode
                     WHEN 'all_messages' THEN TRUE
                     WHEN 'mentions_only' THEN POSITION(
                         '](' || 'urn:user:' ||
                         LOWER(scoped.scoped_user_uuid::text) || ')'
-                        IN LOWER(COALESCE(message.payload->>'content', ''))
+                        IN LOWER(CASE
+                            WHEN message.payload->>'kind' = 'markdown'
+                                THEN COALESCE(message.payload->>'content', '')
+                            ELSE ''
+                        END)
                     ) > 0
                     ELSE FALSE
                 END
@@ -2024,14 +2039,22 @@ LEFT JOIN LATERAL (
                 WHEN 'follow' THEN TRUE
                 WHEN 'unmute' THEN POSITION(
                     '](' || 'urn:user:' || LOWER(scoped.user_uuid::text) || ')'
-                    IN LOWER(COALESCE(message.payload->>'content', ''))
+                    IN LOWER(CASE
+                        WHEN message.payload->>'kind' = 'markdown'
+                            THEN COALESCE(message.payload->>'content', '')
+                        ELSE ''
+                    END)
                 ) > 0
                 ELSE CASE scoped.stream_notification_mode
                     WHEN 'all_messages' THEN TRUE
                     WHEN 'mentions_only' THEN POSITION(
                         '](' || 'urn:user:' ||
                         LOWER(scoped.user_uuid::text) || ')'
-                        IN LOWER(COALESCE(message.payload->>'content', ''))
+                        IN LOWER(CASE
+                            WHEN message.payload->>'kind' = 'markdown'
+                                THEN COALESCE(message.payload->>'content', '')
+                            ELSE ''
+                        END)
                     ) > 0
                     ELSE FALSE
                 END
@@ -2185,7 +2208,11 @@ SELECT
         mention.message_uuid IS NOT NULL
     ELSE POSITION(
         '](' || 'urn:user:' || LOWER(binding.user_uuid::text) || ')'
-        IN LOWER(COALESCE(message.payload->>'content', ''))
+        IN LOWER(CASE
+            WHEN message.payload->>'kind' = 'markdown'
+                THEN COALESCE(message.payload->>'content', '')
+            ELSE ''
+        END)
     ) > 0 END AS mentioned,
     message.reaction_users
 FROM scoped_messages AS message
@@ -5201,7 +5228,11 @@ def ensure_compact_workspace_message_recipients(
                             THEN target.updated_at END,
                        POSITION(
                            '](urn:user:' || lower(target.user_uuid::text) || ')'
-                           IN lower(COALESCE(target.payload->>'content', ''))
+                           IN lower(CASE
+                               WHEN target.payload->>'kind' = 'markdown'
+                                   THEN COALESCE(target.payload->>'content', '')
+                               ELSE ''
+                           END)
                        ) > 0,
                        target.created_at, target.updated_at
                 FROM targets AS target
@@ -5496,11 +5527,7 @@ def create_workspace_user_message(
             current_session,
             project_id,
         ):
-            content = (
-                message.payload.get("content")
-                if hasattr(message.payload, "get")
-                else getattr(message.payload, "content", "")
-            )
+            content = message_payloads.markdown_content(message.payload)
             read_state.sync_message_mentions(
                 current_session,
                 project_id,
@@ -5548,11 +5575,7 @@ def create_workspace_user_message(
     if not return_visible:
         return message
     if compact_events:
-        content = (
-            message.payload.get("content")
-            if hasattr(message.payload, "get")
-            else getattr(message.payload, "content", None)
-        )
+        content = message_payloads.markdown_content(message.payload)
         return models.WorkspaceUserMessage(
             uuid=message.uuid,
             user_uuid=user_uuid,
@@ -5655,11 +5678,7 @@ def update_workspace_user_message(
         )
         if coordinate is None:
             raise RuntimeError("Updated Workspace message has no read coordinate")
-        content = (
-            message.payload.get("content")
-            if hasattr(message.payload, "get")
-            else getattr(message.payload, "content", "")
-        )
+        content = message_payloads.markdown_content(message.payload)
         read_state.sync_message_mentions(
             current_session,
             project_id,

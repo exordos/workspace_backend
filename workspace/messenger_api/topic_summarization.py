@@ -415,6 +415,7 @@ def _load_summary_messages(
             LEFT JOIN previous_boundary ON TRUE
             WHERE message.project_id = %s
               AND message.topic_uuid = %s
+              AND message.payload->>'kind' = 'markdown'
               AND (message.created_at, message.uuid) <= (
                     SELECT created_at, uuid
                     FROM m_workspace_messages
@@ -687,6 +688,7 @@ def claim_summary_work(
                   ON previous_boundary.uuid = topic.summary_last_message_uuid
                 WHERE message.project_id = topic.project_id
                   AND message.topic_uuid = topic.uuid
+                  AND message.payload->>'kind' = 'markdown'
                   AND (
                         previous_boundary.uuid IS NULL
                         OR (message.created_at, message.uuid) > (

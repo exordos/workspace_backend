@@ -142,6 +142,21 @@ def test_message_payload_round_trip_preserves_all_fields(payload_data):
     assert payload_type.to_simple_type(payload) == payload_data
 
 
+@pytest.mark.parametrize("as_model", [False, True])
+def test_only_markdown_exposes_content_for_server_processing(payload_data, as_model):
+    payload = (
+        message_payloads.WORKSPACE_MESSAGE_PAYLOAD_TYPE.from_simple_type(payload_data)
+        if as_model
+        else payload_data
+    )
+
+    content = message_payloads.markdown_content(payload)
+
+    assert content == (
+        payload_data["content"] if payload_data["kind"] == "markdown" else ""
+    )
+
+
 def test_message_payload_rejects_unknown_fields(payload_data):
     payload_data["extra"] = "Unknown field"
 

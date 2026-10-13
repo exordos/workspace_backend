@@ -9311,11 +9311,25 @@ def test_compact_topic_unread_event_serializes_non_default_as_false(api, db):
     assert payload["is_default"] is False
 
 
-def test_scoped_read_state_snapshots_match_public_views_in_every_mode(api, db):
+@pytest.mark.parametrize("encryption", [False, True])
+def test_scoped_read_state_snapshots_match_public_views_in_every_mode(
+    api, db, encryption
+):
     reader_uuid = sys_uuid.uuid4()
     stream_uuid = conftest.seed_user_stream(
         db, api.project_id, api.user_uuid, "Scoped snapshot parity"
     )
+    with db.cursor() as cursor:
+        cursor.execute(
+            "UPDATE messenger_streams SET encryption = %s, "
+            "current_encryption_key_uuid = %s WHERE project_id = %s AND uuid = %s",
+            (
+                encryption,
+                sys_uuid.uuid4() if encryption else None,
+                api.project_id,
+                stream_uuid,
+            ),
+        )
     conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, reader_uuid)
     topic_uuid = conftest.seed_stream_topic(
         db,

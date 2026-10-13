@@ -147,7 +147,7 @@ def test_encryption_migration_defaults_existing_streams_and_restores_views(api, 
             )
             assert cursor.fetchone()[0] == 0
     finally:
-        engine.apply_migration(ENCRYPTION_MIGRATION)
+        engine.apply_migration(engine.get_latest_migration())
 
 
 def test_encrypted_stream_creation_persists_metadata_in_responses_and_events(
