@@ -14,6 +14,7 @@ from workspace.messenger_api import file_storage
 from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.dm import helpers
 from workspace.messenger_api.dm import models
+from workspace.messenger_api.dm import stickers
 
 EXTERNAL_CONTENT_OBJECT_PREFIX = "external-content/sha256/"
 
@@ -116,6 +117,27 @@ class CanonicalFileRepository:
                 storage_id=row["storage_id"],
                 storage_object_id=row["storage_object_id"],
             )
+
+    def resolve_sticker(self, sticker_uuid: sys_uuid.UUID) -> dict[str, Any] | None:
+        with self._current_session() as session:
+            sticker = stickers.Sticker.objects.get_one_or_none(
+                filters={
+                    "uuid": dm_filters.EQ(sticker_uuid),
+                    "active": dm_filters.EQ(True),
+                    "blocked": dm_filters.EQ(False),
+                },
+                session=session,
+            )
+            if sticker is None:
+                return None
+            return {
+                "uuid": str(sticker.uuid),
+                "name": f"{sticker.uuid}.{sticker.format}",
+                "content_type": f"image/{sticker.format}",
+                "size_bytes": sticker.size_bytes,
+                "sha256": sticker.sha256,
+                "storage_object_id": sticker.media_object_id,
+            }
 
     def resolve(self, file_uuid: sys_uuid.UUID | str) -> dict[str, Any] | None:
         file_uuid = sys_uuid.UUID(str(file_uuid))

@@ -17,6 +17,7 @@ from workspace.external_bridge_control import files
 from workspace.external_bridge_control import pki
 from workspace.external_bridge_control import state
 from workspace.messenger_api import file_storage
+from workspace.messenger_api import sticker_storage
 
 
 REALM_UUID = sys_uuid.UUID("11111111-1111-4111-8111-111111111111")
@@ -465,3 +466,168 @@ def test_outgoing_authorization_requires_current_owner_file_access(
             },
         )
     assert raised.value.error == "file_access_denied"
+
+
+@pytest.mark.parametrize("format", ["gif", "png", "webp"])
+def test_outgoing_sticker_reuses_signed_object_download(tmp_path, monkeypatch, format):
+    manager, _, account_uuid, chat_uuid, _ = _manager(tmp_path, monkeypatch)
+    sticker_uuid = sys_uuid.uuid4()
+    content = b"original sticker media"
+    object_id = f"stickers/{sticker_uuid}/media.{format}"
+    saved = sticker_storage.LocalStickerStorage().save(sticker_uuid, format, content)
+    assert saved.storage_object_id == object_id
+    resolver = mock.Mock(
+        return_value={
+            "name": f"{sticker_uuid}.{format}",
+            "content_type": f"image/{format}",
+            "size_bytes": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "storage_object_id": object_id,
+        }
+    )
+    manager.resolve_workspace_sticker = resolver
+    manager.resolve_workspace_file = mock.Mock(
+        side_effect=AssertionError("file ACL resolver")
+    )
+    request = {
+        "operation_uuid": str(sys_uuid.uuid4()),
+        "external_account_uuid": str(account_uuid),
+        "external_chat_uuid": str(chat_uuid),
+        "file_urn": f"urn:sticker:{sticker_uuid}",
+    }
+    transfer_uuid = sys_uuid.uuid4()
+    authorization = manager.authorize_outgoing(_identity(), transfer_uuid, request)
+    token = urllib.parse.parse_qs(
+        urllib.parse.urlsplit(authorization["download"]["url"]).query
+    )["token"][0]
+    assert manager.get_presigned_object(_identity(), token) == content
+    assert authorization["file_uuid"] == str(sticker_uuid)
+    assert authorization["file_urn"] == request["file_urn"]
+    assert authorization["sha256"] == hashlib.sha256(content).hexdigest()
+    assert authorization["content_type"] == f"image/{format}"
+    assert manager.authorize_outgoing(_identity(), transfer_uuid, request)[
+        "file_uuid"
+    ] == str(sticker_uuid)
+    resolver.assert_called_with(sticker_uuid)
+    # A later grant checks catalog visibility again instead of reusing old access.
+    resolver.return_value = None
+    with pytest.raises(files.FileTransferError) as raised:
+        manager.authorize_outgoing(_identity(), transfer_uuid, request)
+    assert raised.value.status == 404
+
+
+def test_sticker_authorization_requires_assignment_before_catalog_lookup(
+    tmp_path, monkeypatch
+):
+    manager, _, account_uuid, _, _ = _manager(tmp_path, monkeypatch)
+    manager.resolve_workspace_sticker = mock.Mock()
+    with pytest.raises(files.FileTransferError) as raised:
+        manager.authorize_outgoing(
+            _identity(),
+            sys_uuid.uuid4(),
+            {
+                "operation_uuid": str(sys_uuid.uuid4()),
+                "external_account_uuid": str(account_uuid),
+                "external_chat_uuid": str(sys_uuid.uuid4()),
+                "file_urn": f"urn:sticker:{sys_uuid.uuid4()}",
+            },
+        )
+    assert raised.value.status == 403
+    manager.resolve_workspace_sticker.assert_not_called()
+
+
+def test_outgoing_sticker_rejects_query_suffix(tmp_path, monkeypatch):
+    manager, _, account_uuid, chat_uuid, _ = _manager(tmp_path, monkeypatch)
+    manager.resolve_workspace_sticker = mock.Mock()
+    sticker_uuid = sys_uuid.uuid4()
+
+    with pytest.raises(files.FileTransferError) as raised:
+        manager.authorize_outgoing(
+            _identity(),
+            sys_uuid.uuid4(),
+            {
+                "operation_uuid": str(sys_uuid.uuid4()),
+                "external_account_uuid": str(account_uuid),
+                "external_chat_uuid": str(chat_uuid),
+                "file_urn": f"urn:sticker:{sticker_uuid}?v=1",
+            },
+        )
+
+    assert raised.value.status == 422
+    assert raised.value.error == "invalid_workspace_urn"
+    manager.resolve_workspace_sticker.assert_not_called()
+
+
+def test_outgoing_sticker_presigns_original_s3_object(tmp_path, monkeypatch):
+    manager, _, account_uuid, chat_uuid, _ = _manager(tmp_path, monkeypatch)
+    sticker_uuid = sys_uuid.uuid4()
+    object_id = f"stickers/{sticker_uuid}/media.webp"
+    manager.resolve_workspace_sticker = lambda _: {
+        "name": f"{sticker_uuid}.webp",
+        "content_type": "image/webp",
+        "size_bytes": 42,
+        "sha256": "a" * 64,
+        "storage_object_id": object_id,
+    }
+    storage = mock.Mock(
+        storage_type=file_storage_opts.STORAGE_TYPE_S3,
+        bucket_name="private-media",
+    )
+    storage.client.generate_presigned_url.return_value = "https://s3.test/signed"
+    monkeypatch.setattr(file_storage, "get_workspace_file_storage", lambda **_: storage)
+    response = manager.authorize_outgoing(
+        _identity(),
+        sys_uuid.uuid4(),
+        {
+            "operation_uuid": str(sys_uuid.uuid4()),
+            "external_account_uuid": str(account_uuid),
+            "external_chat_uuid": str(chat_uuid),
+            "file_urn": f"urn:sticker:{sticker_uuid}",
+        },
+    )
+    storage.client.generate_presigned_url.assert_called_once_with(
+        "get_object",
+        Params={"Bucket": "private-media", "Key": object_id},
+        ExpiresIn=300,
+        HttpMethod="GET",
+    )
+    assert response["download"]["url"] == "https://s3.test/signed"
+    assert "storage_object_id" not in response
+
+
+def test_sticker_metadata_is_read_only_and_assignment_scoped(tmp_path, monkeypatch):
+    manager, _, account_uuid, chat_uuid, _ = _manager(tmp_path, monkeypatch)
+    sticker_uuid = sys_uuid.uuid4()
+    resolver = mock.Mock(
+        return_value={
+            "sha256": "a" * 64,
+            "size_bytes": 42,
+            "content_type": "image/webp",
+            "storage_object_id": f"stickers/{sticker_uuid}/media.webp",
+        }
+    )
+    manager.resolve_workspace_sticker = resolver
+    manager.control_state.file_transfer_put = mock.Mock()
+    manager._presigned_get = mock.Mock()
+    request = {
+        "external_account_uuid": str(account_uuid),
+        "external_chat_uuid": str(chat_uuid),
+    }
+    assert manager.sticker_metadata(_identity(), sticker_uuid, request) == {
+        "uuid": str(sticker_uuid),
+        "sha256": "a" * 64,
+        "size_bytes": 42,
+        "content_type": "image/webp",
+    }
+    manager.control_state.file_transfer_put.assert_not_called()
+    manager._presigned_get.assert_not_called()
+    resolver.return_value = None
+    with pytest.raises(files.FileTransferError) as raised:
+        manager.sticker_metadata(_identity(), sticker_uuid, request)
+    assert raised.value.status == 404
+    resolver.reset_mock()
+    request["external_chat_uuid"] = str(sys_uuid.uuid4())
+    with pytest.raises(files.FileTransferError) as raised:
+        manager.sticker_metadata(_identity(), sticker_uuid, request)
+    assert raised.value.status == 403
+    resolver.assert_not_called()
