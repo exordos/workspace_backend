@@ -18,6 +18,7 @@ import enum
 import random
 import typing
 
+from restalchemy.common import exceptions as ra_exc
 from restalchemy.dm import models
 from restalchemy.dm import properties
 from restalchemy.dm import types
@@ -34,6 +35,13 @@ COLOR_MAX_VALUE = 0xFFFFFF
 
 def random_color() -> int:
     return random.randint(0, COLOR_MAX_VALUE)
+
+
+class StrictBoolean(types.Boolean):
+    def from_simple_type(self, value: typing.Any) -> bool:
+        if not self.validate(value):
+            raise ValueError("Expected a JSON boolean")
+        return value
 
 
 class Color(types.Integer):
@@ -285,6 +293,24 @@ class WorkspaceStreamBase(
     )
 
 
+class WorkspaceStreamEncryptionCreation(models.Model):
+    source_name = properties.property(
+        types.Enum([source.value for source in SourceName]),
+        default=SourceName.NATIVE.value,
+    )
+    encryption = properties.property(StrictBoolean(), default=False)
+    current_encryption_key_uuid = properties.property(
+        types.AllowNone(types.UUID()), default=None
+    )
+
+    def validate(self) -> None:
+        super().validate()
+        if self.encryption != (self.current_encryption_key_uuid is not None):
+            raise ra_exc.ValidationErrorException()
+        if self.encryption and self.source_name == SourceName.ZULIP.value:
+            raise ra_exc.ValidationErrorException()
+
+
 class WorkspaceUserStreamBase(
     UserScopedModelWithUUID,
     models.ModelWithRequiredNameDesc,
@@ -299,11 +325,12 @@ class WorkspaceUserStreamBase(
         types.Enum([role.value for role in WorkspaceStreamRole]),
         required=True,
     )
-    encryption = properties.property(types.Boolean(), default=False)
+    encryption = properties.property(StrictBoolean(), default=False)
     current_encryption_key_uuid = properties.property(
         types.AllowNone(types.UUID()),
         default=None,
     )
+
     notification_mode = properties.property(
         types.Enum([mode.value for mode in WorkspaceStreamNotificationMode]),
         default=WorkspaceStreamNotificationMode.ALL_MESSAGES.value,
@@ -368,3 +395,16 @@ class WorkspaceUserStreamBase(
         default=None,
         read_only=True,
     )
+
+    @staticmethod
+    def validate_encryption_update(values: typing.Mapping[str, typing.Any]) -> None:
+        if {"encryption", "current_encryption_key_uuid"}.intersection(values):
+            raise ra_exc.ValidationErrorException()
+
+    @staticmethod
+    def validate_message_kind(source_name: str, kind: str) -> None:
+        if (
+            source_name == SourceName.ZULIP.value
+            and kind == message_payloads.E2EEPayload.KIND
+        ):
+            raise ra_exc.ValidationErrorException()

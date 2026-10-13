@@ -14,9 +14,11 @@ from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.api import store_factory
 from workspace.services.messenger_workers import v2_projection
 from workspace.tests.integration import conftest
+from workspace.tests.integration import test_messenger_v2
 
 
 STREAMS = "/v1/streams/"
+MESSAGES = "/v1/messages/"
 ENCRYPTION_MIGRATION = "0186-Add-stream-encryption-metadata-17aa3c.py"
 
 
@@ -146,3 +148,329 @@ def test_encryption_migration_defaults_existing_streams_and_restores_views(api, 
             assert cursor.fetchone()[0] == 0
     finally:
         engine.apply_migration(ENCRYPTION_MIGRATION)
+
+
+def test_encrypted_stream_creation_persists_metadata_in_responses_and_events(
+    api, workspace_api, db
+):
+    workspace_api.user_uuid = api.user_uuid
+    workspace_api.project_id = api.project_id
+    key_uuid = str(sys_uuid.uuid4())
+    response = api.post(
+        STREAMS,
+        json={
+            "name": "Secret chat",
+            "encryption": True,
+            "current_encryption_key_uuid": key_uuid,
+        },
+    )
+    assert response.status_code == 201, response.text
+    stream_uuid = response.json()["uuid"]
+    assert response.json()["encryption"] is True
+    assert response.json()["current_encryption_key_uuid"] == key_uuid
+    with db.cursor() as cursor:
+        cursor.execute(
+            "SELECT encryption, current_encryption_key_uuid FROM messenger_streams "
+            "WHERE project_id = %s AND uuid = %s",
+            (api.project_id, stream_uuid),
+        )
+        assert cursor.fetchone() == (True, sys_uuid.UUID(key_uuid))
+    read = workspace_api.get(f"/v1/messenger/streams/{stream_uuid}")
+    assert read.status_code == 200, read.text
+    assert read.json()["encryption"] is True
+    assert read.json()["current_encryption_key_uuid"] == key_uuid
+    test_messenger_v2._drain()
+    response = workspace_api.get("/v1/events/")
+    assert response.status_code == 200, response.text
+    created = [
+        event["payload"]
+        for event in response.json()
+        if event["payload"]["kind"] == "stream.created"
+        and event["payload"]["uuid"] == stream_uuid
+    ]
+    assert created
+    assert created[0]["encryption"] is True
+    assert created[0]["current_encryption_key_uuid"] == key_uuid
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"encryption": True},
+        {"encryption": True, "current_encryption_key_uuid": None},
+        {"current_encryption_key_uuid": "80bc4f0b-87ac-4d8d-9350-e5f88f61ca20"},
+        {
+            "encryption": False,
+            "current_encryption_key_uuid": "80bc4f0b-87ac-4d8d-9350-e5f88f61ca20",
+        },
+        {"encryption": True, "current_encryption_key_uuid": "invalid"},
+        {
+            "encryption": "true",
+            "current_encryption_key_uuid": "80bc4f0b-87ac-4d8d-9350-e5f88f61ca20",
+        },
+        {"encryption": "false"},
+        {"encryption": None},
+        {
+            "source_name": "zulip",
+            "encryption": True,
+            "current_encryption_key_uuid": "80bc4f0b-87ac-4d8d-9350-e5f88f61ca20",
+        },
+    ],
+)
+def test_invalid_stream_encryption_leaves_no_stream_or_outbox(api, db, metadata):
+    response = api.post(STREAMS, json={"name": "Invalid encryption", **metadata})
+
+    assert response.status_code == 400, response.text
+    with db.cursor() as cursor:
+        for table in (
+            "messenger_streams",
+            "messenger_topics",
+            "messenger_stream_bindings",
+            "messenger_domain_outbox_events",
+        ):
+            cursor.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE project_id = %s", (api.project_id,)
+            )
+            assert cursor.fetchone() == (0,)
+
+
+@pytest.mark.parametrize("encryption", [False, True])
+@pytest.mark.parametrize("field", ["encryption", "current_encryption_key_uuid"])
+def test_stream_put_rejects_encryption_fields_without_renaming(
+    api, db, encryption, field
+):
+    metadata = {"encryption": encryption}
+    if encryption:
+        metadata["current_encryption_key_uuid"] = str(sys_uuid.uuid4())
+    created = api.post(STREAMS, json={"name": "Immutable encryption", **metadata})
+    assert created.status_code == 201, created.text
+    stream = created.json()
+    attempted = False if field == "encryption" else str(sys_uuid.uuid4())
+    response = api.put(
+        f"{STREAMS}{stream['uuid']}", json={"name": "Invalid rename", field: attempted}
+    )
+
+    assert response.status_code == 400, response.text
+    read = api.get(f"{STREAMS}{stream['uuid']}")
+    assert read.status_code == 200, read.text
+    assert read.json() == stream
+
+
+@pytest.mark.parametrize("direct", [False, True])
+def test_repeated_stream_creation_cannot_reset_encryption(api, db, direct):
+    metadata = {
+        "name": "Repeat secret chat",
+        "encryption": True,
+        "current_encryption_key_uuid": str(sys_uuid.uuid4()),
+    }
+    if direct:
+        peer_uuid = sys_uuid.uuid4()
+        conftest.seed_workspace_user(db, peer_uuid, "encrypted-peer")
+        test_messenger_v2._register_project_user(db, api.project_id, peer_uuid)
+        metadata["direct_user_uuid"] = str(peer_uuid)
+    else:
+        metadata["uuid"] = str(sys_uuid.uuid4())
+    first = api.post(STREAMS, json=metadata)
+    assert first.status_code == 201, first.text
+    repeated = api.post(STREAMS, json=metadata)
+    assert repeated.status_code == 201, repeated.text
+    assert repeated.json()["uuid"] == first.json()["uuid"]
+    for changed in (
+        {"encryption": False, "current_encryption_key_uuid": None},
+        {"current_encryption_key_uuid": str(sys_uuid.uuid4())},
+    ):
+        response = api.post(STREAMS, json={**metadata, **changed})
+        assert response.status_code == 400, response.text
+    read = api.get(f"{STREAMS}{first.json()['uuid']}")
+    assert read.status_code == 200, read.text
+    assert read.json()["encryption"] is True
+    assert (
+        read.json()["current_encryption_key_uuid"]
+        == metadata["current_encryption_key_uuid"]
+    )
+
+
+@pytest.mark.parametrize("encryption", [False, True])
+def test_native_stream_accepts_e2ee_with_an_old_key(api, db, encryption):
+    metadata = {"name": "Native encrypted message", "encryption": encryption}
+    if encryption:
+        metadata["current_encryption_key_uuid"] = str(sys_uuid.uuid4())
+    created = api.post(STREAMS, json=metadata)
+    assert created.status_code == 201, created.text
+    payload = {
+        "kind": "e2ee",
+        "key_uuid": str(sys_uuid.uuid4()),
+        "content": "opaque ciphertext",
+    }
+    response = api.post(
+        MESSAGES, json={"stream_uuid": created.json()["uuid"], "payload": payload}
+    )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["payload"] == payload
+    test_messenger_v2._drain()
+    read = api.get(f"{MESSAGES}{response.json()['uuid']}")
+    assert read.status_code == 200, read.text
+    assert read.json()["payload"] == payload
+
+
+@pytest.mark.parametrize("author", ["owner", "member"])
+def test_zulip_stream_rejects_e2ee_without_message_or_provider_operation(
+    api, db, author
+):
+    created = api.post(STREAMS, json={"name": "Zulip encryption ban"})
+    assert created.status_code == 201, created.text
+    stream_uuid = created.json()["uuid"]
+    peer_uuid = sys_uuid.uuid4()
+    conftest.seed_workspace_user(db, peer_uuid, "zulip-peer")
+    test_messenger_v2._register_project_user(db, api.project_id, peer_uuid)
+    added = api.post(
+        f"{STREAMS}{stream_uuid}/actions/add_users/invoke",
+        json={"member": [str(peer_uuid)]},
+    )
+    assert added.status_code == 200, added.text
+    account_uuid = test_messenger_v2._seed_v2_provider_route(
+        db, api.project_id, api.user_uuid, stream_uuid
+    )
+    for user in (api.user_uuid, peer_uuid):
+        read = api.get(f"{STREAMS}{stream_uuid}", user=user)
+        assert read.status_code == 200, read.text
+        assert read.json()["source_name"] == "zulip"
+    test_messenger_v2._drain()
+    user_uuid = api.user_uuid if author == "owner" else peer_uuid
+    response = api.post(
+        MESSAGES,
+        user=user_uuid,
+        json={
+            "stream_uuid": stream_uuid,
+            "payload": {
+                "kind": "e2ee",
+                "key_uuid": str(sys_uuid.uuid4()),
+                "content": "opaque ciphertext",
+            },
+        },
+    )
+
+    assert response.status_code == 400, response.text
+    with db.cursor() as cursor:
+        cursor.execute(
+            "SELECT COUNT(*) FROM messenger_messages WHERE project_id = %s",
+            (api.project_id,),
+        )
+        assert cursor.fetchone() == (0,)
+        cursor.execute(
+            "SELECT COUNT(*) FROM m_external_operations_v2 "
+            "WHERE external_account_uuid = %s",
+            (account_uuid,),
+        )
+        assert cursor.fetchone() == (0,)
+    plaintext = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "payload": {"kind": "markdown", "content": "Allowed text"},
+        },
+    )
+    assert plaintext.status_code == 201, plaintext.text
+
+
+def test_zulip_message_cannot_be_replaced_with_e2ee(api, db):
+    created = api.post(STREAMS, json={"name": "Zulip message update ban"})
+    assert created.status_code == 201, created.text
+    stream_uuid = created.json()["uuid"]
+    test_messenger_v2._seed_v2_provider_route(
+        db, api.project_id, api.user_uuid, stream_uuid
+    )
+    plaintext = {"kind": "markdown", "content": "Original text"}
+    message = api.post(
+        MESSAGES, json={"stream_uuid": stream_uuid, "payload": plaintext}
+    )
+    assert message.status_code == 201, message.text
+    response = api.put(
+        f"{MESSAGES}{message.json()['uuid']}",
+        json={
+            "payload": {
+                "kind": "e2ee",
+                "key_uuid": str(sys_uuid.uuid4()),
+                "content": "opaque ciphertext",
+            }
+        },
+    )
+
+    assert response.status_code == 400, response.text
+    read = api.get(f"{MESSAGES}{message.json()['uuid']}")
+    assert read.status_code == 200, read.text
+    assert read.json()["payload"] == plaintext
+
+
+def test_zulip_stream_rejects_encryption_enable_and_recreation(api, db):
+    created = api.post(STREAMS, json={"name": "Zulip encryption settings"})
+    assert created.status_code == 201, created.text
+    stream_uuid = created.json()["uuid"]
+    test_messenger_v2._seed_v2_provider_route(
+        db, api.project_id, api.user_uuid, stream_uuid
+    )
+    metadata = {
+        "encryption": True,
+        "current_encryption_key_uuid": str(sys_uuid.uuid4()),
+    }
+    updated = api.put(f"{STREAMS}{stream_uuid}", json=metadata)
+    recreated = api.post(
+        STREAMS,
+        json={
+            "uuid": stream_uuid,
+            "name": "Zulip encryption settings",
+            "source_name": "zulip",
+            **metadata,
+        },
+    )
+
+    assert updated.status_code == 400, updated.text
+    assert recreated.status_code == 400, recreated.text
+    read = api.get(f"{STREAMS}{stream_uuid}")
+    assert read.status_code == 200, read.text
+    assert read.json()["source_name"] == "zulip"
+    assert read.json()["encryption"] is False
+    assert read.json()["current_encryption_key_uuid"] is None
+
+
+@pytest.mark.parametrize("other_source", ["native", "zulip"])
+def test_message_update_checks_every_stream_placement(api, db, other_source):
+    streams = []
+    for name in ("Original stream", "Other placement stream"):
+        response = api.post(STREAMS, json={"name": name})
+        assert response.status_code == 201, response.text
+        streams.append(response.json())
+    if other_source == "zulip":
+        test_messenger_v2._seed_v2_provider_route(
+            db, api.project_id, api.user_uuid, streams[1]["uuid"]
+        )
+    canonical_uuid = str(sys_uuid.uuid4())
+    plaintext = {"kind": "markdown", "content": "Shared message"}
+    placements = []
+    for stream in streams:
+        response = api.post(
+            MESSAGES,
+            json={
+                "uuid": canonical_uuid,
+                "stream_uuid": stream["uuid"],
+                "payload": plaintext,
+            },
+        )
+        assert response.status_code == 201, response.text
+        placements.append(response.json()["uuid"])
+    encrypted = {
+        "kind": "e2ee",
+        "key_uuid": str(sys_uuid.uuid4()),
+        "content": "opaque ciphertext",
+    }
+    response = api.put(f"{MESSAGES}{placements[0]}", json={"payload": encrypted})
+
+    assert response.status_code == (200 if other_source == "native" else 400), (
+        response.text
+    )
+    expected = encrypted if other_source == "native" else plaintext
+    for placement_uuid in placements:
+        read = api.get(f"{MESSAGES}{placement_uuid}")
+        assert read.status_code == 200, read.text
+        assert read.json()["payload"] == expected

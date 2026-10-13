@@ -26,6 +26,7 @@ from workspace.messenger_api.api import resource_projection
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.dm import helpers
+from workspace.messenger_api.dm import message_payloads
 from workspace.messenger_api.dm import models
 from workspace.messenger_api.dm import read_state
 
@@ -2333,6 +2334,7 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                 **values,
             )
         elif resource == "streams":
+            models.WorkspaceUserStream.validate_encryption_update(values)
             provider_target = self._provider_target(
                 resource_uuid,
                 "stream.update",
@@ -2571,6 +2573,12 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
     ) -> dict[str, typing.Any]:
         values = self._projection_values(values)
         values["uuid"] = values.get("uuid") or sys_uuid.uuid4()
+        payload = resource_projection.simple(values["payload"])
+        if payload["kind"] == message_payloads.E2EEPayload.KIND:
+            stream = helpers.get_workspace_user_stream(
+                self.project_uuid, self.user_uuid, values["stream_uuid"]
+            )
+            stream.validate_message_kind(stream.source_name, payload["kind"])
         provider_targets = self._provider_targets_for_message(
             values["stream_uuid"],
             values.get("topic_uuid"),
@@ -2606,6 +2614,12 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             self.user_uuid,
             message_uuid,
         )
+        payload = resource_projection.simple(values["payload"])
+        if payload["kind"] == message_payloads.E2EEPayload.KIND:
+            stream = helpers.get_workspace_user_stream(
+                self.project_uuid, self.user_uuid, message.stream_uuid
+            )
+            stream.validate_message_kind(stream.source_name, payload["kind"])
         provider_targets = self._message_provider_targets(message, "message.update")
         row = helpers.update_workspace_user_message(
             self.project_uuid,

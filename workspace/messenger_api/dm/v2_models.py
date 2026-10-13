@@ -241,6 +241,27 @@ class WorkspaceUserMessage(
     def get_id_property(cls) -> dict[str, typing.Any]:
         return {"binding_uuid": cls.properties.properties["binding_uuid"]}
 
+    def validate_payload_update(
+        self, payload: typing.Mapping[str, typing.Any], session: typing.Any
+    ) -> None:
+        if payload["kind"] != message_payloads.E2EEPayload.KIND:
+            return
+        streams = session.execute(
+            """
+            SELECT DISTINCT stream.source_name
+            FROM messenger_message_placements AS placement
+            JOIN messenger_streams AS stream
+              ON stream.project_id = placement.project_id
+             AND stream.uuid = placement.stream_uuid
+            WHERE placement.project_id = %s AND placement.message_uuid = %s
+            """,
+            (self.project_id, self.canonical_message_uuid),
+        ).fetchall()
+        for stream in streams:
+            base.WorkspaceUserStreamBase.validate_message_kind(
+                stream["source_name"], payload["kind"]
+            )
+
 
 class WorkspaceStream(
     models.ModelWithUUID,
