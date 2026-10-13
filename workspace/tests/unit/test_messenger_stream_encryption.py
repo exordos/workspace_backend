@@ -12,6 +12,8 @@ from workspace.messenger_api import events
 from workspace.messenger_api.api import resource_projection
 from workspace.messenger_api.api import v2_store
 from workspace.messenger_api.dm import models
+from workspace.messenger_api.dm import base
+from workspace.messenger_api.dm import message_payloads
 from workspace.messenger_api.dm import v2_models
 
 
@@ -93,3 +95,67 @@ def test_stream_responses_and_events_preserve_encryption_metadata(
 def test_stream_encryption_rejects_invalid_types(stream_factory, metadata):
     with pytest.raises(ra_exc.TypeError):
         stream_factory(**metadata)
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {},
+        {"encryption": False, "current_encryption_key_uuid": None},
+        {"encryption": True, "current_encryption_key_uuid": KEY_UUID},
+    ],
+)
+def test_stream_creation_accepts_consistent_encryption(metadata):
+    settings = base.WorkspaceStreamEncryptionCreation(**metadata)
+
+    assert settings.encryption is metadata.get("encryption", False)
+    assert settings.current_encryption_key_uuid == metadata.get(
+        "current_encryption_key_uuid"
+    )
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"encryption": True},
+        {"encryption": True, "current_encryption_key_uuid": None},
+        {"current_encryption_key_uuid": KEY_UUID},
+        {"encryption": False, "current_encryption_key_uuid": KEY_UUID},
+        {
+            "source_name": "zulip",
+            "encryption": True,
+            "current_encryption_key_uuid": KEY_UUID,
+        },
+    ],
+)
+def test_stream_creation_rejects_inconsistent_encryption(metadata):
+    with pytest.raises(ra_exc.ValidationErrorException):
+        base.WorkspaceStreamEncryptionCreation(**metadata)
+
+
+@pytest.mark.parametrize("field", ["encryption", "current_encryption_key_uuid"])
+def test_stream_updates_reject_encryption_fields(field):
+    with pytest.raises(ra_exc.ValidationErrorException):
+        base.WorkspaceUserStreamBase.validate_encryption_update(
+            {"name": "Rename", field: None}
+        )
+
+
+@pytest.mark.parametrize("source_name", ["native", "zulip"])
+def test_e2ee_messages_require_a_native_stream(source_name):
+    payload = message_payloads.E2EEPayload(key_uuid=KEY_UUID, content="opaque data")
+
+    if source_name == "zulip":
+        with pytest.raises(ra_exc.ValidationErrorException):
+            base.WorkspaceUserStreamBase.validate_message_kind(
+                source_name, payload.KIND
+            )
+    else:
+        base.WorkspaceUserStreamBase.validate_message_kind(source_name, payload.KIND)
+
+
+@pytest.mark.parametrize("source_name", ["native", "zulip"])
+def test_markdown_messages_remain_allowed_in_both_stream_sources(source_name):
+    payload = message_payloads.MarkdownPayload(content="Message")
+
+    base.WorkspaceUserStreamBase.validate_message_kind(source_name, payload.KIND)
