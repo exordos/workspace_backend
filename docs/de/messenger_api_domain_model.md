@@ -222,6 +222,8 @@ verweist nur über einen indexierten externen Schlüssel auf den Benutzer
 
 ### `WorkspaceUserStream`
 
+Der gemeinsame kanonische `WorkspaceStream` speichert `encryption` und die nullable `current_encryption_key_uuid`; diese Werte sind für alle Mitglieder identisch und erscheinen in Stream-Antworten und Ereignissen. Das Flag ist nach der Erstellung unveränderlich. Eine `owner`-Nachricht mit `kind: key_announced` speichert die Ankündigung und ändert die aktuelle symmetrische Schlüssel-UUID atomar. `source_name` gilt für den gesamten Stream: `zulip` verbietet `encryption: true` und `e2ee`. Die sechs Payload-Strukturen und Grenzen undurchsichtiger Inhalte stehen im [öffentlichen API-Vertrag](workspace_api.md#message-payloads).
+
 `WorkspaceUserStream` behält die aktuellen öffentlichen Felder, aber die gezielte Darstellung
 wird vom physischen `WorkspaceStreamBinding` aktuellen Benutzer errichtet:
 

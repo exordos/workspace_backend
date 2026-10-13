@@ -71,6 +71,23 @@ Definition von Wiederaufbau, Wiederherstellung, Skalierung und Lastakzeptanz.
 | MSG-DB-006 | Versuchen Sie, ohne Mitgliedschaft oder mit einem Token eines anderen Projekts zu handeln. | IAM Autorisierung lehnt die Anfrage ab und der kanonische Zustand bleibt unverändert. |
 | MSG-DB-007 | Die gleiche erneut ausprobierbare Anfrage nach einem zweideutigen Antwortfehler einreichen. | Die Idempotency wird beibehalten und keine doppelten, für den Benutzer sichtbaren Nachrichten oder Ereignisse werden erstellt. |
 
+## Symmetrische Stream-Schlüssel und verschlüsselte Nachrichten
+
+Diese Szenarien erweitern die Basistests um den vereinbarten Vertrag mit sechs Payload-Arten. Prüfe gegebenenfalls sowohl den kanonischen v2-Writer als auch den verbliebenen Legacy-Writer in einer separaten PostgreSQL-Datenbank mit aktuellen Migrationen.
+
+| ID | Szenario | Erwartetes Ergebnis |
+| --- | --- | --- |
+| MSG-E2EE-001 | Streams mit fehlenden, falschen, wahren und ungültigen Verschlüsselungsmetadaten erstellen. | `encryption` ist standardmäßig `false`; `true` erfordert `current_encryption_key_uuid`, bei `false` muss der Schlüssel fehlen oder `null` sein. Ungültige Daten erzeugen weder Stream noch Outbox-Zeilen. |
+| MSG-E2EE-002 | Streams über beide API-Einstiegspunkte und Echtzeit-Snapshots lesen. | Alle Snapshots enthalten `encryption` und nullable `current_encryption_key_uuid`; Metadaten und Quelle sind für alle Mitglieder gemeinsam. |
+| MSG-E2EE-003 | Alle sechs Arten mit gültigen, fehlenden und zusätzlichen Feldern senden. | Feste Schemas lehnen fehlende/unbekannte Felder ab. Alle Arten sind unabhängig vom Flag erlaubt, mit der Zulip-Ausnahme für `e2ee`. |
+| MSG-E2EE-004 | Als verschiedene Benutzer Verschlüsselung aktivieren oder `e2ee` in einem gemeinsamen Zulip-Stream senden. | HTTP `400`; keine Nachricht oder Provider-Operation entsteht. Das gemeinsame `source_name` entscheidet. |
+| MSG-E2EE-005 | `key_announced` mit jeder Rolle senden und Metadaten über `PUT` ändern. | Nur `owner` darf ankündigen; `PUT` ändert keine Verschlüsselungsfelder und erstellt oder bearbeitet keine Ankündigung. |
+| MSG-E2EE-006 | Fehler nach Schlüsselrotation, parallele Eigentümerankündigungen und gleichzeitige Herabstufung testen. | Nachricht, Schlüssel und Outbox werden atomar bestätigt; Fehler rollen zurück, Rollen werden gesperrt geprüft und Rotationen serialisiert. |
+| MSG-E2EE-007 | Eine alte Ankündigung wiederholen, in einem anderen Thema verwenden und `e2ee` mit altem Schlüssel senden. | Wiederholungen setzen die UUID nicht zurück; ein anderes Thema desselben Streams wird abgelehnt; alte `e2ee`-Schlüssel-UUIDs bleiben erlaubt. |
+| MSG-E2EE-008 | Erwähnungs-/Bildtext in undurchsichtigen Payloads verwenden, zwischen Markdown und undurchsichtigem Inhalt wechseln und Read State neu aufbauen. | Verlauf/Ereignisse bewahren Payloads; nur `markdown` erzeugt Erwähnungen. Wechsel zu undurchsichtigem Inhalt entfernt alte Erwähnungen und korrigiert Zähler. |
+| MSG-E2EE-009 | Undurchsichtige und gemischte Themen mit mehr undurchsichtigen Nachrichten als das Batchlimit zusammenfassen. | Rein undurchsichtige Themen erzeugen keine LLM-Arbeit; nur Markdown zählt zum Batch und liefert Bildverweise. |
+| MSG-E2EE-010 | Beide OpenAPI-Dokumente erzeugen und lokalisierte Dokumentation vergleichen. | POST/PUT- und Antwortschemas entsprechen den Laufzeitregeln; sechs Payloads verlangen Pflichtfelder ohne Zusatzfelder; alle vier Sprachen verwenden identische Beispiele und Grenzen. |
+
 ## Entwürfe
 
 | Identifizierung | Szenario | Erwartetes Ergebnis |

@@ -770,6 +770,8 @@ UUID 在 `direct_user_uuid` 中.重复或同时发送相同的请求
 | `owner` | UUID | 不需要 | 是的 | 从用户流视图中看到所有者. |
 | `user_uuid` | UUID | 不需要 | 是的 | 在用户流视图中的当前用户. |
 | `role` | `guest`, `member`, `moderator`, `administrator`, `owner` | 不需要 | 是的 | 目前用户的角色. |
+| `encryption` | 布尔值 | 否 | 仅创建时 | 共享标志，默认 `false`，仅在创建时设置，之后不可更改。 |
+| `current_encryption_key_uuid` | UUID 或 `null` | 条件必填 | 通过公告管理 | 以 `encryption: true` 创建时必填；否则省略或为 `null`。之后只通过 `key_announced` 更改。 |
 | `notification_mode` | `mentions_only`, `muted`, `all_messages` | 不需要 | 用户范围的操作管理 | 目前用户的流通告模式;默认为`all_messages`. |
 | `unread_count` | 整数 | 不需要 | 是的 | 目前用户的未读数量. |
 | `active_unread_count` | 整数 | 不需要 | 是的 | 根据有效流/topic通知模式,当前用户的未读数值是符合条件的. |
@@ -902,6 +904,25 @@ Authorization: Bearer <access_token>
 流创建也为每个事件写`folder.updated`
 参与者的 `All chats`文件,以及当流是私人的 `Personal`,
 或 `Channels` 当它不是私有.
+
+### 频道加密 {#stream-encryption}
+
+`encryption` 默认为 `false`。创建时，`true` 必须提供非空的 `current_encryption_key_uuid`；为 `false` 时，密钥 UUID 必须省略或为 `null`。频道列表、单独响应及实时事件快照都会返回这两个字段。频道密钥是对称密钥：后端只保存 UUID，不保存明文密钥，也没有频道公钥部分。
+
+```http
+POST /api/workspace/v1/messenger/streams/
+Content-Type: application/json
+
+{
+  "name": "Secret chat",
+  "encryption": true,
+  "current_encryption_key_uuid": "80bc4f0b-87ac-4d8d-9350-e5f88f61ca20"
+}
+```
+
+`source_name` 是整个频道共享的 `native` 或 `zulip` 值，所有参与者看到的值相同。Zulip 频道禁止 `encryption: true` 和 `e2ee` 消息。公共 API 只创建原生频道；Zulip 频道由提供方管理，保持 `encryption: false`。
+
+创建后 `encryption` 不可更改。`PUT` 拒绝 `encryption` 和 `current_encryption_key_uuid`，即使提交的值没有变化。只有 `owner` 可以发送 `key_announced`；消息和当前密钥 UUID 在同一事务中原子保存。即使 `encryption: false` 也允许公告，但它只更新 UUID，不改变标志。新建未加密频道返回 `current_encryption_key_uuid: null`。
 
 ## 流体结合
 
@@ -1185,12 +1206,7 @@ UUID 是确定性结局. 启用终点被声称具有
 | `presence_penalty` | `0.0` | `-2.0..2.0` |
 | `frequency_penalty` | `0.0` | `-2.0..2.0` |
 
-没有Messenger工作者要求一个老话题,最多100个新消息
-步骤,快照的边界和有效提示,承诺的要求,执行
-在每个数据库交易之外的 LLM 请求,并且结果在
-通过现有的内部总结辅助器进行新的交易.
-重试延误,终点租和索赔到期都会被存储,因此重试仍然存在
-它们是有限的,可观察的.
+Messenger worker 每步认领一个主题和最多 100 条新的 `markdown` 消息。其他类型在应用批次限额前被排除，不触发图像加载或 LLM 请求。worker 保存边界和有效提示，提交事务，在数据库事务之外请求 LLM，再通过内部摘要 helper 保存结果。失败、重试延迟、端点租约和认领到期状态继续持久化。
 
 长时间的推理是提供商的正常反应,
 连接时间是30秒,而响应时间是25分钟,所以
@@ -1258,13 +1274,15 @@ Authorization: Bearer <access_token>
 
 ## 信息 {#messages}
 
-`POST /api/workspace/v1/messenger/messages/`验证当前的 PostgreSQL 流
-成员和承诺的规范UTF-8下标信息,旗,一个共享
-接收者观众快照,以及紧的消息/topic/stream
-请求交易.它不会为每个接收者创建一个正规事件行.
-读取仍然限于当前的 IAM 用户,并保留现有的响应.
+`POST /api/workspace/v1/messenger/messages/` 检查 PostgreSQL 中当前的频道成员资格，并在请求事务中保存规范的类型化 JSON payload、标志、共享接收者和紧凑的 message/topic/stream 事件。读取仍限定于当前 IAM 用户和项目。省略 `topic_uuid` 或将其设为 `null` 时，使用频道默认主题。
 
-唯一支持的消息有效载荷是:
+### 消息格式 {#message-payloads}
+
+无论频道加密标志如何，均允许全部六种 `kind`，但 Zulip 频道禁止 `e2ee`。示例中的所有 payload 字段都必填，未知字段会被拒绝。`key_uuid` 和 `request_message_uuid` 必须为 UUID。设备标识和名称是不透明字符串，长度最多 255 个字符。
+
+Markdown 的 `content` 为非空字符串，最多 40,000 个字符。`e2ee.content` 最多允许 213,336 个字符，可容纳 40,000 个 UTF-8 字符（每个最多四字节）经过不改变字节长度的加密再转为 Base64 后的内容。`key_grant.content` 非空且最多 40,000 个字符。`key_request.public_key` 是请求设备的公钥，而非频道对称密钥；它非空且最多 2048 个字符。内容和公钥原样传递；后端不裁剪空格、不检查 Base64、不加密或解密，也不保存明文秘密密钥。
+
+#### Markdown 消息
 
 ```json
 {
@@ -1272,6 +1290,66 @@ Authorization: Bearer <access_token>
   "content": "Hello, workspace"
 }
 ```
+
+#### 加密消息
+
+```json
+{
+  "kind": "e2ee",
+  "key_uuid": "80bc4f0b-87ac-4d8d-9350-e5f88f61ca20",
+  "content": "<encrypted-envelope-base64>"
+}
+```
+
+#### 密钥请求
+
+```json
+{
+  "kind": "key_request",
+  "key_uuid": "80bc4f0b-87ac-4d8d-9350-e5f88f61ca20",
+  "device_id": "requesting-device",
+  "device_name": "Requesting device",
+  "public_key": "<device-public-key-base64>"
+}
+```
+
+#### 加密密钥授予
+
+```json
+{
+  "kind": "key_grant",
+  "key_uuid": "80bc4f0b-87ac-4d8d-9350-e5f88f61ca20",
+  "request_message_uuid": "a93dca35-3061-4748-bda4-7f6f8c660ea5",
+  "sender_device_id": "sender-device",
+  "recipient_device_id": "requesting-device",
+  "content": "<encrypted-symmetric-key-base64>"
+}
+```
+
+#### 拒绝密钥请求
+
+```json
+{
+  "kind": "key_reject",
+  "key_uuid": "80bc4f0b-87ac-4d8d-9350-e5f88f61ca20",
+  "request_message_uuid": "a93dca35-3061-4748-bda4-7f6f8c660ea5",
+  "sender_device_id": "sender-device",
+  "recipient_device_id": "requesting-device"
+}
+```
+
+#### 当前密钥公告
+
+```json
+{
+  "kind": "key_announced",
+  "key_uuid": "80bc4f0b-87ac-4d8d-9350-e5f88f61ca20"
+}
+```
+
+只有 `markdown` 按 Markdown 处理，并参与服务器提及和主题摘要。其他 payload 在历史记录和实时事件中保持不透明；类似提及或图像 URN 的文字没有服务器语义。这些消息不占用摘要批次限额，其附件也不会加载给 LLM。目前没有独立的服务器文本搜索端点。`e2ee` 的旧 `key_uuid` 会被接受，不与当前密钥比较。
+
+`key_announced` 仅包含 `kind` 和 `key_uuid`，没有内容或密钥材料。只有频道绑定中的 `owner` 角色可以发送；`administrator`、`moderator` 和 `member` 会收到 HTTP `400`。新的公告应使用新的消息 UUID。重试旧公告不会回退较新的当前密钥；将同一规范消息放到本频道的另一个主题中会被拒绝。`PUT` 不能创建或编辑公告。删除公告不会回退当前密钥 UUID。`request_message_uuid` 使用密钥请求消息创建响应中返回的公共 `uuid`。
 
 Workspace 标记内容内的实体引用使用常规标记链接
 语法. URL 部分是一个 Workspace URN:
@@ -1294,7 +1372,7 @@ Workspace 标记内容内的实体引用使用常规标记链接
 | `stream_uuid` | UUID | 是的 | 不需要 | 流量 UUID. |
 | `topic_uuid` | UUID | 不需要 | 不需要 | 主题 UUID;省略或 `null` 使用流默认主题.当流没有默认时,请求在代码 `400001007` 中失败. |
 | `author_uuid` | UUID | 不需要 | 是的 | 消息作者 |
-| `payload` | 目标 | 是的 | 不需要 | 标记下来信息的有效载荷; 剪切内容必须为1.4万个字符. |
+| `payload` | 目标 | 是的 | 不需要 | 类型化消息 payload；固定结构及限制见上文。 |
 | `user_uuid` | UUID | 不需要 | 是的 | 目前用户在用户消息视图中. |
 | `read` | 布尔式 | 不需要 | 是的 | 目前用户的读标志.作者是作为读者创建的. |
 | `pinned` | 布尔式 | 不需要 | 是的 | 目前用户的固定标志. |
@@ -1817,9 +1895,7 @@ REST `/events/` 和websocket交付使用相同的平面模式,并且两者都读
 最顶级字段仅描述事件行. `payload.kind`是唯一的 `kind`.
 没有任何可能的高层次 `type`, `kind`, `stream_uuid`,或 `topic_uuid`
 
-创建/update事件的消息,将相同的标记载载存储在
-实体链接仍然是常规的`urn:user`下调链接,
-`urn:message`,`urn:stream`,`urn:topic`,文件/media,像,或 URL URN.
+消息创建和更新事件携带与保存消息相同的类型化 payload。只有 `markdown` 内容使用 `urn:user`、`urn:message`、`urn:stream`、`urn:topic`、文件/媒体、头像或 URL URN 引用；其他类型保持不透明。
 
 Messenger实体创建,更新,读取和操作事件携带相同的完整
 现在的用户从相应的 REST 获得的对象快照

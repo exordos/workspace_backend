@@ -1287,8 +1287,7 @@ aktive Mitgliedschaft im Stream plus anwendbares sichtbares Bindungsverhältnis;
 Die Nachricht wird zurückgegeben `404`.
 Nach dieser Rechteprüfung sind Bearbeiten und Löschen von Inhalten kanonische Vorgänge.
 Placement gibt eindeutig die Antwortzeile und den Status der persönlichen Aktion an.
-Feld `payload` mit Markierung Markdown
-ist auf 140 000 Zeichen begrenzt, nachdem die Randleertungen entfernt wurden, wie im aktuellen Vertrag..
+Die sechs festen `payload`-Strukturen stehen im [öffentlichen API-Vertrag](workspace_api.md#message-payloads). `markdown.content` ist auf 40.000 Zeichen begrenzt, `e2ee.content` auf 213.336 und der öffentliche Geräteschlüssel `public_key` auf 2048. Nur `markdown` beteiligt sich an Erwähnungen und Zusammenfassungen. Verschlüsselungsmetadaten und das nur Eigentümern erlaubte `key_announced` stehen unter [Stream-Verschlüsselung](workspace_api.md#stream-encryption).
 
 ## Reaktionen auf Nachrichten
 

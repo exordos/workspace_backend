@@ -342,12 +342,14 @@ def _object_schema(
     properties: dict[str, typing.Any],
     required: list[str],
 ) -> dict[str, typing.Any]:
-    return {
+    schema = {
         "type": "object",
-        "required": required,
         "additionalProperties": False,
         "properties": copy.deepcopy(properties),
     }
+    if required:
+        schema["required"] = required
+    return schema
 
 
 def _request_body(schema: dict[str, typing.Any]) -> dict[str, typing.Any]:
@@ -916,6 +918,17 @@ def add_public_projection_contract(
             properties["provider"] = copy.deepcopy(PROVIDER_SCHEMA)
             properties["delivery"] = copy.deepcopy(DELIVERY_SCHEMA)
         if name.startswith("WorkspaceUserMessage_"):
+            payload = schema["properties"]["payload"]
+            payload.pop("example", None)
+            payload["description"] = (
+                "Fixed message payload selected by kind. Only markdown is "
+                "interpreted as Markdown and used for mentions and summaries. "
+                "Other kinds remain opaque in history and realtime."
+            )
+            for variant in payload["oneOf"]:
+                variant["required"] = list(variant["properties"])
+                variant["additionalProperties"] = False
+                variant.pop("example", None)
             schema["properties"]["reaction_users"] = {
                 "type": "object",
                 "readOnly": True,
@@ -938,6 +951,29 @@ def add_public_projection_contract(
                     "items": {"type": "string", "format": "uuid"},
                 },
             }
+        if name.startswith("WorkspaceUserStream_"):
+            schema["properties"]["encryption"].update(
+                {
+                    "readOnly": True,
+                    "description": (
+                        "Shared stream encryption flag, immutable after creation. "
+                        "Zulip streams cannot enable encryption."
+                    ),
+                }
+            )
+            schema["properties"]["current_encryption_key_uuid"].update(
+                {
+                    "readOnly": True,
+                    "description": (
+                        "Current symmetric key UUID, or null before a key is set. "
+                        "Changes only through an owner key_announced message; "
+                        "no stream key material is stored."
+                    ),
+                }
+            )
+            for field in ("encryption", "current_encryption_key_uuid"):
+                if field not in schema["required"]:
+                    schema["required"].append(field)
         if name in ("WorkspaceUser_Filter", "WorkspaceUser_Get"):
             properties = schema["properties"]
             properties["identity_kind"] = {
@@ -957,6 +993,143 @@ def add_public_projection_contract(
                     "account_uuid": {"type": "string", "format": "uuid"},
                 },
             }
+    return specification
+
+
+def add_message_encryption_contract(
+    specification: dict[str, typing.Any],
+    root: str,
+    components: dict[str, typing.Any],
+) -> dict[str, typing.Any]:
+    schemas = components["components"]["schemas"]
+    stream_properties = _component_schema(schemas, "WorkspaceUserStream_Create")[
+        "properties"
+    ]
+    create_properties = copy.deepcopy(
+        {
+            name: stream_properties[name]
+            for name in (
+                "uuid",
+                "name",
+                "description",
+                "source_name",
+                "source",
+                "invite_only",
+                "announce",
+                "direct_user_uuid",
+                "private",
+                "color",
+                "encryption",
+                "current_encryption_key_uuid",
+            )
+        }
+    )
+    for property_schema in create_properties.values():
+        property_schema.pop("readOnly", None)
+    create_properties["source_name"].update({"enum": ["native"], "default": "native"})
+    create_schema = _object_schema(create_properties, ["name"])
+    create_schema["oneOf"] = [
+        {
+            "properties": {
+                "encryption": {"enum": [False]},
+                "current_encryption_key_uuid": {
+                    "type": "string",
+                    "nullable": True,
+                    "enum": [None],
+                },
+            },
+        },
+        {
+            "required": ["encryption", "current_encryption_key_uuid"],
+            "properties": {
+                "encryption": {"enum": [True]},
+                "current_encryption_key_uuid": {
+                    "type": "string",
+                    "format": "uuid",
+                    "nullable": False,
+                },
+            },
+        },
+    ]
+    streams = specification["paths"][f"{root}streams/"]
+    streams["post"]["requestBody"] = _request_body(create_schema)
+    streams["post"]["description"] = (
+        "Create a native stream. encryption defaults to false and cannot "
+        "change after creation. True requires current_encryption_key_uuid; "
+        "false accepts only an absent or null key UUID. Zulip streams are "
+        "provider-managed and cannot enable encryption."
+    )
+    stream_update = specification["paths"][
+        f"{root}streams/{{WorkspaceUserStreamUuid}}"
+    ]["put"]
+    update_schema = _object_schema(
+        {
+            name: stream_properties[name]
+            for name in ("name", "description", "invite_only", "announce", "color")
+        },
+        [],
+    )
+    update_schema["minProperties"] = 1
+    stream_update["requestBody"] = _request_body(update_schema)
+    stream_update["description"] = (
+        "Update stream metadata. encryption and current_encryption_key_uuid "
+        "are forbidden, including unchanged values. Only an owner "
+        "key_announced message may change the current key UUID."
+    )
+    message_properties = _component_schema(schemas, "WorkspaceUserMessage_Create")[
+        "properties"
+    ]
+    message_create = specification["paths"][f"{root}messages/"]["post"]
+    message_create_schema = _object_schema(
+        {
+            name: message_properties[name]
+            for name in ("uuid", "stream_uuid", "topic_uuid", "payload")
+        },
+        ["stream_uuid", "payload"],
+    )
+    for property_schema in message_create_schema["properties"].values():
+        property_schema.pop("readOnly", None)
+    message_create_schema["properties"]["uuid"]["description"] = (
+        "Optional canonical creation UUID for retries; the response UUID "
+        "identifies the placement."
+    )
+    message_create_schema["properties"]["topic_uuid"].update(
+        {
+            "nullable": True,
+            "description": "An absent or null topic UUID selects the default topic.",
+        }
+    )
+    message_create["requestBody"] = _request_body(message_create_schema)
+    message_create["description"] = (
+        "Send a message; an absent or null topic_uuid selects the stream's "
+        "default topic. All six payload kinds are allowed regardless of "
+        "encryption, except e2ee is forbidden for a shared Zulip stream. "
+        "Only the owner role may send key_announced; saving the message and "
+        "updating current_encryption_key_uuid is atomic. Old e2ee key UUIDs "
+        "are accepted. The backend does not validate Base64, encrypt, or store "
+        "plaintext private or symmetric keys."
+    )
+    editable_payload = copy.deepcopy(message_properties["payload"])
+    editable_payload["oneOf"] = [
+        variant
+        for variant in editable_payload["oneOf"]
+        if variant["properties"]["kind"]["enum"] != ["key_announced"]
+    ]
+    message_update = specification["paths"][
+        f"{root}messages/{{WorkspaceUserMessageUuid}}"
+    ]["put"]
+    message_update["requestBody"] = _request_body(
+        _object_schema({"payload": editable_payload}, ["payload"])
+    )
+    message_update["description"] = (
+        "Replace a message payload as its author. PUT cannot create or edit "
+        "key_announced messages. e2ee is rejected if any placement of the "
+        "canonical message belongs to a shared Zulip stream."
+    )
+    for operation in (streams["post"], stream_update, message_create, message_update):
+        operation["responses"][400] = {
+            "description": "Invalid payload, encryption metadata, kind, or stream role.",
+        }
     return specification
 
 

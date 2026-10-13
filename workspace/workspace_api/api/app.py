@@ -57,6 +57,11 @@ class WorkspaceOpenApiPaths(openapi_structures.OpenApiPaths):
             "/v1/messenger/messages/",
             components,
         )
+        specification = openapi_contract.add_message_encryption_contract(
+            specification,
+            "/v1/messenger/",
+            components,
+        )
         specification = openapi_contract.add_draft_contract(
             specification,
             "/v1/messenger/drafts/",
