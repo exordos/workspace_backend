@@ -1674,6 +1674,32 @@ def test_native_v2_cutover_preserves_v1_http_and_event_contract(api, workspace_a
         assert cursor.fetchone()[0] == 0
 
 
+def test_native_v2_topic_deletion_drains_derived_projections(api, db):
+    response = api.post(STREAMS, json={"name": "Topic deletion projections"})
+    assert response.status_code == 201, response.text
+    stream = response.json()
+    assert _drain() >= 1
+    topic_uuid = stream["default_topic_uuid"]
+
+    response = api.delete(f"{STREAM_TOPICS}{topic_uuid}")
+    assert response.status_code == 204, response.text
+    assert _drain() >= 1
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            "SELECT count(*) FROM messenger_topics "
+            "WHERE project_id = %s AND uuid = %s",
+            (api.project_id, topic_uuid),
+        )
+        assert cursor.fetchone() == (0,)
+        cursor.execute(
+            "SELECT count(*) FROM messenger_projection_tasks "
+            "WHERE project_id = %s AND status <> 'completed'",
+            (api.project_id,),
+        )
+        assert cursor.fetchone() == (0,)
+
+
 def test_native_v2_deleted_message_supersedes_pending_projection_work(api, db):
     stream_response = api.post(
         STREAMS,

@@ -3151,7 +3151,7 @@ def _purge_completed_tombstone(
                     """,
                     (project_id, canonical_uuid),
                 )
-    if source_kind == "topic.deleted":
+    if source_kind == "topic.deleted" and payload.get("topic_uuid") is not None:
         session.execute(
             """
             DELETE FROM messenger_topics
