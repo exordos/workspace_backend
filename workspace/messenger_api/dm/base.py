@@ -299,6 +299,11 @@ class WorkspaceUserStreamBase(
         types.Enum([role.value for role in WorkspaceStreamRole]),
         required=True,
     )
+    encryption = properties.property(types.Boolean(), default=False)
+    current_encryption_key_uuid = properties.property(
+        types.AllowNone(types.UUID()),
+        default=None,
+    )
     notification_mode = properties.property(
         types.Enum([mode.value for mode in WorkspaceStreamNotificationMode]),
         default=WorkspaceStreamNotificationMode.ALL_MESSAGES.value,

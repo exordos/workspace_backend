@@ -82,6 +82,8 @@ def as_dict(
     result = simple(value)
     if not isinstance(result, dict):
         raise TypeError("Messenger projection rows must serialize to dictionaries")
+    if resource == "streams":
+        result.setdefault("current_encryption_key_uuid", None)
     if resource in EXTENSION_RESOURCES:
         canonical_was_provided = canonical is not CANONICAL_NOT_PROVIDED
         if not canonical_was_provided:

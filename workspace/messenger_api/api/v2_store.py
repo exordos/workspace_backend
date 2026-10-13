@@ -55,6 +55,8 @@ def _public(row: typing.Any, resource: str) -> dict[str, typing.Any]:
     result = resource_projection.simple(row)
     for name in _INTERNAL_FIELDS:
         result.pop(name, None)
+    if resource == "streams":
+        result.setdefault("current_encryption_key_uuid", None)
     if resource in {"streams", "stream_topics", "messages", "message_reactions"}:
         result.setdefault("provider", None)
         result.setdefault("delivery", None)
