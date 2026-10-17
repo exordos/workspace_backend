@@ -3360,6 +3360,7 @@ def get_or_create_workspace_user_stream(
         uuid=stream_uuid,
         project_id=project_id,
         user_uuid=user_uuid,
+        private=private,
         default_topic_uuid=default_topic_uuid,
         **kwargs,
     )
@@ -3436,9 +3437,7 @@ def update_workspace_user_stream(
         },
         session=session,
     )
-    immutable_fields = STREAM_SOURCE_IDENTITY_FIELDS.intersection(values)
-    if stream.private_index is not None:
-        immutable_fields |= DIRECT_STREAM_IDENTITY_FIELDS.intersection(values)
+    immutable_fields = DIRECT_STREAM_CREATE_IDENTITY_FIELDS.intersection(values)
     if immutable_fields:
         raise messenger_exc.StreamIdentityImmutableError(
             fields=", ".join(sorted(immutable_fields))

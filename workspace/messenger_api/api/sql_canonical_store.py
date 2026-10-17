@@ -715,7 +715,7 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
         session = contexts.Context().get_session()
         row = session.execute(
             """
-            SELECT "user_uuid", "direct_user_uuid", "private_index"
+            SELECT "user_uuid", "direct_user_uuid", "private"
             FROM "m_workspace_streams"
             WHERE "project_id" = %s AND "uuid" = %s
             """,
@@ -723,7 +723,10 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
         ).fetchone()
         if row is None:
             raise ra_exceptions.ValidationErrorException()
-        if row["private_index"] is None:
+        models.WorkspaceStream.validate_private_identity(
+            row["private"], row["direct_user_uuid"]
+        )
+        if not row["private"]:
             return None
         return {row["user_uuid"], row["direct_user_uuid"]}
 

@@ -779,8 +779,8 @@ Roh-Providerprotokoll-Identifikatoren, Anmeldeinformationen und Synchronisations
 | `source` | Gegenstand | - Nein. | - Nein. | Quelle Nutzlast; Standard für `{"kind": "native"}`. |
 | `invite_only` | Boolean | - Nein. | - Nein. | Streaming-Flagge nur auf Einladung. |
 | `announce` | Boolean | - Nein. | - Nein. | Ankündigung der Streaming-Flagge. |
-| `direct_user_uuid` | UUID | - Nein. | - Nein. | Gleich dem aktuellen Benutzer UUID nur für einen Selbstchat. |
-| `private` | Boolean | - Nein. | - Ja, das ist es. | Privater Stromflagge. |
+| `direct_user_uuid` | UUID | Bedingt | Nur bei Erstellung | Für private Streams erforderlich. UUID des Gesprächspartners; entspricht nur im Selbstchat dem aktuellen Benutzer. |
+| `private` | Boolean | Nein | Ja | Aus `direct_user_uuid` abgeleitet. Native private Gruppen werden nicht unterstützt. |
 | `is_archived` | Boolean | - Nein. | Aktionsmanagement | Archivflagge. |
 | `color` | - Eine ganze Zahl .`0..0xFFFFFF` | - Nein. | - Nein. | Strömungsfarbe; wird zufällig erzeugt, wenn sie weggelassen wird oder `null`. |
 | `last_message_uuid` | UUID oder `null` | - Nein. | - Ja, das ist es. | Letzte Nachricht im Stream oder `null`, wenn es leer ist. |
@@ -833,24 +833,24 @@ Selbst-Chat-Erstellungsanfrage:
 }
 ```
 
-Für einen Selbstchat muss `direct_user_uuid` dem aktuellen IAM Benutzer UUID entsprechen,
-einschließlich des SymbolsubjektsUUIDSelbst-Chats sind nur nativ.
-die Standardstrommenge mit `private: true`, einem Strombenutzer `owner`
-Bindung und derselbe aktuelle Benutzer UUID in `direct_user_uuid`; kein separater Chat
-Sie können die Daten des Types oder der Selbst-Chat-Flagge anzeigen.
-`private && direct_user_uuid == current_user_uuid` die stabile Kundenseite
-Identitätsprüfung bei gleichzeitiger Erhaltung der normalen privaten Gruppenströme, deren
-`direct_user_uuid` bleibt `null`.
+Für einen Selbstchat muss `direct_user_uuid` der UUID des aktuellen IAM-Benutzers
+einschließlich des Token-Subjekts entsprechen. Selbstchats sind nur nativ verfügbar.
+Die Antwort enthält die normale Stream-Ressource mit `private: true`, einer
+`owner`-Bindung für den aktuellen Benutzer und dessen UUID in `direct_user_uuid`;
+es gibt keinen zusätzlichen Chattyp oder Selbstchat-Schalter. Clients erkennen
+Selbstchats an `private && direct_user_uuid == current_user_uuid`. Native Workspace
+unterstützt keine privaten Gruppen: Jeder private Stream benötigt eine nicht leere
+`direct_user_uuid`. `private: true` ohne Gesprächspartner ergibt HTTP `400`.
 
 Die direkte Mitgliedschaft ist unveränderlich.
 Das Identitätspaar: eine Bindung für einen Selbstchat und zwei für einen gewöhnlichen direkten
 Chat. Hinzufügen oder Entfernen von Teilnehmern und Aktualisierung einer verbindlichen Rollenrückgabe HTTP
 `400`. Das Löschen eines Selbst-Chat-Streams gibt auch HTTP `400` zurück, also Nachrichtenverlauf
 Die Definition der deterministischen Identität kann nicht durch Löschen und Neugestaltung ersetzt werden.
-`source_name` muss mit `source.kind` übereinstimmen, wenn ein Stream erstellt wird.
-Für einen direkten Chat, `direct_user_uuid`,
-`private`, und die inneren `private_index` sind ebenfalls unveränderlich; Versuche,
-Änderungen eines dieser Identitätsfelder geben HTTP `400` zurück.
+Bei der Erstellung muss `source_name` mit `source.kind` übereinstimmen.
+Beide Quellfelder, `direct_user_uuid`, `private` und der interne `private_index`
+sind für jeden Stream unveränderlich; Änderungsversuche ergeben HTTP `400`.
+Ein gewöhnlicher Stream kann nicht in einen privaten Stream umgewandelt werden.
 
 Stream-Benachrichtigungsmodus-Anfrage:
 

@@ -2059,31 +2059,28 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 return_value={"notification_mode": "all_messages"},
             ),
         ):
-            for field, value in (
-                ("source_name", "native"),
-                ("source", {"kind": "native"}),
-                ("direct_user_uuid", user_uuid),
-                ("private_index", f"{user_uuid}:{user_uuid}"),
-                ("private", True),
-            ):
-                existing_stream.private_index = (
-                    None
-                    if field in {"source_name", "source"}
-                    else f"{user_uuid}:{user_uuid}"
-                )
-                with (
-                    self.subTest(field=field),
-                    self.assertRaises(
-                        messenger_exc.StreamIdentityImmutableError
-                    ) as error_context,
+            for private_index in (None, f"{user_uuid}:{user_uuid}"):
+                existing_stream.private_index = private_index
+                for field, value in (
+                    ("source_name", "native"),
+                    ("source", {"kind": "native"}),
+                    ("direct_user_uuid", user_uuid),
+                    ("private_index", f"{user_uuid}:{user_uuid}"),
+                    ("private", True),
                 ):
-                    dm_helpers.update_workspace_user_stream(
-                        project_id=project_id,
-                        user_uuid=user_uuid,
-                        stream_uuid=stream_uuid,
-                        values={field: value},
-                    )
-                self.assertIn(field, error_context.exception.msg)
+                    with (
+                        self.subTest(private_index=private_index, field=field),
+                        self.assertRaises(
+                            messenger_exc.StreamIdentityImmutableError
+                        ) as error_context,
+                    ):
+                        dm_helpers.update_workspace_user_stream(
+                            project_id=project_id,
+                            user_uuid=user_uuid,
+                            stream_uuid=stream_uuid,
+                            values={field: value},
+                        )
+                    self.assertIn(field, error_context.exception.msg)
 
     def test_update_workspace_user_stream_notifications_updates_binding(self):
         project_id = sys_uuid.uuid4()

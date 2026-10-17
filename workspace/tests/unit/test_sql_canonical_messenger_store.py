@@ -177,25 +177,39 @@ def test_stream_projections_emit_mode_duration_and_row_count(monkeypatch):
     ]
 
 
-def test_direct_stream_participant_validation_uses_identity_pair(monkeypatch):
+@pytest.mark.parametrize(
+    "private,direct_user_uuid,participants,valid",
+    [
+        (False, None, [USER_UUID, PROJECTION_OWNER_UUID], True),
+        (True, USER_UUID, [USER_UUID], True),
+        (True, USER_UUID, [USER_UUID, PROJECTION_OWNER_UUID], False),
+        (True, PROJECTION_OWNER_UUID, [USER_UUID, PROJECTION_OWNER_UUID], True),
+        (True, PROJECTION_OWNER_UUID, [USER_UUID], False),
+        (
+            True,
+            PROJECTION_OWNER_UUID,
+            [USER_UUID, PROJECTION_OWNER_UUID, PROJECT_UUID],
+            False,
+        ),
+        (True, None, [USER_UUID], False),
+        (True, None, [USER_UUID, PROJECTION_OWNER_UUID], False),
+    ],
+)
+def test_stream_participant_validation_uses_private_identity_without_index(
+    monkeypatch, private, direct_user_uuid, participants, valid
+):
     stream_uuid = sys_uuid.uuid4()
-    peer_uuid = sys_uuid.uuid4()
-    rows = {
-        stream_uuid: {
-            "user_uuid": USER_UUID,
-            "direct_user_uuid": USER_UUID,
-            "private_index": f"{USER_UUID}:{USER_UUID}",
-        },
-        peer_uuid: {
-            "user_uuid": USER_UUID,
-            "direct_user_uuid": PROJECTION_OWNER_UUID,
-            "private_index": f"{USER_UUID}:{PROJECTION_OWNER_UUID}",
-        },
+    row = {
+        "user_uuid": USER_UUID,
+        "direct_user_uuid": direct_user_uuid,
+        "private": private,
+        "private_index": None,
     }
 
     class Session:
         def execute(self, _statement, values):
-            return types.SimpleNamespace(fetchone=lambda: rows[values[1]])
+            assert values == (PROJECT_UUID, stream_uuid)
+            return types.SimpleNamespace(fetchone=lambda: row)
 
     monkeypatch.setattr(
         sql_canonical_store.contexts,
@@ -204,18 +218,11 @@ def test_direct_stream_participant_validation_uses_identity_pair(monkeypatch):
     )
     store = sql_canonical_store.SQLCanonicalMessengerStore(PROJECT_UUID, USER_UUID)
 
-    store._validate_stream_participants(stream_uuid, [USER_UUID])
-    store._validate_stream_participants(
-        peer_uuid,
-        [USER_UUID, PROJECTION_OWNER_UUID],
-    )
-    with pytest.raises(Exception):
-        store._validate_stream_participants(
-            stream_uuid,
-            [USER_UUID, PROJECTION_OWNER_UUID],
-        )
-    with pytest.raises(Exception):
-        store._validate_stream_participants(peer_uuid, [USER_UUID])
+    if valid:
+        store._validate_stream_participants(stream_uuid, participants)
+    else:
+        with pytest.raises(sql_canonical_store.ra_exceptions.ValidationErrorException):
+            store._validate_stream_participants(stream_uuid, participants)
 
 
 def test_draft_page_reuses_current_context_session(monkeypatch):

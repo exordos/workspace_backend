@@ -428,9 +428,7 @@ def test_native_v2_deletion_before_stream_purge_drains_snapshots(
     if repair_pending:
         with contexts.Context().session_manager() as session:
             migration.downgrade(session)
-    response = api.post(
-        STREAMS, json={"name": "Delivery snapshot deletion", "private": True}
-    )
+    response = api.post(STREAMS, json={"name": "Delivery snapshot deletion"})
     assert response.status_code == 201, response.text
     stream = response.json()
     topic_uuid = stream["default_topic_uuid"]
@@ -620,30 +618,136 @@ def test_native_v2_direct_stream_is_idempotent_and_closed(api, db):
     assert reciprocal.json()["uuid"] == first.json()["uuid"]
     assert reciprocal.json()["direct_user_uuid"] == str(api.user_uuid)
 
-    rejected = api.post(
-        f"{STREAMS}{first.json()['uuid']}/actions/add_users/invoke",
-        json={"member": [str(third_uuid)]},
-    )
-    assert rejected.status_code == 400, rejected.text
+    stream_uuid = first.json()["uuid"]
+    with db.cursor() as cursor:
+        cursor.execute(
+            "SELECT uuid, user_uuid, role FROM messenger_stream_bindings "
+            "WHERE project_id = %s AND stream_uuid = %s AND active ORDER BY user_uuid",
+            (api.project_id, stream_uuid),
+        )
+        bindings = cursor.fetchall()
+    assert {str(row[1]) for row in bindings} == {api.user_uuid, str(peer_uuid)}
+    assert all(row[2] == "owner" for row in bindings)
 
-    group_uuid = sys_uuid.uuid4()
-    group_body = {
-        "uuid": str(group_uuid),
-        "name": "Private group",
+    for actor in (api.user_uuid, peer_uuid):
+        rejected = api.post(
+            f"{STREAMS}{stream_uuid}/actions/add_users/invoke",
+            user=actor,
+            json={"member": [str(third_uuid)]},
+        )
+        assert rejected.status_code == 400, rejected.text
+        for binding_uuid, _user_uuid, _role in bindings:
+            rejected = api.put(
+                f"{STREAM_BINDINGS}{binding_uuid}",
+                user=actor,
+                json={"role": "member"},
+            )
+            assert rejected.status_code == 400, rejected.text
+            rejected = api.delete(f"{STREAM_BINDINGS}{binding_uuid}", user=actor)
+            assert rejected.status_code == 400, rejected.text
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            "SELECT uuid, user_uuid, role FROM messenger_stream_bindings "
+            "WHERE project_id = %s AND stream_uuid = %s AND active ORDER BY user_uuid",
+            (api.project_id, stream_uuid),
+        )
+        assert cursor.fetchall() == bindings
+
+
+@pytest.mark.parametrize("peer", ({}, {"direct_user_uuid": None}))
+def test_native_v2_private_stream_requires_peer(api, db, peer):
+    stream_uuid = sys_uuid.uuid4()
+    body = {
+        "uuid": str(stream_uuid),
+        "name": "Invalid private stream",
         "description": "",
         "private": True,
         "source_name": "native",
         "source": {"kind": "native"},
+        **peer,
     }
-    first_group = api.post(STREAMS, json=group_body)
-    retry_group = api.post(STREAMS, json=group_body)
-    assert first_group.status_code == retry_group.status_code == 201
-    assert first_group.json()["uuid"] == retry_group.json()["uuid"] == str(group_uuid)
-    added_to_group = api.post(
-        f"{STREAMS}{group_uuid}/actions/add_users/invoke",
+    for _ in range(2):
+        response = api.post(STREAMS, json=body)
+        assert response.status_code == 400, response.text
+    with db.cursor() as cursor:
+        cursor.execute(
+            "SELECT count(*) FROM messenger_streams WHERE uuid = %s",
+            (stream_uuid,),
+        )
+        assert cursor.fetchone() == (0,)
+        cursor.execute(
+            "SELECT count(*) FROM messenger_stream_bindings WHERE stream_uuid = %s",
+            (stream_uuid,),
+        )
+        assert cursor.fetchone() == (0,)
+        cursor.execute(
+            "SELECT count(*) FROM messenger_projection_tasks WHERE project_id = %s",
+            (api.project_id,),
+        )
+        assert cursor.fetchone() == (0,)
+
+
+@pytest.mark.parametrize("with_peer", (False, True))
+def test_native_v2_ordinary_stream_cannot_be_converted_to_private(api, with_peer):
+    response = api.post(STREAMS, json={"name": "Ordinary stream"})
+    assert response.status_code == 201, response.text
+    stream = response.json()
+    update = {"name": "Private conversion", "private": True}
+    if with_peer:
+        update["direct_user_uuid"] = api.user_uuid
+    response = api.put(f"{STREAMS}{stream['uuid']}", json=update)
+    assert response.status_code == 400, response.text
+    reloaded = api.get(f"{STREAMS}{stream['uuid']}")
+    assert reloaded.status_code == 200, reloaded.text
+    assert reloaded.json()["name"] == stream["name"]
+    assert reloaded.json()["private"] is False
+    assert reloaded.json().get("direct_user_uuid") is None
+
+
+def test_native_v2_legacy_private_stream_without_peer_rejects_membership_changes(
+    api, db
+):
+    response = api.post(STREAMS, json={"name": "Legacy invalid private stream"})
+    assert response.status_code == 201, response.text
+    stream_uuid = response.json()["uuid"]
+    with db.cursor() as cursor:
+        cursor.execute(
+            "UPDATE messenger_streams SET private = true "
+            "WHERE project_id = %s AND uuid = %s",
+            (api.project_id, stream_uuid),
+        )
+        cursor.execute(
+            "SELECT uuid FROM messenger_stream_bindings "
+            "WHERE project_id = %s AND stream_uuid = %s",
+            (api.project_id, stream_uuid),
+        )
+        binding_uuid = cursor.fetchone()[0]
+    third_uuid = sys_uuid.uuid4()
+    conftest.seed_workspace_user(db, third_uuid, f"user-{third_uuid}")
+    _register_project_user(db, api.project_id, third_uuid)
+
+    added = api.post(
+        f"{STREAMS}{stream_uuid}/actions/add_users/invoke",
         json={"member": [str(third_uuid)]},
     )
-    assert added_to_group.status_code == 200, added_to_group.text
+    assert added.status_code == 400, added.text
+    updated = api.put(f"{STREAM_BINDINGS}{binding_uuid}", json={"role": "member"})
+    assert updated.status_code == 400, updated.text
+    deleted = api.delete(f"{STREAM_BINDINGS}{binding_uuid}")
+    assert deleted.status_code == 400, deleted.text
+    with db.cursor() as cursor:
+        cursor.execute(
+            "SELECT uuid, role FROM messenger_stream_bindings "
+            "WHERE project_id = %s AND stream_uuid = %s AND active",
+            (api.project_id, stream_uuid),
+        )
+        assert cursor.fetchall() == [(binding_uuid, "owner")]
+        cursor.execute(
+            "UPDATE messenger_streams SET private = false "
+            "WHERE project_id = %s AND uuid = %s",
+            (api.project_id, stream_uuid),
+        )
 
 
 def test_native_v2_fanout_is_bounded_and_outbox_is_one_to_one(api, db):

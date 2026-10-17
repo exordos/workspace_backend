@@ -779,8 +779,8 @@ raw provider protocol identifiers, credentials, and synchronization state.
 | `source` | object | no | no | Source payload; defaults to `{"kind": "native"}`. |
 | `invite_only` | boolean | no | no | Invite-only stream flag. |
 | `announce` | boolean | no | no | Announcement stream flag. |
-| `direct_user_uuid` | UUID | no | no | Direct-chat counterpart. Equals the current user UUID only for a self chat. |
-| `private` | boolean | no | yes | Private stream flag. |
+| `direct_user_uuid` | UUID | conditional | creation-only | Required for a private stream. Direct-chat counterpart; equals the current user UUID only for a self chat. |
+| `private` | boolean | no | yes | Private stream flag, derived from `direct_user_uuid`. Native private groups are not supported. |
 | `is_archived` | boolean | no | action-managed | Archived flag. |
 | `color` | integer `0..0xFFFFFF` | no | no | Stream color; generated randomly when omitted or `null`. |
 | `last_message_uuid` | UUID or `null` | no | yes | Latest message in the stream, or `null` when empty. |
@@ -839,8 +839,9 @@ the standard stream resource with `private: true`, one current-user `owner`
 binding, and the same current-user UUID in `direct_user_uuid`; no separate chat
 type or self-chat flag is exposed. This makes
 `private && direct_user_uuid == current_user_uuid` the stable client-side
-identity check while preserving ordinary private-group streams, whose
-`direct_user_uuid` remains `null`.
+identity check. Native Workspace has no private-group mode: every private stream
+requires a non-null `direct_user_uuid`. Creating a stream with `private: true`
+without a peer returns HTTP `400`.
 
 Direct membership is immutable. Its bindings must equal the unique users in
 the identity pair: one binding for a self chat and two for an ordinary direct
@@ -848,9 +849,9 @@ chat. Adding or removing participants and updating a binding role returns HTTP
 `400`. Deleting a self-chat stream also returns HTTP `400` so message history
 cannot be replaced by deleting and recreating the deterministic identity.
 `source_name` must match `source.kind` when a stream is created. Both source
-fields are immutable for every stream. For a direct chat, `direct_user_uuid`,
-`private`, and the internal `private_index` are also immutable; attempts to
-change any of these identity fields return HTTP `400`.
+fields, `direct_user_uuid`, `private`, and the internal `private_index` are
+immutable for every stream; attempts to change them return HTTP `400`.
+An ordinary stream cannot be converted into a private stream.
 
 Stream notification mode request:
 

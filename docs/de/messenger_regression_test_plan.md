@@ -53,7 +53,7 @@ Definition von Wiederaufbau, Wiederherstellung, Skalierung und Lastakzeptanz.
 | Identifizierung | Szenario | Erwartetes Ergebnis |
 | --- | --- | --- |
 | MSG-NATIVE-001 | Erstellen Sie einen öffentlichen Kanal. | Eigentümerbindung, Standardthema, Ordner und Ereignisse erstellen werden einmal erzeugt. |
-| MSG-NATIVE-002 | Erstellen Sie direkt und Gruppenkanäle wiederholt. | Die Schöpfung ist idempotent und private Bindungen bleiben korrekt. |
+| MSG-NATIVE-002 | Direkt- und Selbstchats wiederholt erstellen; private Streams ohne Gesprächspartner sowie Änderungen an Teilnehmern oder Rollen versuchen. | Die Erstellung ist idempotent: genau zwei Teilnehmer im Direktchat, einer im Selbstchat. Fehlende Gesprächspartner und Änderungen an Teilnehmern oder Rollen ergeben HTTP `400`; native private Gruppen werden nicht unterstützt. |
 | MSG-NATIVE-003 | Umbenennen, archivieren, unarchivieren und löschen Sie einen Kanal. | Berechtigte Benutzer erhalten das festgelegte Update oder löschen Ereignisse. |
 | MSG-NATIVE-004 | Benutzer mit jeder unterstützten Rolle hinzufügen und entfernen. | Sichtbarkeit, Bindungen, Zugriff auf Dateien, Ordner und Ereignisse werden nur für betroffene Benutzer aktualisiert. |
 | MSG-NATIVE-005 | Erstellen, umbenennen, beenden, standardmäßig einstellen, stummen, folgen, lesen und löschen. | Der Status des Themas, die nicht gelesenen Zähler und die Ereignisse entsprechen der Basislinie. |

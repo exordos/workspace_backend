@@ -479,6 +479,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         if direct_user is not None:
             direct_user = self._require_project_user(direct_user)
         private = bool(values.get("private", False) or direct_user is not None)
+        base.WorkspaceStreamBase.validate_private_identity(private, direct_user)
         if direct_user is not None and values.get("private") is False:
             raise ra_exceptions.ValidationErrorException()
         if direct_user is not None:
@@ -1335,7 +1336,13 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         if resource == "streams":
             stream = self._stream(resource_uuid)
             stream.validate_encryption_update(values)
-            forbidden = {"source_name", "source", "direct_user_uuid", "private_index"}
+            forbidden = {
+                "source_name",
+                "source",
+                "direct_user_uuid",
+                "private_index",
+                "private",
+            }
             if forbidden.intersection(values):
                 raise ra_exceptions.ValidationErrorException()
             allowed = {"name", "description", "invite_only", "announce", "color"}
@@ -1436,7 +1443,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 )
             )
             stream = self._stream(binding.stream_uuid)
-            if stream.direct_user_uuid is not None:
+            if stream.private:
                 raise ra_exceptions.ValidationErrorException()
             allowed = {"role", "notification_mode"}
             updates = {name: values[name] for name in allowed if name in values}
@@ -1604,7 +1611,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 )
             )
             stream = self._stream(binding.stream_uuid)
-            if stream.direct_user_uuid is not None:
+            if stream.private:
                 raise ra_exceptions.ValidationErrorException()
             remaining = tuple(
                 participant
@@ -1804,7 +1811,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             return _public(self._folder_item(item.uuid), "folder_items")
         if resource == "stream_bindings" and action == "add_users":
             stream = self._stream(resource_uuid)
-            if stream.direct_user_uuid is not None:
+            if stream.private:
                 raise ra_exceptions.ValidationErrorException()
             role_user_uuids = {
                 role: [self._require_project_user(value) for value in user_uuids]

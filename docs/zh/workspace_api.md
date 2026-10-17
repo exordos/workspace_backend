@@ -779,8 +779,8 @@ UUID 在 `direct_user_uuid` 中.重复或同时发送相同的请求
 | `source` | 目标 | 不需要 | 不需要 | 源载荷;默认为 `{"kind": "native"}`. |
 | `invite_only` | 布尔式 | 不需要 | 不需要 | 只有邀请者可以播放. |
 | `announce` | 布尔式 | 不需要 | 不需要 | 广告流旗. |
-| `direct_user_uuid` | UUID | 不需要 | 不需要 | 直接聊天对应.仅用于自动聊天,即当前用户 UUID. |
-| `private` | 布尔式 | 不需要 | 是的 | 个人流旗. |
+| `direct_user_uuid` | UUID | 有条件 | 仅创建时 | 私有流必填。对方的 UUID；仅在自聊时等于当前用户 UUID。 |
+| `private` | 布尔值 | 否 | 是 | 由 `direct_user_uuid` 确定的私有流标志。native 不支持私有群聊。 |
 | `is_archived` | 布尔式 | 不需要 | 行动管理 | 档案的旗. |
 | `color` | 整数 `0..0xFFFFFF` | 不需要 | 不需要 | 流色;如果省略或 `null`,则随机生成. |
 | `last_message_uuid` | UUID没有`null` | 不需要 | 是的 | 最后的消息在流中,或者是空时是 `null`. |
@@ -833,24 +833,21 @@ UUID 在 `direct_user_uuid` 中.重复或同时发送相同的请求
 }
 ```
 
-对于自我聊天, `direct_user_uuid`必须等于当前的 IAM 用户 UUID,
-包含标志主题 UUID.自动聊天是本地. 响应是
-标准流资源,其中 `private: true`,一个当前用户 `owner`
-绑定,并且在 `direct_user_uuid` 中具有相同的当前用户 UUID;没有单独的聊天
-显示了自行聊天的标志.
-`private && direct_user_uuid == current_user_uuid` 稳定的客户端
-通过检查身份,同时保留普通私人集团流,
-`direct_user_uuid`仍然存在`null`.
+自聊的 `direct_user_uuid` 必须等于当前 IAM 用户的 UUID，包括令牌主体 UUID。
+自聊仅支持 native。响应为标准流资源，包含 `private: true`、当前用户的一条
+`owner` 绑定，以及作为 `direct_user_uuid` 的当前用户 UUID；没有额外的聊天类型
+或自聊标志。客户端可用 `private && direct_user_uuid == current_user_uuid` 识别自聊。
+Native Workspace 不支持私有群聊：每个私有流都必须有非空的 `direct_user_uuid`。
+使用 `private: true` 但未指定对方的创建请求返回 HTTP `400`。
 
 直接会员是不可变的.
 身份对:一个约束自行聊天和两个普通直接
 添加或删除参与者,更新约束作用返回 HTTP
 `400`.删除自行聊天流也返回HTTP `400`所以消息历史记录
 通过删除和重建确定性身份来取代.
-`source_name`必须与 `source.kind`相匹配,当创建流.
-对于每一个流, 字段是不变的.`direct_user_uuid`,
-`private`并且是内部`private_index`它们也不可变;
-改变这些身份字段中的任何一个返回 HTTP `400`.
+创建流时，`source_name` 必须与 `source.kind` 一致。两个来源字段、
+`direct_user_uuid`、`private` 和内部 `private_index` 对所有流均不可更改；
+修改这些字段的请求返回 HTTP `400`。普通流不能通过更新转换为私有流。
 
 流通通知模式请求:
 

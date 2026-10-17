@@ -17,6 +17,7 @@
 import enum
 import random
 import typing
+import uuid as sys_uuid
 
 from restalchemy.common import exceptions as ra_exc
 from restalchemy.dm import models
@@ -267,6 +268,17 @@ class WorkspaceStreamBase(
         types.AllowNone(types.UUID()),
         default=None,
     )
+
+    @staticmethod
+    def validate_private_identity(
+        private: bool, direct_user_uuid: sys_uuid.UUID | None
+    ) -> None:
+        if private and direct_user_uuid is None:
+            raise ra_exc.ValidationErrorException()
+
+    def validate(self) -> None:
+        super().validate()
+        self.validate_private_identity(self.private, self.direct_user_uuid)
 
 
 class WorkspaceStreamEncryptionCreation(models.Model):

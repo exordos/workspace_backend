@@ -273,6 +273,12 @@ class WorkspaceStream(
         types.AllowNone(types.UUID()), default=None, read_only=True
     )
 
+    def validate(self) -> None:
+        super().validate()
+        base.WorkspaceStreamBase.validate_private_identity(
+            self.private, self.direct_user_uuid
+        )
+
 
 class WorkspaceStreamBinding(
     models.ModelWithUUID,

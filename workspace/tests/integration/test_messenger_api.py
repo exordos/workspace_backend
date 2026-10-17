@@ -3027,6 +3027,53 @@ def test_stream_delete_cascades_data_and_writes_realtime_events(api, db):
         assert all(item["stream_uuid"] != stream_uuid for item in event["folder_items"])
 
 
+@pytest.mark.parametrize("peer", ({}, {"direct_user_uuid": None}))
+def test_private_stream_creation_without_peer_is_rejected(api, db, peer):
+    stream_uuid = sys_uuid.uuid4()
+    response = api.post(
+        STREAMS,
+        json={
+            "uuid": str(stream_uuid),
+            "name": "Invalid private stream",
+            "private": True,
+            "source_name": "native",
+            "source": {"kind": "native"},
+            **peer,
+        },
+    )
+    assert response.status_code == 400, response.text
+    with db.cursor() as cursor:
+        cursor.execute(
+            "SELECT count(*) FROM m_workspace_streams WHERE uuid = %s",
+            (stream_uuid,),
+        )
+        assert cursor.fetchone() == (0,)
+
+
+@pytest.mark.parametrize("with_peer", (False, True))
+def test_ordinary_stream_cannot_be_converted_to_private(api, with_peer):
+    response = api.post(
+        STREAMS,
+        json={
+            "name": "Ordinary stream",
+            "source_name": "native",
+            "source": {"kind": "native"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    stream = response.json()
+    update = {"name": "Private conversion", "private": True}
+    if with_peer:
+        update["direct_user_uuid"] = api.user_uuid
+    response = api.put(f"{STREAMS}{stream['uuid']}", json=update)
+    assert response.status_code == 400, response.text
+    reloaded = api.get(f"{STREAMS}{stream['uuid']}")
+    assert reloaded.status_code == 200, reloaded.text
+    assert reloaded.json()["name"] == stream["name"]
+    assert reloaded.json()["private"] is False
+    assert reloaded.json().get("direct_user_uuid") is None
+
+
 def test_direct_stream_create_is_idempotent_and_creates_owner_bindings(api, db):
     direct_user_uuid = sys_uuid.uuid4()
     conftest.seed_workspace_user(
