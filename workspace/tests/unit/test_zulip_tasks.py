@@ -125,6 +125,35 @@ def test_client_checks_credentials():
     session.close.assert_called_once()
 
 
+def test_client_gets_channels_including_archived():
+    session = mock.Mock()
+    channels = [{"stream_id": 42, "is_archived": True}]
+    session.get.return_value.json.return_value = {
+        "result": "success",
+        "streams": channels,
+    }
+    account = external_models.ExternalAccount(
+        project_id=uuid.uuid4(),
+        owner_user_uuid=uuid.uuid4(),
+        provider="zulip",
+        settings={
+            "server_url": "https://zulip.example.com/",
+            "email": "user@example.com",
+            "api_key": "test-key",
+        },
+    )
+    with mock.patch.object(client.requests, "Session", return_value=session):
+        zulip = client.ZulipClient(account)
+        assert zulip.get_channels() == channels
+        zulip.close()
+    session.get.assert_called_once_with(
+        "https://zulip.example.com/api/v1/streams",
+        params={"exclude_archived": "false"},
+        timeout=(5, 30),
+    )
+    session.close.assert_called_once()
+
+
 def test_task_executes_connection_content():
     task = _task()
     account = mock.Mock(settings={"api_key": "test-key"})
@@ -132,6 +161,7 @@ def test_task_executes_connection_content():
     with (
         mock.patch.object(external_models.ExternalAccount, "objects") as accounts,
         mock.patch.object(client, "ZulipClient", return_value=zulip) as constructor,
+        mock.patch.object(models.Task, "insert", autospec=True) as insert,
     ):
         accounts.get_one.return_value = account
         task.execute()
@@ -147,6 +177,13 @@ def test_task_executes_connection_content():
     assert zulip.method_calls == [mock.call.check_connection(), mock.call.close()]
     assert task.status == "done"
     account.update_status.assert_called_once_with("backfill")
+    insert.assert_called_once()
+    followup = insert.call_args.args[0]
+    assert followup.project_id == task.project_id
+    assert followup.external_account_uuid == task.external_account_uuid
+    assert followup.priority == models.TASK_PRIORITY_IMPORT_CHANNELS == 50
+    assert followup.not_before_at is None
+    assert isinstance(followup.content, models.ImportChannelsContent)
 
 
 def test_success_calls_task_and_content_hooks_with_the_task(_task_storage):

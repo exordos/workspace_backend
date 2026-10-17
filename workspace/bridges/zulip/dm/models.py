@@ -18,6 +18,8 @@ import abc
 import datetime
 import enum
 import logging
+import urllib.parse
+import uuid as sys_uuid
 
 import requests
 from restalchemy.common import contexts
@@ -38,9 +40,11 @@ from workspace.messenger_api.dm import external_models
 LOG = logging.getLogger(__name__)
 MAX_HISTORY_MESSAGES = 5000
 TASK_PRIORITY_IMPORT_HISTORY = 0
+TASK_PRIORITY_IMPORT_CHANNELS = 50
 TASK_PRIORITY_INITIALIZE_CONNECTION = 100
 TASK_PRIORITY_REALTIME_MESSAGE = 200
 TASK_RETRY_DELAY = datetime.timedelta(minutes=1)
+TASK_CHANNEL_SYNC_INTERVAL = datetime.timedelta(minutes=15)
 
 
 class MessageContent(
@@ -83,6 +87,8 @@ class ZulipChannel(
 ):
     __tablename__ = "bridge_zulip_v5_channels"
 
+    external_account_uuid = properties.property(types.UUID(), required=True)
+    stream_uuid = properties.property(types.UUID(), required=True)
     stream_id = properties.property(
         types.Integer(min_value=1),
         required=True,
@@ -269,31 +275,7 @@ class AbstractTaskContent(types_dynamic.AbstractKindModel):
         pass
 
 
-class InitializeConnectionContent(AbstractTaskContent):
-    KIND = "initialize_connection"
-
-    def execute(self, task: "Task") -> None:
-        account = external_models.ExternalAccount.objects.get_one(
-            filters={
-                "uuid": filters.EQ(task.external_account_uuid),
-                "project_id": filters.EQ(task.project_id),
-            },
-        )
-        zulip = client.ZulipClient(account)
-        try:
-            zulip.check_connection()
-        finally:
-            zulip.close()
-
-    def on_done(self, task: "Task") -> None:
-        account = external_models.ExternalAccount.objects.get_one(
-            filters={
-                "uuid": filters.EQ(task.external_account_uuid),
-                "project_id": filters.EQ(task.project_id),
-            },
-        )
-        account.update_status(external_models.ExternalAccountStatus.BACKFILL.value)
-
+class AbstractZulipTaskContent(AbstractTaskContent):
     def on_error(self, task: "Task", error: Exception) -> None:
         response = error.response if isinstance(error, requests.HTTPError) else None
         if isinstance(error, (requests.ConnectionError, requests.Timeout)) or (
@@ -326,6 +308,116 @@ class InitializeConnectionContent(AbstractTaskContent):
         )
 
 
+class InitializeConnectionContent(AbstractZulipTaskContent):
+    KIND = "initialize_connection"
+
+    def execute(self, task: "Task") -> None:
+        account = external_models.ExternalAccount.objects.get_one(
+            filters={
+                "uuid": filters.EQ(task.external_account_uuid),
+                "project_id": filters.EQ(task.project_id),
+            },
+        )
+        zulip = client.ZulipClient(account)
+        try:
+            zulip.check_connection()
+        finally:
+            zulip.close()
+
+    def on_done(self, task: "Task") -> None:
+        account = external_models.ExternalAccount.objects.get_one(
+            filters={
+                "uuid": filters.EQ(task.external_account_uuid),
+                "project_id": filters.EQ(task.project_id),
+            },
+        )
+        account.update_status(external_models.ExternalAccountStatus.BACKFILL.value)
+        Task(
+            project_id=task.project_id,
+            external_account_uuid=task.external_account_uuid,
+            priority=TASK_PRIORITY_IMPORT_CHANNELS,
+            content=ImportChannelsContent(),
+        ).insert()
+
+
+class ImportChannelsContent(AbstractZulipTaskContent):
+    KIND = "import_channels"
+
+    def execute(self, task: "Task") -> None:
+        account = external_models.ExternalAccount.objects.get_one(
+            filters={
+                "uuid": filters.EQ(task.external_account_uuid),
+                "project_id": filters.EQ(task.project_id),
+            },
+        )
+        hostname = urllib.parse.urlsplit(account.settings["server_url"]).hostname
+        server_namespace = sys_uuid.uuid5(sys_uuid.NAMESPACE_DNS, hostname)
+        zulip = client.ZulipClient(account)
+        try:
+            stream_ids = set()
+            for data in zulip.get_channels():
+                values = {
+                    name: data[name]
+                    for name in (
+                        "stream_id",
+                        "name",
+                        "description",
+                        "rendered_description",
+                        "date_created",
+                        "creator_id",
+                        "invite_only",
+                        "is_web_public",
+                        "history_public_to_subscribers",
+                        "is_archived",
+                        "message_retention_days",
+                    )
+                }
+                values["stream_uuid"] = sys_uuid.uuid5(
+                    server_namespace, str(values["stream_id"])
+                )
+                channel = ZulipChannel.objects.get_one_or_none(
+                    filters={
+                        "external_account_uuid": filters.EQ(account.uuid),
+                        "stream_id": filters.EQ(values["stream_id"]),
+                    },
+                )
+                if channel is None:
+                    ZulipChannel(
+                        external_account_uuid=account.uuid,
+                        **values,
+                    ).insert()
+                else:
+                    channel.update_dm(values=values)
+                    channel.update()
+                stream_ids.add(values["stream_id"])
+            for channel in ZulipChannel.objects.get_all(
+                filters={"external_account_uuid": filters.EQ(account.uuid)},
+            ):
+                if channel.stream_id not in stream_ids:
+                    channel.delete()
+        finally:
+            zulip.close()
+
+    def on_done(self, task: "Task") -> None:
+        account = external_models.ExternalAccount.objects.get_one(
+            filters={
+                "uuid": filters.EQ(task.external_account_uuid),
+                "project_id": filters.EQ(task.project_id),
+            },
+        )
+        account.update_status(external_models.ExternalAccountStatus.BACKFILL.value)
+        Task(
+            project_id=task.project_id,
+            external_account_uuid=task.external_account_uuid,
+            priority=TASK_PRIORITY_IMPORT_CHANNELS,
+            not_before_at=(
+                datetime.datetime.now(datetime.timezone.utc)
+                + TASK_CHANNEL_SYNC_INTERVAL
+            ),
+            content=ImportChannelsContent(),
+        ).insert()
+
+
 class ImportHistoryContent(AbstractTaskContent):
     KIND = "import_history"
 
@@ -347,6 +439,7 @@ class ImportHistoryContent(AbstractTaskContent):
 
 TASK_CONTENT_TYPE = types_dynamic.KindModelSelectorType(
     types_dynamic.KindModelType(InitializeConnectionContent),
+    types_dynamic.KindModelType(ImportChannelsContent),
     types_dynamic.KindModelType(ImportHistoryContent),
 )
 

@@ -66,7 +66,7 @@ def _http_error(status_code, code="BAD_REQUEST", **details):
 
 
 @pytest.mark.parametrize("status", ["new", "error"])
-def test_successful_connection_moves_account_to_history_backfill(
+def test_successful_connection_starts_periodic_channel_sync(
     task_queue, monkeypatch, status
 ):
     task = task_queue()
@@ -77,11 +77,14 @@ def test_successful_connection_moves_account_to_history_backfill(
     account.error_description = (
         "Previous connection error" if status == "error" else None
     )
+    account.settings = {"server_url": "https://zulip.example.com"}
     account.update()
     zulip = mock.Mock()
+    zulip.get_channels.return_value = []
     monkeypatch.setattr(client, "ZulipClient", lambda account: zulip)
 
-    history_import.HistoryImportService()._iteration()
+    service = history_import.HistoryImportService()
+    service._iteration()
 
     assert _stored(task).status == "done"
     account = external_models.ExternalAccount.objects.get_one(
@@ -89,7 +92,79 @@ def test_successful_connection_moves_account_to_history_backfill(
     )
     assert account.status == "backfill"
     assert account.error_description is None
+    pending = models.Task.objects.get_all(
+        filters={
+            "external_account_uuid": filters.EQ(account.uuid),
+            "status": filters.EQ("new"),
+        }
+    )
+    assert len(pending) == 1
+    first_sync = pending[0]
+    assert first_sync.project_id == account.project_id
+    assert first_sync.priority == models.TASK_PRIORITY_IMPORT_CHANNELS == 50
+    assert first_sync.not_before_at is None
+    assert isinstance(first_sync.content, models.ImportChannelsContent)
+
+    before = datetime.datetime.now(datetime.timezone.utc)
+    service._iteration()
+    after = datetime.datetime.now(datetime.timezone.utc)
+
+    assert _stored(first_sync).status == "done"
+    pending = models.Task.objects.get_all(
+        filters={
+            "external_account_uuid": filters.EQ(account.uuid),
+            "status": filters.EQ("new"),
+        }
+    )
+    assert len(pending) == 1
+    next_sync = pending[0]
+    assert next_sync.uuid != first_sync.uuid
+    assert next_sync.project_id == account.project_id
+    assert next_sync.priority == 50
+    assert isinstance(next_sync.content, models.ImportChannelsContent)
+    interval = datetime.timedelta(minutes=15)
+    assert before + interval <= next_sync.not_before_at <= after + interval
+
+    service._iteration()
+
+    assert _stored(next_sync).status == "new"
     zulip.check_connection.assert_called_once_with()
+    zulip.get_channels.assert_called_once_with()
+    assert zulip.close.call_count == 2
+
+
+@pytest.mark.parametrize("phase", ["check", "close", "status", "queue"])
+def test_failed_connection_does_not_queue_channel_sync(task_queue, monkeypatch, phase):
+    task = task_queue()
+    zulip = mock.Mock()
+    monkeypatch.setattr(client, "ZulipClient", lambda account: zulip)
+    if phase == "check":
+        zulip.check_connection.side_effect = requests.Timeout("Timed out")
+    elif phase == "close":
+        zulip.close.side_effect = RuntimeError("Close failed")
+    else:
+
+        def fail(*args, **kwargs):
+            raise RuntimeError("Completion failed")
+
+        if phase == "status":
+            monkeypatch.setattr(external_models.ExternalAccount, "update_status", fail)
+        else:
+            monkeypatch.setattr(models.Task, "insert", fail)
+
+    history_import.HistoryImportService()._iteration()
+
+    stored = models.Task.objects.get_all(
+        filters={"external_account_uuid": filters.EQ(task.external_account_uuid)}
+    )
+    assert len(stored) == 1
+    assert stored[0].uuid == task.uuid
+    assert stored[0].status == ("retry" if phase == "check" else "error")
+    if phase in ("status", "queue"):
+        account = external_models.ExternalAccount.objects.get_one(
+            filters={"uuid": filters.EQ(task.external_account_uuid)}
+        )
+        assert account.status == "new"
     zulip.close.assert_called_once_with()
 
 
@@ -176,6 +251,9 @@ def test_account_status_update_rolls_back_when_its_event_cannot_be_saved(
 
 
 def test_priority_fifo_and_ready_tasks(task_queue, monkeypatch):
+    monkeypatch.setattr(
+        models.InitializeConnectionContent, "on_done", lambda content, task: None
+    )
     now = datetime.datetime.now(datetime.timezone.utc)
     low = task_queue(priority=models.TASK_PRIORITY_IMPORT_HISTORY)
     newer = task_queue(
@@ -320,6 +398,9 @@ def test_cancelling_pending_tasks_uses_the_callers_transaction(task_queue):
 def test_not_before_at_defers_tasks_until_the_scheduled_time(
     task_queue, monkeypatch, status
 ):
+    monkeypatch.setattr(
+        models.InitializeConnectionContent, "on_done", lambda content, task: None
+    )
     now = datetime.datetime.now(datetime.timezone.utc)
     scheduled_at = now + datetime.timedelta(minutes=5)
     scheduled = task_queue(
@@ -564,6 +645,9 @@ def test_error_hook_controls_the_next_retry_time(task_queue, monkeypatch):
 
 
 def test_workers_wait_for_locks_and_skip_leased_tasks(task_queue, monkeypatch):
+    monkeypatch.setattr(
+        models.InitializeConnectionContent, "on_done", lambda content, task: None
+    )
     now = datetime.datetime.now(datetime.timezone.utc)
     first = task_queue(priority=100)
     leased = task_queue(

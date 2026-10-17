@@ -39,3 +39,6 @@ class ZulipClient:
 
     def check_connection(self) -> None:
         self._get("/users/me")
+
+    def get_channels(self) -> list[dict]:
+        return self._get("/streams", params={"exclude_archived": "false"})["streams"]
