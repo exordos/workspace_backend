@@ -65,7 +65,10 @@ def test_external_account_controller_is_a_thin_request_session_adapter(monkeypat
     ]
 
 
-def test_external_account_controller_rejects_missing_exact_permission(monkeypatch):
+@pytest.mark.parametrize("action", ["create", "update"])
+def test_external_account_controller_rejects_missing_exact_permission(
+    monkeypatch, action
+):
     project_uuid = sys_uuid.uuid4()
     owner_uuid = sys_uuid.uuid4()
     spec = _account_spec(project_uuid, sys_uuid.uuid4())
@@ -84,11 +87,11 @@ def test_external_account_controller_rejects_missing_exact_permission(monkeypatc
     called = []
     monkeypatch.setattr(
         controllers.application_services.ExternalAccountApplicationService,
-        "create",
+        action,
         staticmethod(lambda *args: called.append(args)),
     )
 
     with pytest.raises(exceptions.ExternalResourceForbiddenError):
-        controller.create(**spec)
+        getattr(controller, action)(**spec)
 
     assert called == []

@@ -14,7 +14,8 @@
             ],
             "console": "integratedTerminal",
             "justMyCode": false,
-            "subProcess": true
+            "subProcess": true,
+            "preLaunchTask": "Workspace: Start nginx"
         },
         {
             "name": "Python Debugger: Messenger Events",
@@ -115,6 +116,18 @@
             "id": "rollbackMigration",
             "type": "promptString",
             "description": "Migration to roll back, including its dependent migrations (filename or prefix)"
+        }
+    ],
+    "compounds": [
+        {
+            "name": "Workspace: All Backend Services",
+            "configurations": [
+                "Python Debugger: Workspace API",
+                "Python Debugger: Messenger Events",
+                "Python Debugger: Messenger Worker",
+                "Python Debugger: History Import"
+            ],
+            "stopAll": true
         }
     ]
 }

@@ -15,7 +15,7 @@ and protocol descriptions remain one canonical source of truth.
 
 - [Workspace public API](public_workspace_api.yaml)
 
-External accounts contain their owner, provider, generic settings and revision.
+External accounts contain their owner, provider and generic settings.
 Workspace does not process external chats, provider delivery or synchronization.
 Messages, streams and topics retain `source_name` and `source` as
 `native` and `{"kind":"native"}`. Architecture proposals below predate this

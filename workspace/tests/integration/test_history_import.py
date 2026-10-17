@@ -1,0 +1,867 @@
+# Copyright 2026 Genesis Corporation.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+
+import concurrent.futures
+import datetime
+import json
+import threading
+from unittest import mock
+import uuid
+
+import psycopg
+import pytest
+import requests
+from restalchemy.common import contexts
+from restalchemy.dm import filters
+from restalchemy.storage.sql import engines
+from restalchemy.storage.sql import migrations
+
+from workspace.bridges.zulip import client
+from workspace.bridges.zulip.dm import models
+from workspace.messenger_api import events as messenger_events
+from workspace.messenger_api.dm import external_models
+from workspace.services import history_import
+from workspace.tests.integration import conftest
+
+
+@pytest.fixture
+def task_queue(_database, db):
+    owner_uuid = uuid.uuid4()
+    conftest.seed_workspace_user(db, owner_uuid, f"history-import-{owner_uuid}")
+    account = external_models.ExternalAccount(
+        project_id=uuid.uuid4(),
+        owner_user_uuid=owner_uuid,
+        provider="zulip",
+        settings={},
+    )
+    account.insert()
+
+    def create(**values):
+        task = models.Task(
+            project_id=account.project_id,
+            external_account_uuid=account.uuid,
+            content=models.InitializeConnectionContent(),
+            **values,
+        )
+        task.insert()
+        return task
+
+    yield create
+    account.delete()
+
+
+def _stored(task):
+    return models.Task.objects.get_one(filters={"uuid": filters.EQ(task.uuid)})
+
+
+def _http_error(status_code, code="BAD_REQUEST", **details):
+    response = requests.Response()
+    response.status_code = status_code
+    response._content = json.dumps(
+        {"result": "error", "code": code, "msg": "Provider request failed", **details}
+    ).encode()
+    return requests.HTTPError("Provider request failed", response=response)
+
+
+@pytest.mark.parametrize("status", ["new", "error"])
+def test_successful_connection_moves_account_to_history_backfill(
+    task_queue, monkeypatch, status
+):
+    task = task_queue()
+    account = external_models.ExternalAccount.objects.get_one(
+        filters={"uuid": filters.EQ(task.external_account_uuid)}
+    )
+    account.status = status
+    account.error_description = (
+        "Previous connection error" if status == "error" else None
+    )
+    account.update()
+    zulip = mock.Mock()
+    monkeypatch.setattr(client, "ZulipClient", lambda account: zulip)
+
+    history_import.HistoryImportService()._iteration()
+
+    assert _stored(task).status == "done"
+    account = external_models.ExternalAccount.objects.get_one(
+        filters={"uuid": filters.EQ(task.external_account_uuid)}
+    )
+    assert account.status == "backfill"
+    assert account.error_description is None
+    zulip.check_connection.assert_called_once_with()
+    zulip.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [None, requests.Timeout("Timed out"), _http_error(401, "INVALID_API_KEY")],
+)
+def test_connection_outcome_publishes_account_event_only_in_its_project(
+    task_queue, db, monkeypatch, error
+):
+    task = task_queue()
+    account = external_models.ExternalAccount.objects.get_one(
+        filters={"uuid": filters.EQ(task.external_account_uuid)}
+    )
+    projects = [account.project_id, uuid.uuid4()]
+    other_owner = uuid.uuid4()
+    conftest.seed_workspace_user(db, other_owner, f"other-owner-{other_owner}")
+    for project_id, user_uuid in [
+        *((project_id, account.owner_user_uuid) for project_id in projects),
+        (projects[0], other_owner),
+        (uuid.uuid4(), other_owner),
+    ]:
+        db.execute(
+            "INSERT INTO m_workspace_event_cursors (project_id, user_uuid) "
+            "VALUES (%s, %s)",
+            (project_id, user_uuid),
+        )
+    zulip = mock.Mock()
+    zulip.check_connection.side_effect = error
+    monkeypatch.setattr(client, "ZulipClient", lambda account: zulip)
+
+    history_import.HistoryImportService()._iteration()
+
+    account = external_models.ExternalAccount.objects.get_one(
+        filters={"uuid": filters.EQ(task.external_account_uuid)}
+    )
+    events = db.execute(
+        "SELECT project_id, user_uuid, payload FROM m_workspace_events "
+        "WHERE object_type='external_account' AND action='updated' "
+        "AND payload->>'uuid'=%s",
+        (str(account.uuid),),
+    ).fetchall()
+    assert len(events) == 1
+    assert events[0][0] == account.project_id
+    assert account.status == ("backfill" if error is None else "error")
+    assert _stored(task).status == (
+        "done"
+        if error is None
+        else "retry"
+        if isinstance(error, requests.Timeout)
+        else "error"
+    )
+    for _, user_uuid, payload in events:
+        assert user_uuid == account.owner_user_uuid
+        assert payload["kind"] == "external_account.updated"
+        assert payload["snapshot"]["uuid"] == str(account.uuid)
+        assert payload["snapshot"]["project_id"] == str(account.project_id)
+        assert payload["snapshot"]["status"] == account.status
+        assert payload["snapshot"]["error_description"] == account.error_description
+        assert "owner_user_uuid" not in payload["snapshot"]
+
+
+def test_account_status_update_rolls_back_when_its_event_cannot_be_saved(
+    task_queue, monkeypatch
+):
+    task = task_queue()
+    account = external_models.ExternalAccount.objects.get_one(
+        filters={"uuid": filters.EQ(task.external_account_uuid)}
+    )
+
+    def fail_event(*args, **kwargs):
+        raise RuntimeError("Event creation failed")
+
+    monkeypatch.setattr(messenger_events, "create_external_resource_event", fail_event)
+
+    with pytest.raises(RuntimeError, match="Event creation failed"):
+        with contexts.Context().session_manager():
+            account.update_status("backfill")
+
+    account = external_models.ExternalAccount.objects.get_one(
+        filters={"uuid": filters.EQ(task.external_account_uuid)}
+    )
+    assert account.status == "new"
+
+
+def test_priority_fifo_and_ready_tasks(task_queue, monkeypatch):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    low = task_queue(priority=models.TASK_PRIORITY_IMPORT_HISTORY)
+    newer = task_queue(
+        priority=models.TASK_PRIORITY_INITIALIZE_CONNECTION, created_at=now
+    )
+    older = task_queue(
+        priority=models.TASK_PRIORITY_INITIALIZE_CONNECTION,
+        created_at=now - datetime.timedelta(seconds=1),
+    )
+    realtime = task_queue(priority=models.TASK_PRIORITY_REALTIME_MESSAGE)
+    delayed = task_queue(
+        priority=models.TASK_PRIORITY_REALTIME_MESSAGE,
+        status="retry",
+        next_retry_at=now + datetime.timedelta(minutes=5),
+    )
+    done = task_queue(priority=models.TASK_PRIORITY_REALTIME_MESSAGE, status="done")
+    failed = task_queue(priority=models.TASK_PRIORITY_REALTIME_MESSAGE, status="error")
+    cancelled = task_queue(
+        priority=models.TASK_PRIORITY_REALTIME_MESSAGE, status="cancel"
+    )
+    executed = []
+    monkeypatch.setattr(
+        models.InitializeConnectionContent,
+        "execute",
+        lambda content, task: executed.append(task.uuid),
+    )
+    service = history_import.HistoryImportService()
+
+    service._iteration()
+    assert executed == [realtime.uuid]
+    service._iteration()
+    assert executed == [realtime.uuid, older.uuid]
+    service._iteration()
+    service._iteration()
+    service._iteration()
+
+    assert executed == [realtime.uuid, older.uuid, newer.uuid, low.uuid]
+    assert _stored(delayed).status == "retry"
+    assert _stored(done).status == "done"
+    assert _stored(failed).status == "error"
+    assert _stored(cancelled).status == "cancel"
+
+
+@pytest.mark.parametrize("exclude_current", [False, True])
+def test_cancel_pending_tasks_is_account_scoped(task_queue, db, exclude_current):
+    future = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
+        minutes=5
+    )
+    lease_owner = uuid.uuid4()
+    current = task_queue(
+        status="retry",
+        next_retry_at=future,
+        lease_owner=lease_owner,
+        lease_expires_at=future,
+    )
+    pending = [
+        task_queue(
+            status=status,
+            not_before_at=future,
+            next_retry_at=future,
+            lease_owner=lease_owner,
+            lease_expires_at=future,
+        )
+        for status in ("new", "retry")
+    ]
+    terminal = [task_queue(status=status) for status in ("done", "error", "cancel")]
+    other_owner_uuid = uuid.uuid4()
+    conftest.seed_workspace_user(
+        db, other_owner_uuid, f"other-owner-{other_owner_uuid}"
+    )
+    other_account = external_models.ExternalAccount(
+        project_id=uuid.uuid4(),
+        owner_user_uuid=other_owner_uuid,
+        provider="zulip",
+        settings={},
+    )
+    other_account.insert()
+    try:
+        other_tasks = [
+            models.Task(
+                project_id=other_account.project_id,
+                external_account_uuid=other_account.uuid,
+                status=status,
+                content=models.InitializeConnectionContent(),
+            )
+            for status in ("new", "retry")
+        ]
+        for task in other_tasks:
+            task.insert()
+
+        with contexts.Context().session_manager():
+            count = current.cancel_pending_tasks(exclude_current=exclude_current)
+            assert current.cancel_pending_tasks(exclude_current=exclude_current) == 0
+
+        assert count == len(pending) + (not exclude_current)
+        for task in pending:
+            stored = _stored(task)
+            assert stored.status == "cancel"
+            assert stored.next_retry_at is None
+            assert stored.lease_owner is None
+            assert stored.lease_expires_at is None
+            assert stored.not_before_at == future
+        for task in terminal + other_tasks:
+            stored = _stored(task)
+            assert stored.status == task.status
+            assert stored.updated_at == task.updated_at
+        stored_current = _stored(current)
+        assert (
+            stored_current.status
+            == current.status
+            == ("retry" if exclude_current else "cancel")
+        )
+        assert (
+            stored_current.next_retry_at
+            == current.next_retry_at
+            == (future if exclude_current else None)
+        )
+        assert (
+            stored_current.lease_owner
+            == current.lease_owner
+            == (lease_owner if exclude_current else None)
+        )
+        assert stored_current.updated_at == current.updated_at
+    finally:
+        other_account.delete()
+
+
+def test_cancelling_pending_tasks_uses_the_callers_transaction(task_queue):
+    current = task_queue()
+    retry = task_queue(status="retry")
+
+    with pytest.raises(RuntimeError, match="Roll back cancellation"):
+        with contexts.Context().session_manager():
+            assert current.cancel_pending_tasks() == 2
+            raise RuntimeError("Roll back cancellation")
+
+    assert _stored(current).status == "new"
+    assert _stored(retry).status == "retry"
+
+
+@pytest.mark.parametrize("status", ["new", "retry"])
+def test_not_before_at_defers_tasks_until_the_scheduled_time(
+    task_queue, monkeypatch, status
+):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    scheduled_at = now + datetime.timedelta(minutes=5)
+    scheduled = task_queue(
+        priority=models.TASK_PRIORITY_REALTIME_MESSAGE,
+        status=status,
+        not_before_at=scheduled_at,
+    )
+    retry = task_queue(
+        priority=models.TASK_PRIORITY_REALTIME_MESSAGE,
+        status="retry",
+        not_before_at=now,
+        next_retry_at=scheduled_at + datetime.timedelta(minutes=1),
+    )
+    ready = task_queue()
+    executed = []
+    monkeypatch.setattr(
+        models.InitializeConnectionContent,
+        "execute",
+        lambda content, task: executed.append(task.uuid),
+    )
+    service = history_import.HistoryImportService()
+
+    with mock.patch.object(history_import, "datetime") as clock:
+        clock.datetime.now.return_value = now
+        service._iteration()
+        service._iteration()
+        assert executed == [ready.uuid]
+        assert _stored(scheduled).not_before_at == scheduled_at
+        assert _stored(scheduled).status == status
+
+        clock.datetime.now.return_value = scheduled_at
+        service._iteration()
+        assert executed == [ready.uuid, scheduled.uuid]
+        assert _stored(retry).status == "retry"
+
+        clock.datetime.now.return_value = retry.next_retry_at
+        service._iteration()
+
+    assert executed == [ready.uuid, scheduled.uuid, retry.uuid]
+    assert _stored(scheduled).status == "done"
+    assert _stored(retry).status == "done"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        requests.Timeout("Timed out"),
+        requests.ConnectionError("Disconnected"),
+        _http_error(408),
+        _http_error(429, "RATE_LIMIT_HIT"),
+        _http_error(500),
+        _http_error(502),
+        _http_error(503),
+        _http_error(504),
+    ],
+)
+def test_execution_errors_and_delayed_retry(task_queue, monkeypatch, error):
+    task = task_queue()
+    attempts = []
+
+    def execute(content, task):
+        attempts.append(task.uuid)
+        raise error
+
+    monkeypatch.setattr(models.InitializeConnectionContent, "execute", execute)
+    service = history_import.HistoryImportService()
+    before = datetime.datetime.now(datetime.timezone.utc)
+    service._iteration()
+    stored = _stored(task)
+
+    assert stored.status == "retry"
+    assert stored.error_description == str(error)
+    account = external_models.ExternalAccount.objects.get_one(
+        filters={"uuid": filters.EQ(task.external_account_uuid)}
+    )
+    assert account.status == "error"
+    assert account.error_description == (
+        f"{error}\nNext retry at: {stored.next_retry_at.isoformat()}"
+    )
+    service._iteration()
+    assert attempts == [task.uuid]
+    after = datetime.datetime.now(datetime.timezone.utc)
+    assert before + models.TASK_RETRY_DELAY <= stored.next_retry_at
+    assert stored.next_retry_at <= after + models.TASK_RETRY_DELAY
+    stored.next_retry_at = before - datetime.timedelta(seconds=1)
+    stored.update()
+    monkeypatch.setattr(
+        models.InitializeConnectionContent, "execute", lambda content, task: None
+    )
+    service._iteration()
+    stored = _stored(task)
+    assert stored.status == "done"
+    assert stored.error_description is None
+    assert stored.next_retry_at is None
+    account = external_models.ExternalAccount.objects.get_one(
+        filters={"uuid": filters.EQ(task.external_account_uuid)}
+    )
+    assert account.status == "backfill"
+    assert account.error_description is None
+
+
+@pytest.mark.parametrize(
+    "status,code,retryable",
+    [
+        (400, "BAD_REQUEST", False),
+        (401, "INVALID_API_KEY", False),
+        (401, "UNAUTHORIZED", False),
+        (401, "USER_DEACTIVATED", False),
+        (401, "REALM_DEACTIVATED", False),
+        (403, "BAD_REQUEST", False),
+        (404, "NONEXISTENT_SUBDOMAIN", False),
+        (408, "REQUEST_TIMEOUT", True),
+        (429, "RATE_LIMIT_HIT", True),
+        (500, "BAD_REQUEST", True),
+        (502, "BAD_REQUEST", True),
+        (503, "SERVER_NOT_READY", True),
+        (504, "BAD_REQUEST", True),
+    ],
+)
+def test_connection_response_controls_task_and_account_status(
+    task_queue, monkeypatch, status, code, retryable
+):
+    task = task_queue()
+    account = external_models.ExternalAccount.objects.get_one(
+        filters={"uuid": filters.EQ(task.external_account_uuid)}
+    )
+    account.settings = {
+        "server_url": "https://zulip.example.com",
+        "email": "user@example.com",
+        "api_key": "invalid-test-key",
+    }
+    account.update()
+    message = "Provider request failed"
+    response = requests.Response()
+    response.status_code = status
+    response._content = json.dumps(
+        {"result": "error", "code": code, "msg": message}
+    ).encode()
+    session = mock.Mock()
+    session.get.return_value = response
+    monkeypatch.setattr(client.requests, "Session", lambda: session)
+
+    service = history_import.HistoryImportService()
+    service._iteration()
+    stored = _stored(task)
+    account = external_models.ExternalAccount.objects.get_one(
+        filters={"uuid": filters.EQ(task.external_account_uuid)}
+    )
+
+    if retryable:
+        assert stored.status == "retry"
+        assert stored.next_retry_at is not None
+        assert account.status == "error"
+        assert account.error_description == (
+            f"{stored.error_description}\nNext retry at: {stored.next_retry_at.isoformat()}"
+        )
+    else:
+        description = f"HTTP {status} {code}: {message}"
+        assert stored.status == "error"
+        assert stored.error_description == description
+        assert stored.next_retry_at is None
+        assert account.status == "error"
+        assert account.error_description == description
+    service._iteration()
+    session.get.assert_called_once()
+    session.close.assert_called_once()
+
+
+def test_error_hook_can_stop_retries_without_http(task_queue, monkeypatch):
+    task = task_queue()
+    message = "Task input is invalid"
+
+    def execute(content, task):
+        raise ValueError("Invalid task")
+
+    def on_error(content, task, error):
+        task.status = "error"
+        task.error_description = message
+
+    monkeypatch.setattr(models.InitializeConnectionContent, "execute", execute)
+    monkeypatch.setattr(models.InitializeConnectionContent, "on_error", on_error)
+    service = history_import.HistoryImportService()
+
+    service._iteration()
+    service._iteration()
+    stored = _stored(task)
+
+    assert stored.status == "error"
+    assert stored.error_description == message
+    assert stored.next_retry_at is None
+
+
+@pytest.mark.parametrize(
+    "error", [RuntimeError("Invalid task"), NotImplementedError("Not implemented")]
+)
+def test_unknown_errors_are_terminal(task_queue, monkeypatch, error):
+    task = task_queue()
+    attempts = []
+
+    def execute(content, current_task):
+        attempts.append(current_task.uuid)
+        raise error
+
+    monkeypatch.setattr(models.InitializeConnectionContent, "execute", execute)
+    service = history_import.HistoryImportService()
+    service._iteration()
+    service._iteration()
+
+    stored = _stored(task)
+    assert attempts == [task.uuid]
+    assert stored.status == "error"
+    assert stored.error_description == str(error)
+    assert stored.next_retry_at is None
+
+
+def test_error_hook_controls_the_next_retry_time(task_queue, monkeypatch):
+    task = task_queue()
+    next_retry_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
+        minutes=10
+    )
+    attempts = []
+
+    def execute(content, current_task):
+        attempts.append(current_task.uuid)
+        raise RuntimeError("Try again")
+
+    def on_error(content, current_task, error):
+        current_task.status = "retry"
+        current_task.next_retry_at = next_retry_at
+
+    monkeypatch.setattr(models.InitializeConnectionContent, "execute", execute)
+    monkeypatch.setattr(models.InitializeConnectionContent, "on_error", on_error)
+    service = history_import.HistoryImportService()
+    service._iteration()
+    service._iteration()
+
+    stored = _stored(task)
+    assert attempts == [task.uuid]
+    assert stored.status == "retry"
+    assert stored.error_description == "Try again"
+    assert stored.next_retry_at == next_retry_at
+
+
+def test_workers_wait_for_locks_and_skip_leased_tasks(task_queue, monkeypatch):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    first = task_queue(priority=100)
+    leased = task_queue(
+        priority=90,
+        lease_owner=uuid.uuid4(),
+        lease_expires_at=now + datetime.timedelta(minutes=5),
+    )
+    ready = task_queue(priority=1)
+    executed = []
+    first_started = threading.Event()
+    release_first = threading.Event()
+    second_started = threading.Event()
+    second_finished = threading.Event()
+
+    def execute(content, task):
+        executed.append(task.uuid)
+        if task.uuid == first.uuid:
+            first_started.set()
+            assert release_first.wait(timeout=5)
+
+    def second_iteration():
+        second_started.set()
+        try:
+            history_import.HistoryImportService()._iteration()
+        finally:
+            second_finished.set()
+
+    monkeypatch.setattr(models.InitializeConnectionContent, "execute", execute)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as workers:
+        try:
+            first_worker = workers.submit(
+                history_import.HistoryImportService()._iteration
+            )
+            assert first_started.wait(timeout=5)
+            second_worker = workers.submit(second_iteration)
+            assert second_started.wait(timeout=5)
+            assert not second_finished.wait(timeout=0.1)
+        finally:
+            release_first.set()
+        first_worker.result(timeout=5)
+        second_worker.result(timeout=5)
+
+    history_import.HistoryImportService()._iteration()
+    assert executed == [first.uuid, ready.uuid]
+    assert _stored(leased).status == "new"
+
+
+@pytest.mark.parametrize("phase", ["execute", "on_done"])
+@pytest.mark.parametrize("database_error", [False, True])
+def test_failed_execution_or_done_handler_rolls_back_partial_changes(
+    task_queue, monkeypatch, database_error, phase
+):
+    task = task_queue()
+
+    def fail(content, task):
+        account = external_models.ExternalAccount.objects.get_one(
+            filters={"uuid": filters.EQ(task.external_account_uuid)}
+        )
+        account.settings = {"partial": True}
+        account.update()
+        if database_error:
+            with engines.engine_factory.get_engine().session_manager() as session:
+                session.execute("SELECT 1 / 0")
+        raise RuntimeError("Execution failed")
+
+    monkeypatch.setattr(
+        models.InitializeConnectionContent, "execute", lambda content, task: None
+    )
+    monkeypatch.setattr(models.InitializeConnectionContent, phase, fail)
+    history_import.HistoryImportService()._iteration()
+
+    assert _stored(task).status == "error"
+    account = external_models.ExternalAccount.objects.get_one(
+        filters={"uuid": filters.EQ(task.external_account_uuid)}
+    )
+    assert account.settings == {}
+
+
+@pytest.mark.parametrize("database_error", [False, True])
+def test_error_handler_failure_rolls_back_and_saves_terminal_error(
+    task_queue, monkeypatch, database_error
+):
+    task = task_queue()
+
+    def execute(content, current_task):
+        raise RuntimeError("Execution failed")
+
+    def on_error(content, current_task, error):
+        current_task.status = "retry"
+        current_task.next_retry_at = datetime.datetime.now(datetime.timezone.utc)
+        account = external_models.ExternalAccount.objects.get_one(
+            filters={"uuid": filters.EQ(current_task.external_account_uuid)}
+        )
+        account.settings = {"partial": True}
+        account.update()
+        if database_error:
+            with engines.engine_factory.get_engine().session_manager() as session:
+                session.execute("SELECT 1 / 0")
+        raise RuntimeError("Callback failed")
+
+    monkeypatch.setattr(models.InitializeConnectionContent, "execute", execute)
+    monkeypatch.setattr(models.InitializeConnectionContent, "on_error", on_error)
+    history_import.HistoryImportService()._iteration()
+
+    stored = _stored(task)
+    assert stored.status == "error"
+    assert stored.error_description.startswith(
+        "Execution failed\nError handler failed:"
+    )
+    assert ("division by zero" if database_error else "Callback failed") in (
+        stored.error_description
+    )
+    assert stored.next_retry_at is None
+    account = external_models.ExternalAccount.objects.get_one(
+        filters={"uuid": filters.EQ(task.external_account_uuid)}
+    )
+    assert account.settings == {}
+
+
+def test_task_metadata_and_cancel_migrations_round_trip(_database):
+    metadata_migration = "0197-Move-external-account-reference-to-task-5af16f.py"
+    cancel_migration = "0198-Add-task-cancellation-status-452cb8.py"
+    with conftest.isolated_migration_database(
+        "0196-Remove-external-account-revision-fcddce.py"
+    ) as database_url:
+        with psycopg.connect(database_url, autocommit=True) as db:
+            owner_uuid = uuid.uuid4()
+            account_uuid = uuid.uuid4()
+            conftest.seed_workspace_user(db, owner_uuid, "task-migration-owner")
+            db.execute(
+                "INSERT INTO m_external_accounts_v2 "
+                "(uuid, owner_user_uuid, provider, settings) "
+                "VALUES (%s, %s, 'zulip', '{}'::jsonb)",
+                (account_uuid, owner_uuid),
+            )
+            tasks = {
+                uuid.uuid4(): {
+                    "kind": "initialize_connection",
+                    "external_account_uuid": str(account_uuid),
+                },
+                uuid.uuid4(): {
+                    "kind": "import_history",
+                    "external_account_uuid": str(account_uuid),
+                    "first_message_id": 10,
+                    "last_message_id": 20,
+                },
+            }
+            for task_uuid, content in tasks.items():
+                db.execute(
+                    "INSERT INTO bridge_zulip_v5_tasks (uuid, content) "
+                    "VALUES (%s, %s::jsonb)",
+                    (task_uuid, json.dumps(content)),
+                )
+
+            engine = migrations.MigrationEngine(
+                migrations_path=str(conftest.MIGRATIONS_DIR)
+            )
+            engine.apply_migration(cancel_migration)
+            for task_uuid, content in tasks.items():
+                assert db.execute(
+                    "SELECT external_account_uuid, content "
+                    "FROM bridge_zulip_v5_tasks WHERE uuid=%s",
+                    (task_uuid,),
+                ).fetchone() == (
+                    account_uuid,
+                    {
+                        name: value
+                        for name, value in content.items()
+                        if name != "external_account_uuid"
+                    },
+                )
+
+            cancelled_uuid = next(iter(tasks))
+            db.execute(
+                "UPDATE bridge_zulip_v5_tasks SET status='cancel' WHERE uuid=%s",
+                (cancelled_uuid,),
+            )
+            engine.rollback_migration(cancel_migration)
+            assert (
+                db.execute(
+                    "SELECT status FROM bridge_zulip_v5_tasks WHERE uuid=%s",
+                    (cancelled_uuid,),
+                ).fetchone()[0]
+                == "error"
+            )
+            engine.rollback_migration(metadata_migration)
+            for task_uuid, content in tasks.items():
+                assert db.execute(
+                    "SELECT account_uuid, content "
+                    "FROM bridge_zulip_v5_tasks WHERE uuid=%s",
+                    (task_uuid,),
+                ).fetchone() == (account_uuid, content)
+
+            engine.apply_migration(cancel_migration)
+            db.execute(
+                "DELETE FROM m_external_accounts_v2 WHERE uuid=%s", (account_uuid,)
+            )
+            assert (
+                db.execute("SELECT COUNT(*) FROM bridge_zulip_v5_tasks").fetchone()[0]
+                == 0
+            )
+
+
+@pytest.mark.parametrize("source", ["created_event", "single_project", "ambiguous"])
+def test_account_and_task_project_migration_preserves_data(_database, source):
+    migration = "0199-Scope-external-accounts-and-Zulip-tasks-to-projects-4fb70b.py"
+    with conftest.isolated_migration_database(
+        "0198-Add-task-cancellation-status-452cb8.py"
+    ) as database_url:
+        with psycopg.connect(database_url, autocommit=True) as db:
+            owner_uuid, account_uuid, task_uuid, project_id = (
+                uuid.uuid4() for _ in range(4)
+            )
+            conftest.seed_workspace_user(db, owner_uuid, f"project-owner-{owner_uuid}")
+            db.execute(
+                "INSERT INTO m_external_accounts_v2 "
+                "(uuid, owner_user_uuid, provider, settings) "
+                "VALUES (%s, %s, 'zulip', '{}'::jsonb)",
+                (account_uuid, owner_uuid),
+            )
+            content = {"kind": "initialize_connection"}
+            db.execute(
+                "INSERT INTO bridge_zulip_v5_tasks "
+                "(uuid, external_account_uuid, content) VALUES (%s, %s, %s::jsonb)",
+                (task_uuid, account_uuid, json.dumps(content)),
+            )
+            db.execute(
+                "INSERT INTO m_workspace_event_cursors (project_id, user_uuid) "
+                "VALUES (%s, %s)",
+                (project_id, owner_uuid),
+            )
+            if source != "single_project":
+                db.execute(
+                    "INSERT INTO m_workspace_event_cursors (project_id, user_uuid) "
+                    "VALUES (%s, %s)",
+                    (uuid.uuid4(), owner_uuid),
+                )
+            if source == "created_event":
+                db.execute(
+                    "INSERT INTO m_workspace_events "
+                    "(uuid, project_id, user_uuid, object_type, action, payload) "
+                    "VALUES (%s, %s, %s, 'external_account', 'created', %s::jsonb)",
+                    (
+                        uuid.uuid4(),
+                        project_id,
+                        owner_uuid,
+                        json.dumps(
+                            {
+                                "kind": "external_account.created",
+                                "uuid": str(account_uuid),
+                            }
+                        ),
+                    ),
+                )
+            engine = migrations.MigrationEngine(
+                migrations_path=str(conftest.MIGRATIONS_DIR)
+            )
+            if source == "ambiguous":
+                with pytest.raises(
+                    psycopg.errors.RaiseException, match="Cannot infer project_id"
+                ):
+                    engine.apply_migration(migration)
+                assert (
+                    db.execute(
+                        "SELECT COUNT(*) FROM information_schema.columns "
+                        "WHERE table_name='m_external_accounts_v2' AND column_name='project_id'"
+                    ).fetchone()[0]
+                    == 0
+                )
+                return
+
+            engine.apply_migration(migration)
+            assert db.execute(
+                "SELECT project_id FROM m_external_accounts_v2 WHERE uuid=%s",
+                (account_uuid,),
+            ).fetchone() == (project_id,)
+            assert db.execute(
+                "SELECT project_id, external_account_uuid, content FROM bridge_zulip_v5_tasks WHERE uuid=%s",
+                (task_uuid,),
+            ).fetchone() == (project_id, account_uuid, content)
+            with pytest.raises(psycopg.errors.ForeignKeyViolation):
+                db.execute(
+                    "UPDATE bridge_zulip_v5_tasks SET project_id=%s WHERE uuid=%s",
+                    (uuid.uuid4(), task_uuid),
+                )
+            engine.rollback_migration(migration)
+            assert db.execute(
+                "SELECT external_account_uuid, content FROM bridge_zulip_v5_tasks WHERE uuid=%s",
+                (task_uuid,),
+            ).fetchone() == (account_uuid, content)
+            engine.apply_migration(migration)
+            db.execute(
+                "DELETE FROM m_external_accounts_v2 WHERE uuid=%s", (account_uuid,)
+            )
+            assert (
+                db.execute(
+                    "SELECT COUNT(*) FROM bridge_zulip_v5_tasks WHERE uuid=%s",
+                    (task_uuid,),
+                ).fetchone()[0]
+                == 0
+            )

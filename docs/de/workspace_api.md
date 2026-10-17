@@ -321,10 +321,10 @@ Autoritative Momentaufnahmen vor dem Start eines neuen Cursors.
 | `GET` | `/api/workspace/v1/messenger/drafts/{draft_uuid}` | Erhalten Sie einen eigenen Entwurf und seine starke Revision ETag. |
 | `PUT` | `/api/workspace/v1/messenger/drafts/{draft_uuid}` | Ersetzen Sie nur die Markdown-Nutzlast mit `If-Match`. |
 | `DELETE` | `/api/workspace/v1/messenger/drafts/{draft_uuid}` | Ein Eigentumsentwurf mit `If-Match` hart löschen. |
-| `GET` | `/api/workspace/v1/messenger/external_accounts/` | Liste der externen Konten des aktuellen Benutzers im Bereich Global; erfordert `workspace.external_account.read`. |
-| `POST` | `/api/workspace/v1/messenger/external_accounts/` | Erstellen eines externen Kontos mit einem vom Client generierten UUID und nur schreibbaren Zugangsdatum; erfordert `workspace.external_account.create`. |
+| `GET` | `/api/workspace/v1/messenger/external_accounts/` | List the current user's external accounts in the request project; requires `workspace.external_account.read`. |
+| `POST` | `/api/workspace/v1/messenger/external_accounts/` | Create an external account using `project_id` from the request context; requires `workspace.external_account.create`. |
 | `GET` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Erhalten Sie den entlasteten externen Account-Snapshot des Eigentümers; erfordert `workspace.external_account.read`. |
-| `PUT` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Die nicht geheimen Einstellungen, die geändert werden können, durch `If-Match` ersetzen; erfordert `workspace.external_account.update`. |
+| `PUT` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Replace mutable settings; requires `workspace.external_account.update`. |
 | `DELETE` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Das Konto und seine Projektion löschen; erfordert `workspace.external_account.delete`. |
 | `POST` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}/actions/reconnect/invoke` | Validieren und ersetzen Sie die Schreibkredienzial, dann die Synchronisation wieder aufnehmen; erfordert `workspace.external_account.reconnect`. |
 | `POST` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}/actions/disconnect/invoke` | Synchronisierung unter Beibehaltung der Leseschaltvorlage stoppen; erfordert `workspace.external_account.disconnect`. |

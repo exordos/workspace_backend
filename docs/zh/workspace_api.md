@@ -321,10 +321,10 @@ GET /api/workspace/v1/events/?epoch_version%3E=123&epoch_generation=781203&page_
 | `GET` | `/api/workspace/v1/messenger/drafts/{draft_uuid}` | 获得一个拥有草案及其强度修改 ETag. |
 | `PUT` | `/api/workspace/v1/messenger/drafts/{draft_uuid}` | 仅使用 `If-Match` 替换标记载荷. |
 | `DELETE` | `/api/workspace/v1/messenger/drafts/{draft_uuid}` | 使用 `If-Match` 硬删除所有草稿. |
-| `GET` | `/api/workspace/v1/messenger/external_accounts/` | 列出当前用户的区域-全球外部帐户;需要 `workspace.external_account.read`. |
-| `POST` | `/api/workspace/v1/messenger/external_accounts/` | 创建一个外部帐户,使用客户端生成的 UUID 和仅可写的凭证;需要 `workspace.external_account.create`. |
+| `GET` | `/api/workspace/v1/messenger/external_accounts/` | List the current user's external accounts in the request project; requires `workspace.external_account.read`. |
+| `POST` | `/api/workspace/v1/messenger/external_accounts/` | Create an external account using `project_id` from the request context; requires `workspace.external_account.create`. |
 | `GET` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | 获取所有者清理的外部帐户快照;需要 `workspace.external_account.read`. |
-| `PUT` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | 取代可变的非秘密设置使用 `If-Match`;需要 `workspace.external_account.update`. |
+| `PUT` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Replace mutable settings; requires `workspace.external_account.update`. |
 | `DELETE` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | 删除帐户及其投影;需要 `workspace.external_account.delete`. |
 | `POST` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}/actions/reconnect/invoke` | 验证并更换仅写凭证,然后恢复同步;需要 `workspace.external_account.reconnect`. |
 | `POST` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}/actions/disconnect/invoke` | 停止同步,同时保留仅读投影;需要 `workspace.external_account.disconnect`. |

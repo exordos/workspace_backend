@@ -931,16 +931,3 @@ def add_events_cursor_contract(
         "application/json": {"schema": copy.deepcopy(EVENT_CURSOR_SCHEMA)}
     }
     return specification
-
-
-def add_external_account_contract(
-    specification: dict[str, typing.Any],
-    root: str,
-    components: dict[str, typing.Any],
-) -> dict[str, typing.Any]:
-    del components
-    account = specification["paths"][f"{root}external_accounts/{{ExternalAccountUuid}}"]
-    for method in ("get", "put"):
-        account[method]["responses"][200]["headers"] = copy.deepcopy(DRAFT_ETAG_HEADER)
-    account["put"]["parameters"].append(copy.deepcopy(DRAFT_IF_MATCH_PARAMETER))
-    return specification

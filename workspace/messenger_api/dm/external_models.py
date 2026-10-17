@@ -10,6 +10,8 @@ from restalchemy.dm import properties
 from restalchemy.dm import types
 from restalchemy.storage.sql import orm
 
+from workspace.messenger_api import events as messenger_events
+
 
 class ExternalAccountStatus(str, enum.Enum):
     NEW = "new"
@@ -21,6 +23,7 @@ class ExternalAccountStatus(str, enum.Enum):
 
 class ExternalAccount(
     models.ModelWithUUID,
+    models.ModelWithProject,
     models.ModelWithTimestamp,
     orm.SQLStorableMixin,
 ):
@@ -40,8 +43,21 @@ class ExternalAccount(
         types.AllowNone(types.String()),
         default=None,
     )
-    revision = properties.property(
-        types.Integer(min_value=1),
-        default=1,
-        read_only=True,
-    )
+
+    def update_status(
+        self,
+        status: str,
+        error_description: str | None = None,
+    ) -> None:
+        self.status = status
+        self.error_description = error_description
+        if not self.is_dirty():
+            return
+        self.update()
+        messenger_events.create_external_resource_event(
+            self.project_id,
+            self.owner_user_uuid,
+            self,
+            messenger_events.EXTERNAL_ACCOUNT_UPDATED_EVENT,
+            hidden_fields=("owner_user_uuid",),
+        )

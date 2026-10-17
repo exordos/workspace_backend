@@ -1083,27 +1083,9 @@ class ExternalResourceController(ra_controllers.BaseResourceControllerPaginated)
             request=self.request,
         )
 
-    @staticmethod
-    def _etag(revision: int) -> str:
-        return f'"{revision}"'
-
-    def _required_if_match(self, resource: typing.Any) -> None:
-        value = self.request.headers.get("If-Match")
-        if value is None:
-            raise messenger_exc.ExternalPreconditionRequiredError()
-        if value != self._etag(resource.revision):
-            raise messenger_exc.ExternalPreconditionFailedError()
-
     def _create_response(
         self, body: typing.Any, status: typing.Any, headers: typing.Any
     ) -> typing.Any:
-        revision = None
-        if isinstance(body, dict):
-            revision = body.get("revision")
-        elif hasattr(body, "revision"):
-            revision = body.revision
-        if revision is not None:
-            headers["ETag"] = self._etag(revision)
         return ra_controllers.Controller._create_response(self, body, status, headers)
 
     def _owner_filters(self, filters: typing.Any) -> typing.Any:
@@ -1148,6 +1130,11 @@ class ExternalAccountController(ExternalResourceController):
         process_filters=True,
     )
 
+    def _owner_filters(self, filters: typing.Any) -> typing.Any:
+        result = super()._owner_filters(filters)
+        result["project_id"] = dm_filters.EQ(self._get_project_id())
+        return result
+
     def _require_permission(self, action: str) -> None:
         permissions = (
             self.get_context().iam_context.get_introspection_info().permissions
@@ -1182,17 +1169,15 @@ class ExternalAccountController(ExternalResourceController):
             session=session,
             locked=True,
         )
-        self._required_if_match(account)
-        account.update_dm(values=kwargs)
-        _update_internal_fields(account, {"revision": account.revision + 1})
-        account.update(session=session)
-        self._emit_event(
+        return application_services.ExternalAccountApplicationService.update(
+            session,
+            application_services.ExternalAccountActor(
+                user_uuid=self._get_user_uuid(),
+                project_id=self._get_project_id(),
+            ),
             account,
-            messenger_events.EXTERNAL_ACCOUNT_UPDATED_EVENT,
-            hidden_fields=("owner_user_uuid",),
-            session=session,
+            kwargs,
         )
-        return account
 
     def delete(self, uuid: object) -> None:
         self._require_permission("workspace.external_account.delete")

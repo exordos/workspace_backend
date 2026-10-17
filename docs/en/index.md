@@ -1,7 +1,7 @@
 # Workspace Backend Documentation
 
 Current contract: [Workspace public OpenAPI](../public_workspace_api.yaml).
-External accounts contain an owner, `provider`, generic `settings` and `revision`.
+External accounts contain an owner, `provider` and generic `settings`.
 Workspace processes native messages and membership; provider synchronization and
 external delivery live elsewhere. The remaining design and architecture pages
 are historical references from before migration `0186`.

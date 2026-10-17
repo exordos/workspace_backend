@@ -4,9 +4,10 @@ Backend services for **Genesis Workspace Messenger**. The public Messenger API
 is IAM-authenticated and preserves the existing REST and realtime contracts.
 Canonical Messenger persistence is PostgreSQL.
 
-External accounts are an owner-scoped registry with a required `provider` and
-generic `settings`. Creating an account does not connect or synchronize it.
-External services handle provider processing. Workspace messages and chats
+External accounts are scoped to their owner and request project, with a required
+`provider` and generic `settings`. Creating or updating a Zulip account queues connection
+initialization. Updates reset its status to `new` and clear its previous error.
+Workspace messages and chats
 retain `source_name: native` and `source: {"kind": "native"}` and use ordinary
 membership permissions. Attachments use the configured file storage and IAM
 remains the source of authentication.

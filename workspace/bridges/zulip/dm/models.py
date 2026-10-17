@@ -15,8 +15,12 @@
 #    under the License.
 
 import abc
+import datetime
 import enum
+import logging
 
+import requests
+from restalchemy.common import contexts
 from restalchemy.common import exceptions
 from restalchemy.dm import filters
 from restalchemy.dm import models
@@ -25,12 +29,18 @@ from restalchemy.dm import relationships
 from restalchemy.dm import types
 from restalchemy.dm import types_dynamic
 from restalchemy.storage.sql import orm
+from restalchemy.storage.sql import utils
 
 from workspace.bridges.zulip import client
 from workspace.messenger_api.dm import external_models
 
 
+LOG = logging.getLogger(__name__)
 MAX_HISTORY_MESSAGES = 5000
+TASK_PRIORITY_IMPORT_HISTORY = 0
+TASK_PRIORITY_INITIALIZE_CONNECTION = 100
+TASK_PRIORITY_REALTIME_MESSAGE = 200
+TASK_RETRY_DELAY = datetime.timedelta(minutes=1)
 
 
 class MessageContent(
@@ -249,18 +259,25 @@ class ZulipFile(
 
 class AbstractTaskContent(types_dynamic.AbstractKindModel):
     @abc.abstractmethod
-    def execute(self) -> None:
+    def execute(self, task: "Task") -> None:
         raise NotImplementedError()
 
+    def on_error(self, task: "Task", error: Exception) -> None:
+        pass
 
-class CheckConnectionContent(AbstractTaskContent):
-    KIND = "check_connection"
+    def on_done(self, task: "Task") -> None:
+        pass
 
-    external_account_uuid = properties.property(types.UUID(), required=True)
 
-    def execute(self) -> None:
+class InitializeConnectionContent(AbstractTaskContent):
+    KIND = "initialize_connection"
+
+    def execute(self, task: "Task") -> None:
         account = external_models.ExternalAccount.objects.get_one(
-            filters={"uuid": filters.EQ(self.external_account_uuid)},
+            filters={
+                "uuid": filters.EQ(task.external_account_uuid),
+                "project_id": filters.EQ(task.project_id),
+            },
         )
         zulip = client.ZulipClient(account)
         try:
@@ -268,25 +285,68 @@ class CheckConnectionContent(AbstractTaskContent):
         finally:
             zulip.close()
 
+    def on_done(self, task: "Task") -> None:
+        account = external_models.ExternalAccount.objects.get_one(
+            filters={
+                "uuid": filters.EQ(task.external_account_uuid),
+                "project_id": filters.EQ(task.project_id),
+            },
+        )
+        account.update_status(external_models.ExternalAccountStatus.BACKFILL.value)
+
+    def on_error(self, task: "Task", error: Exception) -> None:
+        response = error.response if isinstance(error, requests.HTTPError) else None
+        if isinstance(error, (requests.ConnectionError, requests.Timeout)) or (
+            response is not None
+            and (response.status_code in (408, 429) or response.status_code >= 500)
+        ):
+            task.status = TaskStatus.RETRY.value
+            task.next_retry_at = (
+                datetime.datetime.now(datetime.timezone.utc) + TASK_RETRY_DELAY
+            )
+            description = f"{error}\nNext retry at: {task.next_retry_at.isoformat()}"
+        elif response is not None:
+            result = response.json()
+            description = (
+                f"HTTP {response.status_code} {result['code']}: {result['msg']}"
+            )
+            task.status = TaskStatus.ERROR.value
+            task.error_description = description
+        else:
+            return
+        account = external_models.ExternalAccount.objects.get_one(
+            filters={
+                "uuid": filters.EQ(task.external_account_uuid),
+                "project_id": filters.EQ(task.project_id),
+            },
+        )
+        account.update_status(
+            external_models.ExternalAccountStatus.ERROR.value,
+            error_description=description,
+        )
+
 
 class ImportHistoryContent(AbstractTaskContent):
     KIND = "import_history"
 
-    external_account_uuid = properties.property(types.UUID(), required=True)
-    first_message_id = properties.property(types.Integer(min_value=1), required=True)
-    last_message_id = properties.property(types.Integer(min_value=1), required=True)
+    first_message_id = properties.property(
+        types.Integer(min_value=1), required=True, read_only=True
+    )
+    last_message_id = properties.property(
+        types.Integer(min_value=1), required=True, read_only=True
+    )
 
     def validate(self) -> None:
         count = self.last_message_id - self.first_message_id + 1
         if not 1 <= count <= MAX_HISTORY_MESSAGES:
             raise exceptions.ValidationErrorException()
 
-    def execute(self) -> None:
+    def execute(self, task: "Task") -> None:
         raise NotImplementedError("History import execution is not implemented yet")
 
 
 TASK_CONTENT_TYPE = types_dynamic.KindModelSelectorType(
-    types_dynamic.KindModelType(CheckConnectionContent),
+    types_dynamic.KindModelType(InitializeConnectionContent),
     types_dynamic.KindModelType(ImportHistoryContent),
 )
 
@@ -296,23 +356,31 @@ class TaskStatus(str, enum.Enum):
     RETRY = "retry"
     ERROR = "error"
     DONE = "done"
+    CANCEL = "cancel"
 
 
 class Task(
     models.ModelWithUUID,
+    models.ModelWithProject,
     models.ModelWithTimestamp,
     orm.SQLStorableMixin,
 ):
     __tablename__ = "bridge_zulip_v5_tasks"
 
-    priority = properties.property(types.Integer(min_value=0), default=0)
+    external_account_uuid = properties.property(types.UUID(), required=True)
+    priority = properties.property(
+        types.Integer(min_value=0), default=TASK_PRIORITY_IMPORT_HISTORY
+    )
     status = properties.property(
         types.Enum([status.value for status in TaskStatus]),
         default=TaskStatus.NEW.value,
     )
-    content = properties.property(TASK_CONTENT_TYPE, required=True)
+    content = properties.property(TASK_CONTENT_TYPE, required=True, read_only=True)
     error_description = properties.property(
         types.AllowNone(types.String()), default=None
+    )
+    not_before_at = properties.property(
+        types.AllowNone(types.UTCDateTimeZ()), default=None
     )
     next_retry_at = properties.property(
         types.AllowNone(types.UTCDateTimeZ()), default=None
@@ -322,5 +390,77 @@ class Task(
         types.AllowNone(types.UTCDateTimeZ()), default=None
     )
 
+    def cancel_pending_tasks(self, exclude_current: bool = False) -> int:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        session = contexts.Context().get_session()
+        cancelled = session.execute(
+            """
+            UPDATE bridge_zulip_v5_tasks
+            SET status = %s, next_retry_at = NULL,
+                lease_owner = NULL, lease_expires_at = NULL, updated_at = %s
+            WHERE external_account_uuid = %s AND project_id = %s
+                AND status IN (%s, %s)
+                AND (NOT %s OR uuid <> %s)
+            RETURNING uuid
+            """,
+            (
+                TaskStatus.CANCEL.value,
+                now.replace(tzinfo=None),
+                self.external_account_uuid,
+                self.project_id,
+                TaskStatus.NEW.value,
+                TaskStatus.RETRY.value,
+                exclude_current,
+                self.uuid,
+            ),
+        ).fetchall()
+        if any(row["uuid"] == self.uuid for row in cancelled):
+            self.status = TaskStatus.CANCEL.value
+            self.next_retry_at = None
+            self.lease_owner = None
+            self.lease_expires_at = None
+            self.properties["updated_at"].set_value_force(now)
+        return len(cancelled)
+
     def execute(self) -> None:
-        return self.content.execute()
+        self.error_description = None
+        self.next_retry_at = None
+        try:
+            with utils.savepoint():
+                self.content.execute(self)
+        except Exception as error:
+            LOG.exception("Task %s failed", self.uuid)
+            self.on_error(error)
+        else:
+            self.on_done()
+
+    def on_error(self, error: Exception) -> None:
+        self.status = TaskStatus.ERROR.value
+        self.error_description = str(error)
+        self.next_retry_at = None
+        try:
+            with utils.savepoint():
+                self.content.on_error(self, error)
+        except Exception as handler_error:
+            LOG.exception("Task %s error handler failed", self.uuid)
+            self.status = TaskStatus.ERROR.value
+            self.error_description = f"{error}\nError handler failed: {handler_error}"
+            self.next_retry_at = None
+        self.lease_owner = None
+        self.lease_expires_at = None
+        self.update()
+
+    def on_done(self) -> None:
+        self.status = TaskStatus.DONE.value
+        self.error_description = None
+        self.next_retry_at = None
+        try:
+            with utils.savepoint():
+                self.content.on_done(self)
+        except Exception as error:
+            LOG.exception("Task %s completion handler failed", self.uuid)
+            self.on_error(error)
+        else:
+            self.lease_owner = None
+            self.lease_expires_at = None
+            self.update()

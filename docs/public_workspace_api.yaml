@@ -327,6 +327,11 @@ components:
           example: 00000000-0000-0000-0000-000000000000
           format: uuid
           readOnly: true
+        project_id:
+          type: string
+          example: 00000000-0000-0000-0000-000000000000
+          format: uuid
+          readOnly: true
         created_at:
           type: string
           x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
@@ -372,13 +377,8 @@ components:
           type: string
           example: any_string
           nullable: true
-        revision:
-          type: integer
-          example: 1
-          minimum: 1
-          readOnly: true
-          default: 1
       required:
+      - project_id
       - provider
       - settings
     ExternalAccount_Create:
@@ -2224,6 +2224,14 @@ components:
         format: uuid
         readOnly: true
       required: true
+    ExternalAccount_project_id:
+      name: project_id
+      in: query
+      schema:
+        type: string
+        example: 00000000-0000-0000-0000-000000000000
+        format: uuid
+        readOnly: true
     ExternalAccount_created_at:
       name: created_at
       in: query
@@ -2295,15 +2303,6 @@ components:
         type: string
         example: any_string
         nullable: true
-    ExternalAccount_revision:
-      name: revision
-      in: query
-      schema:
-        type: integer
-        example: 1
-        minimum: 1
-        readOnly: true
-        default: 1
     WorkspaceFile_uuid:
       name: uuid
       in: query
@@ -4830,20 +4829,20 @@ paths:
         - created_at
         - error_description
         - owner_user_uuid
+        - project_id
         - provider
-        - revision
         - settings
         - status
         - updated_at
         - uuid
       - $ref: '#/components/parameters/ExternalAccount_uuid'
+      - $ref: '#/components/parameters/ExternalAccount_project_id'
       - $ref: '#/components/parameters/ExternalAccount_created_at'
       - $ref: '#/components/parameters/ExternalAccount_updated_at'
       - $ref: '#/components/parameters/ExternalAccount_owner_user_uuid'
       - $ref: '#/components/parameters/ExternalAccount_provider'
       - $ref: '#/components/parameters/ExternalAccount_status'
       - $ref: '#/components/parameters/ExternalAccount_error_description'
-      - $ref: '#/components/parameters/ExternalAccount_revision'
       - name: page_limit
         in: query
         description: Maximum resources returned in this page.
@@ -4919,12 +4918,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ExternalAccount_Get'
-          headers:
-            ETag:
-              description: Strong entity tag containing the current draft revision.
-              schema:
-                type: string
-                pattern: ^"[1-9][0-9]*"$
         default:
           $ref: '#/components/responses/Error'
       operationId: Get_v1_messenger_external_accounts_ExternalAccountUuid
@@ -4936,13 +4929,6 @@ paths:
       - ExternalAccount
       parameters:
       - $ref: '#/components/parameters/ExternalAccountUuid'
-      - name: If-Match
-        in: header
-        required: true
-        description: Strong ETag returned by the latest draft response.
-        schema:
-          type: string
-          pattern: ^"[1-9][0-9]*"$
       responses:
         '200':
           description: ExternalAccount_Update
@@ -4950,12 +4936,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ExternalAccount_Update'
-          headers:
-            ETag:
-              description: Strong entity tag containing the current draft revision.
-              schema:
-                type: string
-                pattern: ^"[1-9][0-9]*"$
         default:
           $ref: '#/components/responses/Error'
       operationId: Update_v1_messenger_external_accounts_ExternalAccountUuid

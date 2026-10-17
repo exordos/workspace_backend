@@ -35,12 +35,14 @@ def test_registration_accepts_a_provider_without_an_enrolled_bridge(monkeypatch)
         application_services.ExternalAccountActor(owner_uuid, project_uuid),
         {
             "uuid": account_uuid,
+            "project_id": sys_uuid.uuid4(),
             "provider": "example",
             "settings": {"account_name": "External account"},
         },
     )
 
     assert account.uuid == account_uuid
+    assert account.project_id == project_uuid
     assert account.owner_user_uuid == owner_uuid
     assert account.provider == "example"
     assert account.status == external_models.ExternalAccountStatus.NEW.value
@@ -54,6 +56,7 @@ def test_registration_accepts_a_provider_without_an_enrolled_bridge(monkeypatch)
 @pytest.mark.parametrize("status", list(external_models.ExternalAccountStatus))
 def test_external_account_accepts_status(status):
     account = external_models.ExternalAccount(
+        project_id=sys_uuid.uuid4(),
         owner_user_uuid=sys_uuid.uuid4(),
         provider="example",
         settings={},
@@ -67,6 +70,7 @@ def test_external_account_accepts_status(status):
 def test_external_account_rejects_invalid_status(status):
     with pytest.raises(ra_exc.TypeError):
         external_models.ExternalAccount(
+            project_id=sys_uuid.uuid4(),
             owner_user_uuid=sys_uuid.uuid4(),
             provider="example",
             settings={},
@@ -76,6 +80,7 @@ def test_external_account_rejects_invalid_status(status):
 
 def test_external_account_stores_error_description():
     account = external_models.ExternalAccount(
+        project_id=sys_uuid.uuid4(),
         owner_user_uuid=sys_uuid.uuid4(),
         provider="example",
         settings={},

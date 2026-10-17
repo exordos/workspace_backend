@@ -644,3 +644,16 @@ def test_external_account_status_contract():
     assert "status" not in schema["required"]
     assert schema["properties"]["error_description"]["type"] == "string"
     assert schema["properties"]["error_description"]["nullable"] is True
+    assert "revision" not in schema["properties"]
+    assert schema["properties"]["project_id"]["format"] == "uuid"
+    assert schema["properties"]["project_id"]["readOnly"] is True
+    assert "project_id" in schema["required"]
+    resource = specification["paths"][
+        "/v1/messenger/external_accounts/{ExternalAccountUuid}"
+    ]
+    assert all(
+        _component_parameter(specification, parameter)["name"] != "If-Match"
+        for parameter in resource["put"]["parameters"]
+    )
+    for method in ("get", "put"):
+        assert "ETag" not in resource[method]["responses"][200].get("headers", {})

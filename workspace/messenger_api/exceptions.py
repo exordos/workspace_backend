@@ -152,13 +152,3 @@ class DraftPreconditionFailedError(ra_exc.RestAlchemyException):
 class ExternalResourceForbiddenError(ra_exc.RestAlchemyException):
     message = "External resource access is forbidden"
     code = 403
-
-
-class ExternalPreconditionRequiredError(ra_exc.RestAlchemyException):
-    message = "External resource mutation requires If-Match"
-    code = 428
-
-
-class ExternalPreconditionFailedError(ra_exc.RestAlchemyException):
-    message = "External resource revision does not match If-Match"
-    code = 412

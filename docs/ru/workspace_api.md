@@ -321,10 +321,10 @@ GET /api/workspace/v1/events/?epoch_version%3E=123&epoch_generation=781203&page_
 | `GET` | `/api/workspace/v1/messenger/drafts/{draft_uuid}` | Получить собственный проект и его сильный пересмотр ETag. |
 | `PUT` | `/api/workspace/v1/messenger/drafts/{draft_uuid}` | Заменить только полезную нагрузку Markdown с помощью `If-Match`. |
 | `DELETE` | `/api/workspace/v1/messenger/drafts/{draft_uuid}` | Строго удалить собственный проект с помощью `If-Match`. |
-| `GET` | `/api/workspace/v1/messenger/external_accounts/` | Перечислите внешние учетные записи текущего пользователя в области глобального значения; требуется `workspace.external_account.read`. |
-| `POST` | `/api/workspace/v1/messenger/external_accounts/` | Создать внешнюю учетную запись с генерируемым клиентом UUID и учетными данными только для записи; требуется `workspace.external_account.create`. |
+| `GET` | `/api/workspace/v1/messenger/external_accounts/` | List the current user's external accounts in the request project; requires `workspace.external_account.read`. |
+| `POST` | `/api/workspace/v1/messenger/external_accounts/` | Create an external account using `project_id` from the request context; requires `workspace.external_account.create`. |
 | `GET` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Получить очищенный внешний снимок аккаунта владельца; требует `workspace.external_account.read`. |
-| `PUT` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Заменить изменяемые несекретные настройки с помощью `If-Match`; требует `workspace.external_account.update`. |
+| `PUT` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Replace mutable settings; requires `workspace.external_account.update`. |
 | `DELETE` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Удалить счет и его проекцию; требуется `workspace.external_account.delete`. |
 | `POST` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}/actions/reconnect/invoke` | Проверьте и замените учетные данные только для записи, затем возобновите синхронизацию; требуется `workspace.external_account.reconnect`. |
 | `POST` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}/actions/disconnect/invoke` | Остановить синхронизацию при сохранении проекции только для чтения; требует `workspace.external_account.disconnect`. |
