@@ -17,9 +17,11 @@ LOG = logging.getLogger(__name__)
 
 
 class HistoryImportService(basic.BasicService):
-    def _process_task(self) -> None:
-        for task in self._get_tasks():
+    def _process_task(self) -> bool:
+        tasks = self._get_tasks()
+        for task in tasks:
             self._execute_task(task)
+        return bool(tasks)
 
     def _get_tasks(self) -> list[models.Task]:
         now = datetime.datetime.now(datetime.timezone.utc)
@@ -56,4 +58,6 @@ class HistoryImportService(basic.BasicService):
 
     def _iteration(self) -> None:
         with contexts.Context().session_manager():
-            self._process_task()
+            processed = self._process_task()
+        if processed:
+            self.boost(iterations=2)

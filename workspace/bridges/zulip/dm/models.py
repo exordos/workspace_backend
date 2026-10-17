@@ -17,6 +17,7 @@
 import abc
 import datetime
 import enum
+import hashlib
 import logging
 import urllib.parse
 import uuid as sys_uuid
@@ -39,8 +40,9 @@ from workspace.messenger_api.dm import external_models
 
 LOG = logging.getLogger(__name__)
 MAX_HISTORY_MESSAGES = 5000
-TASK_PRIORITY_IMPORT_HISTORY = 0
+TASK_PRIORITY_IMPORT_HISTORY = 20
 TASK_PRIORITY_IMPORT_CHANNELS = 50
+TASK_PRIORITY_FULL_BACKFILL = 100
 TASK_PRIORITY_INITIALIZE_CONNECTION = 100
 TASK_PRIORITY_REALTIME_MESSAGE = 200
 TASK_RETRY_DELAY = datetime.timedelta(minutes=1)
@@ -158,6 +160,7 @@ class ZulipTopic(
 
 class ZulipMessage(
     models.ModelWithUUID,
+    models.ModelWithProject,
     models.ModelWithTimestamp,
     orm.SQLStorableMixin,
 ):
@@ -169,6 +172,7 @@ class ZulipMessage(
         types.UUID(),
         required=True,
     )
+    message_uuid = properties.property(types.UUID(), required=True)
     message_id = properties.property(
         types.Integer(min_value=1),
         required=True,
@@ -335,9 +339,47 @@ class InitializeConnectionContent(AbstractZulipTaskContent):
         Task(
             project_id=task.project_id,
             external_account_uuid=task.external_account_uuid,
+            priority=TASK_PRIORITY_FULL_BACKFILL,
+            content=FullBackfillContent(),
+        ).insert()
+
+
+class FullBackfillContent(AbstractZulipTaskContent):
+    KIND = "full_backfill"
+
+    def execute(self, task: "Task") -> None:
+        account = external_models.ExternalAccount.objects.get_one(
+            filters={
+                "uuid": filters.EQ(task.external_account_uuid),
+                "project_id": filters.EQ(task.project_id),
+            },
+        )
+        zulip = client.ZulipClient(account)
+        try:
+            last_message_id = zulip.get_last_message_id()
+        finally:
+            zulip.close()
+        Task(
+            project_id=task.project_id,
+            external_account_uuid=task.external_account_uuid,
             priority=TASK_PRIORITY_IMPORT_CHANNELS,
             content=ImportChannelsContent(),
         ).insert()
+        for first_message_id in reversed(
+            range(1, last_message_id + 1, MAX_HISTORY_MESSAGES)
+        ):
+            Task(
+                project_id=task.project_id,
+                external_account_uuid=task.external_account_uuid,
+                priority=TASK_PRIORITY_IMPORT_HISTORY,
+                content=ImportHistoryContent(
+                    first_message_id=first_message_id,
+                    last_message_id=min(
+                        first_message_id + MAX_HISTORY_MESSAGES - 1,
+                        last_message_id,
+                    ),
+                ),
+            ).insert()
 
 
 class ImportChannelsContent(AbstractZulipTaskContent):
@@ -418,7 +460,7 @@ class ImportChannelsContent(AbstractZulipTaskContent):
         ).insert()
 
 
-class ImportHistoryContent(AbstractTaskContent):
+class ImportHistoryContent(AbstractZulipTaskContent):
     KIND = "import_history"
 
     first_message_id = properties.property(
@@ -434,11 +476,118 @@ class ImportHistoryContent(AbstractTaskContent):
             raise exceptions.ValidationErrorException()
 
     def execute(self, task: "Task") -> None:
-        raise NotImplementedError("History import execution is not implemented yet")
+        account = external_models.ExternalAccount.objects.get_one(
+            filters={
+                "uuid": filters.EQ(task.external_account_uuid),
+                "project_id": filters.EQ(task.project_id),
+            },
+        )
+        hostname = urllib.parse.urlsplit(account.settings["server_url"]).hostname
+        server_namespace = sys_uuid.uuid5(sys_uuid.NAMESPACE_DNS, hostname)
+        zulip = client.ZulipClient(account)
+        try:
+            for data in zulip.get_messages(self.first_message_id, self.last_message_id):
+                if data["type"] != "stream":
+                    continue
+                channel = ZulipChannel.objects.get_one(
+                    filters={
+                        "external_account_uuid": filters.EQ(account.uuid),
+                        "stream_id": filters.EQ(data["stream_id"]),
+                    },
+                )
+                topic_uuid = sys_uuid.uuid5(channel.uuid, data["subject"])
+                topic = ZulipTopic.objects.get_one_or_none(
+                    filters={"uuid": filters.EQ(topic_uuid)},
+                )
+                if topic is None:
+                    topic = ZulipTopic(
+                        uuid=topic_uuid,
+                        stream_id=data["stream_id"],
+                        name=data["subject"],
+                        max_id=data["id"],
+                    )
+                    topic.insert()
+                elif data["id"] > topic.max_id:
+                    topic.max_id = data["id"]
+                    topic.update()
+                message = ZulipMessage.objects.get_one_or_none(
+                    filters={
+                        "external_account_uuid": filters.EQ(account.uuid),
+                        "project_id": filters.EQ(task.project_id),
+                        "message_id": filters.EQ(data["id"]),
+                    },
+                )
+                content_hash = hashlib.sha256(
+                    data["content"].encode("utf-8")
+                ).hexdigest()
+                content_updated_at = datetime.datetime.fromtimestamp(
+                    data.get("last_edit_timestamp", data["timestamp"]),
+                    tz=datetime.timezone.utc,
+                )
+                content_values = {
+                    "zulip_content": data["content"],
+                    "workspace_content": data["content"],
+                    "zulip_content_hash": content_hash,
+                    "workspace_content_hash": content_hash,
+                    "zulip_content_updated_at": content_updated_at,
+                    "workspace_content_updated_at": content_updated_at,
+                }
+                if message is None:
+                    content = MessageContent(**content_values)
+                    content.insert()
+                else:
+                    content = message.content
+                    content.update_dm(values=content_values)
+                    content.update()
+                values = {
+                    "message_uuid": sys_uuid.uuid5(server_namespace, str(data["id"])),
+                    "message_id": data["id"],
+                    "sender_id": data["sender_id"],
+                    "timestamp": data["timestamp"],
+                    "channel": channel,
+                    "topic": topic,
+                    "content": content,
+                    "is_me_message": data["is_me_message"],
+                    **{
+                        flag: flag in data["flags"]
+                        for flag in (
+                            "read",
+                            "starred",
+                            "collapsed",
+                            "hide_link_previews",
+                            "mentioned",
+                            "stream_wildcard_mentioned",
+                            "topic_wildcard_mentioned",
+                            "has_alert_word",
+                            "historical",
+                        )
+                    },
+                }
+                if message is None:
+                    ZulipMessage(
+                        project_id=task.project_id,
+                        external_account_uuid=account.uuid,
+                        **values,
+                    ).insert()
+                else:
+                    message.update_dm(values=values)
+                    message.update()
+        finally:
+            zulip.close()
+
+    def on_done(self, task: "Task") -> None:
+        account = external_models.ExternalAccount.objects.get_one(
+            filters={
+                "uuid": filters.EQ(task.external_account_uuid),
+                "project_id": filters.EQ(task.project_id),
+            },
+        )
+        account.update_status(external_models.ExternalAccountStatus.BACKFILL.value)
 
 
 TASK_CONTENT_TYPE = types_dynamic.KindModelSelectorType(
     types_dynamic.KindModelType(InitializeConnectionContent),
+    types_dynamic.KindModelType(FullBackfillContent),
     types_dynamic.KindModelType(ImportChannelsContent),
     types_dynamic.KindModelType(ImportHistoryContent),
 )

@@ -38,7 +38,7 @@ def _task():
 def test_task_is_concrete_with_priority_and_retry_status():
     task = _task()
     assert not inspect.isabstract(models.Task)
-    assert task.priority == 0
+    assert task.priority == models.TASK_PRIORITY_IMPORT_HISTORY == 20
     assert task.status == "new"
     assert task.error_description is None
     assert task.not_before_at is None
@@ -154,6 +154,91 @@ def test_client_gets_channels_including_archived():
     session.close.assert_called_once()
 
 
+@pytest.mark.parametrize(
+    "messages,expected", [([], 0), ([{"id": 1}], 1), ([{"id": 10005}], 10005)]
+)
+def test_client_gets_last_available_message_id(messages, expected):
+    account = mock.Mock(
+        settings={
+            "server_url": "https://zulip.example.com/",
+            "email": "user@example.com",
+            "api_key": "test-key",
+        }
+    )
+    session = mock.Mock()
+    session.get.return_value.json.return_value = {
+        "result": "success",
+        "messages": messages,
+    }
+    with mock.patch.object(client.requests, "Session", return_value=session):
+        zulip = client.ZulipClient(account)
+        assert zulip.get_last_message_id() == expected
+        zulip.close()
+    session.get.assert_called_once_with(
+        "https://zulip.example.com/api/v1/messages",
+        params={
+            "anchor": "newest",
+            "num_before": 1,
+            "num_after": 0,
+            "apply_markdown": "false",
+        },
+        timeout=(5, 30),
+    )
+    session.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    "last_message_id,expected_ranges",
+    [
+        (0, []),
+        (1, [(1, 1)]),
+        (5000, [(1, 5000)]),
+        (5001, [(5001, 5001), (1, 5000)]),
+        (10005, [(10001, 10005), (5001, 10000), (1, 5000)]),
+    ],
+)
+def test_full_backfill_creates_channel_and_bounded_history_tasks(
+    last_message_id, expected_ranges
+):
+    task = models.Task(
+        project_id=uuid.uuid4(),
+        external_account_uuid=uuid.uuid4(),
+        content=models.TASK_CONTENT_TYPE.from_simple_type({"kind": "full_backfill"}),
+    )
+    zulip = mock.Mock()
+    zulip.get_last_message_id.return_value = last_message_id
+    with (
+        mock.patch.object(external_models.ExternalAccount, "objects"),
+        mock.patch.object(client, "ZulipClient", return_value=zulip),
+        mock.patch.object(models.Task, "insert", autospec=True) as insert,
+    ):
+        task.content.execute(task)
+    children = [call.args[0] for call in insert.call_args_list]
+    assert len(children) == len(expected_ranges) + 1
+    assert all(child.project_id == task.project_id for child in children)
+    assert all(
+        child.external_account_uuid == task.external_account_uuid for child in children
+    )
+    assert all(
+        child.status == "new" and child.not_before_at is None for child in children
+    )
+    assert isinstance(children[0].content, models.ImportChannelsContent)
+    assert children[0].priority == models.TASK_PRIORITY_IMPORT_CHANNELS == 50
+    assert [
+        (child.content.first_message_id, child.content.last_message_id)
+        for child in children[1:]
+    ] == expected_ranges
+    assert all(
+        isinstance(child.content, models.ImportHistoryContent) for child in children[1:]
+    )
+    assert all(
+        child.priority == models.TASK_PRIORITY_IMPORT_HISTORY == 20
+        for child in children[1:]
+    )
+    zulip.get_last_message_id.assert_called_once_with()
+    zulip.close.assert_called_once_with()
+
+
 def test_task_executes_connection_content():
     task = _task()
     account = mock.Mock(settings={"api_key": "test-key"})
@@ -181,9 +266,9 @@ def test_task_executes_connection_content():
     followup = insert.call_args.args[0]
     assert followup.project_id == task.project_id
     assert followup.external_account_uuid == task.external_account_uuid
-    assert followup.priority == models.TASK_PRIORITY_IMPORT_CHANNELS == 50
+    assert followup.priority == models.TASK_PRIORITY_FULL_BACKFILL
     assert followup.not_before_at is None
-    assert isinstance(followup.content, models.ImportChannelsContent)
+    assert isinstance(followup.content, models.FullBackfillContent)
 
 
 def test_success_calls_task_and_content_hooks_with_the_task(_task_storage):
@@ -352,12 +437,58 @@ def test_content_closes_client_and_propagates_execution_errors(operation, error)
     zulip.close.assert_called_once()
 
 
-def test_history_execution_remains_unimplemented():
+@pytest.mark.parametrize("first,last", [(10, 20), (10, 10), (1, 5000)])
+def test_client_gets_only_messages_in_the_inclusive_range(first, last):
+    account = mock.Mock(
+        settings={
+            "server_url": "https://zulip.example.com/",
+            "email": "user@example.com",
+            "api_key": "test-key",
+        }
+    )
+    session = mock.Mock()
+    messages = [{"id": message_id} for message_id in sorted({first, last})]
+    session.get.return_value.json.return_value = {
+        "result": "success",
+        "messages": [{"id": first - 1}, *messages, {"id": last + 1}],
+    }
+    with mock.patch.object(client.requests, "Session", return_value=session):
+        zulip = client.ZulipClient(account)
+        assert zulip.get_messages(first, last) == messages
+        zulip.close()
+    session.get.assert_called_once_with(
+        "https://zulip.example.com/api/v1/messages",
+        params={
+            "anchor": first,
+            "num_before": 0,
+            "num_after": last - first,
+            "include_anchor": "true",
+            "apply_markdown": "false",
+            "allow_empty_topic_name": "true",
+        },
+        timeout=(5, 30),
+    )
+    session.close.assert_called_once_with()
+
+
+def test_history_content_passes_bounds_and_closes_the_client():
     task = models.Task(
         project_id=uuid.uuid4(),
         external_account_uuid=uuid.uuid4(),
         content=models.ImportHistoryContent(first_message_id=1, last_message_id=5000),
     )
-    with pytest.raises(NotImplementedError, match="History import execution"):
+    account = mock.Mock(settings={"server_url": "https://zulip.example.com"})
+    zulip = mock.Mock()
+    zulip.get_messages.return_value = []
+    with (
+        mock.patch.object(external_models.ExternalAccount, "objects") as accounts,
+        mock.patch.object(client, "ZulipClient", return_value=zulip),
+    ):
+        accounts.get_one.return_value = account
         task.content.execute(task)
-    assert task.status == "new"
+    accounts.get_one.assert_called_once()
+    selected = accounts.get_one.call_args.kwargs["filters"]
+    assert selected["uuid"].value == task.external_account_uuid
+    assert selected["project_id"].value == task.project_id
+    zulip.get_messages.assert_called_once_with(1, 5000)
+    zulip.close.assert_called_once_with()

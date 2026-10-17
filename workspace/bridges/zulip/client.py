@@ -42,3 +42,33 @@ class ZulipClient:
 
     def get_channels(self) -> list[dict]:
         return self._get("/streams", params={"exclude_archived": "false"})["streams"]
+
+    def get_last_message_id(self) -> int:
+        messages = self._get(
+            "/messages",
+            params={
+                "anchor": "newest",
+                "num_before": 1,
+                "num_after": 0,
+                "apply_markdown": "false",
+            },
+        )["messages"]
+        return messages[-1]["id"] if messages else 0
+
+    def get_messages(self, first_message_id: int, last_message_id: int) -> list[dict]:
+        messages = self._get(
+            "/messages",
+            params={
+                "anchor": first_message_id,
+                "num_before": 0,
+                "num_after": last_message_id - first_message_id,
+                "include_anchor": "true",
+                "apply_markdown": "false",
+                "allow_empty_topic_name": "true",
+            },
+        )["messages"]
+        return [
+            message
+            for message in messages
+            if first_message_id <= message["id"] <= last_message_id
+        ]

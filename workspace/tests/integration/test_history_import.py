@@ -66,7 +66,7 @@ def _http_error(status_code, code="BAD_REQUEST", **details):
 
 
 @pytest.mark.parametrize("status", ["new", "error"])
-def test_successful_connection_starts_periodic_channel_sync(
+def test_successful_connection_starts_full_backfill_and_periodic_channel_sync(
     task_queue, monkeypatch, status
 ):
     task = task_queue()
@@ -80,7 +80,9 @@ def test_successful_connection_starts_periodic_channel_sync(
     account.settings = {"server_url": "https://zulip.example.com"}
     account.update()
     zulip = mock.Mock()
+    zulip.get_last_message_id.return_value = 10005
     zulip.get_channels.return_value = []
+    zulip.get_messages.return_value = []
     monkeypatch.setattr(client, "ZulipClient", lambda account: zulip)
 
     service = history_import.HistoryImportService()
@@ -99,7 +101,45 @@ def test_successful_connection_starts_periodic_channel_sync(
         }
     )
     assert len(pending) == 1
-    first_sync = pending[0]
+    full_backfill = pending[0]
+    assert isinstance(full_backfill.content, models.FullBackfillContent)
+    assert full_backfill.priority == models.TASK_PRIORITY_FULL_BACKFILL
+
+    service._iteration()
+
+    assert _stored(full_backfill).status == "done"
+    pending = models.Task.objects.get_all(
+        filters={
+            "external_account_uuid": filters.EQ(account.uuid),
+            "status": filters.EQ("new"),
+        }
+    )
+    assert len(pending) == 4
+    assert all(child.project_id == task.project_id for child in pending)
+    (first_sync,) = [
+        child
+        for child in pending
+        if isinstance(child.content, models.ImportChannelsContent)
+    ]
+    history = sorted(
+        [
+            child
+            for child in pending
+            if isinstance(child.content, models.ImportHistoryContent)
+        ],
+        key=lambda child: child.created_at,
+    )
+    assert [
+        (child.content.first_message_id, child.content.last_message_id)
+        for child in history
+    ] == [(10001, 10005), (5001, 10000), (1, 5000)]
+    assert all(
+        newer.created_at < older.created_at
+        for newer, older in zip(history, history[1:])
+    )
+    assert all(
+        child.priority == models.TASK_PRIORITY_IMPORT_HISTORY == 20 for child in history
+    )
     assert first_sync.project_id == account.project_id
     assert first_sync.priority == models.TASK_PRIORITY_IMPORT_CHANNELS == 50
     assert first_sync.not_before_at is None
@@ -116,8 +156,12 @@ def test_successful_connection_starts_periodic_channel_sync(
             "status": filters.EQ("new"),
         }
     )
-    assert len(pending) == 1
-    next_sync = pending[0]
+    assert len(pending) == 4
+    (next_sync,) = [
+        child
+        for child in pending
+        if isinstance(child.content, models.ImportChannelsContent)
+    ]
     assert next_sync.uuid != first_sync.uuid
     assert next_sync.project_id == account.project_id
     assert next_sync.priority == 50
@@ -127,14 +171,71 @@ def test_successful_connection_starts_periodic_channel_sync(
 
     service._iteration()
 
+    assert _stored(history[0]).status == "done"
+    zulip.get_messages.assert_called_once_with(10001, 10005)
     assert _stored(next_sync).status == "new"
+    service._iteration()
+    service._iteration()
+    service._iteration()
+
+    assert _stored(next_sync).status == "new"
+    assert all(_stored(child).status == "done" for child in history)
     zulip.check_connection.assert_called_once_with()
+    zulip.get_last_message_id.assert_called_once_with()
     zulip.get_channels.assert_called_once_with()
-    assert zulip.close.call_count == 2
+    assert zulip.get_messages.call_args_list == [
+        mock.call(10001, 10005),
+        mock.call(5001, 10000),
+        mock.call(1, 5000),
+    ]
+    assert zulip.close.call_count == 6
+
+
+@pytest.mark.parametrize("phase", ["fetch", "auth", "close", "queue"])
+def test_failed_full_backfill_does_not_leave_partial_child_tasks(
+    task_queue, monkeypatch, phase
+):
+    initial = task_queue(status="done")
+    task = models.Task(
+        project_id=initial.project_id,
+        external_account_uuid=initial.external_account_uuid,
+        priority=models.TASK_PRIORITY_FULL_BACKFILL,
+        content=models.FullBackfillContent(),
+    )
+    task.insert()
+    zulip = mock.Mock()
+    zulip.get_last_message_id.return_value = 10005
+    monkeypatch.setattr(client, "ZulipClient", lambda account: zulip)
+    if phase == "fetch":
+        zulip.get_last_message_id.side_effect = requests.Timeout("Timed out")
+    elif phase == "auth":
+        zulip.get_last_message_id.side_effect = _http_error(401, "INVALID_API_KEY")
+    elif phase == "close":
+        zulip.close.side_effect = RuntimeError("Close failed")
+    else:
+        insert_task = models.Task.insert
+        attempts = []
+
+        def insert(current_task, *args, **kwargs):
+            attempts.append(current_task.uuid)
+            if len(attempts) == 3:
+                raise RuntimeError("Queue failed")
+            return insert_task(current_task, *args, **kwargs)
+
+        monkeypatch.setattr(models.Task, "insert", insert)
+
+    history_import.HistoryImportService()._iteration()
+
+    stored = models.Task.objects.get_all(
+        filters={"external_account_uuid": filters.EQ(task.external_account_uuid)}
+    )
+    assert {item.uuid for item in stored} == {initial.uuid, task.uuid}
+    assert _stored(task).status == ("retry" if phase == "fetch" else "error")
+    zulip.close.assert_called_once_with()
 
 
 @pytest.mark.parametrize("phase", ["check", "close", "status", "queue"])
-def test_failed_connection_does_not_queue_channel_sync(task_queue, monkeypatch, phase):
+def test_failed_connection_does_not_queue_full_backfill(task_queue, monkeypatch, phase):
     task = task_queue()
     zulip = mock.Mock()
     monkeypatch.setattr(client, "ZulipClient", lambda account: zulip)
