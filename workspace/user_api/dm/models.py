@@ -25,6 +25,8 @@ from restalchemy.dm import types
 from restalchemy.dm import types_dynamic
 from restalchemy.storage.sql import orm
 
+from workspace.common import models as common_models
+
 
 class ChatType(str, enum.Enum):
     STREAM = "stream"
@@ -131,7 +133,7 @@ class FolderItemRAFix(FolderItem):
 
 class Service(
     models.ModelWithUUID,
-    models.ModelWithRequiredNameDesc,
+    common_models.ModelWithRequiredNameDesc,
     models.ModelWithTimestamp,
     orm.SQLStorableMixin,
 ):
@@ -153,7 +155,7 @@ class NativeSource(types_dynamic.AbstractKindModel):
 
 class WorkspaceStream(
     models.ModelWithUUID,
-    models.ModelWithRequiredNameDesc,
+    common_models.ModelWithRequiredNameDesc,
     models.ModelWithTimestamp,
     orm.SQLStorableMixin,
 ):

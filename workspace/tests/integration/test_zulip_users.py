@@ -985,7 +985,7 @@ def test_unknown_identity_outside_zulip_project_does_not_block_user_import(
 
 
 def test_connection_checks_run_before_immediate_user_import_retry(
-    user_import_account, db, monkeypatch
+    user_import_account, db, monkeypatch, scheduled_reconciliation
 ):
     account = user_import_account
     peer_owner = uuid.uuid4()

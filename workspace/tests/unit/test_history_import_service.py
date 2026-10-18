@@ -36,6 +36,7 @@ def test_busy_loop_runs_without_waiting_and_restores_idle_pacing():
         service.stop()
 
     with (
+        mock.patch.object(service, "_ensure_reconciliation_task"),
         mock.patch.object(
             history_import.contexts.Context,
             "session_manager",
@@ -80,6 +81,7 @@ def test_failed_iteration_does_not_enable_boost(phase):
             raise error
 
     with (
+        mock.patch.object(service, "_ensure_reconciliation_task"),
         mock.patch.object(
             history_import.contexts.Context,
             "session_manager",

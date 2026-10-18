@@ -26,6 +26,7 @@ from restalchemy.openapi import constants as oa_c
 from restalchemy.openapi import utils as oa_utils
 from webob import multidict
 
+from workspace.common import models as common_models
 from workspace.messenger_api import file_storage
 from workspace.messenger_api import application_services
 from workspace.messenger_api import events as messenger_events
@@ -673,7 +674,10 @@ setattr(
                         "properties": {
                             "stream_uuid": {"format": "uuid", "type": "string"},
                             "name": {"type": "string"},
-                            "description": {"type": "string"},
+                            "description": {
+                                "type": "string",
+                                "maxLength": common_models.DESCRIPTION_MAX_LENGTH,
+                            },
                             "content_type": {"type": "string"},
                             "size_bytes": {"minimum": 0, "type": "integer"},
                             "hash": {"type": "string"},
@@ -698,7 +702,10 @@ setattr(
                                 "type": "string",
                             },
                             "name": {"type": "string"},
-                            "description": {"type": "string"},
+                            "description": {
+                                "type": "string",
+                                "maxLength": common_models.DESCRIPTION_MAX_LENGTH,
+                            },
                         },
                         "oneOf": [
                             {

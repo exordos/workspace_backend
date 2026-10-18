@@ -28,6 +28,7 @@ below the auth layer, including the composite-primary-key controllers.
 """
 
 import contextlib
+import datetime
 import json
 import os
 import pathlib
@@ -54,6 +55,7 @@ from oslo_config import cfg
 from workspace.common import file_storage_opts
 from workspace.common import messenger_reaction_opts
 from workspace.common import topic_summary_opts
+from workspace.bridges.zulip.dm import models as zulip_models
 from workspace.messenger_api.api import context as auth_context
 from workspace.messenger_api.api import middlewares as app_middlewares
 from workspace.tests.integration import legacy_store
@@ -390,6 +392,20 @@ def db():
         yield conn
     finally:
         conn.close()
+
+
+@pytest.fixture
+def scheduled_reconciliation(_database):
+    """Keep reconciliation waiting while exercising account-bound queue work."""
+    task = zulip_models.Task(
+        priority=zulip_models.TASK_PRIORITY_RECONCILIATION,
+        not_before_at=datetime.datetime.now(datetime.timezone.utc)
+        + datetime.timedelta(days=1),
+        content=zulip_models.ReconciliationContent(),
+    )
+    task.insert()
+    yield task
+    task.delete()
 
 
 # --------------------------------------------------------------------------- #

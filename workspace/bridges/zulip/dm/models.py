@@ -19,6 +19,7 @@ import datetime
 import enum
 import hashlib
 import logging
+import typing
 import uuid as sys_uuid
 
 import requests
@@ -34,9 +35,11 @@ from restalchemy.storage.sql import orm
 from restalchemy.storage.sql import utils
 
 from workspace.bridges.zulip import client
+from workspace.common import models as common_models
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.dm import models as messenger_models
+from workspace.messenger_api.dm import v2_models
 
 
 LOG = logging.getLogger(__name__)
@@ -44,10 +47,11 @@ MAX_HISTORY_MESSAGES = 5000
 TASK_PRIORITY_IMPORT_HISTORY = 10_000
 TASK_PRIORITY_IMPORT_HISTORY_MIN = 10
 TASK_PRIORITY_IMPORT_CHANNELS = 50_000
-TASK_PRIORITY_IMPORT_USERS = 200_000
+TASK_PRIORITY_IMPORT_USERS = 500_000
 TASK_PRIORITY_FULL_BACKFILL = 100_000
-TASK_PRIORITY_INITIALIZE_CONNECTION = 300_000
+TASK_PRIORITY_INITIALIZE_CONNECTION = 600_000
 TASK_PRIORITY_REALTIME_MESSAGE = 200_000
+TASK_PRIORITY_RECONCILIATION = 400_000
 TASK_RETRY_DELAY = datetime.timedelta(minutes=1)
 TASK_CHANNEL_SYNC_INTERVAL = datetime.timedelta(minutes=15)
 TASK_USER_SYNC_INTERVAL = datetime.timedelta(minutes=15)
@@ -100,6 +104,140 @@ class ZulipChannelType(str, enum.Enum):
     CHANNEL = "channel"
 
 
+class ZulipStreamState(
+    models.ModelWithID,
+    models.ModelWithProject,
+    orm.SQLStorableMixin,
+):
+    """Stream differences to reconcile between Zulip and Workspace."""
+
+    __tablename__ = "bridge_zulip_v5_stream_states"
+
+    project_id = properties.property(
+        types.UUID(), required=True, read_only=True, id_property=True
+    )
+    stream_uuid = properties.property(
+        types.UUID(), required=True, read_only=True, id_property=True
+    )
+    action = properties.property(
+        types.Enum(["create", "delete"]), required=True, read_only=True
+    )
+
+    @classmethod
+    def get_id_property(cls) -> dict[str, typing.Any]:
+        return cls.id_properties.copy()
+
+    def get_id(self) -> tuple[sys_uuid.UUID, sys_uuid.UUID]:
+        return self.project_id, self.stream_uuid
+
+    def do(self) -> None:
+        {
+            "create": self.create_workspace_stream,
+            "delete": self.delete_workspace_stream,
+        }[self.action]()
+
+    def create_workspace_stream(self) -> None:
+        channels = ZulipChannel.objects.get_all(
+            filters={"stream_uuid": filters.EQ(self.stream_uuid)},
+            order_by={"updated_at": "desc", "uuid": "asc"},
+        )
+        accounts = {
+            account.uuid: account
+            for account in external_models.ExternalAccount.objects.get_all(
+                filters={
+                    "uuid": filters.In(
+                        [channel.external_account_uuid for channel in channels]
+                    ),
+                    "project_id": filters.EQ(self.project_id),
+                    "provider": filters.EQ("zulip"),
+                },
+            )
+        }
+        channel = next(
+            channel for channel in channels if channel.external_account_uuid in accounts
+        )
+        account = accounts[channel.external_account_uuid]
+        {
+            ZulipChannelType.CHANNEL.value: self._create_channel_stream,
+            ZulipChannelType.GROUP.value: self._create_group_stream,
+            ZulipChannelType.PRIVATE.value: self._create_private_stream,
+        }[channel.channel_type](channel, account)
+
+    def _create_channel_stream(
+        self, channel: "ZulipChannel", account: external_models.ExternalAccount
+    ) -> None:
+        if channel.creator_id is not None:
+            account = external_models.ExternalAccount.objects.get_one(
+                filters={
+                    "project_id": filters.EQ(self.project_id),
+                    "provider": filters.EQ("zulip"),
+                    "external_account_id": filters.EQ(
+                        f"{account.get_host()}:{channel.creator_id}"
+                    ),
+                },
+            )
+        self._create_stream(channel, account.owner_user_uuid)
+
+    def _create_group_stream(
+        self, channel: "ZulipChannel", account: external_models.ExternalAccount
+    ) -> None:
+        self._create_stream(channel, account.owner_user_uuid)
+
+    def _create_private_stream(
+        self, channel: "ZulipChannel", account: external_models.ExternalAccount
+    ) -> None:
+        peer = external_models.ExternalAccount.objects.get_one(
+            filters={
+                "uuid": filters.EQ(channel.direct_user_uuid),
+                "project_id": filters.EQ(self.project_id),
+                "provider": filters.EQ("zulip"),
+            },
+        )
+        self._create_stream(channel, account.owner_user_uuid, peer.owner_user_uuid)
+
+    def _create_stream(
+        self,
+        channel: "ZulipChannel",
+        owner_uuid: sys_uuid.UUID,
+        direct_user_uuid: sys_uuid.UUID | None = None,
+    ) -> None:
+        messenger_models.WorkspaceStream(
+            uuid=self.stream_uuid,
+            project_id=self.project_id,
+            user_uuid=owner_uuid,
+            name=channel.name,
+            description=channel.description,
+            source_name=messenger_models.StreamSourceName.ZULIP.value,
+            source=messenger_models.ZulipSource(),
+            invite_only=channel.invite_only,
+            is_archived=channel.is_archived,
+            private=channel.channel_type == ZulipChannelType.PRIVATE.value,
+            direct_user_uuid=direct_user_uuid,
+            private_index=(
+                f"zulip:{self.stream_uuid}" if direct_user_uuid is not None else None
+            ),
+            created_at=(
+                datetime.datetime.fromtimestamp(
+                    channel.date_created, datetime.timezone.utc
+                )
+                if channel.date_created is not None
+                else channel.created_at
+            ),
+        ).insert()
+
+    def delete_workspace_stream(self) -> None:
+        stream = v2_models.WorkspaceStream.objects.get_one(
+            filters={
+                "project_id": filters.EQ(self.project_id),
+                "uuid": filters.EQ(self.stream_uuid),
+                "source_name": filters.EQ(
+                    messenger_models.StreamSourceName.ZULIP.value
+                ),
+            },
+        )
+        stream.delete()
+
+
 class ZulipChannel(
     models.ModelWithUUID,
     models.ModelWithTimestamp,
@@ -123,7 +261,7 @@ class ZulipChannel(
         required=True,
     )
     description = properties.property(
-        types.String(),
+        types.String(max_length=common_models.DESCRIPTION_MAX_LENGTH),
         required=True,
     )
     rendered_description = properties.property(
@@ -907,12 +1045,48 @@ class ImportHistoryContent(AbstractZulipTaskContent):
         account.update_status(external_models.ExternalAccountStatus.BACKFILL.value)
 
 
+class ReconciliationContent(AbstractTaskContent):
+    KIND = "reconciliation"
+
+    batch_size = properties.property(
+        types.Integer(min_value=1), default=1000, read_only=True
+    )
+    interval = properties.property(
+        types.Integer(min_value=0), default=10, read_only=True
+    )
+
+    def execute(self, task: "Task") -> None:
+        states = ZulipStreamState.objects.get_all(
+            order_by={"project_id": "asc", "stream_uuid": "asc"},
+            limit=self.batch_size,
+        )
+        for state in states:
+            state.do()
+        not_before_at = None
+        if len(states) < self.batch_size:
+            not_before_at = datetime.datetime.now(
+                datetime.timezone.utc
+            ) + datetime.timedelta(seconds=self.interval)
+        Task(
+            priority=TASK_PRIORITY_RECONCILIATION,
+            not_before_at=not_before_at,
+            content=self,
+        ).insert()
+
+    def on_error(self, task: "Task", error: Exception) -> None:
+        task.status = TaskStatus.RETRY.value
+        task.next_retry_at = datetime.datetime.now(
+            datetime.timezone.utc
+        ) + datetime.timedelta(seconds=self.interval)
+
+
 TASK_CONTENT_TYPE = types_dynamic.KindModelSelectorType(
     types_dynamic.KindModelType(InitializeConnectionContent),
     types_dynamic.KindModelType(FullBackfillContent),
     types_dynamic.KindModelType(ImportUsersContent),
     types_dynamic.KindModelType(ImportChannelsContent),
     types_dynamic.KindModelType(ImportHistoryContent),
+    types_dynamic.KindModelType(ReconciliationContent),
 )
 
 
@@ -933,7 +1107,12 @@ class Task(
 ):
     __tablename__ = "bridge_zulip_v5_tasks"
 
-    external_account_uuid = properties.property(types.UUID(), required=True)
+    project_id = properties.property(
+        types.AllowNone(types.UUID()), default=None, read_only=True
+    )
+    external_account_uuid = properties.property(
+        types.AllowNone(types.UUID()), default=None
+    )
     priority = properties.property(
         types.Integer(min_value=0), default=TASK_PRIORITY_IMPORT_HISTORY
     )
@@ -964,6 +1143,11 @@ class Task(
             and self.not_before_at > datetime.datetime.now(datetime.timezone.utc)
         ):
             self.status = TaskStatus.WAITING.value
+
+    def validate(self) -> None:
+        super().validate()
+        if self.external_account_uuid is not None and self.project_id is None:
+            raise exceptions.ValidationErrorException()
 
     def cancel_pending_tasks(self, exclude_current: bool = False) -> int:
         now = datetime.datetime.now(datetime.timezone.utc)

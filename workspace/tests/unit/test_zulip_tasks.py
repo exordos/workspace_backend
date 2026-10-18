@@ -54,6 +54,14 @@ def test_task_is_concrete_with_priority_and_retry_status():
     ]
 
 
+def test_account_bound_task_requires_project():
+    with pytest.raises(exceptions.ValidationErrorException):
+        models.Task(
+            external_account_uuid=uuid.uuid4(),
+            content=models.InitializeConnectionContent(),
+        )
+
+
 @pytest.mark.parametrize(
     "status,delay,expected",
     [
@@ -344,7 +352,7 @@ def test_full_backfill_creates_user_channel_and_bounded_history_tasks(
         child.status == "new" and child.not_before_at is None for child in children
     )
     assert isinstance(children[0].content, models.ImportUsersContent)
-    assert children[0].priority == models.TASK_PRIORITY_IMPORT_USERS == 200_000
+    assert children[0].priority == models.TASK_PRIORITY_IMPORT_USERS
     assert isinstance(children[1].content, models.ImportChannelsContent)
     assert children[1].priority == models.TASK_PRIORITY_IMPORT_CHANNELS == 50_000
     assert [

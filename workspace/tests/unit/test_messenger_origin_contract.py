@@ -351,7 +351,7 @@ def test_file_upload_openapi_keeps_required_multipart_contract():
             "type": "string",
         },
         "name": {"type": "string"},
-        "description": {"type": "string"},
+        "description": {"type": "string", "maxLength": 10000},
     }
 
 

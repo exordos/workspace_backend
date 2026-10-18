@@ -2419,6 +2419,7 @@ def _normalize_stream_identity_value(
             source_kind = _normalize_source_name(value.get("kind"))
             source_type = {
                 models.SourceName.NATIVE.value: models.NativeSource,
+                models.StreamSourceName.ZULIP.value: models.ZulipSource,
             }.get(source_kind)
             if source_type is not None:
                 value = source_type(**dict(value))

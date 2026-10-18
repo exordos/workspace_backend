@@ -25,6 +25,7 @@ from restalchemy.dm import properties
 from restalchemy.dm import types
 from restalchemy.dm import types_dynamic
 
+from workspace.common import models as common_models
 from workspace.messenger_api.dm import message_payloads
 
 
@@ -64,6 +65,15 @@ class NativeSource(types_dynamic.AbstractKindModel):
 
 class SourceName(str, enum.Enum):
     NATIVE = NativeSource.KIND
+
+
+class ZulipSource(types_dynamic.AbstractKindModel):
+    KIND = "zulip"
+
+
+class StreamSourceName(str, enum.Enum):
+    NATIVE = NativeSource.KIND
+    ZULIP = ZulipSource.KIND
 
 
 def native_source() -> NativeSource:
@@ -219,7 +229,7 @@ class WorkspaceTopicNotificationMode(str, enum.Enum):
 class WorkspaceStreamBase(
     models.ModelWithUUID,
     models.ModelWithProject,
-    models.ModelWithRequiredNameDesc,
+    common_models.ModelWithRequiredNameDesc,
     models.ModelWithTimestamp,
 ):
     user_uuid = properties.property(
@@ -227,12 +237,13 @@ class WorkspaceStreamBase(
         required=True,
     )
     source_name = properties.property(
-        types.Enum([source.value for source in SourceName]),
+        types.Enum([source.value for source in StreamSourceName]),
         required=True,
     )
     source = properties.property(
         types_dynamic.KindModelSelectorType(
             types_dynamic.KindModelType(NativeSource),
+            types_dynamic.KindModelType(ZulipSource),
         ),
         required=True,
     )
@@ -283,7 +294,7 @@ class WorkspaceStreamBase(
 
 class WorkspaceStreamEncryptionCreation(models.Model):
     source_name = properties.property(
-        types.Enum([source.value for source in SourceName]),
+        types.Enum([source.value for source in StreamSourceName]),
         default=SourceName.NATIVE.value,
     )
     encryption = properties.property(StrictBoolean(), default=False)
@@ -301,7 +312,7 @@ class WorkspaceStreamEncryptionCreation(models.Model):
 
 class WorkspaceUserStreamBase(
     UserScopedModelWithUUID,
-    models.ModelWithRequiredNameDesc,
+    common_models.ModelWithRequiredNameDesc,
     models.ModelWithProject,
     models.ModelWithTimestamp,
 ):
@@ -336,12 +347,13 @@ class WorkspaceUserStreamBase(
         default=0,
     )
     source_name = properties.property(
-        types.Enum([source.value for source in SourceName]),
+        types.Enum([source.value for source in StreamSourceName]),
         required=True,
     )
     source = properties.property(
         types_dynamic.KindModelSelectorType(
             types_dynamic.KindModelType(NativeSource),
+            types_dynamic.KindModelType(ZulipSource),
         ),
         required=True,
     )

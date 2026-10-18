@@ -25,7 +25,7 @@ from workspace.tests.integration import conftest
 
 
 @pytest.fixture
-def task_queue(_database, db):
+def task_queue(_database, db, scheduled_reconciliation):
     owner_uuid = uuid.uuid4()
     conftest.seed_workspace_user(db, owner_uuid, f"history-import-{owner_uuid}")
     account = external_models.ExternalAccount(

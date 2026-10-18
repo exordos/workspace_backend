@@ -22,6 +22,7 @@ from restalchemy.dm import models
 from restalchemy.dm import types
 from restalchemy.dm import types_dynamic
 
+from workspace.common import models as common_models
 from workspace.messenger_api.dm import base
 from workspace.messenger_api.dm import models as messenger_models
 
@@ -327,13 +328,14 @@ class StreamDeletedEventPayload(
     KIND = "stream.deleted"
 
     source_name = properties.property(
-        types.AllowNone(types.Enum([source.value for source in base.SourceName])),
+        types.AllowNone(types.Enum([source.value for source in base.StreamSourceName])),
         default=None,
     )
     source = properties.property(
         types.AllowNone(
             types_dynamic.KindModelSelectorType(
                 types_dynamic.KindModelType(base.NativeSource),
+                types_dynamic.KindModelType(base.ZulipSource),
             )
         ),
         default=None,
@@ -457,7 +459,7 @@ class FileEventPayloadBase(
     types_dynamic.AbstractKindModel,
     models.ModelWithUUID,
     models.ModelWithProject,
-    models.ModelWithRequiredNameDesc,
+    common_models.ModelWithRequiredNameDesc,
     models.ModelWithTimestamp,
 ):
     user_uuid = properties.property(types.UUID(), required=True)

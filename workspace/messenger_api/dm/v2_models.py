@@ -18,6 +18,7 @@ from restalchemy.dm import properties
 from restalchemy.dm import types
 from restalchemy.storage.sql import orm
 
+from workspace.common import models as common_models
 from workspace.messenger_api.dm import base
 from workspace.messenger_api.dm import message_payloads
 
@@ -244,7 +245,7 @@ class WorkspaceUserMessage(
 class WorkspaceStream(
     models.ModelWithUUID,
     models.ModelWithProject,
-    models.ModelWithRequiredNameDesc,
+    common_models.ModelWithRequiredNameDesc,
     models.ModelWithTimestamp,
     orm.SQLStorableMixin,
 ):
@@ -256,7 +257,7 @@ class WorkspaceStream(
         types.AllowNone(types.UUID()), default=None
     )
     source_name = properties.property(
-        types.Enum([source.value for source in base.SourceName]),
+        types.Enum([source.value for source in base.StreamSourceName]),
         default=base.SourceName.NATIVE.value,
     )
     source = properties.property(types.Dict(), default=base.native_source)

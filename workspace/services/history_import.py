@@ -17,6 +17,28 @@ LOG = logging.getLogger(__name__)
 
 
 class HistoryImportService(basic.BasicService):
+    def _ensure_reconciliation_task(self) -> None:
+        tasks = models.Task.objects.get_all(
+            filters={
+                "content": filters.JSONFields(
+                    {"kind": models.ReconciliationContent.KIND}
+                ),
+                "status": filters.In(
+                    [
+                        models.TaskStatus.NEW.value,
+                        models.TaskStatus.WAITING.value,
+                        models.TaskStatus.RETRY.value,
+                    ]
+                ),
+            },
+            limit=1,
+        )
+        if not tasks:
+            models.Task(
+                priority=models.TASK_PRIORITY_RECONCILIATION,
+                content=models.ReconciliationContent(),
+            ).insert()
+
     def _process_task(self) -> bool:
         tasks = self._get_tasks()
         for task in tasks:
@@ -61,6 +83,7 @@ class HistoryImportService(basic.BasicService):
 
     def _iteration(self) -> None:
         with contexts.Context().session_manager():
+            self._ensure_reconciliation_task()
             processed = self._process_task()
         if processed:
             self.boost(iterations=2)

@@ -30,6 +30,7 @@ from restalchemy.dm import types
 from restalchemy.storage.sql import orm
 
 from workspace.common import file_storage_opts
+from workspace.common import models as common_models
 from workspace.messenger_api.dm import base
 from workspace.messenger_api.dm import message_payloads
 
@@ -46,7 +47,9 @@ class SystemFolderType(str, enum.Enum):
 
 
 NativeSource = base.NativeSource
+ZulipSource = base.ZulipSource
 SourceName = base.SourceName
+StreamSourceName = base.StreamSourceName
 WorkspaceStreamRole = base.WorkspaceStreamRole
 WorkspaceStreamNotificationMode = base.WorkspaceStreamNotificationMode
 WorkspaceTopicNotificationMode = base.WorkspaceTopicNotificationMode
@@ -405,7 +408,7 @@ class WorkspaceDirectoryUser(WorkspaceUser):
 class WorkspaceFile(
     models.ModelWithUUID,
     models.ModelWithProject,
-    models.ModelWithRequiredNameDesc,
+    common_models.ModelWithRequiredNameDesc,
     models.ModelWithTimestamp,
     orm.SQLStorableMixin,
 ):

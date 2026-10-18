@@ -130,12 +130,7 @@ def test_stream_creation_accepts_consistent_encryption(metadata):
     ],
 )
 def test_stream_creation_rejects_inconsistent_encryption(metadata):
-    expected_error = (
-        ra_exc.TypeError
-        if metadata.get("source_name") == "zulip"
-        else ra_exc.ValidationErrorException
-    )
-    with pytest.raises(expected_error):
+    with pytest.raises(ra_exc.ValidationErrorException):
         base.WorkspaceStreamEncryptionCreation(**metadata)
 
 
