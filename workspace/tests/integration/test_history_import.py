@@ -78,7 +78,11 @@ def test_successful_connection_starts_full_backfill_and_periodic_catalog_sync(
     account.settings = {"server_url": "https://zulip.example.com"}
     account.update()
     zulip = mock.Mock()
-    zulip.check_connection.return_value = {"user_id": 7}
+    zulip.check_connection.return_value = {
+        "user_id": 7,
+        "full_name": "Owner",
+        "email": "owner@example.com",
+    }
     zulip.get_last_message_id.return_value = 10005
     zulip.get_channels.return_value = []
     zulip.get_users.return_value = []
@@ -221,7 +225,11 @@ def test_failed_full_backfill_does_not_leave_partial_child_tasks(
     )
     task.insert()
     zulip = mock.Mock()
-    zulip.check_connection.return_value = {"user_id": 7}
+    zulip.check_connection.return_value = {
+        "user_id": 7,
+        "full_name": "Owner",
+        "email": "owner@example.com",
+    }
     zulip.get_last_message_id.return_value = 10005
     monkeypatch.setattr(client, "ZulipClient", lambda account: zulip)
     if phase == "fetch":
@@ -256,7 +264,11 @@ def test_failed_full_backfill_does_not_leave_partial_child_tasks(
 def test_failed_connection_does_not_queue_full_backfill(task_queue, monkeypatch, phase):
     task = task_queue()
     zulip = mock.Mock()
-    zulip.check_connection.return_value = {"user_id": 7}
+    zulip.check_connection.return_value = {
+        "user_id": 7,
+        "full_name": "Owner",
+        "email": "owner@example.com",
+    }
     monkeypatch.setattr(client, "ZulipClient", lambda account: zulip)
     if phase == "check":
         zulip.check_connection.side_effect = requests.Timeout("Timed out")
@@ -313,7 +325,11 @@ def test_connection_outcome_publishes_account_event_only_in_its_project(
             (project_id, user_uuid),
         )
     zulip = mock.Mock()
-    zulip.check_connection.return_value = {"user_id": 7}
+    zulip.check_connection.return_value = {
+        "user_id": 7,
+        "full_name": "Owner",
+        "email": "owner@example.com",
+    }
     zulip.check_connection.side_effect = error
     monkeypatch.setattr(client, "ZulipClient", lambda account: zulip)
 

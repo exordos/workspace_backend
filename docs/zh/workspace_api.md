@@ -325,7 +325,7 @@ GET /api/workspace/v1/events/?epoch_version%3E=123&epoch_generation=781203&page_
 | `POST` | `/api/workspace/v1/messenger/external_accounts/` | Create an external account using `project_id` from the request context; requires `workspace.external_account.create`. |
 | `GET` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | 获取所有者清理的外部帐户快照;需要 `workspace.external_account.read`. |
 | `PUT` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Replace mutable settings; requires `workspace.external_account.update`. |
-| `DELETE` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | 删除帐户及其投影;需要 `workspace.external_account.delete`. |
+| `DELETE` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Unbind a verified Zulip account, clear credentials, cancel pending tasks, and return ownership to its imported user while retaining bridge data. Other or unverified accounts are deleted. Requires `workspace.external_account.delete`. |
 | `POST` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}/actions/reconnect/invoke` | 验证并更换仅写凭证,然后恢复同步;需要 `workspace.external_account.reconnect`. |
 | `POST` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}/actions/disconnect/invoke` | 停止同步,同时保留仅读投影;需要 `workspace.external_account.disconnect`. |
 | `GET` | `/api/workspace/v1/messenger/external_chats/` | 列出所有者清洁的外部聊天目录和分配状态. |
@@ -371,6 +371,15 @@ GET /api/workspace/v1/events/?epoch_version%3E=123&epoch_generation=781203&page_
 | `POST` | `/api/workspace/v1/users/{user_uuid}/actions/avatar_upload/invoke` | 现在的用户的化身. |
 | `POST` | `/api/workspace/v1/users/{user_uuid}/actions/avatar_reset/invoke` | 删除当前用户的自定义化身,并恢复正规的Gravatar URN. |
 | `GET` | `/api/workspace/v1/me/` | 返回当前认证的 Workspace 用户. |
+
+Zulip connection verification creates a deterministic imported user with
+`source="hidden"`, including for the first account connected to a server.
+Hidden users remain available by UUID and are excluded from user collection
+responses. An existing imported external account is rebound to the connecting
+IAM user without changing its UUID or bridge references; an account already
+owned by another real user cannot be claimed. Unbinding returns ownership to
+the imported profile and restores `source="zulip"`. User synchronization keeps
+hidden profiles up to date without making them visible.
 
 ### 外部整合合同的边界
 

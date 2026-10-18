@@ -17,6 +17,7 @@ import uuid as sys_uuid
 from workspace.bridges.zulip.dm import models as zulip_models
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api.dm import external_models
+from workspace.messenger_api.dm import models as messenger_models
 
 
 @dataclasses.dataclass(frozen=True)
@@ -26,6 +27,58 @@ class ExternalAccountActor:
 
 
 class ExternalAccountApplicationService:
+    @staticmethod
+    def delete(
+        session: typing.Any,
+        actor: ExternalAccountActor,
+        account: external_models.ExternalAccount,
+    ) -> None:
+        messenger_events.create_external_resource_event(
+            actor.project_id,
+            actor.user_uuid,
+            account,
+            messenger_events.EXTERNAL_ACCOUNT_DELETED_EVENT,
+            hidden_fields=("owner_user_uuid",),
+            session=session,
+        )
+        if account.provider != "zulip" or account.external_account_id is None:
+            account.delete(session=session)
+            return
+        hostname, user_id = account.external_account_id.rsplit(":", 1)
+        namespace = sys_uuid.uuid5(sys_uuid.NAMESPACE_DNS, hostname)
+        user_uuid = sys_uuid.uuid5(namespace, f"user:{user_id}")
+        user = messenger_models.WorkspaceUser.objects.get_one_or_none(
+            filters={"uuid": user_uuid},
+            session=session,
+        )
+        if user is None:
+            user = messenger_models.WorkspaceUser(
+                uuid=user_uuid,
+                username=f"zulip-{user_uuid}",
+                source=messenger_models.WorkspaceUserSource.ZULIP.value,
+                status=messenger_models.WorkspaceUserStatus.OFFLINE.value,
+                disabled=account.disabled,
+                email=account.settings.get("email"),
+            )
+            user.insert(session=session)
+        else:
+            user.source = messenger_models.WorkspaceUserSource.ZULIP.value
+            user.update(session=session)
+        zulip_models.Task(
+            project_id=account.project_id,
+            external_account_uuid=account.uuid,
+            content=zulip_models.InitializeConnectionContent(),
+        ).cancel_pending_tasks()
+        account.properties["owner_user_uuid"].set_value_force(user.uuid)
+        account.settings = {
+            name: account.settings[name]
+            for name in ("server_url", "email")
+            if name in account.settings
+        }
+        account.status = external_models.ExternalAccountStatus.NEW.value
+        account.error_description = None
+        account.update(session=session)
+
     @staticmethod
     def create(
         session: typing.Any,

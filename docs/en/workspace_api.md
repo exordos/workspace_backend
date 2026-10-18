@@ -325,7 +325,7 @@ authoritative snapshots before starting a new cursor.
 | `POST` | `/api/workspace/v1/messenger/external_accounts/` | Create an external account using `project_id` from the request context; requires `workspace.external_account.create`. |
 | `GET` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Get the owner's sanitized external-account snapshot; requires `workspace.external_account.read`. |
 | `PUT` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Replace mutable settings; requires `workspace.external_account.update`. |
-| `DELETE` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Delete the account and its projection; requires `workspace.external_account.delete`. |
+| `DELETE` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Unbind a verified Zulip account, clear credentials, cancel pending tasks, and return ownership to its imported user while retaining bridge data. Other or unverified accounts are deleted. Requires `workspace.external_account.delete`. |
 | `POST` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}/actions/reconnect/invoke` | Validate and replace the write-only credential, then resume synchronization; requires `workspace.external_account.reconnect`. |
 | `POST` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}/actions/disconnect/invoke` | Stop synchronization while retaining the read-only projection; requires `workspace.external_account.disconnect`. |
 | `GET` | `/api/workspace/v1/messenger/external_chats/` | List the owner's sanitized external chat catalog and assignment state. |
@@ -371,6 +371,15 @@ authoritative snapshots before starting a new cursor.
 | `POST` | `/api/workspace/v1/users/{user_uuid}/actions/avatar_upload/invoke` | Upload and select the current user's avatar. |
 | `POST` | `/api/workspace/v1/users/{user_uuid}/actions/avatar_reset/invoke` | Remove the current user's custom avatar and restore the canonical Gravatar URN. |
 | `GET` | `/api/workspace/v1/me/` | Return the current authenticated Workspace user. |
+
+Zulip connection verification creates a deterministic imported user with
+`source="hidden"`, including for the first account connected to a server.
+Hidden users remain available by UUID and are excluded from user collection
+responses. An existing imported external account is rebound to the connecting
+IAM user without changing its UUID or bridge references; an account already
+owned by another real user cannot be claimed. Unbinding returns ownership to
+the imported profile and restores `source="zulip"`. User synchronization keeps
+hidden profiles up to date without making them visible.
 
 ### External integration contract boundary
 

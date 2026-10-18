@@ -325,7 +325,7 @@ GET /api/workspace/v1/events/?epoch_version%3E=123&epoch_generation=781203&page_
 | `POST` | `/api/workspace/v1/messenger/external_accounts/` | Create an external account using `project_id` from the request context; requires `workspace.external_account.create`. |
 | `GET` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Получить очищенный внешний снимок аккаунта владельца; требует `workspace.external_account.read`. |
 | `PUT` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Replace mutable settings; requires `workspace.external_account.update`. |
-| `DELETE` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Удалить счет и его проекцию; требуется `workspace.external_account.delete`. |
+| `DELETE` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Unbind a verified Zulip account, clear credentials, cancel pending tasks, and return ownership to its imported user while retaining bridge data. Other or unverified accounts are deleted. Requires `workspace.external_account.delete`. |
 | `POST` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}/actions/reconnect/invoke` | Проверьте и замените учетные данные только для записи, затем возобновите синхронизацию; требуется `workspace.external_account.reconnect`. |
 | `POST` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}/actions/disconnect/invoke` | Остановить синхронизацию при сохранении проекции только для чтения; требует `workspace.external_account.disconnect`. |
 | `GET` | `/api/workspace/v1/messenger/external_chats/` | Перечислите очищенный каталог внешнего чата владельца и состояние назначения. |
@@ -371,6 +371,15 @@ GET /api/workspace/v1/events/?epoch_version%3E=123&epoch_generation=781203&page_
 | `POST` | `/api/workspace/v1/users/{user_uuid}/actions/avatar_upload/invoke` | Загрузить и выбрать аватара текущего пользователя. |
 | `POST` | `/api/workspace/v1/users/{user_uuid}/actions/avatar_reset/invoke` | Удалить пользовательский аватара текущего пользователя и восстановить канонический Gravatar URN. |
 | `GET` | `/api/workspace/v1/me/` | Возвращение текущего аутентифицированного пользователя Workspace. |
+
+Zulip connection verification creates a deterministic imported user with
+`source="hidden"`, including for the first account connected to a server.
+Hidden users remain available by UUID and are excluded from user collection
+responses. An existing imported external account is rebound to the connecting
+IAM user without changing its UUID or bridge references; an account already
+owned by another real user cannot be claimed. Unbinding returns ownership to
+the imported profile and restores `source="zulip"`. User synchronization keeps
+hidden profiles up to date without making them visible.
 
 ### Граница договора внешней интеграции
 

@@ -206,6 +206,7 @@ class WorkspaceUserSource(str, enum.Enum):
     IAM = "iam"
     NATIVE = "native"
     ZULIP = "zulip"
+    HIDDEN = "hidden"
 
 
 class WorkspaceUserLastPingAtType(types.UTCDateTimeZ):

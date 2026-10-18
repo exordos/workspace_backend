@@ -34,6 +34,7 @@ from restalchemy.storage.sql import orm
 from restalchemy.storage.sql import utils
 
 from workspace.bridges.zulip import client
+from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.dm import models as messenger_models
 
@@ -53,6 +54,10 @@ TASK_USER_SYNC_INTERVAL = datetime.timedelta(minutes=15)
 
 
 class ExternalAccountIdPendingError(Exception):
+    pass
+
+
+class ExternalAccountAlreadyConnectedError(Exception):
     pass
 
 
@@ -354,13 +359,98 @@ class InitializeConnectionContent(AbstractZulipTaskContent):
         zulip = client.ZulipClient(account)
         try:
             data = zulip.check_connection()
-            hostname = account.get_host()
-            account.properties["external_account_id"].set_value_force(
-                f"{hostname}:{data['user_id']}"
-            )
-            account.update()
         finally:
             zulip.close()
+        external_account_id = f"{account.get_host()}:{data['user_id']}"
+        existing = external_models.ExternalAccount.objects.get_one_or_none(
+            filters={
+                "project_id": filters.EQ(task.project_id),
+                "provider": filters.EQ(account.provider),
+                "external_account_id": filters.EQ(external_account_id),
+            },
+        )
+        if existing is not None and existing.uuid != account.uuid:
+            owner = messenger_models.WorkspaceUser.objects.get_one(
+                filters={"uuid": filters.EQ(existing.owner_user_uuid)},
+            )
+            if (
+                owner.source
+                not in (
+                    messenger_models.WorkspaceUserSource.ZULIP.value,
+                    messenger_models.WorkspaceUserSource.HIDDEN.value,
+                )
+                or "api_key" in existing.settings
+            ):
+                raise ExternalAccountAlreadyConnectedError(
+                    f"External account {external_account_id} is already connected "
+                    "to another Workspace user."
+                )
+        namespace = sys_uuid.uuid5(sys_uuid.NAMESPACE_DNS, account.get_host())
+        user_uuid = sys_uuid.uuid5(namespace, f"user:{data['user_id']}")
+        user = messenger_models.WorkspaceUser.objects.get_one_or_none(
+            filters={"uuid": filters.EQ(user_uuid)},
+        )
+        if user is None:
+            user = messenger_models.WorkspaceUser(
+                uuid=user_uuid,
+                username=f"zulip-{user_uuid}",
+                source=messenger_models.WorkspaceUserSource.HIDDEN.value,
+                status=messenger_models.WorkspaceUserStatus.OFFLINE.value,
+                first_name=data["full_name"],
+                email=data["email"],
+                disabled=account.disabled,
+            )
+            user.insert()
+        else:
+            user.source = messenger_models.WorkspaceUserSource.HIDDEN.value
+            user.update()
+        if existing is None or existing.uuid == account.uuid:
+            account.properties["external_account_id"].set_value_force(
+                external_account_id
+            )
+            account.update()
+            return
+        try:
+            task.external_account_uuid = existing.uuid
+            task.update()
+            account.delete()
+            existing.properties["owner_user_uuid"].set_value_force(
+                account.owner_user_uuid
+            )
+            existing.settings = account.settings
+            existing.update()
+            messenger_events.create_external_resource_event(
+                account.project_id,
+                account.owner_user_uuid,
+                account,
+                messenger_events.EXTERNAL_ACCOUNT_DELETED_EVENT,
+                hidden_fields=("owner_user_uuid",),
+            )
+            messenger_events.create_external_resource_event(
+                existing.project_id,
+                existing.owner_user_uuid,
+                existing,
+                messenger_events.EXTERNAL_ACCOUNT_CREATED_EVENT,
+                hidden_fields=("owner_user_uuid",),
+            )
+        except Exception:
+            task.external_account_uuid = account.uuid
+            raise
+
+    def on_error(self, task: "Task", error: Exception) -> None:
+        if isinstance(error, ExternalAccountAlreadyConnectedError):
+            account = external_models.ExternalAccount.objects.get_one(
+                filters={
+                    "uuid": filters.EQ(task.external_account_uuid),
+                    "project_id": filters.EQ(task.project_id),
+                },
+            )
+            account.update_status(
+                external_models.ExternalAccountStatus.ERROR.value,
+                error_description=str(error),
+            )
+        else:
+            super().on_error(task, error)
 
     def on_done(self, task: "Task") -> None:
         account = external_models.ExternalAccount.objects.get_one(
@@ -458,21 +548,27 @@ class ImportUsersContent(AbstractZulipTaskContent):
                 external_account_id = f"{hostname}:{user_id}"
                 user_uuid = sys_uuid.uuid5(server_namespace, f"user:{user_id}")
                 external_account = accounts_by_id.get(external_account_id)
-                if external_account is None:
-                    user = messenger_models.WorkspaceUser.objects.get_one_or_none(
-                        filters={"uuid": filters.EQ(user_uuid)},
+                user = messenger_models.WorkspaceUser.objects.get_one_or_none(
+                    filters={"uuid": filters.EQ(user_uuid)},
+                )
+                if user is None:
+                    source = (
+                        messenger_models.WorkspaceUserSource.HIDDEN.value
+                        if external_account is not None
+                        and external_account.owner_user_uuid != user_uuid
+                        else messenger_models.WorkspaceUserSource.ZULIP.value
                     )
-                    if user is None:
-                        user = messenger_models.WorkspaceUser(
-                            uuid=user_uuid,
-                            username=f"zulip-{user_uuid}",
-                            source=messenger_models.WorkspaceUserSource.ZULIP.value,
-                            disabled=disabled,
-                            status=messenger_models.WorkspaceUserStatus.OFFLINE.value,
-                            first_name=data["full_name"],
-                            email=data["email"],
-                        )
-                        user.insert()
+                    user = messenger_models.WorkspaceUser(
+                        uuid=user_uuid,
+                        username=f"zulip-{user_uuid}",
+                        source=source,
+                        disabled=disabled,
+                        status=messenger_models.WorkspaceUserStatus.OFFLINE.value,
+                        first_name=data["full_name"],
+                        email=data["email"],
+                    )
+                    user.insert()
+                if external_account is None:
                     external_account = external_models.ExternalAccount(
                         uuid=sys_uuid.uuid5(task.project_id, f"zulip:{user_uuid}"),
                         project_id=task.project_id,
@@ -493,15 +589,12 @@ class ImportUsersContent(AbstractZulipTaskContent):
                 external_account.disabled = disabled
                 external_account.update()
                 accounts_by_id[external_account_id] = external_account
-                if external_account.owner_user_uuid == user_uuid:
-                    user = messenger_models.WorkspaceUser.objects.get_one(
-                        filters={"uuid": filters.EQ(user_uuid)},
-                    )
-                    user.first_name = data["full_name"]
-                    user.email = data["email"]
+                user.first_name = data["full_name"]
+                user.email = data["email"]
+                if user.source != messenger_models.WorkspaceUserSource.HIDDEN.value:
                     user.source = messenger_models.WorkspaceUserSource.ZULIP.value
-                    user.disabled = disabled
-                    user.update()
+                user.disabled = disabled
+                user.update()
         finally:
             zulip.close()
 

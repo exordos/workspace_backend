@@ -17,6 +17,7 @@ from restalchemy.dm import types_dynamic
 from workspace.bridges.zulip import client
 from workspace.bridges.zulip.dm import models
 from workspace.messenger_api.dm import external_models
+from workspace.messenger_api.dm import models as messenger_models
 
 
 @pytest.fixture(autouse=True)
@@ -408,16 +409,27 @@ def test_task_executes_connection_content():
             "api_key": "test-key",
         },
         properties={"external_account_id": mock.Mock()},
+        disabled=False,
         get_host=mock.Mock(return_value="zulip.example.com"),
     )
     zulip = mock.Mock()
-    zulip.check_connection.return_value = {"user_id": 7}
+    zulip.check_connection.return_value = {
+        "user_id": 7,
+        "full_name": "Owner",
+        "email": "owner@example.com",
+    }
     with (
         mock.patch.object(external_models.ExternalAccount, "objects") as accounts,
         mock.patch.object(client, "ZulipClient", return_value=zulip) as constructor,
         mock.patch.object(models.Task, "insert", autospec=True) as insert,
+        mock.patch.object(messenger_models.WorkspaceUser, "objects") as users,
+        mock.patch.object(
+            messenger_models.WorkspaceUser, "insert", autospec=True
+        ) as insert_user,
     ):
         accounts.get_one.return_value = account
+        accounts.get_one_or_none.return_value = None
+        users.get_one_or_none.return_value = None
         task.execute()
     assert (
         accounts.get_one.call_args.kwargs["filters"]["uuid"].value
@@ -435,6 +447,11 @@ def test_task_executes_connection_content():
     )
     account.update.assert_called_once_with()
     account.update_status.assert_called_once_with("backfill")
+    (profile,) = insert_user.call_args.args
+    assert profile.source == "hidden"
+    assert profile.uuid == uuid.uuid5(
+        uuid.uuid5(uuid.NAMESPACE_DNS, "zulip.example.com"), "user:7"
+    )
     insert.assert_called_once()
     followup = insert.call_args.args[0]
     assert followup.project_id == task.project_id

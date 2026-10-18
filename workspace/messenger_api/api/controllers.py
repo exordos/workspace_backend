@@ -1188,14 +1188,14 @@ class ExternalAccountController(ExternalResourceController):
     def delete(self, uuid: object) -> None:
         self._require_permission("workspace.external_account.delete")
         account = super().get(uuid)
-        session = contexts.Context().get_session()
-        self._emit_event(
+        application_services.ExternalAccountApplicationService.delete(
+            contexts.Context().get_session(),
+            application_services.ExternalAccountActor(
+                user_uuid=self._get_user_uuid(),
+                project_id=self._get_project_id(),
+            ),
             account,
-            messenger_events.EXTERNAL_ACCOUNT_DELETED_EVENT,
-            hidden_fields=("owner_user_uuid",),
-            session=session,
         )
-        account.delete(session=session)
 
 
 class TopicSummaryEndpointController(

@@ -16,6 +16,7 @@ from restalchemy.storage.sql import migrations
 
 from workspace.bridges.zulip import client
 from workspace.bridges.zulip.dm import models
+from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.dm import models as messenger_models
 from workspace.services import history_import
@@ -74,6 +75,535 @@ def _run_user_import(account):
         assert isinstance(restored.content, models.ImportUsersContent)
         restored.execute()
     return models.Task.objects.get_one(filters={"uuid": filters.EQ(task.uuid)})
+
+
+@pytest.fixture
+def pending_user_connection(user_import_account, db, monkeypatch):
+    account = user_import_account
+    zulip = mock.Mock()
+    zulip.get_users.return_value = [_user_data()]
+    zulip.check_connection.return_value = _user_data()
+    monkeypatch.setattr(client, "ZulipClient", lambda current: zulip)
+    assert _run_user_import(account).status == "done"
+    imported = external_models.ExternalAccount.objects.get_one(
+        filters={
+            "project_id": filters.EQ(account.project_id),
+            "external_account_id": filters.EQ(f"{account.get_host()}:8"),
+        }
+    )
+    owner_uuid = uuid.uuid4()
+    conftest.seed_workspace_user(db, owner_uuid, f"connected-{owner_uuid}")
+    pending = external_models.ExternalAccount(
+        project_id=account.project_id,
+        owner_user_uuid=owner_uuid,
+        provider="zulip",
+        settings={
+            "server_url": account.settings["server_url"],
+            "email": "user-8@example.com",
+            "api_key": "connected-key",
+        },
+    )
+    pending.insert()
+    task = models.Task(
+        project_id=account.project_id,
+        external_account_uuid=pending.uuid,
+        priority=models.TASK_PRIORITY_INITIALIZE_CONNECTION,
+        content=models.InitializeConnectionContent(),
+    )
+    task.insert()
+    return imported, pending, task
+
+
+def test_connection_rebinds_imported_account_preserving_identity_and_references(
+    user_import_account, pending_user_connection, db, api
+):
+    imported, pending, task = pending_user_connection
+    channel = models.ZulipChannel(
+        external_account_uuid=user_import_account.uuid,
+        channel_type="private",
+        direct_user_uuid=imported.uuid,
+        stream_uuid=uuid.uuid4(),
+        name="Imported peer",
+        description="",
+        rendered_description="",
+        invite_only=True,
+        is_web_public=False,
+        history_public_to_subscribers=False,
+        is_archived=False,
+    )
+    channel.insert()
+
+    with contexts.Context().session_manager():
+        task.execute()
+
+    restored = external_models.ExternalAccount.objects.get_one(
+        filters={"uuid": filters.EQ(imported.uuid)}
+    )
+    assert restored.owner_user_uuid == pending.owner_user_uuid
+    assert restored.external_account_id == imported.external_account_id
+    assert restored.settings == pending.settings
+    assert restored.status == "backfill"
+    assert restored.error_description is None
+    assert (
+        messenger_models.WorkspaceUser.objects.get_one(
+            filters={"uuid": filters.EQ(imported.owner_user_uuid)}
+        ).source
+        == "hidden"
+    )
+    assert (
+        messenger_models.WorkspaceDirectoryUser.objects.get_one_or_none(
+            filters={"uuid": filters.EQ(imported.owner_user_uuid)}
+        )
+        is None
+    )
+    assert api.get(f"/v1/users/{imported.owner_user_uuid}").status_code == 200
+    listed = api.get("/v1/users/", params={"uuid": str(imported.owner_user_uuid)})
+    assert listed.status_code == 200, listed.text
+    assert listed.json() == []
+    assert (
+        external_models.ExternalAccount.objects.get_one_or_none(
+            filters={"uuid": filters.EQ(pending.uuid)}
+        )
+        is None
+    )
+    stored_task = models.Task.objects.get_one(filters={"uuid": filters.EQ(task.uuid)})
+    assert stored_task.status == "done"
+    assert stored_task.external_account_uuid == imported.uuid
+    assert (
+        models.ZulipChannel.objects.get_one(
+            filters={"uuid": filters.EQ(channel.uuid)}
+        ).direct_user_uuid
+        == imported.uuid
+    )
+    (backfill,) = models.Task.objects.get_all(
+        filters={"external_account_uuid": filters.EQ(imported.uuid), "status": "new"}
+    )
+    assert isinstance(backfill.content, models.FullBackfillContent)
+    events = db.execute(
+        "SELECT action, payload->>'uuid' FROM m_workspace_events "
+        "WHERE project_id=%s AND user_uuid=%s AND object_type='external_account' "
+        "ORDER BY epoch_version",
+        (pending.project_id, pending.owner_user_uuid),
+    ).fetchall()
+    assert events == [
+        ("deleted", str(pending.uuid)),
+        ("created", str(imported.uuid)),
+        ("updated", str(imported.uuid)),
+    ]
+    models.InitializeConnectionContent().execute(stored_task)
+    assert _run_user_import(user_import_account).status == "done"
+    assert {row.uuid for row in _accounts(user_import_account)} == {
+        user_import_account.uuid,
+        imported.uuid,
+    }
+    assert (
+        external_models.ExternalAccount.objects.get_one(
+            filters={"uuid": filters.EQ(imported.uuid)}
+        ).owner_user_uuid
+        == pending.owner_user_uuid
+    )
+
+
+@pytest.mark.parametrize(
+    "source,has_credentials",
+    [("iam", False), ("iam", True), ("native", False), ("zulip", True)],
+)
+def test_connection_does_not_take_over_an_account_of_another_real_user(
+    pending_user_connection, source, has_credentials
+):
+    imported, pending, task = pending_user_connection
+    owner = messenger_models.WorkspaceUser.objects.get_one(
+        filters={"uuid": filters.EQ(imported.owner_user_uuid)}
+    )
+    owner.source = source
+    owner.email = f"{owner.uuid}@example.com"
+    owner.update()
+    if has_credentials:
+        imported.settings = {**imported.settings, "api_key": "existing-key"}
+        imported.update()
+
+    with contexts.Context().session_manager():
+        task.execute()
+
+    restored = external_models.ExternalAccount.objects.get_one(
+        filters={"uuid": filters.EQ(imported.uuid)}
+    )
+    assert restored.owner_user_uuid == imported.owner_user_uuid
+    assert restored.settings == imported.settings
+    rejected = external_models.ExternalAccount.objects.get_one(
+        filters={"uuid": filters.EQ(pending.uuid)}
+    )
+    assert rejected.external_account_id is None
+    assert rejected.status == "error"
+    stored = models.Task.objects.get_one(filters={"uuid": filters.EQ(task.uuid)})
+    assert stored.status == "error"
+    assert stored.next_retry_at is None
+    assert "already connected to another Workspace user" in stored.error_description
+    assert rejected.error_description == stored.error_description
+    assert [
+        row.uuid
+        for row in models.Task.objects.get_all(
+            filters={"external_account_uuid": filters.EQ(pending.uuid)}
+        )
+    ] == [task.uuid]
+
+
+@pytest.mark.parametrize("phase", ("close", "account_update", "event"))
+def test_failed_rebinding_preserves_both_accounts_and_original_task_reference(
+    pending_user_connection, monkeypatch, phase, db
+):
+    imported, pending, task = pending_user_connection
+    if phase == "close":
+        zulip = mock.Mock()
+        zulip.check_connection.return_value = _user_data()
+        zulip.close.side_effect = RuntimeError("Rebinding failed")
+        monkeypatch.setattr(client, "ZulipClient", lambda current: zulip)
+    elif phase == "account_update":
+        update = external_models.ExternalAccount.update
+
+        def fail(current, *args, **kwargs):
+            if current.uuid == imported.uuid:
+                raise RuntimeError("Rebinding failed")
+            return update(current, *args, **kwargs)
+
+        monkeypatch.setattr(external_models.ExternalAccount, "update", fail)
+    else:
+
+        def fail(*args, **kwargs):
+            raise RuntimeError("Rebinding failed")
+
+        monkeypatch.setattr(messenger_events, "create_external_resource_event", fail)
+
+    with contexts.Context().session_manager():
+        task.execute()
+
+    restored = external_models.ExternalAccount.objects.get_one(
+        filters={"uuid": filters.EQ(imported.uuid)}
+    )
+    assert restored.owner_user_uuid == imported.owner_user_uuid
+    assert restored.settings == imported.settings
+    assert (
+        external_models.ExternalAccount.objects.get_one(
+            filters={"uuid": filters.EQ(pending.uuid)}
+        ).external_account_id
+        is None
+    )
+    stored = models.Task.objects.get_one(filters={"uuid": filters.EQ(task.uuid)})
+    assert stored.status == "error"
+    assert stored.external_account_uuid == pending.uuid
+    assert "Rebinding failed" in stored.error_description
+    assert db.execute(
+        "SELECT COUNT(*) FROM m_workspace_events WHERE project_id=%s AND user_uuid=%s",
+        (pending.project_id, pending.owner_user_uuid),
+    ).fetchone() == (0,)
+    assert (
+        messenger_models.WorkspaceUser.objects.get_one(
+            filters={"uuid": filters.EQ(imported.owner_user_uuid)}
+        ).source
+        == "zulip"
+    )
+
+
+def test_unbinding_restores_imported_profile_and_preserves_external_account(
+    pending_user_connection, api
+):
+    imported, pending, task = pending_user_connection
+    with contexts.Context().session_manager():
+        task.execute()
+    channel = models.ZulipChannel(
+        external_account_uuid=imported.uuid,
+        stream_uuid=uuid.uuid4(),
+        stream_id=42,
+        name="Imported channel",
+        description="",
+        rendered_description="",
+        invite_only=False,
+        is_web_public=False,
+        history_public_to_subscribers=True,
+        is_archived=False,
+    )
+    channel.insert()
+
+    response = api.delete(
+        f"/v1/messenger/external_accounts/{imported.uuid}",
+        user=pending.owner_user_uuid,
+        project=pending.project_id,
+        permissions=("workspace.external_account.delete",),
+    )
+
+    assert response.status_code == 204, response.text
+    restored = external_models.ExternalAccount.objects.get_one(
+        filters={"uuid": filters.EQ(imported.uuid)}
+    )
+    assert restored.owner_user_uuid == imported.owner_user_uuid
+    assert restored.external_account_id == imported.external_account_id
+    assert restored.settings == imported.settings
+    assert restored.status == "new"
+    assert (
+        models.ZulipChannel.objects.get_one(
+            filters={"uuid": filters.EQ(channel.uuid)}
+        ).external_account_uuid
+        == imported.uuid
+    )
+    assert (
+        messenger_models.WorkspaceDirectoryUser.objects.get_one(
+            filters={"uuid": filters.EQ(imported.owner_user_uuid)}
+        ).source
+        == "zulip"
+    )
+    (backfill,) = models.Task.objects.get_all(
+        filters={"external_account_uuid": filters.EQ(imported.uuid), "status": "cancel"}
+    )
+    assert isinstance(backfill.content, models.FullBackfillContent)
+    assert (
+        api.get(
+            f"/v1/messenger/external_accounts/{imported.uuid}",
+            user=pending.owner_user_uuid,
+            project=pending.project_id,
+            permissions=("workspace.external_account.read",),
+        ).status_code
+        == 404
+    )
+    created = api.post(
+        "/v1/messenger/external_accounts/",
+        user=pending.owner_user_uuid,
+        project=pending.project_id,
+        permissions=("workspace.external_account.create",),
+        json={"provider": "zulip", "settings": pending.settings},
+    )
+    assert created.status_code == 201, created.text
+    (check,) = models.Task.objects.get_all(
+        filters={"external_account_uuid": uuid.UUID(created.json()["uuid"])}
+    )
+    with contexts.Context().session_manager():
+        check.execute()
+    assert check.status == "done"
+    assert check.external_account_uuid == imported.uuid
+    assert (
+        messenger_models.WorkspaceUser.objects.get_one(
+            filters={"uuid": filters.EQ(imported.owner_user_uuid)}
+        ).source
+        == "hidden"
+    )
+
+
+def test_unbinding_creates_missing_imported_profile_and_cancels_only_pending_tasks(
+    user_import_account, api
+):
+    account = user_import_account
+    tasks = []
+    for status in ("new", "waiting", "retry", "done", "error", "cancel"):
+        task = models.Task(
+            project_id=account.project_id,
+            external_account_uuid=account.uuid,
+            content=models.ImportUsersContent(),
+            status=status,
+        )
+        task.insert()
+        tasks.append(task)
+
+    response = api.delete(
+        f"/v1/messenger/external_accounts/{account.uuid}",
+        user=account.owner_user_uuid,
+        project=account.project_id,
+        permissions=("workspace.external_account.delete",),
+    )
+
+    assert response.status_code == 204, response.text
+    restored = external_models.ExternalAccount.objects.get_one(
+        filters={"uuid": filters.EQ(account.uuid)}
+    )
+    namespace = uuid.uuid5(uuid.NAMESPACE_DNS, account.get_host())
+    assert restored.owner_user_uuid == uuid.uuid5(namespace, "user:7")
+    assert restored.external_account_id == account.external_account_id
+    assert "api_key" not in restored.settings
+    profile = messenger_models.WorkspaceDirectoryUser.objects.get_one(
+        filters={"uuid": filters.EQ(restored.owner_user_uuid)}
+    )
+    assert profile.source == "zulip"
+    assert profile.email == account.settings["email"]
+    assert profile.status == "offline"
+    assert (
+        messenger_models.WorkspaceUser.objects.get_one(
+            filters={"uuid": filters.EQ(account.owner_user_uuid)}
+        ).source
+        == "iam"
+    )
+    assert [
+        models.Task.objects.get_one(filters={"uuid": filters.EQ(task.uuid)}).status
+        for task in tasks
+    ] == ["cancel", "cancel", "cancel", "done", "error", "cancel"]
+
+
+def test_first_connection_creates_hidden_profile_before_user_synchronization(
+    user_import_account, monkeypatch, api
+):
+    account = user_import_account
+    account.properties["external_account_id"].set_value_force(None)
+    account.update()
+    zulip = mock.Mock()
+    zulip.check_connection.return_value = _user_data(7)
+    zulip.get_users.return_value = [_user_data(7, full_name="Updated owner")]
+    monkeypatch.setattr(client, "ZulipClient", lambda current: zulip)
+    task = models.Task(
+        project_id=account.project_id,
+        external_account_uuid=account.uuid,
+        content=models.InitializeConnectionContent(),
+    )
+    task.insert()
+
+    with contexts.Context().session_manager():
+        task.execute()
+
+    assert task.status == "done"
+    namespace = uuid.uuid5(uuid.NAMESPACE_DNS, account.get_host())
+    user_uuid = uuid.uuid5(namespace, "user:7")
+    profile = messenger_models.WorkspaceUser.objects.get_one(
+        filters={"uuid": filters.EQ(user_uuid)}
+    )
+    assert profile.source == "hidden"
+    assert profile.first_name == "User 7"
+    assert profile.email == "user-7@example.com"
+    assert (
+        messenger_models.WorkspaceDirectoryUser.objects.get_one_or_none(
+            filters={"uuid": filters.EQ(user_uuid)}
+        )
+        is None
+    )
+    assert _run_user_import(account).status == "done"
+    profile = messenger_models.WorkspaceUser.objects.get_one(
+        filters={"uuid": filters.EQ(user_uuid)}
+    )
+    assert profile.source == "hidden"
+    assert profile.first_name == "Updated owner"
+    assert (
+        external_models.ExternalAccount.objects.get_one(
+            filters={"uuid": filters.EQ(account.uuid)}
+        ).owner_user_uuid
+        == account.owner_user_uuid
+    )
+
+    response = api.delete(
+        f"/v1/messenger/external_accounts/{account.uuid}",
+        user=account.owner_user_uuid,
+        project=account.project_id,
+        permissions=("workspace.external_account.delete",),
+    )
+    assert response.status_code == 204, response.text
+    assert (
+        external_models.ExternalAccount.objects.get_one(
+            filters={"uuid": filters.EQ(account.uuid)}
+        ).owner_user_uuid
+        == user_uuid
+    )
+    assert (
+        messenger_models.WorkspaceDirectoryUser.objects.get_one(
+            filters={"uuid": filters.EQ(user_uuid)}
+        ).source
+        == "zulip"
+    )
+
+
+def test_failed_unbinding_rolls_back_profile_visibility_and_account_ownership(
+    pending_user_connection, api, monkeypatch
+):
+    imported, pending, task = pending_user_connection
+    with contexts.Context().session_manager():
+        task.execute()
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("Cancellation failed")
+
+    monkeypatch.setattr(models.Task, "cancel_pending_tasks", fail)
+    response = api.delete(
+        f"/v1/messenger/external_accounts/{imported.uuid}",
+        user=pending.owner_user_uuid,
+        project=pending.project_id,
+        permissions=("workspace.external_account.delete",),
+    )
+
+    assert response.status_code == 500
+    restored = external_models.ExternalAccount.objects.get_one(
+        filters={"uuid": filters.EQ(imported.uuid)}
+    )
+    assert restored.owner_user_uuid == pending.owner_user_uuid
+    assert restored.settings == pending.settings
+    assert (
+        messenger_models.WorkspaceUser.objects.get_one(
+            filters={"uuid": filters.EQ(imported.owner_user_uuid)}
+        ).source
+        == "hidden"
+    )
+
+
+@pytest.mark.parametrize("scope", ("project", "provider", "host"))
+def test_connection_does_not_claim_external_identity_from_another_scope(
+    pending_user_connection, scope
+):
+    imported, pending, task = pending_user_connection
+    if scope == "project":
+        imported.properties["project_id"].set_value_force(uuid.uuid4())
+    elif scope == "provider":
+        imported.provider = "other"
+    else:
+        imported.properties["external_account_id"].set_value_force(
+            "other.example.com:8"
+        )
+    imported.update()
+    try:
+        with contexts.Context().session_manager():
+            task.execute()
+
+        assert task.status == "done"
+        assert task.external_account_uuid == pending.uuid
+        assert (
+            external_models.ExternalAccount.objects.get_one(
+                filters={"uuid": filters.EQ(imported.uuid)}
+            ).owner_user_uuid
+            == imported.owner_user_uuid
+        )
+        assert (
+            external_models.ExternalAccount.objects.get_one(
+                filters={"uuid": filters.EQ(pending.uuid)}
+            ).external_account_id
+            == f"{pending.get_host()}:8"
+        )
+    finally:
+        imported.delete()
+
+
+def test_hidden_profile_directory_migration_can_be_applied_and_rolled_back(_database):
+    migration = "0210-Hide-rebound-Zulip-profiles-from-the-user-directory-751a1a.py"
+    with conftest.isolated_migration_database(
+        "0209-Add-Zulip-channel-types-and-direct-account-references-6bdbf2.py"
+    ):
+        user = messenger_models.WorkspaceUser(
+            username=f"hidden-{uuid.uuid4()}", source="hidden"
+        )
+        user.insert()
+        engine = migrations.MigrationEngine(
+            migrations_path=str(conftest.MIGRATIONS_DIR)
+        )
+        engine.apply_migration(migration)
+        assert (
+            messenger_models.WorkspaceDirectoryUser.objects.get_one_or_none(
+                filters={"uuid": filters.EQ(user.uuid)}
+            )
+            is None
+        )
+        assert (
+            messenger_models.WorkspaceUser.objects.get_one(
+                filters={"uuid": filters.EQ(user.uuid)}
+            ).source
+            == "hidden"
+        )
+        engine.rollback_migration(migration)
+        assert (
+            messenger_models.WorkspaceDirectoryUser.objects.get_one(
+                filters={"uuid": filters.EQ(user.uuid)}
+            ).source
+            == "zulip"
+        )
 
 
 @pytest.mark.parametrize("operation", ("create", "update"))
@@ -474,7 +1004,7 @@ def test_connection_checks_run_before_immediate_user_import_retry(
     users_client = mock.Mock()
     users_client.get_users.return_value = [_user_data()]
     check_client = mock.Mock()
-    check_client.check_connection.return_value = {"user_id": 8}
+    check_client.check_connection.return_value = _user_data()
     clients = {account.uuid: users_client, peer.uuid: check_client}
     monkeypatch.setattr(client, "ZulipClient", lambda current: clients[current.uuid])
 
