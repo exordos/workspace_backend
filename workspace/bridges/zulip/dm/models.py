@@ -238,6 +238,65 @@ class ZulipStreamState(
         stream.delete()
 
 
+class ZulipTopicState(
+    models.ModelWithID,
+    models.ModelWithProject,
+    orm.SQLStorableMixin,
+):
+    """Topic differences to reconcile between Zulip and Workspace."""
+
+    __tablename__ = "bridge_zulip_v5_topic_states"
+
+    project_id = properties.property(
+        types.UUID(), required=True, read_only=True, id_property=True
+    )
+    topic_uuid = properties.property(
+        types.UUID(), required=True, read_only=True, id_property=True
+    )
+    stream_uuid = properties.property(types.UUID(), required=True, read_only=True)
+    action = properties.property(
+        types.Enum(["create", "delete"]), required=True, read_only=True
+    )
+
+    @classmethod
+    def get_id_property(cls) -> dict[str, typing.Any]:
+        return cls.id_properties.copy()
+
+    def get_id(self) -> tuple[sys_uuid.UUID, sys_uuid.UUID]:
+        return self.project_id, self.topic_uuid
+
+    def do(self) -> None:
+        {
+            "create": self.create_workspace_topic,
+            "delete": self.delete_workspace_topic,
+        }[self.action]()
+
+    def create_workspace_topic(self) -> None:
+        topic = ZulipTopic.objects.get_one(
+            filters={"uuid": filters.EQ(self.topic_uuid)},
+        )
+        messenger_models.WorkspaceStreamTopic(
+            uuid=self.topic_uuid,
+            project_id=self.project_id,
+            stream_uuid=self.stream_uuid,
+            name=topic.name,
+            source_name=messenger_models.TopicSourceName.ZULIP.value,
+            source=messenger_models.ZulipSource(),
+            created_at=topic.created_at,
+        ).insert()
+
+    def delete_workspace_topic(self) -> None:
+        topic = v2_models.WorkspaceStreamTopic.objects.get_one(
+            filters={
+                "project_id": filters.EQ(self.project_id),
+                "uuid": filters.EQ(self.topic_uuid),
+                "stream_uuid": filters.EQ(self.stream_uuid),
+                "source_name": filters.EQ(messenger_models.TopicSourceName.ZULIP.value),
+            },
+        )
+        topic.delete()
+
+
 class ZulipChannel(
     models.ModelWithUUID,
     models.ModelWithTimestamp,
@@ -946,7 +1005,7 @@ class ImportHistoryContent(AbstractZulipTaskContent):
                     else:
                         channel.update_dm(values=values)
                         channel.update()
-                topic_uuid = sys_uuid.uuid5(channel.uuid, data["subject"])
+                topic_uuid = sys_uuid.uuid5(channel.stream_uuid, data["subject"])
                 topic_name = data["subject"] or "General Topic"
                 topic = ZulipTopic.objects.get_one_or_none(
                     filters={"uuid": filters.EQ(topic_uuid)},
@@ -1064,8 +1123,17 @@ class ReconciliationContent(AbstractTaskContent):
         )
         for state in states:
             state.do()
+        processed = len(states)
+        if processed < self.batch_size:
+            topic_states = ZulipTopicState.objects.get_all(
+                order_by={"project_id": "asc", "topic_uuid": "asc"},
+                limit=self.batch_size - processed,
+            )
+            for topic_state in topic_states:
+                topic_state.do()
+            processed += len(topic_states)
         not_before_at = None
-        if len(states) < self.batch_size:
+        if processed < self.batch_size:
             not_before_at = datetime.datetime.now(
                 datetime.timezone.utc
             ) + datetime.timedelta(seconds=self.interval)

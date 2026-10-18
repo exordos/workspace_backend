@@ -76,6 +76,11 @@ class StreamSourceName(str, enum.Enum):
     ZULIP = ZulipSource.KIND
 
 
+class TopicSourceName(str, enum.Enum):
+    NATIVE = NativeSource.KIND
+    ZULIP = ZulipSource.KIND
+
+
 def native_source() -> NativeSource:
     return NativeSource()
 
@@ -88,6 +93,20 @@ class WorkspaceSourceBase(models.Model):
     source = properties.property(
         types_dynamic.KindModelSelectorType(
             types_dynamic.KindModelType(NativeSource),
+        ),
+        default=native_source,
+    )
+
+
+class WorkspaceTopicSourceBase(WorkspaceSourceBase):
+    source_name = properties.property(
+        types.Enum([source.value for source in TopicSourceName]),
+        default=SourceName.NATIVE.value,
+    )
+    source = properties.property(
+        types_dynamic.KindModelSelectorType(
+            types_dynamic.KindModelType(NativeSource),
+            types_dynamic.KindModelType(ZulipSource),
         ),
         default=native_source,
     )

@@ -2452,7 +2452,10 @@ def _reject_conflicting_stream_identity(
 def _build_topic_source(
     source_name: typing.Any, source: typing.Any, topic_name: typing.Any
 ) -> typing.Any:
-    return models.NativeSource()
+    return {
+        models.TopicSourceName.NATIVE.value: models.NativeSource,
+        models.TopicSourceName.ZULIP.value: models.ZulipSource,
+    }[_normalize_source_name(source_name)]()
 
 
 def _build_message_source(source_name: typing.Any, source: typing.Any) -> typing.Any:

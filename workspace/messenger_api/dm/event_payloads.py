@@ -232,6 +232,7 @@ class TopicEventPayloadBase(
     types_dynamic.AbstractKindModel,
     base.UserScopedModelWithUUID,
     models.ModelWithProject,
+    base.WorkspaceTopicSourceBase,
 ):
     name = properties.property(
         types.String(max_length=128),
@@ -308,13 +309,14 @@ class TopicDeletedEventPayload(
         required=True,
     )
     source_name = properties.property(
-        types.AllowNone(types.Enum([source.value for source in base.SourceName])),
+        types.AllowNone(types.Enum([source.value for source in base.TopicSourceName])),
         default=None,
     )
     source = properties.property(
         types.AllowNone(
             types_dynamic.KindModelSelectorType(
                 types_dynamic.KindModelType(base.NativeSource),
+                types_dynamic.KindModelType(base.ZulipSource),
             )
         ),
         default=None,

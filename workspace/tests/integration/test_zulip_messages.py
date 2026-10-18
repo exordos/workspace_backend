@@ -19,13 +19,18 @@ from restalchemy.storage.sql import migrations
 from workspace.bridges.zulip import client
 from workspace.bridges.zulip.dm import models
 from workspace.messenger_api.dm import external_models
+from workspace.messenger_api.dm import event_payloads
+from workspace.messenger_api.dm import models as messenger_models
+from workspace.messenger_api.dm import v2_models
 from workspace.tests.integration import conftest
 
 
 def _channel(account, stream_id=42):
     channel = models.ZulipChannel(
         external_account_uuid=account.uuid,
-        stream_uuid=uuid.uuid4(),
+        stream_uuid=uuid.uuid5(
+            uuid.uuid5(uuid.NAMESPACE_DNS, account.get_host()), str(stream_id)
+        ),
         stream_id=stream_id,
         name=f"Channel {stream_id}",
         description="",
@@ -55,6 +60,13 @@ def history_account(_database, db):
     _channel(account)
     yield account
     account.delete()
+    db.execute(
+        "DELETE FROM bridge_zulip_v5_topics AS topic WHERE NOT EXISTS "
+        "(SELECT 1 FROM bridge_zulip_v5_messages AS message WHERE message.topic = topic.uuid)"
+    )
+    db.execute(
+        "DELETE FROM messenger_streams WHERE project_id = %s", (account.project_id,)
+    )
 
 
 def _message_data(message_id=42, **values):
@@ -206,7 +218,7 @@ def test_history_import_names_empty_topics_without_changing_identity(
     channel = models.ZulipChannel.objects.get_one(
         filters={"external_account_uuid": filters.EQ(account.uuid)}
     )
-    topic_uuid = uuid.uuid5(channel.uuid, "")
+    topic_uuid = uuid.uuid5(channel.stream_uuid, "")
     if existing:
         models.ZulipTopic(
             uuid=topic_uuid, stream_id=channel.stream_id, name="", max_id=44
@@ -222,7 +234,7 @@ def test_history_import_names_empty_topics_without_changing_identity(
     empty, named = _messages(account)
     assert empty.topic.name == named.topic.name == "General Topic"
     assert empty.topic.uuid == topic_uuid
-    assert named.topic.uuid == uuid.uuid5(channel.uuid, "General Topic")
+    assert named.topic.uuid == uuid.uuid5(channel.stream_uuid, "General Topic")
     assert empty.topic.uuid != named.topic.uuid
     assert empty.topic.max_id == (44 if existing else 42)
     identities = [(message.uuid, message.topic.uuid) for message in (empty, named)]
@@ -270,8 +282,348 @@ def test_direct_conversation_identity_is_shared_between_accounts(
     (incoming,) = _messages(direct_peer)
     assert outgoing.channel.stream_uuid == incoming.channel.stream_uuid
     assert outgoing.channel.uuid != incoming.channel.uuid
+    assert outgoing.topic.uuid == incoming.topic.uuid
     assert outgoing.channel.direct_user_uuid == direct_peer.uuid
     assert incoming.channel.direct_user_uuid == history_account.uuid
+
+
+def test_topic_identity_migration_merges_accounts_and_preserves_messages(_database):
+    with conftest.isolated_migration_database(
+        "0215-Name-empty-Zulip-topics-General-Topic-146c8a.py"
+    ) as database_url:
+        project_id = uuid.uuid4()
+        now = datetime.datetime.now(datetime.timezone.utc)
+        content = models.MessageContent(
+            zulip_content="Message",
+            workspace_content="Message",
+            zulip_content_hash="hash",
+            workspace_content_hash="hash",
+            zulip_content_updated_at=now,
+            workspace_content_updated_at=now,
+        )
+        content.insert()
+        expected_topics = {}
+        expected_messages = {}
+        for index in range(2):
+            owner_uuid = uuid.uuid4()
+            with psycopg.connect(database_url, autocommit=True) as connection:
+                conftest.seed_workspace_user(
+                    connection, owner_uuid, f"migration-{owner_uuid}"
+                )
+            account = external_models.ExternalAccount(
+                project_id=project_id,
+                owner_user_uuid=owner_uuid,
+                provider="zulip",
+                settings={"server_url": "https://zulip.example.com"},
+            )
+            account.insert()
+            channel = _channel(account)
+            for message_id, subject in enumerate(("Planning", "", "General Topic"), 42):
+                canonical_uuid = uuid.uuid5(channel.stream_uuid, subject)
+                topic = models.ZulipTopic(
+                    uuid=uuid.uuid5(channel.uuid, subject),
+                    stream_id=42,
+                    name=subject or "General Topic",
+                    max_id=44 + index,
+                )
+                topic.insert()
+                message = models.ZulipMessage(
+                    project_id=project_id,
+                    external_account_uuid=account.uuid,
+                    message_uuid=uuid.uuid4(),
+                    message_id=message_id,
+                    sender_id=7,
+                    timestamp=0,
+                    channel=channel,
+                    topic=topic,
+                    content=content,
+                )
+                message.insert()
+                expected_topics[canonical_uuid] = (subject or "General Topic", 45)
+                expected_messages[message.uuid] = canonical_uuid
+        with psycopg.connect(database_url, autocommit=True) as connection:
+            before = connection.execute(
+                "SELECT to_jsonb(message) - 'topic' FROM bridge_zulip_v5_messages AS message ORDER BY uuid"
+            ).fetchall()
+            engine = migrations.MigrationEngine(
+                migrations_path=str(conftest.MIGRATIONS_DIR)
+            )
+            migration = "0216-Add-Zulip-topic-reconciliation-view-140730.py"
+            engine.apply_migration(migration)
+            assert {
+                topic.uuid: (topic.name, topic.max_id)
+                for topic in models.ZulipTopic.objects.get_all()
+            } == expected_topics
+            assert (
+                dict(
+                    connection.execute(
+                        "SELECT uuid, topic FROM bridge_zulip_v5_messages"
+                    ).fetchall()
+                )
+                == expected_messages
+            )
+            assert (
+                connection.execute(
+                    "SELECT to_jsonb(message) - 'topic' FROM bridge_zulip_v5_messages AS message ORDER BY uuid"
+                ).fetchall()
+                == before
+            )
+            engine.rollback_migration(migration)
+            assert connection.execute(
+                "SELECT to_regclass('bridge_zulip_v5_topic_states')"
+            ).fetchone() == (None,)
+            engine.apply_migration(migration)
+            assert (
+                dict(
+                    connection.execute(
+                        "SELECT uuid, topic FROM bridge_zulip_v5_messages"
+                    ).fetchall()
+                )
+                == expected_messages
+            )
+
+
+def _topic_states(account):
+    return models.ZulipTopicState.objects.get_all(
+        filters={"project_id": filters.EQ(account.project_id)},
+        order_by={"topic_uuid": "asc"},
+    )
+
+
+def _create_workspace_stream(account, db):
+    state = models.ZulipStreamState.objects.get_one(
+        filters={"project_id": filters.EQ(account.project_id)}
+    )
+    state.do()
+    conftest.seed_user_stream_binding(
+        db, account.project_id, state.stream_uuid, account.owner_user_uuid
+    )
+    return state.stream_uuid
+
+
+@pytest.mark.parametrize("subject", ["Planning", "", "General Topic"])
+def test_topic_state_creates_topics_after_the_stream_and_exposes_zulip_source(
+    history_account, db, monkeypatch, subject
+):
+    account = history_account
+    zulip = mock.Mock()
+    zulip.get_messages.return_value = [_message_data(subject=subject)]
+    monkeypatch.setattr(client, "ZulipClient", lambda current: zulip)
+    assert _import_history(account).status == "done"
+    assert _topic_states(account) == []
+
+    stream_uuid = _create_workspace_stream(account, db)
+    (state,) = _topic_states(account)
+    assert state.get_id() == (account.project_id, uuid.uuid5(stream_uuid, subject))
+    assert state.action == "create"
+    state.do()
+
+    for topic_model in (
+        messenger_models.WorkspaceStreamTopic,
+        v2_models.WorkspaceStreamTopic,
+    ):
+        topic = topic_model.objects.get_one(
+            filters={"uuid": filters.EQ(state.topic_uuid)}
+        )
+        assert topic.name == (subject or "General Topic")
+        assert topic.stream_uuid == stream_uuid
+        assert topic.source_name == "zulip"
+        assert topic.source.KIND == "zulip"
+    for topic_model in (
+        messenger_models.WorkspaceUserTopic,
+        v2_models.WorkspaceUserTopic,
+    ):
+        visible = topic_model.objects.get_one(
+            filters={"uuid": filters.EQ(state.topic_uuid)}
+        )
+        assert visible.source.KIND == "zulip"
+        assert (
+            event_payloads.TopicCreatedEventPayload(**dict(visible)).source.KIND
+            == "zulip"
+        )
+    assert (
+        event_payloads.TopicDeletedEventPayload(
+            uuid=state.topic_uuid,
+            stream_uuid=stream_uuid,
+            source_name="zulip",
+            source=messenger_models.ZulipSource(),
+        ).source.KIND
+        == "zulip"
+    )
+    assert _topic_states(account) == []
+
+
+def test_topic_states_deduplicate_accounts_and_delete_only_unreferenced_zulip_topics(
+    history_account, direct_peer, db, monkeypatch
+):
+    account = history_account
+    _channel(direct_peer)
+    zulip = mock.Mock()
+    zulip.get_messages.return_value = [_message_data()]
+    monkeypatch.setattr(client, "ZulipClient", lambda current: zulip)
+    assert (
+        _import_history(account).status == _import_history(direct_peer).status == "done"
+    )
+    stream_uuid = _create_workspace_stream(account, db)
+    (state,) = _topic_states(account)
+    state.do()
+    native = v2_models.WorkspaceStreamTopic(
+        project_id=account.project_id, stream_uuid=stream_uuid, name="Native"
+    )
+    native.insert()
+
+    _messages(account)[0].delete()
+    assert _topic_states(account) == []
+    _messages(direct_peer)[0].delete()
+    (deletion,) = _topic_states(account)
+    assert deletion.action == "delete"
+    assert deletion.topic_uuid == state.topic_uuid
+    deletion.do()
+
+    for topic_model in (
+        messenger_models.WorkspaceStreamTopic,
+        v2_models.WorkspaceStreamTopic,
+    ):
+        assert (
+            topic_model.objects.get_one_or_none(
+                filters={"uuid": filters.EQ(state.topic_uuid)}
+            )
+            is None
+        )
+        assert (
+            topic_model.objects.get_one(filters={"uuid": filters.EQ(native.uuid)}).name
+            == "Native"
+        )
+    assert db.execute(
+        "SELECT count(*) FROM messenger_user_topic_bindings WHERE topic_uuid = %s",
+        (state.topic_uuid,),
+    ).fetchone() == (0,)
+    assert _topic_states(account) == []
+
+
+@pytest.mark.parametrize("case", ["native_topic", "native_stream", "other_provider"])
+def test_topic_states_preserve_native_data_and_filter_other_providers(
+    history_account, db, monkeypatch, case
+):
+    account = history_account
+    zulip = mock.Mock()
+    zulip.get_messages.return_value = [_message_data()]
+    monkeypatch.setattr(client, "ZulipClient", lambda current: zulip)
+    assert _import_history(account).status == "done"
+    stream_uuid = _create_workspace_stream(account, db)
+    if case == "native_topic":
+        v2_models.WorkspaceStreamTopic(
+            uuid=_messages(account)[0].topic.uuid,
+            project_id=account.project_id,
+            stream_uuid=stream_uuid,
+            name="Native",
+        ).insert()
+    elif case == "native_stream":
+        stream = v2_models.WorkspaceStream.objects.get_one(
+            filters={"uuid": filters.EQ(stream_uuid)}
+        )
+        stream.source_name = "native"
+        stream.source = {"kind": "native"}
+        stream.update()
+    else:
+        account.provider = "other"
+        account.update()
+    assert _topic_states(account) == []
+
+
+def test_topic_state_restores_soft_deleted_topics_in_the_current_transaction(
+    history_account, db, monkeypatch
+):
+    account = history_account
+    zulip = mock.Mock()
+    zulip.get_messages.return_value = [_message_data()]
+    monkeypatch.setattr(client, "ZulipClient", lambda current: zulip)
+    assert _import_history(account).status == "done"
+    _create_workspace_stream(account, db)
+    (state,) = _topic_states(account)
+    state.do()
+    db.execute(
+        "UPDATE messenger_topics SET deleted_at = NOW() WHERE uuid = %s",
+        (state.topic_uuid,),
+    )
+
+    with pytest.raises(RuntimeError, match="Rollback topic creation"):
+        with contexts.Context().session_manager():
+            (state,) = _topic_states(account)
+            state.do()
+            assert _topic_states(account) == []
+            raise RuntimeError("Rollback topic creation")
+    (state,) = _topic_states(account)
+    state.do()
+    assert _topic_states(account) == []
+
+
+def test_topic_failure_rolls_back_stream_creation_and_retries_reconciliation(
+    history_account, monkeypatch
+):
+    account = history_account
+    zulip = mock.Mock()
+    zulip.get_messages.return_value = [_message_data()]
+    monkeypatch.setattr(client, "ZulipClient", lambda current: zulip)
+    assert _import_history(account).status == "done"
+    with mock.patch.object(
+        models.ZulipTopicState, "do", side_effect=RuntimeError("Topic failed")
+    ):
+        task = models.Task(content=models.ReconciliationContent(interval=17))
+        task.insert()
+        with contexts.Context().session_manager():
+            task.execute()
+    assert task.status == "retry"
+    assert task.next_retry_at is not None
+    assert (
+        v2_models.WorkspaceStream.objects.get_all(
+            filters={"project_id": filters.EQ(account.project_id)}
+        )
+        == []
+    )
+    assert (
+        models.ZulipStreamState.objects.get_one(
+            filters={"project_id": filters.EQ(account.project_id)}
+        ).action
+        == "create"
+    )
+    task.delete()
+
+
+def test_reconciliation_shares_the_batch_budget_between_streams_and_topics(
+    history_account, db, monkeypatch
+):
+    account = history_account
+    zulip = mock.Mock()
+    zulip.get_messages.return_value = [
+        _message_data(subject="One"),
+        _message_data(43, subject="Two"),
+    ]
+    monkeypatch.setattr(client, "ZulipClient", lambda current: zulip)
+    assert _import_history(account).status == "done"
+    task = models.Task(content=models.ReconciliationContent(batch_size=2, interval=17))
+    task.insert()
+    try:
+        with contexts.Context().session_manager():
+            task.execute()
+        assert task.status == "done"
+        assert len(_topic_states(account)) == 1
+        (followup,) = models.Task.objects.get_all(
+            filters={"project_id": filters.Is(None), "uuid": filters.NE(task.uuid)}
+        )
+        assert followup.not_before_at is None
+        with contexts.Context().session_manager():
+            followup.execute()
+        assert _topic_states(account) == []
+        (waiting,) = models.Task.objects.get_all(
+            filters={"project_id": filters.Is(None), "status": filters.EQ("waiting")}
+        )
+        assert waiting.not_before_at is not None
+    finally:
+        for stored in models.Task.objects.get_all(
+            filters={"project_id": filters.Is(None)}
+        ):
+            stored.delete()
 
 
 @pytest.mark.parametrize("peer_scope", ("missing", "project", "host"))
@@ -437,7 +789,9 @@ def test_history_import_keeps_accounts_and_projects_separate(
         assert second.project_id == other.project_id
         assert second.message_uuid == uuid.UUID(expected_uuid)
         assert first.uuid != second.uuid
-        assert first.topic.uuid != second.topic.uuid
+        assert (first.topic.uuid == second.topic.uuid) == (
+            account.get_host() == other.get_host()
+        )
         assert first.content.uuid != second.content.uuid
         zulip.get_messages.return_value = [_message_data(content="Changed")]
 

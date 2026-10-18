@@ -348,7 +348,7 @@ class WorkspaceStreamTopic(
     models.ModelWithUUID,
     models.ModelWithProject,
     models.ModelWithTimestamp,
-    base.WorkspaceSourceBase,
+    base.WorkspaceTopicSourceBase,
     orm.SQLStorableMixin,
 ):
     __tablename__ = "messenger_topics"
@@ -400,7 +400,7 @@ class WorkspaceUserTopic(
     base.UserScopedModelWithUUID,
     models.ModelWithProject,
     models.ModelWithTimestamp,
-    base.WorkspaceSourceBase,
+    base.WorkspaceTopicSourceBase,
     orm.SQLStorableMixin,
 ):
     __tablename__ = "messenger_api_user_topics_v1"

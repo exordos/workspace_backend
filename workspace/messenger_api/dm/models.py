@@ -50,6 +50,7 @@ NativeSource = base.NativeSource
 ZulipSource = base.ZulipSource
 SourceName = base.SourceName
 StreamSourceName = base.StreamSourceName
+TopicSourceName = base.TopicSourceName
 WorkspaceStreamRole = base.WorkspaceStreamRole
 WorkspaceStreamNotificationMode = base.WorkspaceStreamNotificationMode
 WorkspaceTopicNotificationMode = base.WorkspaceTopicNotificationMode
@@ -834,7 +835,7 @@ class WorkspaceStreamTopic(
     models.ModelWithUUID,
     models.ModelWithProject,
     models.ModelWithTimestamp,
-    base.WorkspaceSourceBase,
+    base.WorkspaceTopicSourceBase,
     models.CustomPropertiesMixin,
     orm.SQLStorableMixin,
 ):
@@ -919,7 +920,7 @@ class WorkspaceUserTopic(
     base.UserScopedModelWithUUID,
     models.ModelWithProject,
     models.ModelWithTimestamp,
-    base.WorkspaceSourceBase,
+    base.WorkspaceTopicSourceBase,
     orm.SQLStorableMixin,
 ):
     __tablename__ = "m_workspace_user_topics_view"
