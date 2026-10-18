@@ -431,14 +431,15 @@ class ZulipMessageState(
         for project_id, message_uuid in batch:
             projects.setdefault(project_id, []).append(message_uuid)
         for project_id, message_uuids in projects.items():
-            states = cls.objects.get_all(
-                filters={
-                    "project_id": filters.EQ(project_id),
-                    "message_uuid": filters.In(message_uuids),
-                },
-            )
-            for state in states:
-                state.do()
+            for model in (cls, ZulipMessagePlacementState):
+                states = model.objects.get_all(
+                    filters={
+                        "project_id": filters.EQ(project_id),
+                        "message_uuid": filters.In(message_uuids),
+                    },
+                )
+                for state in states:
+                    state.do()
         for model in change_models:
             pending = [
                 change
@@ -584,6 +585,85 @@ class ZulipMessageState(
         message.delete()
 
 
+class ZulipMessagePlacementState(
+    models.ModelWithID,
+    models.ModelWithProject,
+    orm.SQLStorableMixin,
+):
+    """Zulip-owned placements missing or differing from the latest observation."""
+
+    __tablename__ = "bridge_zulip_v5_message_placement_states"
+
+    project_id = properties.property(
+        types.UUID(), required=True, read_only=True, id_property=True
+    )
+    message_uuid = properties.property(
+        types.UUID(), required=True, read_only=True, id_property=True
+    )
+    placement_uuid = properties.property(types.UUID(), required=True, read_only=True)
+    stream_uuid = properties.property(
+        types.AllowNone(types.UUID()), default=None, read_only=True
+    )
+    topic_uuid = properties.property(
+        types.AllowNone(types.UUID()), default=None, read_only=True
+    )
+    action = properties.property(
+        types.Enum(["create", "update", "delete"]), required=True, read_only=True
+    )
+
+    @classmethod
+    def get_id_property(cls) -> dict[str, typing.Any]:
+        return cls.id_properties.copy()
+
+    def get_id(self) -> tuple[sys_uuid.UUID, sys_uuid.UUID]:
+        return self.project_id, self.message_uuid
+
+    def do(self) -> None:
+        {
+            "create": self.reconcile_workspace_placement,
+            "update": self.reconcile_workspace_placement,
+            "delete": self.delete_workspace_placement,
+        }[self.action]()
+
+    def reconcile_workspace_placement(self) -> None:
+        placement = v2_models.WorkspaceMessagePlacement.objects.get_one_or_none(
+            filters={
+                "project_id": filters.EQ(self.project_id),
+                "uuid": filters.EQ(self.placement_uuid),
+            },
+        )
+        if placement is None:
+            message = v2_models.WorkspaceMessage.objects.get_one(
+                filters={
+                    "project_id": filters.EQ(self.project_id),
+                    "uuid": filters.EQ(self.message_uuid),
+                    "source_name": filters.EQ(messenger_base.SourceName.ZULIP.value),
+                },
+            )
+            v2_models.WorkspaceMessagePlacement(
+                uuid=self.placement_uuid,
+                project_id=self.project_id,
+                message_uuid=self.message_uuid,
+                stream_uuid=self.stream_uuid,
+                topic_uuid=self.topic_uuid,
+                created_at=message.created_at,
+                updated_at=message.updated_at,
+            ).insert()
+        else:
+            for field in ("message_uuid", "stream_uuid", "topic_uuid"):
+                placement.properties[field].set_value_force(getattr(self, field))
+            placement.update()
+
+    def delete_workspace_placement(self) -> None:
+        placement = v2_models.WorkspaceMessagePlacement.objects.get_one(
+            filters={
+                "project_id": filters.EQ(self.project_id),
+                "uuid": filters.EQ(self.placement_uuid),
+            },
+        )
+        placement.delete()
+
+
 class ZulipChannel(
     models.ModelWithUUID,
     models.ModelWithTimestamp,
@@ -702,6 +782,9 @@ class ZulipMessage(
     timestamp = properties.property(
         types.Integer(min_value=0),
         required=True,
+    )
+    placement_updated_at = properties.property(
+        types.AllowNone(types.UTCDateTimeZ()), default=None
     )
     content = relationships.relationship(
         MessageContent,
@@ -1316,6 +1399,15 @@ class ImportHistoryContent(AbstractZulipTaskContent):
                         "message_id": filters.EQ(data["id"]),
                     },
                 )
+                if message is not None:
+                    contexts.Context().get_session().execute(
+                        "SELECT uuid FROM bridge_zulip_v5_messages "
+                        "WHERE uuid = %s FOR UPDATE",
+                        (message.uuid,),
+                    )
+                    message = ZulipMessage.objects.get_one(
+                        filters={"uuid": filters.EQ(message.uuid)}
+                    )
                 content_hash = hashlib.sha256(
                     data["content"].encode("utf-8")
                 ).hexdigest()
@@ -1364,6 +1456,7 @@ class ImportHistoryContent(AbstractZulipTaskContent):
                     "message_id": data["id"],
                     "sender_id": data["sender_id"],
                     "timestamp": data["timestamp"],
+                    "placement_updated_at": content_updated_at,
                     "channel": channel,
                     "topic": topic,
                     "content": content,
@@ -1390,6 +1483,9 @@ class ImportHistoryContent(AbstractZulipTaskContent):
                         **values,
                     ).insert()
                 else:
+                    if content_updated_at <= message.placement_updated_at:
+                        for field in ("channel", "topic", "placement_updated_at"):
+                            del values[field]
                     message.update_dm(values=values)
                     message.update()
         finally:

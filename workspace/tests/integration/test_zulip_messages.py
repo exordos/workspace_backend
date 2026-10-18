@@ -344,7 +344,25 @@ def test_topic_identity_migration_merges_accounts_and_preserves_messages(_databa
                     topic=topic,
                     content=content,
                 )
-                message.insert()
+                with psycopg.connect(database_url, autocommit=True) as connection:
+                    connection.execute(
+                        "INSERT INTO bridge_zulip_v5_messages "
+                        "(uuid, project_id, external_account_uuid, message_uuid, "
+                        "message_id, sender_id, timestamp, channel, topic, content) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                        (
+                            message.uuid,
+                            project_id,
+                            account.uuid,
+                            message.message_uuid,
+                            message_id,
+                            message.sender_id,
+                            message.timestamp,
+                            channel.uuid,
+                            topic.uuid,
+                            content.uuid,
+                        ),
+                    )
                 expected_topics[canonical_uuid] = (subject or "General Topic", 45)
                 expected_messages[message.uuid] = canonical_uuid
         with psycopg.connect(database_url, autocommit=True) as connection:
@@ -1170,9 +1188,30 @@ def test_history_reimport_reloads_content_changed_after_the_observation_was_read
 
     with monkeypatch.context() as patched:
         patched.setattr(
-            models.ZulipMessage, "objects", mock.Mock(get_one_or_none=load_then_edit)
+            models.ZulipMessage,
+            "objects",
+            mock.Mock(get_one_or_none=load_then_edit, get_one=collection.get_one),
         )
         assert _import_history(account).status == "done"
     (stored,) = _messages(account)
     assert stored.content.workspace_content == "A concurrent Workspace edit"
     assert stored.content.workspace_content_updated_at == edited_at
+
+
+def test_history_reimport_does_not_reverse_a_newer_move(history_account, monkeypatch):
+    account = history_account
+    zulip = mock.Mock()
+    zulip.get_messages.return_value = [
+        _message_data(subject="Moved", last_edit_timestamp=1691057203)
+    ]
+    monkeypatch.setattr(client, "ZulipClient", lambda current_account: zulip)
+    assert _import_history(account).status == "done"
+    (moved,) = _messages(account)
+    zulip.get_messages.return_value = [
+        _message_data(subject="Old topic", last_edit_timestamp=1691057103)
+    ]
+    assert _import_history(account).status == "done"
+    (stored,) = _messages(account)
+    assert stored.topic.uuid == moved.topic.uuid
+    assert stored.topic.name == "Moved"
+    assert stored.placement_updated_at == moved.placement_updated_at

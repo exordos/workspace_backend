@@ -15,12 +15,15 @@ from restalchemy.dm import filters
 from restalchemy.storage.sql import migrations
 
 from workspace.bridges.zulip.dm import models
+from workspace.messenger_api.api import store as api_store
+from workspace.messenger_api.api import store_factory
 from workspace.messenger_api.dm import event_payloads
 from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.dm import message_payloads
 from workspace.messenger_api.dm import models as messenger_models
 from workspace.messenger_api.dm import v2_models
 from workspace.tests.integration import conftest
+from workspace.tests.integration import legacy_store
 
 
 @pytest.fixture
@@ -125,6 +128,18 @@ def _states(account):
 
 def _messages(account):
     return v2_models.WorkspaceMessage.objects.get_all(
+        filters={"project_id": filters.EQ(account.project_id)}
+    )
+
+
+def _placement_states(account):
+    return models.ZulipMessagePlacementState.objects.get_all(
+        filters={"project_id": filters.EQ(account.project_id)}
+    )
+
+
+def _placements(account):
+    return v2_models.WorkspaceMessagePlacement.objects.get_all(
         filters={"project_id": filters.EQ(account.project_id)}
     )
 
@@ -552,6 +567,7 @@ def test_batch_counts_a_shared_key_once_even_without_a_difference(message_source
     (state,) = _states(account)
     with contexts.Context().session_manager():
         state.do()
+        _placement_states(account)[0].do()
         assert models.ZulipMessageState.reconcile_batch(1) == 1
     assert _changes(models.ZulipMessageChange, account) == []
     assert _changes(v2_models.WorkspaceMessageChange, account) == []
@@ -570,6 +586,7 @@ def test_concurrent_updates_survive_batch_acknowledgement(
     if side == "workspace":
         with contexts.Context().session_manager():
             _states(account)[0].do()
+            _placement_states(account)[0].do()
         model = v2_models.WorkspaceMessageChange
         table = "messenger_messages"
     snapshot = _changes(model, account)[0]
@@ -728,6 +745,8 @@ def test_content_reconciliation_uses_the_last_edit_and_preserves_creation_time(
     assert content.zulip_content == "Original **message**"
     assert (source.read, source.starred, source.mentioned) == (True, True, True)
     assert _states(account) == []
+    with contexts.Context().session_manager():
+        assert models.ZulipMessageState.reconcile_batch(10) == 1
     with contexts.Context().session_manager():
         assert models.ZulipMessageState.reconcile_batch(10) == 1
     assert _changes(models.ZulipMessageChange, account) == []
@@ -945,3 +964,331 @@ def test_content_reconciliation_does_not_change_another_project(message_sources,
         filters={"uuid": filters.EQ(other.content.uuid)}
     )
     assert other_content.workspace_content == "Workspace **message**"
+
+
+def _move_source(source, stream_id=None, subject="Moved", edited_at=None):
+    channel = source.channel
+    if stream_id is not None:
+        namespace = uuid.uuid5(uuid.NAMESPACE_DNS, "zulip.example.com")
+        channel = models.ZulipChannel(
+            external_account_uuid=source.external_account_uuid,
+            stream_uuid=uuid.uuid5(namespace, str(stream_id)),
+            stream_id=stream_id,
+            name="Another channel",
+            description="",
+            rendered_description="",
+            invite_only=False,
+            is_web_public=False,
+            history_public_to_subscribers=True,
+            is_archived=False,
+        )
+        channel.insert()
+    topic_uuid = uuid.uuid5(channel.stream_uuid, subject)
+    topic = models.ZulipTopic.objects.get_one_or_none(
+        filters={"uuid": filters.EQ(topic_uuid)}
+    )
+    if topic is None:
+        topic = models.ZulipTopic(
+            uuid=topic_uuid,
+            stream_id=channel.stream_id,
+            name=subject or "General Topic",
+            max_id=source.message_id,
+        )
+        topic.insert()
+    source.channel = channel
+    source.topic = topic
+    if edited_at is not None:
+        source.placement_updated_at = edited_at
+    source.update()
+    return channel, topic
+
+
+def test_message_batch_creates_a_stable_placement_and_checks_both_api_projections(
+    message_sources, db, api
+):
+    account, source = message_sources()
+    _prepare(account)
+    (creation,) = _states(account)
+    with contexts.Context().session_manager():
+        assert models.ZulipMessageState.reconcile_batch(1) == 1
+    (placement,) = _placements(account)
+    assert placement.uuid == uuid.uuid5(creation.message_uuid, "zulip-placement")
+    assert placement.message_uuid == creation.message_uuid
+    assert placement.stream_uuid == source.channel.stream_uuid
+    assert placement.topic_uuid == source.topic.uuid
+    assert placement.created_at == _messages(account)[0].created_at
+    assert _placement_states(account) == []
+    legacy = db.execute(
+        "SELECT uuid, canonical_message_uuid, created_at FROM m_workspace_messages "
+        "WHERE project_id = %s",
+        (account.project_id,),
+    ).fetchone()
+    assert legacy[:2] == (placement.uuid, placement.message_uuid)
+    assert legacy[2] == placement.created_at.replace(tzinfo=None)
+    response = api.get(
+        "/v1/messenger/messages/",
+        user=account.owner_user_uuid,
+        project=account.project_id,
+        params={"stream_uuid": str(placement.stream_uuid)},
+    )
+    assert response.status_code == 200, response.text
+    assert [row["uuid"] for row in response.json()] == [str(placement.uuid)]
+    api_store.configure_store_factory(store_factory.build_store_factory())
+    try:
+        response = api.get(
+            "/v1/messenger/messages/",
+            user=account.owner_user_uuid,
+            project=account.project_id,
+            params={"stream_uuid": str(placement.stream_uuid)},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json() == []
+    finally:
+        api_store.configure_store_factory(legacy_store.LegacyMessengerStoreFactory())
+    assert _changes(models.ZulipMessageChange, account) == []
+    assert len(_changes(v2_models.WorkspaceMessageChange, account)) == 1
+    with contexts.Context().session_manager():
+        assert models.ZulipMessageState.reconcile_batch(1) == 1
+    assert _changes(v2_models.WorkspaceMessageChange, account) == []
+    for table in ("messenger_user_message_bindings", "messenger_user_message_states"):
+        assert db.execute(
+            f"SELECT count(*) FROM {table} WHERE project_id = %s", (account.project_id,)
+        ).fetchone() == (0,)
+
+
+@pytest.mark.parametrize("stream_id,subject", ((None, "Another topic"), (43, "")))
+def test_source_moves_keep_the_placement_identity(
+    message_sources, db, stream_id, subject
+):
+    account, source = message_sources()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(10)
+    (original,) = _placements(account)
+    message = _messages(account)[0]
+    channel, topic = _move_source(source, stream_id, subject)
+    _prepare(account)
+    (state,) = _placement_states(account)
+    assert state.action == "update"
+    assert state.placement_uuid == original.uuid
+    assert state.get_id() == (account.project_id, message.uuid)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(10)
+    (moved,) = _placements(account)
+    assert moved.uuid == original.uuid
+    assert moved.created_at == original.created_at
+    assert (moved.stream_uuid, moved.topic_uuid) == (channel.stream_uuid, topic.uuid)
+    assert _messages(account)[0].created_at == message.created_at
+    assert db.execute(
+        "SELECT stream_uuid, topic_uuid, created_at FROM m_workspace_messages WHERE uuid = %s",
+        (moved.uuid,),
+    ).fetchone() == (
+        channel.stream_uuid,
+        topic.uuid,
+        message.created_at.replace(tzinfo=None),
+    )
+    assert _placement_states(account) == []
+
+
+def test_old_observation_flags_cannot_reverse_a_move(message_sources):
+    account, source = message_sources()
+    _, old_copy = message_sources(project_id=account.project_id, sender_id=8)
+    _prepare(account)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(10)
+    _, topic = _move_source(source)
+    _prepare(account)
+    old_copy.read = False
+    old_copy.update()
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(10)
+    assert _placements(account)[0].topic_uuid == topic.uuid
+
+
+def test_workspace_placement_changes_are_marked_and_repaired(message_sources):
+    account, source = message_sources()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(10)
+        models.ZulipMessageState.reconcile_batch(10)
+    (placement,) = _placements(account)
+    old_topic = source.topic.uuid
+    _, topic = _move_source(source)
+    _prepare(account)
+    placement.properties["topic_uuid"].set_value_force(topic.uuid)
+    placement.update()
+    source.topic = models.ZulipTopic.objects.get_one(
+        filters={"uuid": filters.EQ(old_topic)}
+    )
+    source.update()
+    assert len(_changes(v2_models.WorkspaceMessageChange, account)) == 1
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(10)
+    assert _placements(account)[0].topic_uuid == old_topic
+    _placements(account)[0].delete()
+    assert _placements(account) == []
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(10)
+    assert _placements(account)[0].uuid == placement.uuid
+
+
+@pytest.mark.parametrize("deleted_root", ("source", "canonical"))
+def test_message_deletion_cascades_to_placement_and_legacy_projection(
+    message_sources, db, deleted_root
+):
+    account, source = message_sources()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(10)
+    (placement,) = _placements(account)
+    with contexts.Context().session_manager():
+        if deleted_root == "source":
+            source.delete()
+            models.ZulipMessageState.reconcile_batch(10)
+        else:
+            _messages(account)[0].delete()
+    assert _placements(account) == _messages(account) == []
+    assert db.execute(
+        "SELECT count(*) FROM m_workspace_messages WHERE uuid = %s", (placement.uuid,)
+    ).fetchone() == (0,)
+
+
+def test_placement_deletion_preserves_unmanaged_copies(message_sources):
+    account, source = message_sources()
+    _, other = message_sources(
+        project_id=account.project_id, sender_id=8, message_id=99, stream_id=43
+    )
+    _prepare(account)
+    with contexts.Context().session_manager():
+        _states(account)[0].do()
+        _states(account)[0].do()
+        for state in _placement_states(account):
+            state.do()
+    message_uuid = uuid.uuid5(account.project_id, str(source.message_uuid))
+    forwarded = v2_models.WorkspaceMessagePlacement(
+        project_id=account.project_id,
+        message_uuid=message_uuid,
+        stream_uuid=other.channel.stream_uuid,
+        topic_uuid=other.topic.uuid,
+    )
+    forwarded.insert()
+    source.delete()
+    (deletion,) = _placement_states(account)
+    assert deletion.action == "delete"
+    with contexts.Context().session_manager():
+        deletion.do()
+    assert forwarded.uuid in [row.uuid for row in _placements(account)]
+    assert message_uuid in [row.uuid for row in _messages(account)]
+
+
+def test_placement_failure_rolls_back_content_and_keeps_the_batch(
+    message_sources, monkeypatch
+):
+    account, source = message_sources()
+    _prepare(account)
+    pending = _changes(models.ZulipMessageChange, account)[0]
+
+    def fail_placement(self):
+        raise RuntimeError("Placement failed")
+
+    monkeypatch.setattr(models.ZulipMessagePlacementState, "do", fail_placement)
+    with pytest.raises(RuntimeError, match="Placement failed"):
+        with contexts.Context().session_manager():
+            models.ZulipMessageState.reconcile_batch(10)
+    assert _messages(account) == _placements(account) == []
+    assert _changes(models.ZulipMessageChange, account)[0].revision == pending.revision
+
+
+@pytest.mark.parametrize("existing_placement", (False, True))
+def test_placement_migration_is_reversible_and_backfills_existing_messages(
+    message_sources, db, existing_placement
+):
+    account, source = message_sources()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        _states(account)[0].do()
+    engine = migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    migration = "0222-Reconcile-Zulip-message-placements-1f12c4.py"
+    (message,) = _messages(account)
+    placement_uuid = uuid.uuid5(message.uuid, "zulip-placement")
+    engine.rollback_migration(migration)
+    try:
+        if existing_placement:
+            v2_models.WorkspaceMessagePlacement(
+                uuid=placement_uuid,
+                project_id=account.project_id,
+                message_uuid=message.uuid,
+                stream_uuid=source.channel.stream_uuid,
+                topic_uuid=source.topic.uuid,
+            ).insert()
+        _clear_changes(db, account)
+        assert db.execute(
+            "SELECT to_regclass('bridge_zulip_v5_message_placement_states')"
+        ).fetchone() == (None,)
+    finally:
+        engine.apply_migration(engine.get_latest_migration())
+    if existing_placement:
+        assert _placement_states(account) == []
+        assert db.execute(
+            "SELECT canonical_message_uuid FROM m_workspace_messages WHERE uuid = %s",
+            (placement_uuid,),
+        ).fetchone() == (message.uuid,)
+        message.delete()
+        assert db.execute(
+            "SELECT count(*) FROM m_workspace_messages WHERE uuid = %s",
+            (placement_uuid,),
+        ).fetchone() == (0,)
+    else:
+        (state,) = _placement_states(account)
+        assert state.action == "create"
+        with contexts.Context().session_manager():
+            models.ZulipMessageState.reconcile_batch(10)
+        assert _placements(account)[0].uuid == state.placement_uuid
+    assert (
+        models.ZulipMessage.objects.get_one(
+            filters={"uuid": filters.EQ(source.uuid)}
+        ).placement_updated_at
+        == source.content.zulip_content_updated_at
+    )
+
+
+def test_parent_cleanup_waits_until_the_placement_has_moved(message_sources):
+    account, source = message_sources()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(10)
+    old_channel = source.channel
+    old_topic_uuid = source.topic.uuid
+    placement_uuid = _placements(account)[0].uuid
+    channel, topic = _move_source(source, stream_id=43)
+    old_channel.delete()
+    _prepare(account)
+    assert _placements(account)[0].uuid == placement_uuid
+    assert _placement_states(account)[0].action == "update"
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(10)
+    _prepare(account)
+    (placement,) = _placements(account)
+    assert placement.uuid == placement_uuid
+    assert (placement.stream_uuid, placement.topic_uuid) == (
+        channel.stream_uuid,
+        topic.uuid,
+    )
+    assert (
+        v2_models.WorkspaceStreamTopic.objects.get_one_or_none(
+            filters={
+                "project_id": filters.EQ(account.project_id),
+                "uuid": filters.EQ(old_topic_uuid),
+            }
+        )
+        is None
+    )
+    assert (
+        v2_models.WorkspaceStream.objects.get_one_or_none(
+            filters={
+                "project_id": filters.EQ(account.project_id),
+                "uuid": filters.EQ(old_channel.stream_uuid),
+            }
+        )
+        is None
+    )
