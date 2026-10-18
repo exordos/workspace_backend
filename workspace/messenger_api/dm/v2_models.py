@@ -145,6 +145,12 @@ class WorkspaceMessage(
         default=base.SourceName.NATIVE.value,
     )
     source = properties.property(types.Dict(), default=base.native_source)
+    content_hash = properties.property(
+        types.AllowNone(types.String(max_length=64)), default=None, read_only=True
+    )
+    content_updated_at = properties.property(
+        types.AllowNone(types.UTCDateTimeZ()), default=None, read_only=True
+    )
     reactions = properties.property(types.Dict(), default=dict, read_only=True)
     reaction_users = properties.property(types.Dict(), default=dict, read_only=True)
     ingest_sequence = properties.property(

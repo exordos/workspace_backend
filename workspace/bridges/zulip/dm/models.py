@@ -395,7 +395,7 @@ class ZulipMessageState(
     models.ModelWithProject,
     orm.SQLStorableMixin,
 ):
-    """Message existence differences, without content updates or viewer state."""
+    """Message existence and content differences, without viewer state."""
 
     __tablename__ = "bridge_zulip_v5_message_states"
 
@@ -409,7 +409,7 @@ class ZulipMessageState(
         types.AllowNone(types.UUID()), default=None, read_only=True
     )
     action = properties.property(
-        types.Enum(["create", "delete"]), required=True, read_only=True
+        types.Enum(["create", "delete", "update"]), required=True, read_only=True
     )
 
     @classmethod
@@ -454,6 +454,7 @@ class ZulipMessageState(
         {
             "create": self.create_workspace_message,
             "delete": self.delete_workspace_message,
+            "update": self.update_content,
         }[self.action]()
 
     def create_workspace_message(self) -> None:
@@ -503,11 +504,74 @@ class ZulipMessageState(
                 ingest_sequence=sequence,
                 created_at=created_at,
                 updated_at=source.content.workspace_content_updated_at,
+                content_updated_at=source.content.workspace_content_updated_at,
             )
             message.insert()
         else:
             message.properties["deleted_at"].set_value_force(None)
             message.update()
+        self.update_content()
+
+    def update_content(self) -> None:
+        session = contexts.Context().get_session()
+        session.execute(
+            "SELECT uuid FROM messenger_messages "
+            "WHERE project_id = %s AND uuid = %s AND source_name = 'zulip' "
+            "FOR UPDATE",
+            (self.project_id, self.message_uuid),
+        )
+        message = v2_models.WorkspaceMessage.objects.get_one(
+            filters={
+                "project_id": filters.EQ(self.project_id),
+                "uuid": filters.EQ(self.message_uuid),
+                "source_name": filters.EQ(messenger_base.SourceName.ZULIP.value),
+            },
+        )
+        rows = session.execute(
+            "SELECT content.uuid FROM bridge_zulip_v5_messages AS message "
+            "JOIN m_external_accounts_v2 AS account "
+            "ON account.uuid = message.external_account_uuid "
+            "AND account.project_id = message.project_id "
+            "JOIN bridge_zulip_v5_message_contents AS content "
+            "ON content.uuid = message.content "
+            "WHERE message.project_id = %s AND "
+            "messenger_uuid_v5(message.project_id, message.message_uuid::text) = %s "
+            "AND account.provider = 'zulip' "
+            "ORDER BY content.uuid FOR UPDATE OF content",
+            (self.project_id, self.message_uuid),
+        ).fetchall()
+        contents = MessageContent.objects.get_all(
+            filters={"uuid": filters.In([row["uuid"] for row in rows])},
+            order_by={"uuid": "asc"},
+        )
+        text = message.payload.content
+        content_hash = message.content_hash
+        edited_at = message.content_updated_at
+        for content in contents:
+            if content.workspace_content_updated_at > edited_at:
+                text = content.workspace_content
+                content_hash = content.workspace_content_hash
+                edited_at = content.workspace_content_updated_at
+        if (message.content_hash, message.content_updated_at) != (
+            content_hash,
+            edited_at,
+        ):
+            message.payload = message_payloads.MarkdownPayload(content=text)
+            message.properties["content_updated_at"].set_value_force(edited_at)
+            message.properties["updated_at"].set_value_force(
+                max(message.updated_at, edited_at)
+            )
+            # Preserve the edit time instead of dating the synchronization itself.
+            orm.SQLStorableMixin.update(message)
+        for content in contents:
+            if (
+                content.workspace_content_hash,
+                content.workspace_content_updated_at,
+            ) != (content_hash, edited_at):
+                content.workspace_content = text
+                content.workspace_content_hash = content_hash
+                content.workspace_content_updated_at = edited_at
+                content.update()
 
     def delete_workspace_message(self) -> None:
         message = v2_models.WorkspaceMessage.objects.get_one(
@@ -1271,7 +1335,28 @@ class ImportHistoryContent(AbstractZulipTaskContent):
                     content = MessageContent(**content_values)
                     content.insert()
                 else:
-                    content = message.content
+                    contexts.Context().get_session().execute(
+                        "SELECT uuid FROM bridge_zulip_v5_message_contents "
+                        "WHERE uuid = %s FOR UPDATE",
+                        (message.content.uuid,),
+                    )
+                    content = MessageContent.objects.get_one(
+                        filters={"uuid": filters.EQ(message.content.uuid)}
+                    )
+                    if content_updated_at < content.zulip_content_updated_at:
+                        for field in (
+                            "zulip_content",
+                            "zulip_content_hash",
+                            "zulip_content_updated_at",
+                        ):
+                            del content_values[field]
+                    if content_updated_at <= content.workspace_content_updated_at:
+                        for field in (
+                            "workspace_content",
+                            "workspace_content_hash",
+                            "workspace_content_updated_at",
+                        ):
+                            del content_values[field]
                     content.update_dm(values=content_values)
                     content.update()
                 values = {

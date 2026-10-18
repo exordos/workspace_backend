@@ -787,7 +787,7 @@ def test_history_import_saves_and_updates_messages_without_duplicates(
     ],
 )
 def test_history_import_keeps_accounts_and_projects_separate(
-    history_account, monkeypatch, server_url, expected_uuid
+    history_account, monkeypatch, db, server_url, expected_uuid
 ):
     account = history_account
     other = external_models.ExternalAccount(
@@ -821,6 +821,10 @@ def test_history_import_keeps_accounts_and_projects_separate(
         assert _messages(other)[0].content.zulip_content == "Message **42**"
     finally:
         other.delete()
+        for table in ("bridge_zulip_v5_message_changes", "messenger_message_changes"):
+            db.execute(
+                f"DELETE FROM {table} WHERE project_id = %s", (other.project_id,)
+            )
 
 
 def test_empty_history_import_succeeds_without_rows(history_account, monkeypatch):
@@ -1102,3 +1106,73 @@ def test_message_uuid_and_project_migrations_backfill_and_round_trip(_database):
                 )
                 == expected_projects
             )
+
+
+def test_history_reimport_keeps_a_newer_workspace_edit(history_account, monkeypatch):
+    account = history_account
+    data = _message_data(last_edit_timestamp=1691057103)
+    zulip = mock.Mock()
+    zulip.get_messages.return_value = [data]
+    monkeypatch.setattr(client, "ZulipClient", lambda current_account: zulip)
+    assert _import_history(account).status == "done"
+    (source,) = _messages(account)
+    edited_at = source.content.workspace_content_updated_at + datetime.timedelta(days=1)
+    source.content.workspace_content = "A newer Workspace edit"
+    source.content.workspace_content_hash = hashlib.sha256(
+        b"A newer Workspace edit"
+    ).hexdigest()
+    source.content.workspace_content_updated_at = edited_at
+    source.content.update()
+    assert _import_history(account).status == "done"
+    (reimported,) = _messages(account)
+    assert reimported.content.workspace_content == "A newer Workspace edit"
+    assert reimported.content.workspace_content_updated_at == edited_at
+    assert (
+        reimported.content.workspace_content_hash
+        == hashlib.sha256(b"A newer Workspace edit").hexdigest()
+    )
+    assert reimported.content.zulip_content == data["content"]
+    zulip.get_messages.return_value = [
+        _message_data(
+            content="A new Zulip edit", last_edit_timestamp=1691057103 + 172800
+        )
+    ]
+    assert _import_history(account).status == "done"
+    (updated,) = _messages(account)
+    assert (
+        updated.content.workspace_content
+        == updated.content.zulip_content
+        == "A new Zulip edit"
+    )
+    assert updated.timestamp == data["timestamp"]
+
+
+def test_history_reimport_reloads_content_changed_after_the_observation_was_read(
+    history_account, monkeypatch, db
+):
+    account = history_account
+    zulip = mock.Mock()
+    zulip.get_messages.return_value = [_message_data()]
+    monkeypatch.setattr(client, "ZulipClient", lambda current_account: zulip)
+    assert _import_history(account).status == "done"
+    collection = models.ZulipMessage.objects
+    edited_at = datetime.datetime(2025, 1, 1, tzinfo=datetime.timezone.utc)
+
+    def load_then_edit(**kwargs):
+        source = collection.get_one_or_none(**kwargs)
+        db.execute(
+            "UPDATE bridge_zulip_v5_message_contents "
+            "SET workspace_content = 'A concurrent Workspace edit', "
+            "workspace_content_updated_at = %s WHERE uuid = %s",
+            (edited_at.replace(tzinfo=None), source.content.uuid),
+        )
+        return source
+
+    with monkeypatch.context() as patched:
+        patched.setattr(
+            models.ZulipMessage, "objects", mock.Mock(get_one_or_none=load_then_edit)
+        )
+        assert _import_history(account).status == "done"
+    (stored,) = _messages(account)
+    assert stored.content.workspace_content == "A concurrent Workspace edit"
+    assert stored.content.workspace_content_updated_at == edited_at

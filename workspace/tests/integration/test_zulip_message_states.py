@@ -236,21 +236,33 @@ def test_message_states_deduplicate_accounts_and_delete_the_root(message_sources
         ).fetchone() == (0,)
 
 
-def test_message_states_leave_existing_content_and_flags_unchanged(message_sources):
+def test_message_states_update_content_without_changing_personal_flags(message_sources):
     account, source = message_sources()
     _prepare(account)
     (state,) = _states(account)
     with contexts.Context().session_manager():
         state.do()
     source.content.workspace_content = "Updated content"
+    source.content.workspace_content_updated_at += datetime.timedelta(days=1)
     source.content.update()
     source.read = False
     source.starred = False
     source.mentioned = False
     source.update()
-    assert _states(account) == []
+    (update,) = _states(account)
+    assert update.action == "update"
+    with contexts.Context().session_manager():
+        update.do()
     (message,) = _messages(account)
-    assert message.payload.content == "Workspace **message**"
+    assert message.payload.content == "Updated content"
+    assert message.created_at == datetime.datetime.fromtimestamp(
+        source.timestamp, tz=datetime.timezone.utc
+    )
+    assert message.updated_at == source.content.workspace_content_updated_at
+    stored = models.ZulipMessage.objects.get_one(
+        filters={"uuid": filters.EQ(source.uuid)}
+    )
+    assert (stored.read, stored.starred, stored.mentioned) == (False, False, False)
 
 
 def test_message_creation_uses_the_current_author_account_owner(message_sources, db):
@@ -652,3 +664,284 @@ def test_change_migration_backfills_both_sides_and_is_reversible(message_sources
         states[source.uuid].message_uuid
     ]
     assert _states(account) == []
+
+
+def _write_workspace_content(db, message, text, edited_at):
+    db.execute(
+        "UPDATE messenger_messages SET payload = jsonb_build_object("
+        "'kind', 'markdown', 'content', %s::text), updated_at = %s, content_updated_at = %s "
+        "WHERE project_id = %s AND uuid = %s",
+        (
+            text,
+            edited_at.replace(tzinfo=None),
+            edited_at.replace(tzinfo=None),
+            message.project_id,
+            message.uuid,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "workspace_year,source_year,winner",
+    ((2024, 2025, "source"), (2025, 2024, "workspace"), (2025, 2025, "workspace")),
+)
+def test_content_reconciliation_uses_the_last_edit_and_preserves_creation_time(
+    message_sources, db, workspace_year, source_year, winner
+):
+    account, source = message_sources()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        _states(account)[0].do()
+    (message,) = _messages(account)
+    created_at = message.created_at
+    workspace_time = datetime.datetime(
+        workspace_year, 1, 1, tzinfo=datetime.timezone.utc
+    )
+    source_time = datetime.datetime(source_year, 1, 1, tzinfo=datetime.timezone.utc)
+    _write_workspace_content(db, message, "Workspace edit 🌍", workspace_time)
+    source.content.workspace_content = "Source edit 📝"
+    source.content.workspace_content_updated_at = source_time
+    source.content.update()
+    (state,) = _states(account)
+    assert state.action == "update"
+    with contexts.Context().session_manager():
+        state.do()
+    (stored,) = _messages(account)
+    content = models.MessageContent.objects.get_one(
+        filters={"uuid": filters.EQ(source.content.uuid)}
+    )
+    expected = "Source edit 📝" if winner == "source" else "Workspace edit 🌍"
+    expected_hash = hashlib.sha256(expected.encode()).hexdigest()
+    assert stored.payload.content == content.workspace_content == expected
+    assert stored.content_hash == content.workspace_content_hash == expected_hash
+    assert (
+        stored.content_updated_at
+        == content.workspace_content_updated_at
+        == max(workspace_time, source_time)
+    )
+    assert (
+        stored.created_at
+        == created_at
+        == datetime.datetime.fromtimestamp(source.timestamp, tz=datetime.timezone.utc)
+    )
+    assert stored.updated_at == max(workspace_time, source_time)
+    assert content.zulip_content == "Original **message**"
+    assert (source.read, source.starred, source.mentioned) == (True, True, True)
+    assert _states(account) == []
+    with contexts.Context().session_manager():
+        assert models.ZulipMessageState.reconcile_batch(10) == 1
+    assert _changes(models.ZulipMessageChange, account) == []
+    assert _changes(v2_models.WorkspaceMessageChange, account) == []
+
+
+def test_content_reconciliation_uses_content_dates_instead_of_observation_dates(
+    message_sources, db
+):
+    account, old_copy = message_sources()
+    _, latest_copy = message_sources(project_id=account.project_id, sender_id=8)
+    latest_copy.content.workspace_content = "The most recent content"
+    latest_copy.content.workspace_content_updated_at += datetime.timedelta(days=1)
+    latest_copy.content.update()
+    db.execute(
+        "UPDATE bridge_zulip_v5_messages SET updated_at = '2099-01-01' WHERE uuid = %s",
+        (old_copy.uuid,),
+    )
+    _prepare(account)
+    (state,) = _states(account)
+    assert state.source_uuid == latest_copy.uuid
+    with contexts.Context().session_manager():
+        state.do()
+    (message,) = _messages(account)
+    assert message.payload.content == latest_copy.content.workspace_content
+    assert (
+        message.content_updated_at == latest_copy.content.workspace_content_updated_at
+    )
+    assert message.updated_at == latest_copy.content.workspace_content_updated_at
+    assert message.created_at == datetime.datetime.fromtimestamp(
+        latest_copy.timestamp, tz=datetime.timezone.utc
+    )
+    for copy in (old_copy, latest_copy):
+        content = models.MessageContent.objects.get_one(
+            filters={"uuid": filters.EQ(copy.content.uuid)}
+        )
+        assert content.workspace_content == message.payload.content
+        assert content.workspace_content_updated_at == message.content_updated_at
+    assert _states(account) == []
+
+
+def test_metadata_updates_do_not_win_over_a_content_edit(message_sources, db):
+    account, source = message_sources()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        _states(account)[0].do()
+    (original,) = _messages(account)
+    db.execute(
+        "UPDATE messenger_messages SET updated_at = '2099-01-01', reactions = '{}'::jsonb "
+        "WHERE project_id = %s AND uuid = %s",
+        (account.project_id, original.uuid),
+    )
+    source.content.workspace_content = "A later actual edit"
+    source.content.workspace_content_updated_at += datetime.timedelta(days=1)
+    source.content.update()
+    with contexts.Context().session_manager():
+        _states(account)[0].do()
+    (updated,) = _messages(account)
+    assert updated.payload.content == "A later actual edit"
+    assert updated.content_updated_at == source.content.workspace_content_updated_at
+    assert updated.updated_at.year == 2099
+    assert updated.created_at == original.created_at
+
+
+def test_content_reconciliation_reloads_the_winner_after_reading_the_view(
+    message_sources, db
+):
+    account, source = message_sources()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        _states(account)[0].do()
+    source.content.workspace_content = "Earlier source edit"
+    source.content.workspace_content_updated_at += datetime.timedelta(days=1)
+    source.content.update()
+    (state,) = _states(account)
+    (message,) = _messages(account)
+    later = source.content.workspace_content_updated_at + datetime.timedelta(days=1)
+    _write_workspace_content(db, message, "A concurrent newer edit", later)
+    with contexts.Context().session_manager():
+        state.do()
+    (updated,) = _messages(account)
+    content = models.MessageContent.objects.get_one(
+        filters={"uuid": filters.EQ(source.content.uuid)}
+    )
+    assert (
+        updated.payload.content
+        == content.workspace_content
+        == "A concurrent newer edit"
+    )
+    assert updated.content_updated_at == content.workspace_content_updated_at == later
+
+
+def test_equal_hashes_align_edit_times_without_replacing_the_payload(message_sources):
+    account, source = message_sources()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        _states(account)[0].do()
+    (message,) = _messages(account)
+    source.content.workspace_content_updated_at += datetime.timedelta(days=1)
+    source.content.update()
+    with contexts.Context().session_manager():
+        _states(account)[0].do()
+    (updated,) = _messages(account)
+    assert updated.payload.as_plain_dict() == message.payload.as_plain_dict()
+    assert updated.content_hash == message.content_hash
+    assert updated.content_updated_at == source.content.workspace_content_updated_at
+    assert updated.created_at == message.created_at
+    assert _states(account) == []
+
+
+def test_content_failure_rolls_back_the_payload_and_keeps_the_marks(
+    message_sources, monkeypatch
+):
+    account, source = message_sources()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        _states(account)[0].do()
+    (original,) = _messages(account)
+    source.content.workspace_content = "A changed payload"
+    source.content.workspace_content_updated_at += datetime.timedelta(days=1)
+    source.content.update()
+    pending = _changes(models.ZulipMessageChange, account)[0]
+    acknowledge = models.ZulipMessageChange.acknowledge_many
+
+    def fail_after_acknowledgement(changes):
+        acknowledge(changes)
+        raise RuntimeError("Cannot finish content reconciliation")
+
+    monkeypatch.setattr(
+        models.ZulipMessageChange, "acknowledge_many", fail_after_acknowledgement
+    )
+    with pytest.raises(RuntimeError, match="Cannot finish content"):
+        with contexts.Context().session_manager():
+            models.ZulipMessageState.reconcile_batch(10)
+    (message,) = _messages(account)
+    assert message.payload.content == original.payload.content
+    assert message.content_updated_at == original.content_updated_at
+    assert _changes(models.ZulipMessageChange, account)[0].revision == pending.revision
+
+
+def test_content_migration_backfills_marks_and_preserves_source_creation_time(
+    message_sources, db
+):
+    account, source = message_sources()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        _states(account)[0].do()
+    (original,) = _messages(account)
+    engine = migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    migration = "0221-Reconcile-Zulip-message-content-by-hash-and-edit-time-68dbbd.py"
+    engine.rollback_migration(migration)
+    try:
+        _clear_changes(db, account)
+        assert db.execute(
+            "SELECT count(*) FROM information_schema.columns "
+            "WHERE table_name = 'messenger_messages' "
+            "AND column_name IN ('content_hash', 'content_updated_at')"
+        ).fetchone() == (0,)
+    finally:
+        engine.apply_migration(engine.get_latest_migration())
+    (message,) = _messages(account)
+    assert message.created_at == original.created_at
+    assert message.content_updated_at == original.updated_at
+    assert (
+        message.content_hash
+        == hashlib.sha256(message.payload.content.encode()).hexdigest()
+    )
+    assert len(_changes(models.ZulipMessageChange, account)) == 1
+    assert len(_changes(v2_models.WorkspaceMessageChange, account)) == 1
+    assert _states(account) == []
+
+
+def test_workspace_edits_record_utc_content_time_independently_of_database_timezone(
+    message_sources, db
+):
+    account, source = message_sources()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        _states(account)[0].do()
+    (original,) = _messages(account)
+    before = datetime.datetime.now(datetime.timezone.utc)
+    db.execute("SET TIME ZONE 'Europe/Moscow'")
+    db.execute(
+        "UPDATE messenger_messages SET payload = "
+        '\'{"kind":"markdown","content":"A real edit"}\'::jsonb, updated_at = NOW() '
+        "WHERE project_id = %s AND uuid = %s",
+        (account.project_id, original.uuid),
+    )
+    after = datetime.datetime.now(datetime.timezone.utc)
+    (updated,) = _messages(account)
+    assert before <= updated.content_updated_at <= after
+    assert updated.created_at == original.created_at
+    assert updated.content_hash == hashlib.sha256(b"A real edit").hexdigest()
+
+
+def test_content_reconciliation_does_not_change_another_project(message_sources, db):
+    first, source = message_sources()
+    second, other = message_sources(stream_id=43)
+    _prepare(first)
+    _prepare(second)
+    with contexts.Context().session_manager():
+        _states(first)[0].do()
+        _states(second)[0].do()
+    (message,) = _messages(first)
+    _write_workspace_content(
+        db,
+        message,
+        "First project only",
+        datetime.datetime(2025, 1, 1, tzinfo=datetime.timezone.utc),
+    )
+    with contexts.Context().session_manager():
+        _states(first)[0].do()
+    assert _messages(second)[0].payload.content == "Workspace **message**"
+    other_content = models.MessageContent.objects.get_one(
+        filters={"uuid": filters.EQ(other.content.uuid)}
+    )
+    assert other_content.workspace_content == "Workspace **message**"
