@@ -1060,6 +1060,6 @@ def test_binding_state_view_migration_is_reversible(stream_state_account, db):
             (account.project_id,),
         ).fetchone() == (None,)
     finally:
-        engine.apply_migration(migration)
+        engine.apply_migration(engine.get_latest_migration())
     (restored,) = _binding_states(account)
     assert restored.as_plain_dict() == state.as_plain_dict()

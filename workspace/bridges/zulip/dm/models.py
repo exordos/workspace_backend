@@ -105,6 +105,36 @@ class ZulipChannelType(str, enum.Enum):
     CHANNEL = "channel"
 
 
+class ZulipProjectUserState(
+    models.ModelWithID,
+    models.ModelWithProject,
+    orm.SQLStorableMixin,
+):
+    """Zulip account owners missing from the Workspace project registry."""
+
+    __tablename__ = "bridge_zulip_v5_project_user_states"
+
+    project_id = properties.property(
+        types.UUID(), required=True, read_only=True, id_property=True
+    )
+    user_uuid = properties.property(
+        types.UUID(), required=True, read_only=True, id_property=True
+    )
+
+    @classmethod
+    def get_id_property(cls) -> dict[str, typing.Any]:
+        return cls.id_properties.copy()
+
+    def get_id(self) -> tuple[sys_uuid.UUID, sys_uuid.UUID]:
+        return self.project_id, self.user_uuid
+
+    def do(self) -> None:
+        contexts.Context().get_session().execute(
+            "SELECT messenger_v2_register_project_user(%s, %s)",
+            (self.project_id, self.user_uuid),
+        )
+
+
 class ZulipStreamState(
     models.ModelWithID,
     models.ModelWithProject,
@@ -1174,13 +1204,21 @@ class ReconciliationContent(AbstractTaskContent):
     )
 
     def execute(self, task: "Task") -> None:
-        states = ZulipStreamState.objects.get_all(
-            order_by={"project_id": "asc", "stream_uuid": "asc"},
+        states = ZulipProjectUserState.objects.get_all(
+            order_by={"project_id": "asc", "user_uuid": "asc"},
             limit=self.batch_size,
         )
         for state in states:
             state.do()
         processed = len(states)
+        if processed < self.batch_size:
+            stream_states = ZulipStreamState.objects.get_all(
+                order_by={"project_id": "asc", "stream_uuid": "asc"},
+                limit=self.batch_size - processed,
+            )
+            for stream_state in stream_states:
+                stream_state.do()
+            processed += len(stream_states)
         if processed < self.batch_size:
             binding_states = ZulipStreamBindingState.objects.get_all(
                 order_by={

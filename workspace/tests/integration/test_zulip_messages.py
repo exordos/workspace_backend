@@ -590,7 +590,7 @@ def test_topic_failure_rolls_back_stream_creation_and_retries_reconciliation(
     task.delete()
 
 
-def test_reconciliation_shares_the_batch_budget_between_streams_bindings_and_topics(
+def test_reconciliation_shares_the_batch_budget_between_all_stages(
     history_account, db, monkeypatch
 ):
     account = history_account
@@ -601,7 +601,7 @@ def test_reconciliation_shares_the_batch_budget_between_streams_bindings_and_top
     ]
     monkeypatch.setattr(client, "ZulipClient", lambda current: zulip)
     assert _import_history(account).status == "done"
-    task = models.Task(content=models.ReconciliationContent(batch_size=3, interval=17))
+    task = models.Task(content=models.ReconciliationContent(batch_size=4, interval=17))
     task.insert()
     try:
         with contexts.Context().session_manager():

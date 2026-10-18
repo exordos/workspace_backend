@@ -204,6 +204,55 @@ def test_connection_rebinds_imported_account_preserving_identity_and_references(
     )
 
 
+@pytest.mark.parametrize("registered", (False, True))
+def test_project_user_reconciliation_follows_account_rebinding(
+    pending_user_connection, db, registered
+):
+    imported, pending, task = pending_user_connection
+    if registered:
+        db.execute(
+            "SELECT messenger_v2_register_project_user(%s, %s)",
+            (imported.project_id, imported.owner_user_uuid),
+        )
+
+    with contexts.Context().session_manager():
+        task.execute()
+
+    assert models.Task.objects.get_one(
+        filters={"uuid": filters.EQ(task.uuid)}
+    ).status == "done"
+    states = {
+        state.user_uuid: state
+        for state in models.ZulipProjectUserState.objects.get_all(
+            filters={"project_id": filters.EQ(imported.project_id)}
+        )
+    }
+    assert imported.owner_user_uuid not in states
+    with contexts.Context().session_manager():
+        states[pending.owner_user_uuid].do()
+
+    assert db.execute(
+        "SELECT user_uuid FROM messenger_project_users "
+        "WHERE project_id = %s AND user_uuid = ANY(%s) ORDER BY user_uuid",
+        (
+            imported.project_id,
+            [imported.owner_user_uuid, pending.owner_user_uuid],
+        ),
+    ).fetchall() == sorted(
+        [(pending.owner_user_uuid,)]
+        + ([(imported.owner_user_uuid,)] if registered else [])
+    )
+    assert (
+        models.ZulipProjectUserState.objects.get_one_or_none(
+            filters={
+                "project_id": filters.EQ(imported.project_id),
+                "user_uuid": filters.EQ(pending.owner_user_uuid),
+            }
+        )
+        is None
+    )
+
+
 @pytest.mark.parametrize(
     "source,has_credentials",
     [("iam", False), ("iam", True), ("native", False), ("zulip", True)],
