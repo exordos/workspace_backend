@@ -23,6 +23,7 @@ from workspace.messenger_api.dm import message_payloads
 from workspace.messenger_api.dm import models as messenger_models
 from workspace.messenger_api.dm import v2_models
 from workspace.services.messenger_workers import v2_projection
+from workspace.services import history_import
 from workspace.tests.integration import conftest
 from workspace.tests.integration import legacy_store
 
@@ -104,6 +105,10 @@ def message_sources(_database, db):
         _clear_changes(db, account)
         db.execute(
             "DELETE FROM bridge_zulip_v5_topic_changes WHERE project_id = %s",
+            (account.project_id,),
+        )
+        db.execute(
+            "DELETE FROM bridge_zulip_v5_message_counter_changes WHERE project_id = %s",
             (account.project_id,),
         )
     for task in models.Task.objects.get_all(filters={"project_id": filters.Is(None)}):
@@ -1603,6 +1608,322 @@ def test_user_message_migration_is_reversible_and_requeues_existing_placements(
         _viewer_rows(account, v2_models.WorkspaceUserMessage)[0].user_uuid
         == account.owner_user_uuid
     )
+
+
+def _refresh_counters():
+    task = models.Task(
+        priority=models.TASK_PRIORITY_REFRESH_MESSAGE_COUNTERS,
+        content=models.RefreshMessageCountersContent(),
+    )
+    task.insert()
+    with contexts.Context().session_manager():
+        task.execute()
+    assert task.status == "done", task.error_description
+    with contexts.Context().session_manager() as session:
+        v2_projection.drain_projection_queue(session, str(uuid.uuid4()))
+        assert (
+            session.execute(
+                "SELECT count(*) AS count FROM messenger_projection_tasks "
+                "WHERE status IN ('failed', 'dead_letter')"
+            ).fetchone()["count"]
+            == 0
+        )
+    return task
+
+
+def test_counter_refresh_combines_imports_and_updates_previews_and_folders(
+    message_sources, db
+):
+    account, source = message_sources()
+    source.read = source.mentioned = False
+    source.update()
+    namespace = uuid.uuid5(uuid.NAMESPACE_DNS, account.get_host())
+    for offset in range(1, 11):
+        last = models.ZulipMessage(
+            project_id=account.project_id,
+            external_account_uuid=account.uuid,
+            message_uuid=uuid.uuid5(namespace, str(source.message_id + offset)),
+            message_id=source.message_id + offset,
+            sender_id=source.sender_id,
+            timestamp=source.timestamp + offset,
+            channel=source.channel,
+            topic=source.topic,
+            content=source.content,
+        )
+        last.insert()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(100)
+    changes = _changes(models.ZulipMessageCounterChange, account)
+    assert len(changes) == 2
+    (before,) = _viewer_rows(account, v2_models.WorkspaceStreamBinding)
+    assert before.unread_count == 0 and before.last_message_uuid is None
+    _refresh_counters()
+    assert _changes(models.ZulipMessageCounterChange, account) == []
+    last_uuid = uuid.uuid5(
+        uuid.uuid5(account.project_id, str(last.message_uuid)), "zulip-placement"
+    )
+    (stream,) = _viewer_rows(account, v2_models.WorkspaceStreamBinding)
+    (topic,) = _viewer_rows(account, v2_models.WorkspaceUserTopicBinding)
+    assert stream.unread_count == stream.active_unread_count == topic.unread_count == 11
+    assert stream.passive_unread_count == topic.passive_unread_count == 0
+    assert stream.last_message_uuid == topic.last_message_uuid == last_uuid
+    folder = v2_models.WorkspaceUserFolder.objects.get_one(
+        filters={
+            "project_id": filters.EQ(account.project_id),
+            "user_uuid": filters.EQ(account.owner_user_uuid),
+            "uuid": filters.EQ(uuid.UUID(int=0)),
+        }
+    )
+    assert folder.unread_count == 11
+    pending_before = db.execute(
+        "SELECT count(*) FROM messenger_domain_outbox_events WHERE project_id=%s",
+        (account.project_id,),
+    ).fetchone()
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(100)
+        assert models.ZulipMessageCounterChange.publish_batch(100) == 0
+    assert (
+        db.execute(
+            "SELECT count(*) FROM messenger_domain_outbox_events WHERE project_id=%s",
+            (account.project_id,),
+        ).fetchone()
+        == pending_before
+    )
+
+
+@pytest.mark.parametrize("inaccessible", [None, "hidden", "stale_generation"])
+def test_counter_previews_only_include_the_users_accessible_messages(
+    message_sources, inaccessible
+):
+    first, source = message_sources()
+    second, other = message_sources(
+        project_id=first.project_id, sender_id=8, message_id=99
+    )
+    source.read = other.read = False
+    source.update()
+    other.properties["timestamp"].set_value_force(source.timestamp + 100)
+    other.update()
+    _prepare(first)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(100)
+    if inaccessible == "hidden":
+        binding = v2_models.WorkspaceUserMessageBinding.objects.get_one(
+            filters={
+                "project_id": filters.EQ(first.project_id),
+                "user_uuid": filters.EQ(first.owner_user_uuid),
+            }
+        )
+        binding.visibility = "hidden"
+        binding.update()
+    elif inaccessible == "stale_generation":
+        state = v2_models.WorkspaceUserMessageState.objects.get_one(
+            filters={
+                "project_id": filters.EQ(first.project_id),
+                "user_uuid": filters.EQ(first.owner_user_uuid),
+            }
+        )
+        state.properties["membership_generation"].set_value_force(
+            state.membership_generation + 1
+        )
+        state.update()
+    _refresh_counters()
+    for account, observed in ((first, source), (second, other)):
+        excluded = account == first and inaccessible is not None
+        expected_uuid = (
+            None
+            if excluded
+            else uuid.uuid5(
+                uuid.uuid5(first.project_id, str(observed.message_uuid)),
+                "zulip-placement",
+            )
+        )
+        stream = v2_models.WorkspaceStreamBinding.objects.get_one(
+            filters={
+                "project_id": filters.EQ(first.project_id),
+                "user_uuid": filters.EQ(account.owner_user_uuid),
+            }
+        )
+        topic = v2_models.WorkspaceUserTopicBinding.objects.get_one(
+            filters={
+                "project_id": filters.EQ(first.project_id),
+                "user_uuid": filters.EQ(account.owner_user_uuid),
+            }
+        )
+        assert stream.unread_count == topic.unread_count == (0 if excluded else 1)
+        assert stream.last_message_uuid == topic.last_message_uuid == expected_uuid
+
+
+def test_counter_refresh_tracks_old_and_new_scopes_on_moves_and_deletion(
+    message_sources,
+):
+    account, source = message_sources()
+    source.read = False
+    source.update()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(100)
+    _refresh_counters()
+    old_stream, old_topic = source.channel.stream_uuid, source.topic.uuid
+    channel, topic = _move_source(source, stream_id=43)
+    _prepare(account)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(100)
+    changes = _changes(models.ZulipMessageCounterChange, account)
+    assert {row.scope_uuid for row in changes} == {
+        old_stream,
+        old_topic,
+        channel.stream_uuid,
+        topic.uuid,
+    }
+    _refresh_counters()
+    streams = {
+        row.uuid: row for row in _viewer_rows(account, v2_models.WorkspaceUserStream)
+    }
+    assert (
+        streams[old_stream].unread_count == 0
+        and streams[old_stream].last_message_uuid is None
+    )
+    assert streams[channel.stream_uuid].unread_count == 1
+    source.delete()
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(100)
+    _refresh_counters()
+    assert all(
+        row.unread_count == 0 and row.last_message_uuid is None
+        for row in _viewer_rows(account, v2_models.WorkspaceStreamBinding)
+    )
+
+
+def test_counter_refresh_publication_preserves_concurrent_changes(
+    message_sources, monkeypatch
+):
+    account, source = message_sources()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(100)
+    pending = _changes(models.ZulipMessageCounterChange, account)
+    acknowledge = models.ZulipMessageCounterChange.acknowledge_many
+
+    def update_before_acknowledgement(changes):
+        with psycopg.connect(conftest.TEST_DB_URL, autocommit=True) as concurrent:
+            concurrent.execute(
+                "UPDATE bridge_zulip_v5_message_counter_changes SET revision=nextval('messenger_message_change_revision_seq') WHERE project_id=%s",
+                (account.project_id,),
+            )
+        acknowledge(changes)
+
+    monkeypatch.setattr(
+        models.ZulipMessageCounterChange,
+        "acknowledge_many",
+        update_before_acknowledgement,
+    )
+    with contexts.Context().session_manager():
+        assert models.ZulipMessageCounterChange.publish_batch(100) == 2
+    remaining = _changes(models.ZulipMessageCounterChange, account)
+    assert len(remaining) == 2
+    assert min(row.revision for row in remaining) > max(row.revision for row in pending)
+
+
+def test_counter_refresh_failure_rolls_back_publication_and_retries(
+    message_sources, monkeypatch, db
+):
+    account, source = message_sources()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(100)
+    task = models.Task(
+        priority=models.TASK_PRIORITY_REFRESH_MESSAGE_COUNTERS,
+        content=models.RefreshMessageCountersContent(),
+    )
+    task.insert()
+    before = db.execute(
+        "SELECT count(*) FROM messenger_domain_outbox_events WHERE project_id=%s",
+        (account.project_id,),
+    ).fetchone()
+
+    def fail_schedule(self):
+        raise RuntimeError("Cannot schedule the next refresh")
+
+    monkeypatch.setattr(models.Task, "insert", fail_schedule)
+    with contexts.Context().session_manager():
+        task.execute()
+    assert task.status == "retry" and task.next_retry_at is not None
+    assert len(_changes(models.ZulipMessageCounterChange, account)) == 2
+    assert (
+        db.execute(
+            "SELECT count(*) FROM messenger_domain_outbox_events WHERE project_id=%s",
+            (account.project_id,),
+        ).fetchone()
+        == before
+    )
+
+
+def test_counter_task_is_periodic_high_priority_and_bounded(message_sources):
+    account, source = message_sources()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(100)
+    service = history_import.HistoryImportService()
+    with contexts.Context().session_manager():
+        service._ensure_reconciliation_task()
+        service._ensure_reconciliation_task()
+    (scheduled,) = models.Task.objects.get_all(
+        filters={
+            "content": filters.JSONFields({"kind": "refresh_message_counters"}),
+            "status": filters.EQ("waiting"),
+        }
+    )
+    assert (
+        scheduled.priority == models.TASK_PRIORITY_REFRESH_MESSAGE_COUNTERS == 700_000
+    )
+    assert scheduled.content.interval == 30
+    assert (
+        25
+        < (
+            scheduled.not_before_at - datetime.datetime.now(datetime.timezone.utc)
+        ).total_seconds()
+        <= 30
+    )
+    task = models.Task(
+        priority=700_000, content=models.RefreshMessageCountersContent(batch_size=1)
+    )
+    task.insert()
+    assert service._get_tasks()[0].uuid == task.uuid
+    scheduled.delete()
+    before = datetime.datetime.now(datetime.timezone.utc)
+    with contexts.Context().session_manager():
+        task.execute()
+    assert len(_changes(models.ZulipMessageCounterChange, account)) == 1
+    (next_task,) = models.Task.objects.get_all(
+        filters={
+            "content": filters.JSONFields({"kind": "refresh_message_counters"}),
+            "status": filters.EQ("waiting"),
+        }
+    )
+    assert next_task.priority == 700_000 and next_task.content.batch_size == 1
+    assert next_task.not_before_at >= before + datetime.timedelta(seconds=30)
+
+
+def test_counter_migration_backfills_existing_imports_and_is_reversible(
+    message_sources, db
+):
+    account, source = message_sources()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(100)
+    engine = migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    migration = "0225-Refresh-imported-Zulip-message-counters-periodically-09ca0b.py"
+    engine.rollback_migration(migration)
+    try:
+        assert db.execute(
+            "SELECT to_regclass('bridge_zulip_v5_message_counter_changes')"
+        ).fetchone() == (None,)
+    finally:
+        engine.apply_migration(engine.get_latest_migration())
+    assert {
+        row.scope_uuid for row in _changes(models.ZulipMessageCounterChange, account)
+    } == {source.channel.stream_uuid, source.topic.uuid}
 
 
 def test_topic_changes_coalesce_and_ignore_content_and_viewer_flags(message_sources):

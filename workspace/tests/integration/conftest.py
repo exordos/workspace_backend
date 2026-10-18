@@ -404,7 +404,15 @@ def scheduled_reconciliation(_database):
         content=zulip_models.ReconciliationContent(),
     )
     task.insert()
+    counters = zulip_models.Task(
+        priority=zulip_models.TASK_PRIORITY_REFRESH_MESSAGE_COUNTERS,
+        not_before_at=datetime.datetime.now(datetime.timezone.utc)
+        + datetime.timedelta(days=1),
+        content=zulip_models.RefreshMessageCountersContent(),
+    )
+    counters.insert()
     yield task
+    counters.delete()
     task.delete()
 
 

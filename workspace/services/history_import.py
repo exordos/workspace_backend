@@ -18,26 +18,37 @@ LOG = logging.getLogger(__name__)
 
 class HistoryImportService(basic.BasicService):
     def _ensure_reconciliation_task(self) -> None:
-        tasks = models.Task.objects.get_all(
-            filters={
-                "content": filters.JSONFields(
-                    {"kind": models.ReconciliationContent.KIND}
-                ),
-                "status": filters.In(
-                    [
-                        models.TaskStatus.NEW.value,
-                        models.TaskStatus.WAITING.value,
-                        models.TaskStatus.RETRY.value,
-                    ]
-                ),
-            },
-            limit=1,
-        )
-        if not tasks:
-            models.Task(
-                priority=models.TASK_PRIORITY_RECONCILIATION,
-                content=models.ReconciliationContent(),
-            ).insert()
+        for content, priority in (
+            (models.ReconciliationContent(), models.TASK_PRIORITY_RECONCILIATION),
+            (
+                models.RefreshMessageCountersContent(),
+                models.TASK_PRIORITY_REFRESH_MESSAGE_COUNTERS,
+            ),
+        ):
+            tasks = models.Task.objects.get_all(
+                filters={
+                    "content": filters.JSONFields({"kind": content.kind}),
+                    "status": filters.In(
+                        [
+                            models.TaskStatus.NEW.value,
+                            models.TaskStatus.WAITING.value,
+                            models.TaskStatus.RETRY.value,
+                        ]
+                    ),
+                },
+                limit=1,
+            )
+            if not tasks:
+                models.Task(
+                    priority=priority,
+                    not_before_at=(
+                        datetime.datetime.now(datetime.timezone.utc)
+                        + datetime.timedelta(seconds=content.interval)
+                        if isinstance(content, models.RefreshMessageCountersContent)
+                        else None
+                    ),
+                    content=content,
+                ).insert()
 
     def _process_task(self) -> bool:
         tasks = self._get_tasks()

@@ -18,6 +18,7 @@ import abc
 import datetime
 import enum
 import hashlib
+import json
 import logging
 import typing
 import uuid as sys_uuid
@@ -56,6 +57,7 @@ TASK_PRIORITY_FULL_BACKFILL = 100_000
 TASK_PRIORITY_INITIALIZE_CONNECTION = 600_000
 TASK_PRIORITY_REALTIME_MESSAGE = 200_000
 TASK_PRIORITY_RECONCILIATION = 400_000
+TASK_PRIORITY_REFRESH_MESSAGE_COUNTERS = 700_000
 TASK_RETRY_DELAY = datetime.timedelta(minutes=1)
 TASK_CHANNEL_SYNC_INTERVAL = datetime.timedelta(minutes=15)
 TASK_USER_SYNC_INTERVAL = datetime.timedelta(minutes=15)
@@ -450,6 +452,171 @@ class ZulipMessageChange(v2_models.WorkspaceMessageChange):
     __tablename__ = "bridge_zulip_v5_message_changes"
 
 
+class ZulipMessageCounterChange(
+    models.ModelWithID,
+    models.ModelWithProject,
+    orm.SQLStorableMixin,
+):
+    __tablename__ = "bridge_zulip_v5_message_counter_changes"
+
+    project_id = properties.property(
+        types.UUID(), required=True, read_only=True, id_property=True
+    )
+    user_uuid = properties.property(
+        types.UUID(), required=True, read_only=True, id_property=True
+    )
+    scope_kind = properties.property(
+        types.Enum(["user-stream", "user-topic"]),
+        required=True,
+        read_only=True,
+        id_property=True,
+    )
+    scope_uuid = properties.property(
+        types.UUID(), required=True, read_only=True, id_property=True
+    )
+    stream_uuid = properties.property(types.UUID(), required=True, read_only=True)
+    topic_uuid = properties.property(
+        types.AllowNone(types.UUID()), default=None, read_only=True
+    )
+    revision = properties.property(
+        types.Integer(min_value=1), required=True, read_only=True
+    )
+
+    @classmethod
+    def get_id_property(cls) -> dict[str, typing.Any]:
+        return cls.id_properties.copy()
+
+    def get_id(self) -> tuple[sys_uuid.UUID, sys_uuid.UUID, str, sys_uuid.UUID]:
+        return self.project_id, self.user_uuid, self.scope_kind, self.scope_uuid
+
+    @classmethod
+    def message_scopes(
+        cls, project_id: sys_uuid.UUID, message_uuids: typing.Sequence[sys_uuid.UUID]
+    ) -> set[tuple[sys_uuid.UUID, sys_uuid.UUID, sys_uuid.UUID, sys_uuid.UUID]]:
+        rows = (
+            contexts.Context()
+            .get_session()
+            .execute(
+                """
+            SELECT placement.project_id, audience.user_uuid,
+                   placement.stream_uuid, placement.topic_uuid
+            FROM messenger_message_placements AS placement
+            JOIN messenger_messages AS message
+              ON message.project_id = placement.project_id AND message.uuid = placement.message_uuid
+            CROSS JOIN LATERAL (
+                SELECT user_uuid FROM messenger_user_message_bindings
+                WHERE project_id = placement.project_id AND placement_uuid = placement.uuid
+                UNION
+                SELECT user_uuid FROM messenger_user_message_states
+                WHERE project_id = placement.project_id AND placement_uuid = placement.uuid
+            ) AS audience
+            WHERE placement.project_id = %s AND placement.message_uuid = ANY(%s::uuid[])
+              AND message.source_name = 'zulip'
+            """,
+                (project_id, message_uuids),
+            )
+            .fetchall()
+        )
+        return {
+            (row["project_id"], row["user_uuid"], row["stream_uuid"], row["topic_uuid"])
+            for row in rows
+        }
+
+    @classmethod
+    def mark_many(
+        cls,
+        scopes: set[tuple[sys_uuid.UUID, sys_uuid.UUID, sys_uuid.UUID, sys_uuid.UUID]],
+    ) -> None:
+        if not scopes:
+            return
+        rows = {
+            (
+                project,
+                user,
+                kind,
+                scope,
+                stream,
+                topic if kind == "user-topic" else None,
+            )
+            for project, user, stream, topic in scopes
+            for kind, scope in (("user-stream", stream), ("user-topic", topic))
+        }
+        columns = list(zip(*rows))
+        contexts.Context().get_session().execute(
+            """
+            INSERT INTO bridge_zulip_v5_message_counter_changes
+                (project_id, user_uuid, scope_kind, scope_uuid, stream_uuid, topic_uuid)
+            SELECT * FROM unnest(%s::uuid[], %s::uuid[], %s::text[], %s::uuid[], %s::uuid[], %s::uuid[])
+            ON CONFLICT (project_id, user_uuid, scope_kind, scope_uuid)
+            DO UPDATE SET revision = EXCLUDED.revision,
+                          stream_uuid = EXCLUDED.stream_uuid, topic_uuid = EXCLUDED.topic_uuid
+            """,
+            tuple(list(column) for column in columns),
+        )
+
+    @classmethod
+    def publish_batch(cls, limit: int) -> int:
+        changes = cls.objects.get_all(limit=limit)
+        if not changes:
+            return 0
+        session = contexts.Context().get_session()
+        session.execute(
+            """
+            INSERT INTO messenger_domain_outbox_events
+                (uuid, project_id, event_kind, scope_kind, scope_key, payload)
+            SELECT event_uuid, project_id, 'read_counters', scope_kind, scope_key, payload::jsonb
+            FROM unnest(%s::uuid[], %s::uuid[], %s::text[], %s::text[], %s::text[])
+                AS pending(event_uuid, project_id, scope_kind, scope_key, payload)
+            """,
+            (
+                [sys_uuid.uuid4() for change in changes],
+                [change.project_id for change in changes],
+                [change.scope_kind for change in changes],
+                [
+                    f"{change.project_id}:{change.user_uuid}:{change.scope_uuid}"
+                    for change in changes
+                ],
+                [
+                    json.dumps(
+                        {
+                            "source_kind": "zulip.reconciled",
+                            "user_uuid": str(change.user_uuid),
+                            "stream_uuid": str(change.stream_uuid),
+                            "topic_uuid": str(change.topic_uuid)
+                            if change.topic_uuid is not None
+                            else None,
+                        }
+                    )
+                    for change in changes
+                ],
+            ),
+        )
+        cls.acknowledge_many(changes)
+        return len(changes)
+
+    @classmethod
+    def acknowledge_many(
+        cls, changes: typing.Sequence["ZulipMessageCounterChange"]
+    ) -> None:
+        contexts.Context().get_session().execute(
+            """
+            DELETE FROM bridge_zulip_v5_message_counter_changes AS pending
+            USING unnest(%s::uuid[], %s::uuid[], %s::text[], %s::uuid[], %s::bigint[])
+                AS checked(project_id, user_uuid, scope_kind, scope_uuid, revision)
+            WHERE pending.project_id = checked.project_id AND pending.user_uuid = checked.user_uuid
+              AND pending.scope_kind = checked.scope_kind AND pending.scope_uuid = checked.scope_uuid
+              AND pending.revision = checked.revision
+            """,
+            (
+                [change.project_id for change in changes],
+                [change.user_uuid for change in changes],
+                [change.scope_kind for change in changes],
+                [change.scope_uuid for change in changes],
+                [change.revision for change in changes],
+            ),
+        )
+
+
 class ZulipMessageState(
     models.ModelWithID,
     models.ModelWithProject,
@@ -490,6 +657,7 @@ class ZulipMessageState(
         projects = {}
         for project_id, message_uuid in batch:
             projects.setdefault(project_id, []).append(message_uuid)
+        counter_scopes = set()
         for project_id, message_uuids in projects.items():
             for model in (cls, ZulipMessagePlacementState, ZulipUserMessageState):
                 states = model.objects.get_all(
@@ -498,8 +666,18 @@ class ZulipMessageState(
                         "message_uuid": filters.In(message_uuids),
                     },
                 )
+                if not states:
+                    continue
+                changed_uuids = list({state.message_uuid for state in states})
+                counter_scopes.update(
+                    ZulipMessageCounterChange.message_scopes(project_id, changed_uuids)
+                )
                 for state in states:
                     state.do()
+                counter_scopes.update(
+                    ZulipMessageCounterChange.message_scopes(project_id, changed_uuids)
+                )
+        ZulipMessageCounterChange.mark_many(counter_scopes)
         for model in change_models:
             pending = [
                 change
@@ -1732,6 +1910,32 @@ class ImportHistoryContent(AbstractZulipTaskContent):
         account.update_status(external_models.ExternalAccountStatus.BACKFILL.value)
 
 
+class RefreshMessageCountersContent(AbstractTaskContent):
+    KIND = "refresh_message_counters"
+
+    batch_size = properties.property(
+        types.Integer(min_value=1), default=1000, read_only=True
+    )
+    interval = properties.property(
+        types.Integer(min_value=1), default=30, read_only=True
+    )
+
+    def execute(self, task: "Task") -> None:
+        ZulipMessageCounterChange.publish_batch(self.batch_size)
+        Task(
+            priority=TASK_PRIORITY_REFRESH_MESSAGE_COUNTERS,
+            not_before_at=datetime.datetime.now(datetime.timezone.utc)
+            + datetime.timedelta(seconds=self.interval),
+            content=self,
+        ).insert()
+
+    def on_error(self, task: "Task", error: Exception) -> None:
+        task.status = TaskStatus.RETRY.value
+        task.next_retry_at = datetime.datetime.now(
+            datetime.timezone.utc
+        ) + datetime.timedelta(seconds=self.interval)
+
+
 class ReconciliationContent(AbstractTaskContent):
     KIND = "reconciliation"
 
@@ -1792,6 +1996,7 @@ TASK_CONTENT_TYPE = types_dynamic.KindModelSelectorType(
     types_dynamic.KindModelType(ImportChannelsContent),
     types_dynamic.KindModelType(ImportHistoryContent),
     types_dynamic.KindModelType(ReconciliationContent),
+    types_dynamic.KindModelType(RefreshMessageCountersContent),
 )
 
 

@@ -1002,7 +1002,12 @@ def test_worker_bootstraps_and_recreates_missing_reconciliation(stream_state_acc
 
     service._iteration()
 
-    (waiting,) = models.Task.objects.get_all(filters={"status": filters.EQ("waiting")})
+    (waiting,) = models.Task.objects.get_all(
+        filters={
+            "status": filters.EQ("waiting"),
+            "content": filters.JSONFields({"kind": "reconciliation"}),
+        }
+    )
     assert waiting.project_id is waiting.external_account_uuid is None
     assert isinstance(waiting.content, models.ReconciliationContent)
     count = models.Task.objects.count()
@@ -1013,7 +1018,10 @@ def test_worker_bootstraps_and_recreates_missing_reconciliation(stream_state_acc
     service._iteration()
 
     (replacement,) = models.Task.objects.get_all(
-        filters={"status": filters.EQ("waiting")}
+        filters={
+            "status": filters.EQ("waiting"),
+            "content": filters.JSONFields({"kind": "reconciliation"}),
+        }
     )
     assert replacement.uuid != waiting.uuid
     assert replacement.project_id is replacement.external_account_uuid is None

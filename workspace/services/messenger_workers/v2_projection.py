@@ -70,6 +70,7 @@ _CLAIM_PARTITION_CURSORS: dict[
 LEGACY_FOLDER_SNAPSHOT_SOURCE_KINDS = (
     "legacy_message_state.deleted",
     "legacy_message_state.updated",
+    "zulip.reconciled",
 )
 
 
@@ -1192,6 +1193,19 @@ def _refresh_recipient_counters(
               ON placement.project_id = target.project_id
              AND placement.stream_uuid = target.stream_uuid
              AND EXISTS (
+                 SELECT 1 FROM messenger_user_message_bindings AS access
+                 JOIN messenger_user_message_states AS personal
+                   ON personal.project_id = access.project_id
+                  AND personal.user_uuid = access.user_uuid
+                  AND personal.placement_uuid = access.placement_uuid
+                  AND personal.membership_generation = access.membership_generation
+                 WHERE access.project_id = placement.project_id
+                   AND access.placement_uuid = placement.uuid
+                   AND access.user_uuid = target.user_uuid
+                   AND access.membership_generation = target.membership_generation
+                   AND access.visibility = 'visible'
+             )
+             AND EXISTS (
                  SELECT 1 FROM messenger_messages AS visible_message
                  WHERE visible_message.project_id = placement.project_id
                    AND visible_message.uuid = placement.message_uuid
@@ -1255,9 +1269,30 @@ def _refresh_recipient_counters(
                    (array_agg(placement.uuid ORDER BY message.created_at DESC,
                               placement.uuid DESC))[1] AS last_message_uuid
             FROM messenger_user_topic_bindings AS target
+            JOIN messenger_topics AS topic
+              ON topic.project_id = target.project_id
+             AND topic.uuid = target.topic_uuid
+            JOIN messenger_stream_bindings AS stream_binding
+              ON stream_binding.project_id = topic.project_id
+             AND stream_binding.stream_uuid = topic.stream_uuid
+             AND stream_binding.user_uuid = target.user_uuid
+             AND stream_binding.active
             LEFT JOIN messenger_message_placements AS placement
               ON placement.project_id = target.project_id
              AND placement.topic_uuid = target.topic_uuid
+             AND EXISTS (
+                 SELECT 1 FROM messenger_user_message_bindings AS access
+                 JOIN messenger_user_message_states AS personal
+                   ON personal.project_id = access.project_id
+                  AND personal.user_uuid = access.user_uuid
+                  AND personal.placement_uuid = access.placement_uuid
+                  AND personal.membership_generation = access.membership_generation
+                 WHERE access.project_id = placement.project_id
+                   AND access.placement_uuid = placement.uuid
+                   AND access.user_uuid = target.user_uuid
+                   AND access.membership_generation = stream_binding.membership_generation
+                   AND access.visibility = 'visible'
+             )
              AND EXISTS (
                  SELECT 1 FROM messenger_messages AS visible_message
                  WHERE visible_message.project_id = placement.project_id
@@ -1277,14 +1312,7 @@ def _refresh_recipient_counters(
               ON state.project_id = placement.project_id
              AND state.placement_uuid = placement.uuid
              AND state.user_uuid = target.user_uuid
-            JOIN messenger_topics AS topic
-              ON topic.project_id = target.project_id
-             AND topic.uuid = target.topic_uuid
-            JOIN messenger_stream_bindings AS stream_binding
-              ON stream_binding.project_id = topic.project_id
-             AND stream_binding.stream_uuid = topic.stream_uuid
-             AND stream_binding.user_uuid = target.user_uuid
-             AND stream_binding.active
+             AND state.membership_generation = stream_binding.membership_generation
             WHERE target.project_id = %s AND target.topic_uuid = %s
               AND target.user_uuid = ANY(%s::uuid[])
             GROUP BY target.user_uuid
@@ -2129,7 +2157,8 @@ def _process_folder_projection(
                   AND (lease_expires_at IS NULL OR lease_expires_at <= NOW())
                   AND payload->>'source_kind' IN (
                       'legacy_message_state.deleted',
-                      'legacy_message_state.updated'
+                      'legacy_message_state.updated',
+                      'zulip.reconciled'
                   )
                 FOR UPDATE SKIP LOCKED
             )
