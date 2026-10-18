@@ -52,6 +52,10 @@ def stream_state_account(_database, db):
     db.execute(
         "DELETE FROM messenger_streams WHERE project_id = %s", (account.project_id,)
     )
+    db.execute(
+        "DELETE FROM bridge_zulip_v5_topic_changes WHERE project_id = %s",
+        (account.project_id,),
+    )
 
 
 def _channel(account, stream_uuid, **values):

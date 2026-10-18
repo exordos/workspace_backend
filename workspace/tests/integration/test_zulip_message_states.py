@@ -102,6 +102,10 @@ def message_sources(_database, db):
             ):
                 row.delete()
         _clear_changes(db, account)
+        db.execute(
+            "DELETE FROM bridge_zulip_v5_topic_changes WHERE project_id = %s",
+            (account.project_id,),
+        )
     for task in models.Task.objects.get_all(filters={"project_id": filters.Is(None)}):
         task.delete()
 
@@ -118,6 +122,9 @@ def _prepare(account):
                 filters={"project_id": filters.EQ(account.project_id)}
             ):
                 state.do()
+        changes = _topic_changes(account)
+        if changes:
+            models.ZulipTopicChange.acknowledge_many(changes)
 
 
 def _states(account):
@@ -153,6 +160,16 @@ def _user_states(account):
 
 def _changes(model, account):
     return model.objects.get_all(filters={"project_id": filters.EQ(account.project_id)})
+
+
+def _topic_changes(account):
+    return _changes(models.ZulipTopicChange, account)
+
+
+def _topic_states(account):
+    return models.ZulipTopicState.objects.get_all(
+        filters={"project_id": filters.EQ(account.project_id)}
+    )
 
 
 def _clear_changes(db, account):
@@ -406,7 +423,7 @@ def test_reconciliation_batches_messages_and_schedules_continuation(message_sour
     _prepare(account)
     task = models.Task(content=models.ReconciliationContent(batch_size=1, interval=17))
     task.insert()
-    for remaining in (1, 0, 0, 0):
+    for remaining in (1, 1, 0, 0, 0, 0):
         with contexts.Context().session_manager():
             task.execute()
         assert task.status == "done"
@@ -1586,3 +1603,230 @@ def test_user_message_migration_is_reversible_and_requeues_existing_placements(
         _viewer_rows(account, v2_models.WorkspaceUserMessage)[0].user_uuid
         == account.owner_user_uuid
     )
+
+
+def test_topic_changes_coalesce_and_ignore_content_and_viewer_flags(message_sources):
+    account, source = message_sources()
+    (original,) = _topic_changes(account)
+    assert original.get_id() == (account.project_id, source.topic.uuid)
+    assert set(original.get_id_property()) == {"project_id", "topic_uuid"}
+    source.read = False
+    source.starred = False
+    source.update()
+    source.content.workspace_content = "Edited content"
+    source.content.update()
+    assert _topic_changes(account)[0].revision == original.revision
+    _prepare(account)
+    assert _topic_changes(account) == []
+    message_sources(project_id=account.project_id, message_id=43, sender_id=8)
+    (created,) = _topic_changes(account)
+    assert created.topic_uuid == original.topic_uuid
+    assert created.revision > original.revision
+    source.delete()
+    assert _topic_changes(account)[0].revision > created.revision
+
+
+def test_topic_moves_mark_both_topics_and_wait_for_placement_cleanup(message_sources):
+    account, source = message_sources()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(10)
+        models.ZulipTopicState.reconcile_batch(10)
+    old_topic = source.topic.uuid
+    _, destination = _move_source(source)
+    assert {change.topic_uuid for change in _topic_changes(account)} == {
+        old_topic,
+        destination.uuid,
+    }
+    assert [(state.topic_uuid, state.action) for state in _topic_states(account)] == [
+        (destination.uuid, "create")
+    ]
+    with contexts.Context().session_manager():
+        models.ZulipTopicState.reconcile_batch(10)
+        models.ZulipMessageState.reconcile_batch(10)
+    assert _placements(account)[0].topic_uuid == destination.uuid
+    assert (old_topic, "delete") in {
+        (state.topic_uuid, state.action) for state in _topic_states(account)
+    }
+    with contexts.Context().session_manager():
+        models.ZulipTopicState.reconcile_batch(10)
+    assert (
+        v2_models.WorkspaceStreamTopic.objects.get_one_or_none(
+            filters={
+                "project_id": filters.EQ(account.project_id),
+                "uuid": filters.EQ(old_topic),
+            }
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("root", ("account", "channel", "topic", "content"))
+def test_source_cascades_queue_topic_deletion(message_sources, root):
+    account, source = message_sources()
+    _prepare(account)
+    topic_uuid = source.topic.uuid
+    {
+        "account": account,
+        "channel": source.channel,
+        "topic": source.topic,
+        "content": source.content,
+    }[root].delete()
+    assert _topic_changes(account)[0].topic_uuid == topic_uuid
+    assert _topic_states(account)[0].action == "delete"
+
+
+@pytest.mark.parametrize("changed", ("provider", "channel", "stream", "topic"))
+def test_topic_parent_and_workspace_changes_are_tracked(message_sources, db, changed):
+    account, source = message_sources()
+    _prepare(account)
+    if changed == "provider":
+        account.provider = "other"
+        account.update()
+    elif changed == "channel":
+        source.channel.properties["stream_uuid"].set_value_force(uuid.uuid4())
+        source.channel.update()
+    else:
+        table = "messenger_streams" if changed == "stream" else "messenger_topics"
+        target = (
+            source.channel.stream_uuid if changed == "stream" else source.topic.uuid
+        )
+        db.execute(
+            f"UPDATE {table} SET deleted_at = NOW() WHERE project_id = %s AND uuid = %s",
+            (account.project_id, target),
+        )
+    assert _topic_changes(account)[0].topic_uuid == source.topic.uuid
+    assert _topic_states(account)[0].action == (
+        "create" if changed == "topic" else "delete"
+    )
+
+
+def test_topic_batch_is_bounded_and_acknowledges_no_difference(message_sources):
+    first, source = message_sources()
+    second, other = message_sources(host="other.example.com")
+    _prepare(first)
+    _prepare(second)
+    source.delete()
+    other.delete()
+    with contexts.Context().session_manager():
+        assert models.ZulipTopicState.reconcile_batch(1) == 1
+    assert sum(len(_topic_states(account)) for account in (first, second)) == 1
+    with contexts.Context().session_manager():
+        while models.ZulipTopicState.reconcile_batch(1):
+            pass
+    assert _topic_states(first) == _topic_states(second) == []
+    with mock.patch.object(models.ZulipTopicState, "objects") as manager:
+        manager.get_all.side_effect = AssertionError("Empty queues must skip the view")
+        with contexts.Context().session_manager():
+            assert models.ZulipTopicState.reconcile_batch(1) == 0
+
+
+def test_topic_checks_keep_projects_separate(message_sources):
+    first, source = message_sources()
+    second, other = message_sources()
+    assert source.topic.uuid == other.topic.uuid
+    _prepare(first)
+    with contexts.Context().session_manager():
+        models.ZulipTopicChange.acknowledge_many(_topic_changes(second))
+    source.delete()
+    assert _topic_states(first)[0].action == "delete"
+    assert _topic_changes(second) == _topic_states(second) == []
+    with contexts.Context().session_manager():
+        models.ZulipTopicState.reconcile_batch(10)
+    assert (
+        models.ZulipMessage.objects.get_one(
+            filters={
+                "project_id": filters.EQ(second.project_id),
+                "uuid": filters.EQ(other.uuid),
+            }
+        ).topic.uuid
+        == other.topic.uuid
+    )
+
+
+def test_concurrent_topic_changes_survive_acknowledgement(message_sources, monkeypatch):
+    account, source = message_sources()
+    _prepare(account)
+    message_sources(project_id=account.project_id, message_id=43, sender_id=8)
+    snapshot = _topic_changes(account)[0]
+    acknowledge = models.ZulipTopicChange.acknowledge_many
+
+    def change_before_acknowledgement(changes):
+        with psycopg.connect(conftest.TEST_DB_URL, autocommit=True) as writer:
+            writer.execute(
+                "UPDATE m_external_accounts_v2 SET provider = 'other' WHERE uuid = %s",
+                (account.uuid,),
+            )
+        acknowledge(changes)
+
+    monkeypatch.setattr(
+        models.ZulipTopicChange, "acknowledge_many", change_before_acknowledgement
+    )
+    with contexts.Context().session_manager():
+        assert models.ZulipTopicState.reconcile_batch(10) == 1
+    (pending,) = _topic_changes(account)
+    assert pending.revision > snapshot.revision
+
+
+def test_topic_creation_and_acknowledgement_roll_back_together(
+    message_sources, monkeypatch
+):
+    account, source = message_sources()
+    _prepare(account)
+    topic = v2_models.WorkspaceStreamTopic.objects.get_one(
+        filters={
+            "project_id": filters.EQ(account.project_id),
+            "uuid": filters.EQ(source.topic.uuid),
+        }
+    )
+    topic.delete()
+    revision = _topic_changes(account)[0].revision
+    acknowledge = models.ZulipTopicChange.acknowledge_many
+
+    def fail_after_acknowledgement(changes):
+        acknowledge(changes)
+        raise RuntimeError("Cannot commit topic reconciliation")
+
+    monkeypatch.setattr(
+        models.ZulipTopicChange, "acknowledge_many", fail_after_acknowledgement
+    )
+    with pytest.raises(RuntimeError, match="Cannot commit topic reconciliation"):
+        with contexts.Context().session_manager():
+            models.ZulipTopicState.reconcile_batch(10)
+    assert _topic_changes(account)[0].revision == revision
+    assert _topic_states(account)[0].action == "create"
+
+
+def test_topic_migration_round_trip_backfills_pending_topics(message_sources, db):
+    account, source = message_sources()
+    _prepare(account)
+    source.delete()
+    expected = _topic_states(account)[0].as_plain_dict()
+    engine = migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    migration = "0224-Track-topic-changes-for-bounded-Zulip-reconciliation-0dbef1.py"
+    engine.rollback_migration(migration)
+    try:
+        assert db.execute(
+            "SELECT to_regclass('bridge_zulip_v5_topic_changes')"
+        ).fetchone() == (None,)
+        assert _topic_states(account)[0].as_plain_dict() == expected
+    finally:
+        engine.apply_migration(engine.get_latest_migration())
+    assert _topic_states(account)[0].as_plain_dict() == expected
+    assert _topic_changes(account)[0].topic_uuid == source.topic.uuid
+
+
+def test_empty_topic_queue_does_not_scan_source_messages(message_sources, db):
+    account, source = message_sources()
+    _prepare(account)
+    plan = db.execute(
+        "EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM bridge_zulip_v5_topic_states LIMIT 1000"
+    ).fetchone()[0][0]
+
+    def check(node):
+        if node.get("Relation Name") == "bridge_zulip_v5_messages":
+            assert node["Actual Loops"] == 0
+        for child in node.get("Plans", []):
+            check(child)
+
+    check(plan["Plan"])

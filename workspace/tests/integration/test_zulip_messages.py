@@ -73,6 +73,10 @@ def history_account(_database, db):
     db.execute(
         "DELETE FROM messenger_streams WHERE project_id = %s", (account.project_id,)
     )
+    db.execute(
+        "DELETE FROM bridge_zulip_v5_topic_changes WHERE project_id = %s",
+        (account.project_id,),
+    )
 
 
 def _message_data(message_id=42, **values):
@@ -653,6 +657,18 @@ def test_reconciliation_shares_the_batch_budget_between_all_stages(
             )
             == 2
         )
+        for _ in range(4):
+            (continuation,) = models.Task.objects.get_all(
+                filters={
+                    "project_id": filters.Is(None),
+                    "status": filters.In(["new", "waiting"]),
+                }
+            )
+            if continuation.status == "waiting":
+                break
+            with contexts.Context().session_manager():
+                continuation.execute()
+            assert continuation.status == "done"
         (waiting,) = models.Task.objects.get_all(
             filters={"project_id": filters.Is(None), "status": filters.EQ("waiting")}
         )
@@ -839,7 +855,11 @@ def test_history_import_keeps_accounts_and_projects_separate(
         assert _messages(other)[0].content.zulip_content == "Message **42**"
     finally:
         other.delete()
-        for table in ("bridge_zulip_v5_message_changes", "messenger_message_changes"):
+        for table in (
+            "bridge_zulip_v5_message_changes",
+            "messenger_message_changes",
+            "bridge_zulip_v5_topic_changes",
+        ):
             db.execute(
                 f"DELETE FROM {table} WHERE project_id = %s", (other.project_id,)
             )

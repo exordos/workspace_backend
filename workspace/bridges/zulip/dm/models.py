@@ -328,6 +328,47 @@ class ZulipStreamBindingState(
         )
 
 
+class ZulipTopicChange(
+    models.ModelWithID,
+    models.ModelWithProject,
+    orm.SQLStorableMixin,
+):
+    __tablename__ = "bridge_zulip_v5_topic_changes"
+
+    project_id = properties.property(
+        types.UUID(), required=True, read_only=True, id_property=True
+    )
+    topic_uuid = properties.property(
+        types.UUID(), required=True, read_only=True, id_property=True
+    )
+    revision = properties.property(
+        types.Integer(min_value=1), required=True, read_only=True
+    )
+
+    @classmethod
+    def get_id_property(cls) -> dict[str, typing.Any]:
+        return cls.id_properties.copy()
+
+    def get_id(self) -> tuple[sys_uuid.UUID, sys_uuid.UUID]:
+        return self.project_id, self.topic_uuid
+
+    @classmethod
+    def acknowledge_many(cls, changes: typing.Sequence["ZulipTopicChange"]) -> None:
+        contexts.Context().get_session().execute(
+            "DELETE FROM bridge_zulip_v5_topic_changes AS pending "
+            "USING unnest(%s::uuid[], %s::uuid[], %s::bigint[]) "
+            "AS checked(project_id, topic_uuid, revision) "
+            "WHERE pending.project_id = checked.project_id "
+            "AND pending.topic_uuid = checked.topic_uuid "
+            "AND pending.revision = checked.revision",
+            (
+                [change.project_id for change in changes],
+                [change.topic_uuid for change in changes],
+                [change.revision for change in changes],
+            ),
+        )
+
+
 class ZulipTopicState(
     models.ModelWithID,
     models.ModelWithProject,
@@ -354,6 +395,24 @@ class ZulipTopicState(
 
     def get_id(self) -> tuple[sys_uuid.UUID, sys_uuid.UUID]:
         return self.project_id, self.topic_uuid
+
+    @classmethod
+    def reconcile_batch(cls, limit: int) -> int:
+        changes = ZulipTopicChange.objects.get_all(limit=limit)
+        projects = {}
+        for change in changes:
+            projects.setdefault(change.project_id, []).append(change.topic_uuid)
+        for project_id, topic_uuids in projects.items():
+            for state in cls.objects.get_all(
+                filters={
+                    "project_id": filters.EQ(project_id),
+                    "topic_uuid": filters.In(topic_uuids),
+                },
+            ):
+                state.do()
+        if changes:
+            ZulipTopicChange.acknowledge_many(changes)
+        return len(changes)
 
     def do(self) -> None:
         {
@@ -1705,12 +1764,7 @@ class ReconciliationContent(AbstractTaskContent):
                 binding_state.do()
             processed += len(binding_states)
         if processed < self.batch_size:
-            topic_states = ZulipTopicState.objects.get_all(
-                limit=self.batch_size - processed,
-            )
-            for topic_state in topic_states:
-                topic_state.do()
-            processed += len(topic_states)
+            processed += ZulipTopicState.reconcile_batch(self.batch_size - processed)
         if processed < self.batch_size:
             processed += ZulipMessageState.reconcile_batch(self.batch_size - processed)
         not_before_at = None
