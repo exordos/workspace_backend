@@ -8,6 +8,12 @@ and diagram source trees have the same structure in every language.
 - [Deutsch](de/index.md)
 - [中文](zh/index.md)
 
+## Zulip message conversion examples
+
+[Open the rendered Zulip → Workspace Markdown comparison](zulip_messages_preview.html).
+The offline preview shows the source and expected converted messages side by
+side, including nested quotes, mentions, attachments, and unsupported features.
+
 ## Canonical machine-readable contracts
 
 OpenAPI documents are not translated: identifiers, schemas, enum values, paths,
