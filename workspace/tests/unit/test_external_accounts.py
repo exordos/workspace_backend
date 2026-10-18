@@ -10,6 +10,7 @@ import pytest
 from workspace.messenger_api.api import routes
 from workspace.workspace_api.api import routes as workspace_routes
 from workspace.messenger_api.dm import models
+from workspace.messenger_api.dm import external_models
 
 
 @pytest.mark.parametrize(
@@ -32,7 +33,27 @@ def test_workspace_gravatar_avatar_normalizes_email():
 
 
 def test_external_accounts_use_the_new_provider_neutral_messenger_route():
-    assert workspace_routes.MessengerRoute.external_accounts is routes.ExternalAccountRoute
+    assert (
+        workspace_routes.MessengerRoute.external_accounts is routes.ExternalAccountRoute
+    )
     assert routes.ExternalAccountRoute.__controller__.__name__ == (
         "ExternalAccountController"
     )
+
+
+@pytest.mark.parametrize(
+    "server_url,host",
+    [
+        ("https://ZULIP.example.com:9981/path/", "zulip.example.com"),
+        ("http://localhost:21080", "localhost"),
+        ("https://192.168.100.28/", "192.168.100.28"),
+    ],
+)
+def test_external_account_host_excludes_scheme_port_and_path(server_url, host):
+    account = external_models.ExternalAccount(
+        project_id=sys_uuid.uuid4(),
+        owner_user_uuid=sys_uuid.uuid4(),
+        provider="zulip",
+        settings={"server_url": server_url},
+    )
+    assert account.get_host() == host

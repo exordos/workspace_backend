@@ -302,11 +302,11 @@ def test_channel_import_handles_provider_errors(
         pending = models.Task.objects.get_all(
             filters={
                 "external_account_uuid": filters.EQ(account.uuid),
-                "status": filters.EQ("new"),
+                "status": filters.EQ("waiting"),
             }
         )
         assert len(pending) == 1
-        assert pending[0].priority == 50
+        assert pending[0].priority == models.TASK_PRIORITY_IMPORT_CHANNELS
         assert pending[0].not_before_at is not None
 
 
@@ -333,7 +333,7 @@ def test_channel_account_and_stream_references(_database, action):
                 provider="zulip",
                 settings={},
             )
-            account.insert()
+            conftest.seed_legacy_external_account(db, account)
             channel = models.ZulipChannel(
                 external_account_uuid=account.uuid,
                 stream_uuid=stream_uuid,
@@ -413,7 +413,7 @@ def test_unmapped_channel_migration_round_trip(_database):
                 provider="zulip",
                 settings={},
             )
-            account.insert()
+            conftest.seed_legacy_external_account(db, account)
             channels = [
                 models.ZulipChannel(
                     external_account_uuid=account.uuid,
@@ -479,7 +479,7 @@ def test_deterministic_channel_uuid_migration_backfills_and_restores_constraints
                 provider="zulip",
                 settings={"server_url": "https://ZULIP.example.com:8443/path/"},
             )
-            account.insert()
+            conftest.seed_legacy_external_account(db, account)
             channels = [
                 models.ZulipChannel(
                     external_account_uuid=account.uuid,

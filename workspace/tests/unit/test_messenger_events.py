@@ -659,6 +659,25 @@ class MessengerEventsTestCase(unittest.TestCase):
         self.assertEqual(stream_uuid, payload.uuid)
         self.assertEqual(str(user_uuid), payload["items"][0]["user_uuid"])
 
+    def test_user_updated_event_payload_accepts_all_workspace_user_sources(self):
+        for source in models.WorkspaceUserSource:
+            with self.subTest(source=source.value):
+                payload = event_payloads.WORKSPACE_EVENT_PAYLOAD_TYPE.from_simple_type(
+                    {
+                        "kind": "user.updated",
+                        "uuid": str(sys_uuid.uuid4()),
+                        "username": "imported-user",
+                        "source": source.value,
+                        "status": "offline",
+                        "avatar": models.build_workspace_user_default_avatar(
+                            "imported-user"
+                        ),
+                        "last_ping_at": "2026-10-18T00:00:00Z",
+                    }
+                )
+                self.assertIsInstance(payload, event_payloads.UserUpdatedEventPayload)
+                self.assertEqual(source.value, payload.source)
+
     def test_user_updated_event_payload_accepts_postgres_json_timestamp(self):
         user_uuid = sys_uuid.uuid4()
 

@@ -205,6 +205,7 @@ class WorkspaceUserStatus(str, enum.Enum):
 class WorkspaceUserSource(str, enum.Enum):
     IAM = "iam"
     NATIVE = "native"
+    ZULIP = "zulip"
 
 
 class WorkspaceUserLastPingAtType(types.UTCDateTimeZ):
@@ -307,6 +308,7 @@ class WorkspaceUser(
         types.Enum([source.value for source in WorkspaceUserSource]),
         default=WorkspaceUserSource.IAM.value,
     )
+    disabled = properties.property(types.Boolean(), default=False)
     status = properties.property(
         types.Enum([status.value for status in WorkspaceUserStatus]),
         default=WorkspaceUserStatus.ACTIVE.value,

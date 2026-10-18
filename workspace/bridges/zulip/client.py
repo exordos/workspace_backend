@@ -37,8 +37,11 @@ class ZulipClient:
             raise ZulipApiError("Zulip API request failed")
         return result
 
-    def check_connection(self) -> None:
-        self._get("/users/me")
+    def check_connection(self) -> dict:
+        return self._get("/users/me")
+
+    def get_users(self) -> list[dict]:
+        return self._get("/users")["members"]
 
     def get_channels(self) -> list[dict]:
         return self._get("/streams", params={"exclude_archived": "false"})["streams"]

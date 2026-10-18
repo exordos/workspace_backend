@@ -1125,6 +1125,13 @@ class ExternalResourceController(ra_controllers.BaseResourceControllerPaginated)
 class ExternalAccountController(ExternalResourceController):
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=external_models.ExternalAccount,
+        fields_permissions=ra_field_permissions.FieldsPermissions(
+            fields={
+                "external_account_id": {
+                    ra_constants.ALL: ra_field_permissions.Permissions.RO
+                }
+            }
+        ),
         hidden_fields=["owner_user_uuid"],
         convert_underscore=False,
         process_filters=True,

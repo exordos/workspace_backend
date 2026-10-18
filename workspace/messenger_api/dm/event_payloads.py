@@ -402,11 +402,7 @@ class UserUpdatedEventPayload(
         required=True,
     )
     source = properties.property(
-        types.Enum(
-            [
-                messenger_models.WorkspaceUserSource.IAM.value,
-            ]
-        ),
+        types.Enum([source.value for source in messenger_models.WorkspaceUserSource]),
         required=True,
     )
     status = properties.property(

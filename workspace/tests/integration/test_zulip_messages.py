@@ -375,7 +375,7 @@ def test_message_uuid_and_project_migrations_backfill_and_round_trip(_database):
                     provider="zulip",
                     settings={"server_url": server_url},
                 )
-                account.insert()
+                conftest.seed_legacy_external_account(db, account)
                 channel = models.ZulipChannel(
                     external_account_uuid=account.uuid,
                     stream_uuid=uuid.uuid4(),

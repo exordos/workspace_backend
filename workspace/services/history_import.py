@@ -29,7 +29,11 @@ class HistoryImportService(basic.BasicService):
             filters=filters.AND(
                 {
                     "status": filters.In(
-                        [models.TaskStatus.NEW.value, models.TaskStatus.RETRY.value]
+                        [
+                            models.TaskStatus.NEW.value,
+                            models.TaskStatus.WAITING.value,
+                            models.TaskStatus.RETRY.value,
+                        ]
                     )
                 },
                 filters.OR(

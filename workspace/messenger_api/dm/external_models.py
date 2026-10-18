@@ -4,6 +4,7 @@
 # you may not use this file except in compliance with the License.
 
 import enum
+import urllib.parse
 
 from restalchemy.dm import models
 from restalchemy.dm import properties
@@ -34,6 +35,12 @@ class ExternalAccount(
         types.String(min_length=1, max_length=64),
         required=True,
     )
+    external_account_id = properties.property(
+        types.AllowNone(types.String(min_length=1, max_length=255)),
+        default=None,
+        read_only=True,
+    )
+    disabled = properties.property(types.Boolean(), default=False)
     settings = properties.property(types.Dict(), required=True)
     status = properties.property(
         types.Enum([status.value for status in ExternalAccountStatus]),
@@ -43,6 +50,9 @@ class ExternalAccount(
         types.AllowNone(types.String()),
         default=None,
     )
+
+    def get_host(self) -> str | None:
+        return urllib.parse.urlsplit(self.settings["server_url"]).hostname
 
     def update_status(
         self,

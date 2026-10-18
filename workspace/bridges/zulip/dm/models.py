@@ -19,7 +19,6 @@ import datetime
 import enum
 import hashlib
 import logging
-import urllib.parse
 import uuid as sys_uuid
 
 import requests
@@ -36,17 +35,25 @@ from restalchemy.storage.sql import utils
 
 from workspace.bridges.zulip import client
 from workspace.messenger_api.dm import external_models
+from workspace.messenger_api.dm import models as messenger_models
 
 
 LOG = logging.getLogger(__name__)
 MAX_HISTORY_MESSAGES = 5000
-TASK_PRIORITY_IMPORT_HISTORY = 20
-TASK_PRIORITY_IMPORT_CHANNELS = 50
-TASK_PRIORITY_FULL_BACKFILL = 100
-TASK_PRIORITY_INITIALIZE_CONNECTION = 100
-TASK_PRIORITY_REALTIME_MESSAGE = 200
+TASK_PRIORITY_IMPORT_HISTORY = 10_000
+TASK_PRIORITY_IMPORT_HISTORY_MIN = 10
+TASK_PRIORITY_IMPORT_CHANNELS = 50_000
+TASK_PRIORITY_IMPORT_USERS = 200_000
+TASK_PRIORITY_FULL_BACKFILL = 100_000
+TASK_PRIORITY_INITIALIZE_CONNECTION = 300_000
+TASK_PRIORITY_REALTIME_MESSAGE = 200_000
 TASK_RETRY_DELAY = datetime.timedelta(minutes=1)
 TASK_CHANNEL_SYNC_INTERVAL = datetime.timedelta(minutes=15)
+TASK_USER_SYNC_INTERVAL = datetime.timedelta(minutes=15)
+
+
+class ExternalAccountIdPendingError(Exception):
+    pass
 
 
 class MessageContent(
@@ -324,7 +331,12 @@ class InitializeConnectionContent(AbstractZulipTaskContent):
         )
         zulip = client.ZulipClient(account)
         try:
-            zulip.check_connection()
+            data = zulip.check_connection()
+            hostname = account.get_host()
+            account.properties["external_account_id"].set_value_force(
+                f"{hostname}:{data['user_id']}"
+            )
+            account.update()
         finally:
             zulip.close()
 
@@ -362,16 +374,25 @@ class FullBackfillContent(AbstractZulipTaskContent):
         Task(
             project_id=task.project_id,
             external_account_uuid=task.external_account_uuid,
+            priority=TASK_PRIORITY_IMPORT_USERS,
+            content=ImportUsersContent(),
+        ).insert()
+        Task(
+            project_id=task.project_id,
+            external_account_uuid=task.external_account_uuid,
             priority=TASK_PRIORITY_IMPORT_CHANNELS,
             content=ImportChannelsContent(),
         ).insert()
-        for first_message_id in reversed(
-            range(1, last_message_id + 1, MAX_HISTORY_MESSAGES)
+        for index, first_message_id in enumerate(
+            reversed(range(1, last_message_id + 1, MAX_HISTORY_MESSAGES))
         ):
             Task(
                 project_id=task.project_id,
                 external_account_uuid=task.external_account_uuid,
-                priority=TASK_PRIORITY_IMPORT_HISTORY,
+                priority=max(
+                    TASK_PRIORITY_IMPORT_HISTORY_MIN,
+                    TASK_PRIORITY_IMPORT_HISTORY - index,
+                ),
                 content=ImportHistoryContent(
                     first_message_id=first_message_id,
                     last_message_id=min(
@@ -380,6 +401,112 @@ class FullBackfillContent(AbstractZulipTaskContent):
                     ),
                 ),
             ).insert()
+
+
+class ImportUsersContent(AbstractZulipTaskContent):
+    KIND = "import_users"
+
+    def execute(self, task: "Task") -> None:
+        account = external_models.ExternalAccount.objects.get_one(
+            filters={
+                "uuid": filters.EQ(task.external_account_uuid),
+                "project_id": filters.EQ(task.project_id),
+            },
+        )
+        hostname = account.get_host()
+        server_namespace = sys_uuid.uuid5(sys_uuid.NAMESPACE_DNS, hostname)
+        accounts_by_id = {}
+        for existing in external_models.ExternalAccount.objects.get_all(
+            filters={
+                "project_id": filters.EQ(task.project_id),
+                "provider": filters.EQ("zulip"),
+            },
+        ):
+            if existing.external_account_id is None:
+                raise ExternalAccountIdPendingError(
+                    f"External account {existing.uuid} has no external_account_id; "
+                    "waiting for account verification."
+                )
+            accounts_by_id[existing.external_account_id] = existing
+        zulip = client.ZulipClient(account)
+        try:
+            for data in zulip.get_users():
+                user_id = data["user_id"]
+                disabled = not data["is_active"]
+                external_account_id = f"{hostname}:{user_id}"
+                user_uuid = sys_uuid.uuid5(server_namespace, f"user:{user_id}")
+                external_account = accounts_by_id.get(external_account_id)
+                if external_account is None:
+                    user = messenger_models.WorkspaceUser.objects.get_one_or_none(
+                        filters={"uuid": filters.EQ(user_uuid)},
+                    )
+                    if user is None:
+                        user = messenger_models.WorkspaceUser(
+                            uuid=user_uuid,
+                            username=f"zulip-{user_uuid}",
+                            source=messenger_models.WorkspaceUserSource.ZULIP.value,
+                            disabled=disabled,
+                            status=messenger_models.WorkspaceUserStatus.OFFLINE.value,
+                            first_name=data["full_name"],
+                            email=data["email"],
+                        )
+                        user.insert()
+                    external_account = external_models.ExternalAccount(
+                        uuid=sys_uuid.uuid5(task.project_id, f"zulip:{user_uuid}"),
+                        project_id=task.project_id,
+                        owner_user_uuid=user.uuid,
+                        provider="zulip",
+                        external_account_id=external_account_id,
+                        disabled=disabled,
+                        settings={
+                            "server_url": account.settings["server_url"],
+                            "email": data["email"],
+                        },
+                    )
+                    external_account.insert()
+                settings = dict(external_account.settings)
+                if "api_key" not in settings:
+                    settings["email"] = data["email"]
+                external_account.settings = settings
+                external_account.disabled = disabled
+                external_account.update()
+                accounts_by_id[external_account_id] = external_account
+                if external_account.owner_user_uuid == user_uuid:
+                    user = messenger_models.WorkspaceUser.objects.get_one(
+                        filters={"uuid": filters.EQ(user_uuid)},
+                    )
+                    user.first_name = data["full_name"]
+                    user.email = data["email"]
+                    user.source = messenger_models.WorkspaceUserSource.ZULIP.value
+                    user.disabled = disabled
+                    user.update()
+        finally:
+            zulip.close()
+
+    def on_error(self, task: "Task", error: Exception) -> None:
+        if isinstance(error, ExternalAccountIdPendingError):
+            task.status = TaskStatus.RETRY.value
+            task.next_retry_at = datetime.datetime.now(datetime.timezone.utc)
+        else:
+            super().on_error(task, error)
+
+    def on_done(self, task: "Task") -> None:
+        account = external_models.ExternalAccount.objects.get_one(
+            filters={
+                "uuid": filters.EQ(task.external_account_uuid),
+                "project_id": filters.EQ(task.project_id),
+            },
+        )
+        account.update_status(external_models.ExternalAccountStatus.BACKFILL.value)
+        Task(
+            project_id=task.project_id,
+            external_account_uuid=task.external_account_uuid,
+            priority=TASK_PRIORITY_IMPORT_USERS,
+            not_before_at=(
+                datetime.datetime.now(datetime.timezone.utc) + TASK_USER_SYNC_INTERVAL
+            ),
+            content=ImportUsersContent(),
+        ).insert()
 
 
 class ImportChannelsContent(AbstractZulipTaskContent):
@@ -392,7 +519,7 @@ class ImportChannelsContent(AbstractZulipTaskContent):
                 "project_id": filters.EQ(task.project_id),
             },
         )
-        hostname = urllib.parse.urlsplit(account.settings["server_url"]).hostname
+        hostname = account.get_host()
         server_namespace = sys_uuid.uuid5(sys_uuid.NAMESPACE_DNS, hostname)
         zulip = client.ZulipClient(account)
         try:
@@ -482,7 +609,7 @@ class ImportHistoryContent(AbstractZulipTaskContent):
                 "project_id": filters.EQ(task.project_id),
             },
         )
-        hostname = urllib.parse.urlsplit(account.settings["server_url"]).hostname
+        hostname = account.get_host()
         server_namespace = sys_uuid.uuid5(sys_uuid.NAMESPACE_DNS, hostname)
         zulip = client.ZulipClient(account)
         try:
@@ -588,6 +715,7 @@ class ImportHistoryContent(AbstractZulipTaskContent):
 TASK_CONTENT_TYPE = types_dynamic.KindModelSelectorType(
     types_dynamic.KindModelType(InitializeConnectionContent),
     types_dynamic.KindModelType(FullBackfillContent),
+    types_dynamic.KindModelType(ImportUsersContent),
     types_dynamic.KindModelType(ImportChannelsContent),
     types_dynamic.KindModelType(ImportHistoryContent),
 )
@@ -595,6 +723,7 @@ TASK_CONTENT_TYPE = types_dynamic.KindModelSelectorType(
 
 class TaskStatus(str, enum.Enum):
     NEW = "new"
+    WAITING = "waiting"
     RETRY = "retry"
     ERROR = "error"
     DONE = "done"
@@ -632,6 +761,15 @@ class Task(
         types.AllowNone(types.UTCDateTimeZ()), default=None
     )
 
+    def __init__(self, **kwargs: object) -> None:
+        super().__init__(**kwargs)
+        if (
+            self.status == TaskStatus.NEW.value
+            and self.not_before_at is not None
+            and self.not_before_at > datetime.datetime.now(datetime.timezone.utc)
+        ):
+            self.status = TaskStatus.WAITING.value
+
     def cancel_pending_tasks(self, exclude_current: bool = False) -> int:
         now = datetime.datetime.now(datetime.timezone.utc)
         session = contexts.Context().get_session()
@@ -641,7 +779,7 @@ class Task(
             SET status = %s, next_retry_at = NULL,
                 lease_owner = NULL, lease_expires_at = NULL, updated_at = %s
             WHERE external_account_uuid = %s AND project_id = %s
-                AND status IN (%s, %s)
+                AND status IN (%s, %s, %s)
                 AND (NOT %s OR uuid <> %s)
             RETURNING uuid
             """,
@@ -651,6 +789,7 @@ class Task(
                 self.external_account_uuid,
                 self.project_id,
                 TaskStatus.NEW.value,
+                TaskStatus.WAITING.value,
                 TaskStatus.RETRY.value,
                 exclude_current,
                 self.uuid,

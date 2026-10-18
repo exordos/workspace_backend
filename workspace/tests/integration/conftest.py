@@ -28,6 +28,7 @@ below the auth layer, including the composite-primary-key controllers.
 """
 
 import contextlib
+import json
 import os
 import pathlib
 import threading
@@ -431,6 +432,27 @@ def seed_user_stream(conn, project_id, user_uuid, name, description="seeded"):
             ),
         )
     return str(stream_uuid)
+
+
+def seed_legacy_external_account(conn, account):
+    """Seed external-account schemas published before provider identity support."""
+    conn.execute(
+        """
+        INSERT INTO m_external_accounts_v2
+            (uuid, project_id, owner_user_uuid, provider, settings, status,
+             error_description, created_at, updated_at)
+        VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s, NOW(), NOW())
+        """,
+        (
+            account.uuid,
+            account.project_id,
+            account.owner_user_uuid,
+            account.provider,
+            json.dumps(account.settings),
+            account.status,
+            account.error_description,
+        ),
+    )
 
 
 def seed_workspace_user(conn, user_uuid, username, status="active", last_ping_at=None):

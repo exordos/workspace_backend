@@ -34,7 +34,7 @@ def task_queue(_database, db):
         project_id=uuid.uuid4(),
         owner_user_uuid=owner_uuid,
         provider="zulip",
-        settings={},
+        settings={"server_url": "https://zulip.example.com"},
     )
     account.insert()
 
@@ -66,7 +66,7 @@ def _http_error(status_code, code="BAD_REQUEST", **details):
 
 
 @pytest.mark.parametrize("status", ["new", "error"])
-def test_successful_connection_starts_full_backfill_and_periodic_channel_sync(
+def test_successful_connection_starts_full_backfill_and_periodic_catalog_sync(
     task_queue, monkeypatch, status
 ):
     task = task_queue()
@@ -80,8 +80,10 @@ def test_successful_connection_starts_full_backfill_and_periodic_channel_sync(
     account.settings = {"server_url": "https://zulip.example.com"}
     account.update()
     zulip = mock.Mock()
+    zulip.check_connection.return_value = {"user_id": 7}
     zulip.get_last_message_id.return_value = 10005
     zulip.get_channels.return_value = []
+    zulip.get_users.return_value = []
     zulip.get_messages.return_value = []
     monkeypatch.setattr(client, "ZulipClient", lambda account: zulip)
 
@@ -93,6 +95,7 @@ def test_successful_connection_starts_full_backfill_and_periodic_channel_sync(
         filters={"uuid": filters.EQ(task.external_account_uuid)}
     )
     assert account.status == "backfill"
+    assert account.external_account_id == "zulip.example.com:7"
     assert account.error_description is None
     pending = models.Task.objects.get_all(
         filters={
@@ -114,8 +117,24 @@ def test_successful_connection_starts_full_backfill_and_periodic_channel_sync(
             "status": filters.EQ("new"),
         }
     )
-    assert len(pending) == 4
+    assert len(pending) == 5
     assert all(child.project_id == task.project_id for child in pending)
+    (user_sync,) = [
+        child
+        for child in pending
+        if isinstance(child.content, models.ImportUsersContent)
+    ]
+    assert user_sync.priority == models.TASK_PRIORITY_IMPORT_USERS
+    service._iteration()
+    assert _stored(user_sync).status == "done"
+    (next_user_sync,) = models.Task.objects.get_all(
+        filters={
+            "external_account_uuid": filters.EQ(account.uuid),
+            "priority": filters.EQ(models.TASK_PRIORITY_IMPORT_USERS),
+            "status": filters.EQ("waiting"),
+        }
+    )
+    assert next_user_sync.not_before_at is not None
     (first_sync,) = [
         child
         for child in pending
@@ -137,11 +156,9 @@ def test_successful_connection_starts_full_backfill_and_periodic_channel_sync(
         newer.created_at < older.created_at
         for newer, older in zip(history, history[1:])
     )
-    assert all(
-        child.priority == models.TASK_PRIORITY_IMPORT_HISTORY == 20 for child in history
-    )
+    assert [child.priority for child in history] == [10_000, 9_999, 9_998]
     assert first_sync.project_id == account.project_id
-    assert first_sync.priority == models.TASK_PRIORITY_IMPORT_CHANNELS == 50
+    assert first_sync.priority == models.TASK_PRIORITY_IMPORT_CHANNELS == 50_000
     assert first_sync.not_before_at is None
     assert isinstance(first_sync.content, models.ImportChannelsContent)
 
@@ -153,10 +170,10 @@ def test_successful_connection_starts_full_backfill_and_periodic_channel_sync(
     pending = models.Task.objects.get_all(
         filters={
             "external_account_uuid": filters.EQ(account.uuid),
-            "status": filters.EQ("new"),
+            "status": filters.In(["new", "waiting"]),
         }
     )
-    assert len(pending) == 4
+    assert len(pending) == 5
     (next_sync,) = [
         child
         for child in pending
@@ -164,8 +181,9 @@ def test_successful_connection_starts_full_backfill_and_periodic_channel_sync(
     ]
     assert next_sync.uuid != first_sync.uuid
     assert next_sync.project_id == account.project_id
-    assert next_sync.priority == 50
+    assert next_sync.priority == models.TASK_PRIORITY_IMPORT_CHANNELS
     assert isinstance(next_sync.content, models.ImportChannelsContent)
+    assert next_sync.status == "waiting"
     interval = datetime.timedelta(minutes=15)
     assert before + interval <= next_sync.not_before_at <= after + interval
 
@@ -173,22 +191,23 @@ def test_successful_connection_starts_full_backfill_and_periodic_channel_sync(
 
     assert _stored(history[0]).status == "done"
     zulip.get_messages.assert_called_once_with(10001, 10005)
-    assert _stored(next_sync).status == "new"
+    assert _stored(next_sync).status == "waiting"
     service._iteration()
     service._iteration()
     service._iteration()
 
-    assert _stored(next_sync).status == "new"
+    assert _stored(next_sync).status == "waiting"
     assert all(_stored(child).status == "done" for child in history)
     zulip.check_connection.assert_called_once_with()
     zulip.get_last_message_id.assert_called_once_with()
     zulip.get_channels.assert_called_once_with()
+    zulip.get_users.assert_called_once_with()
     assert zulip.get_messages.call_args_list == [
         mock.call(10001, 10005),
         mock.call(5001, 10000),
         mock.call(1, 5000),
     ]
-    assert zulip.close.call_count == 6
+    assert zulip.close.call_count == 7
 
 
 @pytest.mark.parametrize("phase", ["fetch", "auth", "close", "queue"])
@@ -204,6 +223,7 @@ def test_failed_full_backfill_does_not_leave_partial_child_tasks(
     )
     task.insert()
     zulip = mock.Mock()
+    zulip.check_connection.return_value = {"user_id": 7}
     zulip.get_last_message_id.return_value = 10005
     monkeypatch.setattr(client, "ZulipClient", lambda account: zulip)
     if phase == "fetch":
@@ -238,6 +258,7 @@ def test_failed_full_backfill_does_not_leave_partial_child_tasks(
 def test_failed_connection_does_not_queue_full_backfill(task_queue, monkeypatch, phase):
     task = task_queue()
     zulip = mock.Mock()
+    zulip.check_connection.return_value = {"user_id": 7}
     monkeypatch.setattr(client, "ZulipClient", lambda account: zulip)
     if phase == "check":
         zulip.check_connection.side_effect = requests.Timeout("Timed out")
@@ -294,6 +315,7 @@ def test_connection_outcome_publishes_account_event_only_in_its_project(
             (project_id, user_uuid),
         )
     zulip = mock.Mock()
+    zulip.check_connection.return_value = {"user_id": 7}
     zulip.check_connection.side_effect = error
     monkeypatch.setattr(client, "ZulipClient", lambda account: zulip)
 
@@ -384,14 +406,14 @@ def test_priority_fifo_and_ready_tasks(task_queue, monkeypatch):
     service = history_import.HistoryImportService()
 
     service._iteration()
-    assert executed == [realtime.uuid]
+    assert executed == [older.uuid]
     service._iteration()
-    assert executed == [realtime.uuid, older.uuid]
+    assert executed == [older.uuid, newer.uuid]
     service._iteration()
     service._iteration()
     service._iteration()
 
-    assert executed == [realtime.uuid, older.uuid, newer.uuid, low.uuid]
+    assert executed == [older.uuid, newer.uuid, realtime.uuid, low.uuid]
     assert _stored(delayed).status == "retry"
     assert _stored(done).status == "done"
     assert _stored(failed).status == "error"
@@ -418,7 +440,7 @@ def test_cancel_pending_tasks_is_account_scoped(task_queue, db, exclude_current)
             lease_owner=lease_owner,
             lease_expires_at=future,
         )
-        for status in ("new", "retry")
+        for status in ("new", "waiting", "retry")
     ]
     terminal = [task_queue(status=status) for status in ("done", "error", "cancel")]
     other_owner_uuid = uuid.uuid4()
@@ -440,7 +462,7 @@ def test_cancel_pending_tasks_is_account_scoped(task_queue, db, exclude_current)
                 status=status,
                 content=models.InitializeConnectionContent(),
             )
-            for status in ("new", "retry")
+            for status in ("new", "waiting", "retry")
         ]
         for task in other_tasks:
             task.insert()
@@ -495,7 +517,7 @@ def test_cancelling_pending_tasks_uses_the_callers_transaction(task_queue):
     assert _stored(retry).status == "retry"
 
 
-@pytest.mark.parametrize("status", ["new", "retry"])
+@pytest.mark.parametrize("status", ["new", "waiting", "retry"])
 def test_not_before_at_defers_tasks_until_the_scheduled_time(
     task_queue, monkeypatch, status
 ):
@@ -509,6 +531,8 @@ def test_not_before_at_defers_tasks_until_the_scheduled_time(
         status=status,
         not_before_at=scheduled_at,
     )
+    expected_status = "waiting" if status == "new" else status
+    assert scheduled.status == expected_status
     retry = task_queue(
         priority=models.TASK_PRIORITY_REALTIME_MESSAGE,
         status="retry",
@@ -530,7 +554,7 @@ def test_not_before_at_defers_tasks_until_the_scheduled_time(
         service._iteration()
         assert executed == [ready.uuid]
         assert _stored(scheduled).not_before_at == scheduled_at
-        assert _stored(scheduled).status == status
+        assert _stored(scheduled).status == expected_status
 
         clock.datetime.now.return_value = scheduled_at
         service._iteration()
@@ -824,7 +848,7 @@ def test_failed_execution_or_done_handler_rolls_back_partial_changes(
     account = external_models.ExternalAccount.objects.get_one(
         filters={"uuid": filters.EQ(task.external_account_uuid)}
     )
-    assert account.settings == {}
+    assert account.settings == {"server_url": "https://zulip.example.com"}
 
 
 @pytest.mark.parametrize("database_error", [False, True])
@@ -865,7 +889,164 @@ def test_error_handler_failure_rolls_back_and_saves_terminal_error(
     account = external_models.ExternalAccount.objects.get_one(
         filters={"uuid": filters.EQ(task.external_account_uuid)}
     )
-    assert account.settings == {}
+    assert account.settings == {"server_url": "https://zulip.example.com"}
+
+
+def test_priority_migration_updates_pending_tasks_and_preserves_completed_tasks(
+    _database,
+):
+    migration = "0208-Reserve-descending-priorities-for-history-import-tasks-bc5850.py"
+    with conftest.isolated_migration_database(
+        "0207-Add-waiting-status-for-scheduled-bridge-tasks-e1b0e4.py"
+    ) as database_url:
+        with psycopg.connect(database_url, autocommit=True) as db:
+            project_id = uuid.uuid4()
+            accounts = [
+                (uuid.uuid4(), project_id),
+                (uuid.uuid4(), project_id),
+                (uuid.uuid4(), uuid.uuid4()),
+            ]
+            for account_uuid, account_project in accounts:
+                owner_uuid = uuid.uuid4()
+                conftest.seed_workspace_user(db, owner_uuid, f"priority-{owner_uuid}")
+                db.execute(
+                    "INSERT INTO m_external_accounts_v2 "
+                    "(uuid, project_id, owner_user_uuid, provider, settings) "
+                    "VALUES (%s, %s, %s, 'zulip', '{}'::jsonb)",
+                    (account_uuid, account_project, owner_uuid),
+                )
+            cases = [
+                (0, status, {"kind": kind}, old_priority, priority)
+                for kind, old_priority, priority in (
+                    ("initialize_connection", 300, 300_000),
+                    ("import_users", 200, 200_000),
+                    ("full_backfill", 100, 100_000),
+                    ("import_channels", 50, 50_000),
+                )
+                for status in ("new", "waiting", "retry")
+            ]
+            cases.append((0, "done", {"kind": "import_users"}, 200, 200))
+            cases.extend(
+                (
+                    account,
+                    status,
+                    {
+                        "kind": "import_history",
+                        "first_message_id": first,
+                        "last_message_id": first + 4999,
+                    },
+                    20,
+                    priority,
+                )
+                for account, status, first, priority in (
+                    (0, "done", 50_000_001, 20),
+                    (0, "new", 49_995_001, 9_999),
+                    (0, "retry", 49_990_001, 9_998),
+                    (0, "waiting", 50_001, 10),
+                    (0, "new", 45_001, 10),
+                    (0, "new", 1, 10),
+                    (0, "error", 1, 20),
+                    (0, "cancel", 1, 20),
+                    (1, "new", 5_001, 10_000),
+                    (1, "new", 1, 9_999),
+                    (2, "new", 1, 10_000),
+                )
+            )
+            tasks = {uuid.uuid4(): case for case in cases}
+            for task_uuid, (account, status, content, old_priority, _) in tasks.items():
+                account_uuid, account_project = accounts[account]
+                db.execute(
+                    "INSERT INTO bridge_zulip_v5_tasks "
+                    "(uuid, project_id, external_account_uuid, status, content, priority) "
+                    "VALUES (%s, %s, %s, %s, %s::jsonb, %s)",
+                    (
+                        task_uuid,
+                        account_project,
+                        account_uuid,
+                        status,
+                        json.dumps(content),
+                        old_priority,
+                    ),
+                )
+            engine = migrations.MigrationEngine(
+                migrations_path=str(conftest.MIGRATIONS_DIR)
+            )
+            engine.apply_migration(migration)
+            for task_uuid, (_, status, content, _, expected) in tasks.items():
+                assert db.execute(
+                    "SELECT priority, status, content FROM bridge_zulip_v5_tasks WHERE uuid=%s",
+                    (task_uuid,),
+                ).fetchone() == (expected, status, content)
+
+            engine.rollback_migration(migration)
+            for task_uuid, (_, status, content, old_priority, _) in tasks.items():
+                assert db.execute(
+                    "SELECT priority, status, content FROM bridge_zulip_v5_tasks WHERE uuid=%s",
+                    (task_uuid,),
+                ).fetchone() == (old_priority, status, content)
+            engine.apply_migration(migration)
+
+
+def test_waiting_status_migration_preserves_schedules_and_rolls_back(_database):
+    migration = "0207-Add-waiting-status-for-scheduled-bridge-tasks-e1b0e4.py"
+    with conftest.isolated_migration_database(
+        "0206-Add-provider-account-identity-to-external-accounts-812e0e.py"
+    ) as database_url:
+        with psycopg.connect(database_url, autocommit=True) as db:
+            owner_uuid, account_uuid, project_id = (uuid.uuid4() for _ in range(3))
+            conftest.seed_workspace_user(db, owner_uuid, f"waiting-{owner_uuid}")
+            db.execute(
+                "INSERT INTO m_external_accounts_v2 "
+                "(uuid, project_id, owner_user_uuid, provider, settings) "
+                "VALUES (%s, %s, %s, 'zulip', '{}'::jsonb)",
+                (account_uuid, project_id, owner_uuid),
+            )
+            now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+            future = now + datetime.timedelta(minutes=15)
+            cases = [
+                ("new", future, "waiting"),
+                ("new", now - datetime.timedelta(minutes=1), "new"),
+                ("new", None, "new"),
+                *(
+                    (status, future, status)
+                    for status in ("retry", "error", "done", "cancel")
+                ),
+            ]
+            tasks = {uuid.uuid4(): case for case in cases}
+            for task_uuid, (status, scheduled_at, _) in tasks.items():
+                db.execute(
+                    "INSERT INTO bridge_zulip_v5_tasks "
+                    "(uuid, project_id, external_account_uuid, status, not_before_at, content) "
+                    'VALUES (%s, %s, %s, %s, %s, \'{"kind": "initialize_connection"}\'::jsonb)',
+                    (task_uuid, project_id, account_uuid, status, scheduled_at),
+                )
+            engine = migrations.MigrationEngine(
+                migrations_path=str(conftest.MIGRATIONS_DIR)
+            )
+            engine.apply_migration(migration)
+            for task_uuid, (_, scheduled_at, expected) in tasks.items():
+                assert db.execute(
+                    "SELECT status, not_before_at FROM bridge_zulip_v5_tasks WHERE uuid=%s",
+                    (task_uuid,),
+                ).fetchone() == (expected, scheduled_at)
+            index = db.execute(
+                "SELECT indexdef FROM pg_indexes "
+                "WHERE indexname='bridge_zulip_v5_tasks_ready_idx'"
+            ).fetchone()[0]
+            assert "waiting" in index
+
+            engine.rollback_migration(migration)
+            for task_uuid, (status, scheduled_at, _) in tasks.items():
+                assert db.execute(
+                    "SELECT status, not_before_at FROM bridge_zulip_v5_tasks WHERE uuid=%s",
+                    (task_uuid,),
+                ).fetchone() == (status, scheduled_at)
+            with pytest.raises(psycopg.errors.CheckViolation):
+                db.execute(
+                    "UPDATE bridge_zulip_v5_tasks SET status='waiting' WHERE uuid=%s",
+                    (next(iter(tasks)),),
+                )
+            engine.apply_migration(migration)
 
 
 def test_task_metadata_and_cancel_migrations_round_trip(_database):
