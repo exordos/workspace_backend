@@ -102,6 +102,233 @@ def _states(account):
     ]
 
 
+def _binding_states(account):
+    return models.ZulipStreamBindingState.objects.get_all(
+        filters={"project_id": filters.EQ(account.project_id)},
+        order_by={"user_uuid": "asc"},
+    )
+
+
+@pytest.mark.parametrize(
+    "has_channel,membership,source,deleted,action",
+    [
+        (True, None, "zulip", False, "create"),
+        (True, "member", "zulip", False, None),
+        (True, "owner", "zulip", False, None),
+        (True, "administrator", "zulip", False, None),
+        (True, "inactive", "zulip", False, "create"),
+        (False, "member", "zulip", False, "delete"),
+        (False, "inactive", "zulip", False, None),
+        (False, None, "zulip", False, None),
+        (True, None, "native", False, None),
+        (False, "member", "native", False, None),
+        (True, None, "zulip", True, None),
+        (False, "member", "zulip", True, None),
+    ],
+)
+def test_binding_states_show_only_required_actions(
+    stream_state_account, db, has_channel, membership, source, deleted, action
+):
+    account = stream_state_account
+    stream_uuid = uuid.uuid4()
+    _stream(db, account, stream_uuid, source)
+    if has_channel:
+        _channel(account, stream_uuid)
+    binding_uuid = uuid.uuid5(
+        account.project_id, f"zulip-binding:{stream_uuid}:{account.owner_user_uuid}"
+    )
+    if membership is not None:
+        conftest.seed_user_stream_binding(
+            db,
+            account.project_id,
+            stream_uuid,
+            account.owner_user_uuid,
+            role="member" if membership == "inactive" else membership,
+        )
+        binding = messenger_models.WorkspaceStreamBinding.objects.get_one(
+            filters={"project_id": filters.EQ(account.project_id)}
+        )
+        binding_uuid = binding.uuid
+        if membership == "inactive":
+            binding.delete()
+    if deleted:
+        db.execute(
+            "UPDATE messenger_streams SET deleted_at = NOW() WHERE project_id = %s",
+            (account.project_id,),
+        )
+
+    states = _binding_states(account)
+
+    if action is None:
+        assert states == []
+    else:
+        (state,) = states
+        assert state.as_plain_dict() == dict(
+            project_id=account.project_id,
+            stream_uuid=stream_uuid,
+            user_uuid=account.owner_user_uuid,
+            binding_uuid=binding_uuid,
+            action=action,
+        )
+        assert state.get_id() == (
+            account.project_id,
+            stream_uuid,
+            account.owner_user_uuid,
+        )
+    assert set(models.ZulipStreamBindingState.get_id_property()) == {
+        "project_id",
+        "stream_uuid",
+        "user_uuid",
+    }
+
+
+def test_binding_states_use_each_account_owner(stream_state_account, db):
+    account = stream_state_account
+    stream_uuid = uuid.uuid4()
+    _stream(db, account, stream_uuid, "zulip")
+    first_channel = _channel(account, stream_uuid)
+
+    other_owner = uuid.uuid4()
+    conftest.seed_workspace_user(db, other_owner, f"binding-state-{other_owner}")
+    second = external_models.ExternalAccount(
+        project_id=account.project_id,
+        owner_user_uuid=other_owner,
+        provider="zulip",
+        settings=account.settings,
+    )
+    second.insert()
+    _channel(second, stream_uuid)
+    assert {state.user_uuid for state in _binding_states(account)} == {
+        account.owner_user_uuid,
+        other_owner,
+    }
+    first_channel.delete()
+    (state,) = _binding_states(account)
+    assert state.user_uuid == other_owner
+    _channel(account, stream_uuid)
+    second.provider = "other"
+    second.update()
+    (state,) = _binding_states(account)
+    assert state.user_uuid == account.owner_user_uuid
+
+
+def test_binding_states_do_not_match_other_projects(stream_state_account, db):
+    account = stream_state_account
+    stream_uuid = uuid.uuid4()
+    _channel(account, stream_uuid)
+    other = external_models.ExternalAccount(
+        project_id=uuid.uuid4(),
+        owner_user_uuid=account.owner_user_uuid,
+        provider="zulip",
+        settings=account.settings,
+    )
+    other.insert()
+    db.execute(
+        "INSERT INTO messenger_project_users (project_id, user_uuid) VALUES (%s, %s)",
+        (other.project_id, other.owner_user_uuid),
+    )
+    _stream(db, other, stream_uuid, "zulip")
+    conftest.seed_user_stream_binding(
+        db, other.project_id, stream_uuid, other.owner_user_uuid
+    )
+    try:
+        assert _binding_states(account) == []
+        (delete,) = _binding_states(other)
+        assert delete.action == "delete"
+        assert delete.project_id == other.project_id
+    finally:
+        other.delete()
+        db.execute(
+            "DELETE FROM messenger_streams WHERE project_id = %s", (other.project_id,)
+        )
+
+
+def test_binding_state_preserves_identity_across_leave_and_rejoin(
+    stream_state_account, db
+):
+    account = stream_state_account
+    stream_uuid = uuid.uuid4()
+    _stream(db, account, stream_uuid, "zulip")
+    channel = _channel(account, stream_uuid)
+    (create,) = _binding_states(account)
+    with contexts.Context().session_manager():
+        create.do()
+    assert _binding_states(account) == []
+    assert db.execute(
+        "SELECT payload->>'kind' FROM m_workspace_visible_events "
+        "WHERE project_id = %s AND user_uuid = %s AND object_type = 'stream'",
+        (account.project_id, account.owner_user_uuid),
+    ).fetchall() == [("stream.created",)]
+    channel.delete()
+    (delete,) = _binding_states(account)
+    assert delete.action == "delete"
+    with contexts.Context().session_manager():
+        delete.do()
+    assert _binding_states(account) == []
+    inactive = v2_models.WorkspaceStreamBinding.objects.get_one(
+        filters={"uuid": filters.EQ(create.binding_uuid)}
+    )
+    assert not inactive.active
+    assert inactive.membership_generation == 2
+    assert db.execute(
+        "SELECT payload->>'kind' FROM m_workspace_visible_events "
+        "WHERE project_id = %s AND user_uuid = %s AND object_type = 'stream' "
+        "ORDER BY epoch_version DESC LIMIT 1",
+        (account.project_id, account.owner_user_uuid),
+    ).fetchone() == ("stream.deleted",)
+
+    _channel(account, stream_uuid)
+    (rejoin,) = _binding_states(account)
+    assert rejoin.binding_uuid == create.binding_uuid
+    with contexts.Context().session_manager():
+        rejoin.do()
+
+    assert _binding_states(account) == []
+    (binding,) = v2_models.WorkspaceStreamBinding.objects.get_all(
+        filters={"project_id": filters.EQ(account.project_id)}
+    )
+    assert binding.uuid == create.binding_uuid
+    assert binding.active
+    assert binding.membership_generation == 3
+    assert binding.role == "member"
+    legacy = messenger_models.WorkspaceStreamBinding.objects.get_one(
+        filters={"project_id": filters.EQ(account.project_id)}
+    )
+    assert legacy.uuid == binding.uuid
+    assert legacy.who_uuid == account.owner_user_uuid
+    assert db.execute(
+        "SELECT payload->>'kind' FROM m_workspace_visible_events "
+        "WHERE project_id = %s AND user_uuid = %s AND object_type = 'stream' "
+        "ORDER BY epoch_version DESC LIMIT 1",
+        (account.project_id, account.owner_user_uuid),
+    ).fetchone() == ("stream.created",)
+
+
+@pytest.mark.parametrize("action", ["create", "delete"])
+def test_binding_state_uses_current_transaction(stream_state_account, db, action):
+    account = stream_state_account
+    stream_uuid = uuid.uuid4()
+    _stream(db, account, stream_uuid, "zulip")
+    if action == "create":
+        _channel(account, stream_uuid)
+    else:
+        conftest.seed_user_stream_binding(
+            db, account.project_id, stream_uuid, account.owner_user_uuid
+        )
+    (state,) = _binding_states(account)
+    with pytest.raises(RuntimeError, match="Rollback binding"):
+        with contexts.Context().session_manager():
+            state.do()
+            raise RuntimeError("Rollback binding")
+    assert [stored.as_plain_dict() for stored in _binding_states(account)] == [
+        state.as_plain_dict()
+    ]
+    assert db.execute(
+        "SELECT count(*) FROM m_workspace_visible_events WHERE project_id = %s",
+        (account.project_id,),
+    ).fetchone() == (0,)
+
+
 @pytest.mark.parametrize(
     "has_channel,source,deleted,action",
     [
@@ -504,7 +731,13 @@ def _run_reconciliation(task):
 
 @pytest.mark.parametrize(
     "count,settings",
-    [(0, {}), (1, {}), (1000, {}), (1001, {}), (3, {"batch_size": 2, "interval": 17})],
+    [
+        (0, {}),
+        (1, {}),
+        (2, {"batch_size": 2}),
+        (3, {"batch_size": 2}),
+        (3, {"batch_size": 2, "interval": 17}),
+    ],
 )
 def test_reconciliation_batches_and_schedules_continuation(
     stream_state_account, db, count, settings
@@ -543,18 +776,27 @@ def test_reconciliation_batches_and_schedules_continuation(
     assert followup.priority > max(
         models.TASK_PRIORITY_IMPORT_HISTORY,
         models.TASK_PRIORITY_IMPORT_CHANNELS,
-        models.TASK_PRIORITY_IMPORT_USERS,
         models.TASK_PRIORITY_FULL_BACKFILL,
-        models.TASK_PRIORITY_INITIALIZE_CONNECTION,
         models.TASK_PRIORITY_REALTIME_MESSAGE,
     )
-    if count < batch_size:
+    assert followup.priority < min(
+        models.TASK_PRIORITY_IMPORT_USERS,
+        models.TASK_PRIORITY_INITIALIZE_CONNECTION,
+    )
+    if 2 * count < batch_size:
         assert followup.status == "waiting"
         assert before + interval <= followup.not_before_at <= after + interval
     else:
         assert followup.status == "new"
         assert followup.not_before_at is None
-        assert _run_reconciliation(followup).status == "done"
+        while followup.status == "new":
+            assert _run_reconciliation(followup).status == "done"
+            (followup,) = models.Task.objects.get_all(
+                filters={
+                    "project_id": filters.Is(None),
+                    "status": filters.In(["new", "waiting"]),
+                }
+            )
         assert _states(account) == []
         (delayed,) = models.Task.objects.get_all(
             filters={
@@ -566,6 +808,17 @@ def test_reconciliation_batches_and_schedules_continuation(
         assert delayed.not_before_at >= after + interval
         assert delayed.content.batch_size == batch_size
         assert delayed.content.interval == task.content.interval
+    assert (
+        models.ZulipStreamBindingState.objects.get_all(
+            filters={"project_id": filters.EQ(account.project_id)}
+        )
+        == []
+    )
+    assert db.execute(
+        "SELECT count(*) FROM messenger_stream_bindings "
+        "WHERE project_id = %s AND active AND role = 'member'",
+        (account.project_id,),
+    ).fetchone() == (count,)
 
 
 @pytest.mark.parametrize("phase", ["process", "continuation"])
@@ -638,15 +891,15 @@ def test_reconciliation_retries_after_failure_and_preserves_continuation(
     assert followup.content.interval == 23
 
 
-def test_reconciliation_preempts_other_tasks(stream_state_account):
+def test_reconciliation_preempts_history_import(stream_state_account):
     account = stream_state_account
-    initialization = models.Task(
+    history = models.Task(
         project_id=account.project_id,
         external_account_uuid=account.uuid,
-        priority=models.TASK_PRIORITY_INITIALIZE_CONNECTION,
-        content=models.InitializeConnectionContent(),
+        priority=models.TASK_PRIORITY_IMPORT_HISTORY,
+        content=models.ImportHistoryContent(first_message_id=1, last_message_id=1),
     )
-    initialization.insert()
+    history.insert()
     reconciliation = models.Task(
         priority=models.TASK_PRIORITY_RECONCILIATION,
         content=models.ReconciliationContent(),
@@ -663,12 +916,10 @@ def test_reconciliation_preempts_other_tasks(stream_state_account):
         == "done"
     )
     assert (
-        models.Task.objects.get_one(
-            filters={"uuid": filters.EQ(initialization.uuid)}
-        ).status
+        models.Task.objects.get_one(filters={"uuid": filters.EQ(history.uuid)}).status
         == "new"
     )
-    assert [task.uuid for task in service._get_tasks()] == [initialization.uuid]
+    assert [task.uuid for task in service._get_tasks()] == [history.uuid]
 
 
 def test_reconciliation_processes_multiple_projects(stream_state_account):
@@ -789,3 +1040,26 @@ def test_stream_state_view_migration_is_reversible(stream_state_account, db):
         )
         == []
     )
+
+
+def test_binding_state_view_migration_is_reversible(stream_state_account, db):
+    account = stream_state_account
+    stream_uuid = uuid.uuid4()
+    _stream(db, account, stream_uuid, "zulip")
+    _channel(account, stream_uuid)
+    (state,) = _binding_states(account)
+    engine = migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    migration = "0217-Add-Zulip-stream-binding-reconciliation-view-5fa84f.py"
+    engine.rollback_migration(migration)
+    try:
+        assert db.execute(
+            "SELECT to_regclass('bridge_zulip_v5_stream_binding_states')"
+        ).fetchone() == (None,)
+        assert db.execute(
+            "SELECT deleted_at FROM messenger_streams WHERE project_id = %s",
+            (account.project_id,),
+        ).fetchone() == (None,)
+    finally:
+        engine.apply_migration(migration)
+    (restored,) = _binding_states(account)
+    assert restored.as_plain_dict() == state.as_plain_dict()

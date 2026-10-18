@@ -590,7 +590,7 @@ def test_topic_failure_rolls_back_stream_creation_and_retries_reconciliation(
     task.delete()
 
 
-def test_reconciliation_shares_the_batch_budget_between_streams_and_topics(
+def test_reconciliation_shares_the_batch_budget_between_streams_bindings_and_topics(
     history_account, db, monkeypatch
 ):
     account = history_account
@@ -601,13 +601,19 @@ def test_reconciliation_shares_the_batch_budget_between_streams_and_topics(
     ]
     monkeypatch.setattr(client, "ZulipClient", lambda current: zulip)
     assert _import_history(account).status == "done"
-    task = models.Task(content=models.ReconciliationContent(batch_size=2, interval=17))
+    task = models.Task(content=models.ReconciliationContent(batch_size=3, interval=17))
     task.insert()
     try:
         with contexts.Context().session_manager():
             task.execute()
         assert task.status == "done"
         assert len(_topic_states(account)) == 1
+        (binding,) = v2_models.WorkspaceStreamBinding.objects.get_all(
+            filters={"project_id": filters.EQ(account.project_id)}
+        )
+        assert binding.user_uuid == account.owner_user_uuid
+        assert binding.active
+        assert binding.role == "member"
         (followup,) = models.Task.objects.get_all(
             filters={"project_id": filters.Is(None), "uuid": filters.NE(task.uuid)}
         )

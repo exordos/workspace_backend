@@ -38,6 +38,7 @@ from workspace.bridges.zulip import client
 from workspace.common import models as common_models
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api.dm import external_models
+from workspace.messenger_api.dm import helpers as messenger_helpers
 from workspace.messenger_api.dm import models as messenger_models
 from workspace.messenger_api.dm import v2_models
 
@@ -236,6 +237,62 @@ class ZulipStreamState(
             },
         )
         stream.delete()
+
+
+class ZulipStreamBindingState(
+    models.ModelWithID,
+    models.ModelWithProject,
+    orm.SQLStorableMixin,
+):
+    """Stream membership differences between Zulip and Workspace."""
+
+    __tablename__ = "bridge_zulip_v5_stream_binding_states"
+
+    project_id = properties.property(
+        types.UUID(), required=True, read_only=True, id_property=True
+    )
+    stream_uuid = properties.property(
+        types.UUID(), required=True, read_only=True, id_property=True
+    )
+    user_uuid = properties.property(
+        types.UUID(), required=True, read_only=True, id_property=True
+    )
+    binding_uuid = properties.property(types.UUID(), required=True, read_only=True)
+    action = properties.property(
+        types.Enum(["create", "delete"]), required=True, read_only=True
+    )
+
+    @classmethod
+    def get_id_property(cls) -> dict[str, typing.Any]:
+        return cls.id_properties.copy()
+
+    def get_id(self) -> tuple[sys_uuid.UUID, sys_uuid.UUID, sys_uuid.UUID]:
+        return self.project_id, self.stream_uuid, self.user_uuid
+
+    def do(self) -> None:
+        {
+            "create": self.create_workspace_binding,
+            "delete": self.delete_workspace_binding,
+        }[self.action]()
+
+    def create_workspace_binding(self) -> None:
+        messenger_helpers.get_or_create_workspace_stream_bindings(
+            project_id=self.project_id,
+            stream_uuid=self.stream_uuid,
+            who_uuid=self.user_uuid,
+            role_user_uuids={
+                messenger_models.WorkspaceStreamRole.MEMBER.value: [self.user_uuid]
+            },
+            binding_uuids={str(self.user_uuid): self.binding_uuid},
+            session=contexts.Context().get_session(),
+        )
+
+    def delete_workspace_binding(self) -> None:
+        messenger_helpers.delete_workspace_stream_binding(
+            project_id=self.project_id,
+            binding_uuid=self.binding_uuid,
+            session=contexts.Context().get_session(),
+        )
 
 
 class ZulipTopicState(
@@ -1124,6 +1181,18 @@ class ReconciliationContent(AbstractTaskContent):
         for state in states:
             state.do()
         processed = len(states)
+        if processed < self.batch_size:
+            binding_states = ZulipStreamBindingState.objects.get_all(
+                order_by={
+                    "project_id": "asc",
+                    "stream_uuid": "asc",
+                    "user_uuid": "asc",
+                },
+                limit=self.batch_size - processed,
+            )
+            for binding_state in binding_states:
+                binding_state.do()
+            processed += len(binding_states)
         if processed < self.batch_size:
             topic_states = ZulipTopicState.objects.get_all(
                 order_by={"project_id": "asc", "topic_uuid": "asc"},
