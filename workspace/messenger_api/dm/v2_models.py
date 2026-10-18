@@ -12,7 +12,9 @@ internal.
 """
 
 import typing
+import uuid as sys_uuid
 
+from restalchemy.common import contexts
 from restalchemy.dm import models
 from restalchemy.dm import properties
 from restalchemy.dm import types
@@ -148,6 +150,55 @@ class WorkspaceMessage(
     ingest_sequence = properties.property(
         types.Integer(min_value=1), required=False, read_only=True
     )
+    deleted_at = properties.property(
+        types.AllowNone(types.UTCDateTimeZ()), default=None, read_only=True
+    )
+
+
+class WorkspaceMessageChange(
+    models.ModelWithID,
+    models.ModelWithProject,
+    orm.SQLStorableMixin,
+):
+    __tablename__ = "messenger_message_changes"
+
+    project_id = properties.property(
+        types.UUID(), required=True, read_only=True, id_property=True
+    )
+    message_uuid = properties.property(
+        types.UUID(), required=True, read_only=True, id_property=True
+    )
+    revision = properties.property(
+        types.Integer(min_value=1), required=True, read_only=True
+    )
+
+    @classmethod
+    def get_id_property(cls) -> dict[str, typing.Any]:
+        return cls.id_properties.copy()
+
+    def get_id(self) -> tuple[sys_uuid.UUID, sys_uuid.UUID]:
+        return self.project_id, self.message_uuid
+
+    def acknowledge(self) -> None:
+        self.acknowledge_many([self])
+
+    @classmethod
+    def acknowledge_many(
+        cls, changes: typing.Sequence["WorkspaceMessageChange"]
+    ) -> None:
+        contexts.Context().get_session().execute(
+            f"DELETE FROM {cls.__tablename__} AS pending "
+            "USING unnest(%s::uuid[], %s::uuid[], %s::bigint[]) "
+            "AS checked(project_id, message_uuid, revision) "
+            "WHERE pending.project_id = checked.project_id "
+            "AND pending.message_uuid = checked.message_uuid "
+            "AND pending.revision = checked.revision",
+            (
+                [change.project_id for change in changes],
+                [change.message_uuid for change in changes],
+                [change.revision for change in changes],
+            ),
+        )
 
 
 class WorkspaceMessagePlacement(

@@ -108,6 +108,7 @@ class MessageDeletedEventPayload(
     source = properties.property(
         types_dynamic.KindModelSelectorType(
             types_dynamic.KindModelType(base.NativeSource),
+            types_dynamic.KindModelType(base.ZulipSource),
         ),
         required=True,
     )

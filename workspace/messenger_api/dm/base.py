@@ -63,12 +63,13 @@ class NativeSource(types_dynamic.AbstractKindModel):
     KIND = "native"
 
 
-class SourceName(str, enum.Enum):
-    NATIVE = NativeSource.KIND
-
-
 class ZulipSource(types_dynamic.AbstractKindModel):
     KIND = "zulip"
+
+
+class SourceName(str, enum.Enum):
+    NATIVE = NativeSource.KIND
+    ZULIP = ZulipSource.KIND
 
 
 class StreamSourceName(str, enum.Enum):
@@ -93,6 +94,7 @@ class WorkspaceSourceBase(models.Model):
     source = properties.property(
         types_dynamic.KindModelSelectorType(
             types_dynamic.KindModelType(NativeSource),
+            types_dynamic.KindModelType(ZulipSource),
         ),
         default=native_source,
     )

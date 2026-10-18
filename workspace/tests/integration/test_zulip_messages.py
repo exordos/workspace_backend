@@ -60,6 +60,12 @@ def history_account(_database, db):
     _channel(account)
     yield account
     account.delete()
+    for message in v2_models.WorkspaceMessage.objects.get_all(
+        filters={"project_id": filters.EQ(account.project_id)}
+    ):
+        message.delete()
+    for table in ("bridge_zulip_v5_message_changes", "messenger_message_changes"):
+        db.execute(f"DELETE FROM {table} WHERE project_id = %s", (account.project_id,))
     db.execute(
         "DELETE FROM bridge_zulip_v5_topics AS topic WHERE NOT EXISTS "
         "(SELECT 1 FROM bridge_zulip_v5_messages AS message WHERE message.topic = topic.uuid)"
@@ -621,6 +627,14 @@ def test_reconciliation_shares_the_batch_budget_between_all_stages(
         with contexts.Context().session_manager():
             followup.execute()
         assert _topic_states(account) == []
+        assert (
+            len(
+                v2_models.WorkspaceMessage.objects.get_all(
+                    filters={"project_id": filters.EQ(account.project_id)}
+                )
+            )
+            == 2
+        )
         (waiting,) = models.Task.objects.get_all(
             filters={"project_id": filters.Is(None), "status": filters.EQ("waiting")}
         )

@@ -159,6 +159,8 @@ def test_reconciliation_batches_project_users_before_other_stages(
             models.ZulipStreamState,
             models.ZulipStreamBindingState,
             models.ZulipTopicState,
+            models.ZulipMessageState,
+            models.ZulipMessageChange,
         ):
             patched.setattr(model, "objects", mock.Mock(get_all=unexpected_stage))
         for remaining in (1, 0):

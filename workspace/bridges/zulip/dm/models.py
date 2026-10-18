@@ -37,8 +37,10 @@ from restalchemy.storage.sql import utils
 from workspace.bridges.zulip import client
 from workspace.common import models as common_models
 from workspace.messenger_api import events as messenger_events
+from workspace.messenger_api.dm import base as messenger_base
 from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.dm import helpers as messenger_helpers
+from workspace.messenger_api.dm import message_payloads
 from workspace.messenger_api.dm import models as messenger_models
 from workspace.messenger_api.dm import v2_models
 
@@ -382,6 +384,140 @@ class ZulipTopicState(
             },
         )
         topic.delete()
+
+
+class ZulipMessageChange(v2_models.WorkspaceMessageChange):
+    __tablename__ = "bridge_zulip_v5_message_changes"
+
+
+class ZulipMessageState(
+    models.ModelWithID,
+    models.ModelWithProject,
+    orm.SQLStorableMixin,
+):
+    """Message existence differences, without content updates or viewer state."""
+
+    __tablename__ = "bridge_zulip_v5_message_states"
+
+    project_id = properties.property(
+        types.UUID(), required=True, read_only=True, id_property=True
+    )
+    message_uuid = properties.property(
+        types.UUID(), required=True, read_only=True, id_property=True
+    )
+    source_uuid = properties.property(
+        types.AllowNone(types.UUID()), default=None, read_only=True
+    )
+    action = properties.property(
+        types.Enum(["create", "delete"]), required=True, read_only=True
+    )
+
+    @classmethod
+    def get_id_property(cls) -> dict[str, typing.Any]:
+        return cls.id_properties.copy()
+
+    def get_id(self) -> tuple[sys_uuid.UUID, sys_uuid.UUID]:
+        return self.project_id, self.message_uuid
+
+    @classmethod
+    def reconcile_batch(cls, limit: int) -> int:
+        changes = {}
+        change_models = (ZulipMessageChange, v2_models.WorkspaceMessageChange)
+        for model in change_models:
+            for change in model.objects.get_all(limit=limit):
+                changes.setdefault(change.get_id(), []).append(change)
+        batch = dict(list(changes.items())[:limit])
+        projects = {}
+        for project_id, message_uuid in batch:
+            projects.setdefault(project_id, []).append(message_uuid)
+        for project_id, message_uuids in projects.items():
+            states = cls.objects.get_all(
+                filters={
+                    "project_id": filters.EQ(project_id),
+                    "message_uuid": filters.In(message_uuids),
+                },
+            )
+            for state in states:
+                state.do()
+        for model in change_models:
+            pending = [
+                change
+                for changes in batch.values()
+                for change in changes
+                if type(change) is model
+            ]
+            if pending:
+                model.acknowledge_many(pending)
+        return len(batch)
+
+    def do(self) -> None:
+        {
+            "create": self.create_workspace_message,
+            "delete": self.delete_workspace_message,
+        }[self.action]()
+
+    def create_workspace_message(self) -> None:
+        source = ZulipMessage.objects.get_one(
+            filters={"uuid": filters.EQ(self.source_uuid)},
+        )
+        account = external_models.ExternalAccount.objects.get_one(
+            filters={"uuid": filters.EQ(source.external_account_uuid)},
+        )
+        author = external_models.ExternalAccount.objects.get_one(
+            filters={
+                "project_id": filters.EQ(self.project_id),
+                "provider": filters.EQ("zulip"),
+                "external_account_id": filters.EQ(
+                    f"{account.get_host()}:{source.sender_id}"
+                ),
+            },
+        )
+        message = v2_models.WorkspaceMessage.objects.get_one_or_none(
+            filters={
+                "project_id": filters.EQ(self.project_id),
+                "uuid": filters.EQ(self.message_uuid),
+                "source_name": filters.EQ(messenger_base.SourceName.ZULIP.value),
+            },
+        )
+        created_at = datetime.datetime.fromtimestamp(
+            source.timestamp, tz=datetime.timezone.utc
+        )
+        if message is None:
+            sequence = (
+                contexts.Context()
+                .get_session()
+                .execute(
+                    "SELECT nextval('messenger_messages_ingest_sequence_seq') AS value"
+                )
+                .fetchone()["value"]
+            )
+            message = v2_models.WorkspaceMessage(
+                uuid=self.message_uuid,
+                project_id=self.project_id,
+                author_uuid=author.owner_user_uuid,
+                payload=message_payloads.MarkdownPayload(
+                    content=source.content.workspace_content,
+                ),
+                source_name=messenger_base.SourceName.ZULIP.value,
+                source={"kind": "zulip"},
+                ingest_sequence=sequence,
+                created_at=created_at,
+                updated_at=source.content.workspace_content_updated_at,
+            )
+            message.insert()
+        else:
+            message.properties["deleted_at"].set_value_force(None)
+            message.update()
+
+    def delete_workspace_message(self) -> None:
+        message = v2_models.WorkspaceMessage.objects.get_one(
+            filters={
+                "project_id": filters.EQ(self.project_id),
+                "uuid": filters.EQ(self.message_uuid),
+                "source_name": filters.EQ(messenger_base.SourceName.ZULIP.value),
+            },
+        )
+        message.delete()
 
 
 class ZulipChannel(
@@ -1205,7 +1341,6 @@ class ReconciliationContent(AbstractTaskContent):
 
     def execute(self, task: "Task") -> None:
         states = ZulipProjectUserState.objects.get_all(
-            order_by={"project_id": "asc", "user_uuid": "asc"},
             limit=self.batch_size,
         )
         for state in states:
@@ -1213,7 +1348,6 @@ class ReconciliationContent(AbstractTaskContent):
         processed = len(states)
         if processed < self.batch_size:
             stream_states = ZulipStreamState.objects.get_all(
-                order_by={"project_id": "asc", "stream_uuid": "asc"},
                 limit=self.batch_size - processed,
             )
             for stream_state in stream_states:
@@ -1221,11 +1355,6 @@ class ReconciliationContent(AbstractTaskContent):
             processed += len(stream_states)
         if processed < self.batch_size:
             binding_states = ZulipStreamBindingState.objects.get_all(
-                order_by={
-                    "project_id": "asc",
-                    "stream_uuid": "asc",
-                    "user_uuid": "asc",
-                },
                 limit=self.batch_size - processed,
             )
             for binding_state in binding_states:
@@ -1233,12 +1362,13 @@ class ReconciliationContent(AbstractTaskContent):
             processed += len(binding_states)
         if processed < self.batch_size:
             topic_states = ZulipTopicState.objects.get_all(
-                order_by={"project_id": "asc", "topic_uuid": "asc"},
                 limit=self.batch_size - processed,
             )
             for topic_state in topic_states:
                 topic_state.do()
             processed += len(topic_states)
+        if processed < self.batch_size:
+            processed += ZulipMessageState.reconcile_batch(self.batch_size - processed)
         not_before_at = None
         if processed < self.batch_size:
             not_before_at = datetime.datetime.now(
