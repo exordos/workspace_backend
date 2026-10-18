@@ -7428,7 +7428,8 @@ SOFTWARE.
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;The deployment finished successfully.&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;The deployment finished successfully.&quot;
 }</pre></details>
     </article>
 <article id="paragraphs_and_line_breaks" class="example" data-unsupported="false" data-search="paragraphs_and_line_breaks single line breaks, blank lines, and trailing spaces. first line.
@@ -7498,7 +7499,8 @@ Final paragraph.</pre></details></section></div>
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;First line.\nSecond line.  \nThird line.\n\nA separate paragraph.\n\nFinal paragraph.&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;First line.\nSecond line.  \nThird line.\n\nA separate paragraph.\n\nFinal paragraph.&quot;
 }</pre></details>
     </article>
 <article id="unicode_and_combining_characters" class="example" data-unsupported="false" data-search="unicode_and_combining_characters accented names, combining marks, nonbreaking spaces, and unicode emoji. zoë and josé reviewed the café notes. the same accent can be written as é or é.
@@ -7545,7 +7547,8 @@ A nonbreaking space: first second. Emoji: 👍🏽 👩‍💻 👨‍👩‍�
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;Zoë and José reviewed the café notes. The same accent can be written as é or é.\nA nonbreaking space: first second. Emoji: 👍🏽 👩‍💻 👨‍👩‍👧‍👦.&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;Zoë and José reviewed the café notes. The same accent can be written as é or é.\nA nonbreaking space: first second. Emoji: 👍🏽 👩‍💻 👨‍👩‍👧‍👦.&quot;
 }</pre></details>
     </article>
 <article id="emphasis_and_strikethrough" class="example" data-unsupported="false" data-search="emphasis_and_strikethrough bold, italic, strikethrough, and nested emphasis. **bold** and *italic* and _also italic_ and ~~removed~~.
@@ -7596,7 +7599,8 @@ A nonbreaking space: first second. Emoji: 👍🏽 👩‍💻 👨‍👩‍�
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;**Bold** and *italic* and _also italic_ and ~~removed~~.\n\n**Bold with *nested italic* inside**.&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;**Bold** and *italic* and _also italic_ and ~~removed~~.\n\n**Bold with *nested italic* inside**.&quot;
 }</pre></details>
     </article>
 <article id="escaped_markdown" class="example" data-unsupported="false" data-search="escaped_markdown escaped formatting and mention syntax must remain literal. \*not italic\* and \_not italic\_ and \~\~not removed\~\~.
@@ -7649,7 +7653,8 @@ A nonbreaking space: first second. Emoji: 👍🏽 👩‍💻 👨‍👩‍�
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;\\*not italic\\* and \\_not italic\\_ and \\~\\~not removed\\~\\~.\n\\@**Bob Example|12** and \\#**general**.&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;\\*not italic\\* and \\_not italic\\_ and \\~\\~not removed\\~\\~.\n\\@**Bob Example|12** and \\#**general**.&quot;
 }</pre></details>
     </article>
 <article id="headings_and_horizontal_rule" class="example" data-unsupported="false" data-search="headings_and_horizontal_rule heading levels and a section separator. # release notes
@@ -7736,7 +7741,8 @@ A paragraph after it.</pre></details></section></div>
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;# Release notes\n\n## Changes\n\n### Details\n\nA paragraph before the separator.\n\n---\n\nA paragraph after it.&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;# Release notes\n\n## Changes\n\n### Details\n\nA paragraph before the separator.\n\n---\n\nA paragraph after it.&quot;
 }</pre></details>
     </article>
 <article id="bulleted_list" class="example" data-unsupported="false" data-search="bulleted_list an unordered list containing emphasis and a link. - review **schema changes**
@@ -7790,7 +7796,8 @@ A paragraph after it.</pre></details></section></div>
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;- Review **schema changes**\n- Read the [guide](urn:url:https://docs.example.test/guide)\n- Deploy the release&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;- Review **schema changes**\n- Read the [guide](https://docs.example.test/guide)\n- Deploy the release&quot;
 }</pre></details>
     </article>
 <article id="numbered_list" class="example" data-unsupported="false" data-search="numbered_list an ordered list with an explicit non-default starting number. 3. download the archive
@@ -7844,7 +7851,8 @@ A paragraph after it.</pre></details></section></div>
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;3. Download the archive\n4. Verify its checksum\n5. Extract the files&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;3. Download the archive\n4. Verify its checksum\n5. Extract the files&quot;
 }</pre></details>
     </article>
 <article id="nested_lists" class="example" data-unsupported="false" data-search="nested_lists nested unordered and ordered lists with continuation paragraphs. - backend
@@ -7930,7 +7938,8 @@ A paragraph after it.</pre></details></section></div>
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;- Backend\n    - API\n    - Worker\n- Frontend\n    1. Install dependencies\n    2. Start the application\n\n        Keep the terminal open.&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;- Backend\n    - API\n    - Worker\n- Frontend\n    1. Install dependencies\n    2. Start the application\n\n        Keep the terminal open.&quot;
 }</pre></details>
     </article>
 <article id="table" class="example" data-unsupported="false" data-search="table a markdown table with alignment and inline formatting. | component | state | owner |
@@ -8004,7 +8013,8 @@ A paragraph after it.</pre></details></section></div>
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;| Component | State | Owner |\n| :--- | :---: | ---: |\n| **API** | Ready | Alice |\n| Worker | `retry` | Bob |&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;| Component | State | Owner |\n| :--- | :---: | ---: |\n| **API** | Ready | Alice |\n| Worker | `retry` | Bob |&quot;
 }</pre></details>
     </article>
 <article id="block_quotes" class="example" data-unsupported="false" data-search="block_quotes standard and nested quotes are preserved in an existing forward snapshot urn, with unknown as the author. &gt; original proposal.
@@ -8077,7 +8087,8 @@ My reply is outside the quote.</pre></details></section></div>
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;[unknown](urn:forward:3ba51ad6-176b-5edf-aa00-69ce615772f5?snapshot=T3JpZ2luYWwgcHJvcG9zYWwuCgotIEtlZXAgdGhlIGltcG9ydCBpZGVtcG90ZW50LgotIFByZXNlcnZlIG1lc3NhZ2Ugb3JkZXIuCgo-IEEgcmVwbHkgaW5zaWRlIHRoZSBxdW90ZS4)\n\nMy reply is outside the quote.&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;```quote\nOriginal proposal.\n\n- Keep the import idempotent.\n- Preserve message order.\n\n&gt; A reply inside the quote.\n```\n\nMy reply is outside the quote.&quot;
 }</pre></details>
     </article>
 <article id="fenced_quote" class="example" data-unsupported="false" data-search="fenced_quote an anonymous quote uses the existing forward snapshot urn with an unknown author. the source uuid identifies the containing message; formatting and links remain inside the snapshot. ```quote
@@ -8142,7 +8153,8 @@ A reply outside the quotation.</pre></details></section></div>
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;[unknown](urn:forward:c5626519-9906-58e8-b8c8-93611b399bd4?snapshot=UXVvdGVkICoqdGV4dCoqIHdpdGggYSBbcmVmZXJlbmNlXSh1cm46dXJsOmh0dHBzOi8vZG9jcy5leGFtcGxlLnRlc3QvcmVmZXJlbmNlKS4KCkEgc2Vjb25kIHF1b3RlZCBwYXJhZ3JhcGgu)\n\nA reply outside the quotation.&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;```quote\nQuoted **text** with a [reference](https://docs.example.test/reference).\n\nA second quoted paragraph.\n```\n\nA reply outside the quotation.&quot;
 }</pre></details>
     </article>
 <article id="quoted_message_reference" class="example" data-unsupported="false" data-search="quoted_message_reference a reply converted to a native workspace quote reference; the quoted author is not an unsupported silent mention. @_**alice example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/formatting.20examples/near/1001):
@@ -8208,7 +8220,8 @@ Thanks, confirmed.</pre></details></section></div>
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;[Alice Example](urn:quote:38c6b1e8-3017-53c6-b963-1694633751bb)\n\nThanks, confirmed.&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;@_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1001):\n```quote\nThe deployment finished successfully.\n```\n\nThanks, confirmed.&quot;
 }</pre></details>
     </article>
 <article id="partial_quoted_message_reference" class="example" data-unsupported="false" data-search="partial_quoted_message_reference a selected quote fragment is stored in the quote urn text parameter and rendered as plain text inside the native quote card. @_**alice example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/formatting.20examples/near/1001):
@@ -8274,7 +8287,8 @@ The quoted fragment is enough.</pre></details></section></div>
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;[Alice Example](urn:quote:38c6b1e8-3017-53c6-b963-1694633751bb?text=deployment%20finished%20successfully.)\n\nThe quoted fragment is enough.&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;@_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1001):\n```quote\ndeployment finished successfully.\n```\n\nThe quoted fragment is enough.&quot;
 }</pre></details>
     </article>
 <article id="nested_message_quote" class="example" data-unsupported="false" data-search="nested_message_quote a two-level message quote used as the source of the three-level quote example; each level references an existing fixture message. @_**bob example|12** [said](https://zulip.example.test/#narrow/channel/42-general/topic/formatting.20examples/near/1056):
@@ -8354,7 +8368,8 @@ Zoë&#39;s reply is outside both quotes.</pre></details></section></div>
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;[Bob Example](urn:quote:e5ccdf1d-ed8f-5d68-b096-ee17baca17f2)\n\nZoë&#39;s reply is outside both quotes.&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;@_**Bob Example|12** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1056):\n````quote\n@_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1001):\n```quote\ndeployment finished successfully.\n```\n\nThe quoted fragment is enough.\n````\n\nZoë&#39;s reply is outside both quotes.&quot;
 }</pre></details>
     </article>
 <article id="triple_nested_quote" class="example" data-unsupported="false" data-search="triple_nested_quote a quote inside a quote inside a quote: three native workspace quote urns with distinct message uuids, followed by a reply outside every quote. @_**zoë example|13** [said](https://zulip.example.test/#narrow/channel/42-general/topic/formatting.20examples/near/1057):
@@ -8448,7 +8463,8 @@ Alice&#39;s reply is outside all three quotes.</pre></details></section></div>
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;[Zoë Example](urn:quote:ee2ca07c-91c3-5dcc-a28b-47dcb38f902f)\n\nAlice&#39;s reply is outside all three quotes.&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;@_**Zoë Example|13** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1057):\n`````quote\n@_**Bob Example|12** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1056):\n````quote\n@_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1001):\n```quote\ndeployment finished successfully.\n```\n\nThe quoted fragment is enough.\n````\n\nZoë&#39;s reply is outside both quotes.\n`````\n\nAlice&#39;s reply is outside all three quotes.&quot;
 }</pre></details>
     </article>
 <article id="inline_code" class="example" data-unsupported="false" data-search="inline_code inline code keeps its code formatting while embedded zulip mentions are converted to workspace urns. run `python -m pytest`.
@@ -8503,7 +8519,8 @@ A backtick inside a code span: ``value = `literal` ``.</pre></details></section>
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;Run `python -m pytest`.\nKeep `[Bob Example](urn:user:7af731c9-ccd4-5318-9a12-bab962ee4679)` literal.\nA backtick inside a code span: ``value = `literal` ``.&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;Run `python -m pytest`.\nKeep `@**Bob Example|12**` literal.\nA backtick inside a code span: ``value = `literal` ``.&quot;
 }</pre></details>
     </article>
 <article id="fenced_python" class="example" data-unsupported="false" data-search="fenced_python a language-tagged code block containing indentation and a blank line. ```python
@@ -8572,7 +8589,8 @@ print(greeting(&quot;Alice&quot;))
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;```python\ndef greeting(name: str) -&gt; str:\n    return f\&quot;Hello, {name}!\&quot;\n\nprint(greeting(\&quot;Alice\&quot;))\n```&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;```python\ndef greeting(name: str) -&gt; str:\n    return f\&quot;Hello, {name}!\&quot;\n\nprint(greeting(\&quot;Alice\&quot;))\n```&quot;
 }</pre></details>
     </article>
 <article id="fenced_literal_markup" class="example" data-unsupported="true" data-search="fenced_literal_markup zulip references are converted inside fenced code; unsupported math is marked as plain text, with one original-message link at the end. ```text
@@ -8673,7 +8691,8 @@ Outside code: [Bob Example](urn:user:7af731c9-ccd4-5318-9a12-bab962ee4679).
   },
   &quot;unsupported_features&quot;: [
     &quot;inline_latex&quot;
-  ]
+  ],
+  &quot;expected_zulip_content&quot;: &quot;```text\n@**Bob Example|12**\n#**general&gt;Roadmap**\n[file](/user_uploads/1/abc123/report.pdf)\n:smile: (Not supported in Workspace: inline LaTeX)\n```\n\nOutside code: @**Bob Example|12**.\n\n[Original message](https://zulip.example.test/#narrow/near/1016)&quot;
 }</pre></details>
     </article>
 <article id="nested_code_fences" class="example" data-unsupported="false" data-search="nested_code_fences a longer outer fence contains a shorter fence as literal code. ````markdown
@@ -8742,7 +8761,8 @@ print(&quot;hello&quot;)
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;````markdown\nExample input:\n```python\nprint(\&quot;hello\&quot;)\n```\n````&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;````markdown\nExample input:\n```python\nprint(\&quot;hello\&quot;)\n```\n````&quot;
 }</pre></details>
     </article>
 <article id="incomplete_markdown" class="example" data-unsupported="false" data-search="incomplete_markdown an unclosed fence and incomplete formatting are valid message text. an unfinished **emphasis and [link](
@@ -8798,7 +8818,8 @@ print(&quot;unfinished&quot;)</pre></details></section></div>
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;An unfinished **emphasis and [link](\n\n```python\nprint(\&quot;unfinished\&quot;)&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;An unfinished **emphasis and [link](\n\n```python\nprint(\&quot;unfinished\&quot;)&quot;
 }</pre></details>
     </article>
 <article id="inline_math" class="example" data-unsupported="true" data-search="inline_math zulip inline latex uses double dollar delimiters. the identity is $$a^2 + b^2 = c^2$$, and $$\frac{1}{2} + \frac{1}{2} = 1$$. not supported in workspace: inline latex
@@ -8846,7 +8867,8 @@ print(&quot;unfinished&quot;)</pre></details></section></div>
   },
   &quot;unsupported_features&quot;: [
     &quot;inline_latex&quot;
-  ]
+  ],
+  &quot;expected_zulip_content&quot;: &quot;Not supported in Workspace: inline LaTeX\n\n[Original message](https://zulip.example.test/#narrow/near/1019)&quot;
 }</pre></details>
     </article>
 <article id="display_math" class="example" data-unsupported="true" data-search="display_math a fenced math block with multiple lines and latex commands. ```math
@@ -8907,7 +8929,8 @@ x - y &amp;= 1
   },
   &quot;unsupported_features&quot;: [
     &quot;block_latex&quot;
-  ]
+  ],
+  &quot;expected_zulip_content&quot;: &quot;Not supported in Workspace: LaTeX block\n\n[Original message](https://zulip.example.test/#narrow/near/1020)&quot;
 }</pre></details>
     </article>
 <article id="spoiler" class="example" data-unsupported="false" data-search="spoiler zulip spoiler fence with a title and formatted hidden content. ```spoiler release details
@@ -8986,7 +9009,8 @@ Visible text after the spoiler.</pre></details></section></div>
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;```spoiler Release details\nThe **feature flag** is enabled.\n\n- Restart the worker.\n- Check the import.\n```\n\nVisible text after the spoiler.&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;```spoiler Release details\nThe **feature flag** is enabled.\n\n- Restart the worker.\n- Check the import.\n```\n\nVisible text after the spoiler.&quot;
 }</pre></details>
     </article>
 <article id="spoiler_inside_quote" class="example" data-unsupported="false" data-search="spoiler_inside_quote the existing forward snapshot urn preserves an anonymous quote containing a nested spoiler. ~~~~quote
@@ -9048,7 +9072,8 @@ The answer is **42**.
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;[unknown](urn:forward:0a930c38-3cb9-545d-b611-ff9515f53fc2?snapshot=QSBxdW90ZWQgbWVzc2FnZToKYGBgc3BvaWxlciBTb2x1dGlvbgpUaGUgYW5zd2VyIGlzICoqNDIqKi4KYGBg)&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;````quote\nA quoted message:\n```spoiler Solution\nThe answer is **42**.\n```\n````&quot;
 }</pre></details>
     </article>
 <article id="user_mentions_by_id" class="example" data-unsupported="false" data-search="user_mentions_by_id several mentions, including different ids sharing the same display name. @**bob example|12**, please ask @**zoë example|13** to review this.
@@ -9103,7 +9128,8 @@ Two different users: [Alex Example](urn:user:a5fbf77f-5146-5f54-9e70-f1151798112
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;[Bob Example](urn:user:7af731c9-ccd4-5318-9a12-bab962ee4679), please ask [Zoë Example](urn:user:0b596ff7-0956-5783-9ad4-0660396b0543) to review this.\nTwo different users: [Alex Example](urn:user:a5fbf77f-5146-5f54-9e70-f11517981127) and [Alex Example](urn:user:4284ffb1-3e93-5687-9770-da00fe7038f6).&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;@**Bob Example|12**, please ask @**Zoë Example|13** to review this.\nTwo different users: @**Alex Example|14** and @**Alex Example|15**.&quot;
 }</pre></details>
     </article>
 <article id="user_mention_by_name" class="example" data-unsupported="false" data-search="user_mention_by_name a mention using only the user&#39;s full name. thanks, @**bob example**! thanks, [bob example](urn:user:7af731c9-ccd4-5318-9a12-bab962ee4679)!">
@@ -9150,7 +9176,8 @@ Two different users: [Alex Example](urn:user:a5fbf77f-5146-5f54-9e70-f1151798112
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;Thanks, [Bob Example](urn:user:7af731c9-ccd4-5318-9a12-bab962ee4679)!&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;Thanks, @**Bob Example**!&quot;
 }</pre></details>
     </article>
 <article id="silent_user_mention" class="example" data-unsupported="true" data-search="silent_user_mention a silent mention refers to the user without triggering a notification. following @_**bob example|12**&#39;s suggestion. following (not supported in workspace: silent mention of bob example)&#39;s suggestion.
@@ -9201,7 +9228,8 @@ Two different users: [Alex Example](urn:user:a5fbf77f-5146-5f54-9e70-f1151798112
   },
   &quot;unsupported_features&quot;: [
     &quot;silent_user_mention&quot;
-  ]
+  ],
+  &quot;expected_zulip_content&quot;: &quot;Following (Not supported in Workspace: silent mention of Bob Example)&#39;s suggestion.\n\n[Original message](https://zulip.example.test/#narrow/near/1025)&quot;
 }</pre></details>
     </article>
 <article id="user_group_mention" class="example" data-unsupported="true" data-search="user_group_mention a zulip user group is distinct from a group direct conversation. @*engineering* please review the migration. (not supported in workspace: mention of user group engineering) please review the migration.
@@ -9243,7 +9271,10 @@ Two different users: [Alex Example](urn:user:a5fbf77f-5146-5f54-9e70-f1151798112
   },
   &quot;conversion_context&quot;: {
     &quot;server_url&quot;: &quot;https://zulip.example.test&quot;,
-    &quot;original_url&quot;: &quot;https://zulip.example.test/#narrow/near/1026&quot;
+    &quot;original_url&quot;: &quot;https://zulip.example.test/#narrow/near/1026&quot;,
+    &quot;user_group_ids&quot;: {
+      &quot;Engineering&quot;: 101
+    }
   },
   &quot;expected_payload&quot;: {
     &quot;kind&quot;: &quot;markdown&quot;,
@@ -9251,7 +9282,8 @@ Two different users: [Alex Example](urn:user:a5fbf77f-5146-5f54-9e70-f1151798112
   },
   &quot;unsupported_features&quot;: [
     &quot;user_group_mention&quot;
-  ]
+  ],
+  &quot;expected_zulip_content&quot;: &quot;(Not supported in Workspace: mention of user group Engineering) please review the migration.\n\n[Original message](https://zulip.example.test/#narrow/near/1026)&quot;
 }</pre></details>
     </article>
 <article id="channel_wildcard_mention" class="example" data-unsupported="true" data-search="channel_wildcard_mention a channel-wide wildcard mention and the corresponding message flags. @**all** the maintenance window starts in ten minutes. (not supported in workspace: channel-wide mention) the maintenance window starts in ten minutes.
@@ -9302,7 +9334,8 @@ Two different users: [Alex Example](urn:user:a5fbf77f-5146-5f54-9e70-f1151798112
   },
   &quot;unsupported_features&quot;: [
     &quot;channel_wildcard_mention&quot;
-  ]
+  ],
+  &quot;expected_zulip_content&quot;: &quot;(Not supported in Workspace: channel-wide mention) the maintenance window starts in ten minutes.\n\n[Original message](https://zulip.example.test/#narrow/near/1027)&quot;
 }</pre></details>
     </article>
 <article id="topic_wildcard_mention" class="example" data-unsupported="true" data-search="topic_wildcard_mention a mention of participants in the current topic. @**topic** the issue is resolved. (not supported in workspace: topic-wide mention) the issue is resolved.
@@ -9353,7 +9386,8 @@ Two different users: [Alex Example](urn:user:a5fbf77f-5146-5f54-9e70-f1151798112
   },
   &quot;unsupported_features&quot;: [
     &quot;topic_wildcard_mention&quot;
-  ]
+  ],
+  &quot;expected_zulip_content&quot;: &quot;(Not supported in Workspace: topic-wide mention) the issue is resolved.\n\n[Original message](https://zulip.example.test/#narrow/near/1028)&quot;
 }</pre></details>
     </article>
 <article id="unresolved_mentions" class="example" data-unsupported="true" data-search="unresolved_mentions unresolvable user and group references remain possible message input. please ask @**former member|999** or @*missing group* about the old deployment. please ask (not supported in workspace: unresolved user former member) or (not supported in workspace: unresolved user group missing group) about the old deployment.
@@ -9402,7 +9436,8 @@ Two different users: [Alex Example](urn:user:a5fbf77f-5146-5f54-9e70-f1151798112
   &quot;unsupported_features&quot;: [
     &quot;unresolved_user_mention&quot;,
     &quot;unresolved_user_group_mention&quot;
-  ]
+  ],
+  &quot;expected_zulip_content&quot;: &quot;Please ask (Not supported in Workspace: unresolved user Former member) or (Not supported in Workspace: unresolved user group Missing group) about the old deployment.\n\n[Original message](https://zulip.example.test/#narrow/near/1029)&quot;
 }</pre></details>
     </article>
 <article id="external_links" class="example" data-unsupported="false" data-search="external_links named links, bare urls, angle-bracket links, and email addresses. [documentation](https://docs.example.test/guide?q=one&amp;lang=en#setup)
@@ -9459,7 +9494,8 @@ Contact support@example.test.</pre></details></section></div>
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;[Documentation](urn:url:https://docs.example.test/guide?q=one&amp;lang=en#setup)\n[https://example.test/path_(v2)](urn:url:https://example.test/path_(v2))\n[https://example.test/contact](urn:url:https://example.test/contact)\nContact support@example.test.&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;[Documentation](https://docs.example.test/guide?q=one&amp;lang=en#setup)\n[https://example.test/path_(v2)](https://example.test/path_(v2))\n[https://example.test/contact](https://example.test/contact)\nContact support@example.test.&quot;
 }</pre></details>
     </article>
 <article id="links_with_escaped_characters" class="example" data-unsupported="false" data-search="links_with_escaped_characters spaces and parentheses in link labels and percent-encoded url paths. [release notes (v2)](https://docs.example.test/releases/v2%20notes)
@@ -9506,7 +9542,8 @@ Contact support@example.test.</pre></details></section></div>
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;[Release notes (v2)](urn:url:https://docs.example.test/releases/v2%20notes)\n[Report](urn:url:https://files.example.test/reports/annual%20report.pdf?download=1&amp;version=2)&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;[Release notes (v2)](https://docs.example.test/releases/v2%20notes)\n[Report](https://files.example.test/reports/annual%20report.pdf?download=1&amp;version=2)&quot;
 }</pre></details>
     </article>
 <article id="channel_topic_and_message_links" class="example" data-unsupported="false" data-search="channel_topic_and_message_links zulip shorthand references to a channel, a topic, and a specific message. channel: #**general**
@@ -9567,7 +9604,8 @@ Message: [#general &gt; Roadmap](urn:message:38c6b1e8-3017-53c6-b963-1694633751b
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;Channel: [#general](urn:stream:15465556-ef95-57a2-bc7a-d8c5cea801f1)\nTopic: [#general &gt; Roadmap](urn:topic:40000000-0000-4000-8000-000000000042)\nMessage: [#general &gt; Roadmap](urn:message:38c6b1e8-3017-53c6-b963-1694633751bb)&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;Channel: #**general**\nTopic: #**general&gt;Roadmap**\nMessage: #**general&gt;Roadmap@1001**&quot;
 }</pre></details>
     </article>
 <article id="internal_message_urls" class="example" data-unsupported="false" data-search="internal_message_urls absolute and relative links to messages and narrow views. [original message](https://zulip.example.test/#narrow/channel/42-general/topic/roadmap/near/1001)
@@ -9622,13 +9660,17 @@ Message: [#general &gt; Roadmap](urn:message:38c6b1e8-3017-53c6-b963-1694633751b
     },
     &quot;message_uuids&quot;: {
       &quot;1001&quot;: &quot;38c6b1e8-3017-53c6-b963-1694633751bb&quot;
+    },
+    &quot;stream_ids&quot;: {
+      &quot;general&quot;: 42
     }
   },
   &quot;expected_payload&quot;: {
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;[Original message](urn:message:38c6b1e8-3017-53c6-b963-1694633751bb)\n[Conversation](urn:topic:40000000-0000-4000-8000-000000000042)\n[Search](urn:url:https://zulip.example.test/#narrow/search/deployment)&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;[Original message](https://zulip.example.test/#narrow/near/1001)\n[Conversation](https://zulip.example.test/#narrow/channel/42-general/topic/Roadmap)\n[Search](https://zulip.example.test/#narrow/search/deployment)&quot;
 }</pre></details>
     </article>
 <article id="custom_linkifier" class="example" data-unsupported="false" data-search="custom_linkifier ticket text and topic link metadata from a configured organization linkifier. see task-123 and task-456 for the implementation. see [task-123](urn:url:https://issues.example.test/task-123) and [task-456](urn:url:https://issues.example.test/task-456) for the implementation.">
@@ -9679,7 +9721,8 @@ Message: [#general &gt; Roadmap](urn:message:38c6b1e8-3017-53c6-b963-1694633751b
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;See [TASK-123](urn:url:https://issues.example.test/TASK-123) and [TASK-456](urn:url:https://issues.example.test/TASK-456) for the implementation.&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;See [TASK-123](https://issues.example.test/TASK-123) and [TASK-456](https://issues.example.test/TASK-456) for the implementation.&quot;
 }</pre></details>
     </article>
 <article id="uploaded_document" class="example" data-unsupported="false" data-search="uploaded_document an uploaded file uses a relative zulip upload url. [deployment-notes.pdf](/user_uploads/1/abc123/deployment-notes.pdf) [deployment-notes.pdf](urn:file:60000000-0000-4000-8000-000000000001?name=deployment-notes.pdf&amp;content_type=application%2fpdf&amp;size=23142)">
@@ -9724,7 +9767,8 @@ Message: [#general &gt; Roadmap](urn:message:38c6b1e8-3017-53c6-b963-1694633751b
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;[deployment-notes.pdf](urn:file:60000000-0000-4000-8000-000000000001?name=deployment-notes.pdf&amp;content_type=application%2Fpdf&amp;size=23142)&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;[deployment-notes.pdf](/user_uploads/1/abc123/deployment-notes.pdf)&quot;
 }</pre></details>
     </article>
 <article id="multiple_attachments" class="example" data-unsupported="false" data-search="multiple_attachments several uploaded files, including spaces and a unicode filename. the requested files:
@@ -9790,7 +9834,8 @@ Message: [#general &gt; Roadmap](urn:message:38c6b1e8-3017-53c6-b963-1694633751b
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;The requested files:\n\n[report.pdf](urn:file:60000000-0000-4000-8000-000000000002?name=report.pdf&amp;content_type=application%2Fpdf)\n[build log.txt](urn:file:60000000-0000-4000-8000-000000000003?name=build+log.txt&amp;content_type=text%2Fplain)\n[café.csv](urn:file:60000000-0000-4000-8000-000000000004?name=caf%C3%A9.csv&amp;content_type=text%2Fcsv)&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;The requested files:\n\n[report.pdf](/user_uploads/1/abc123/report.pdf)\n[build log.txt](/user_uploads/1/def456/build%20log.txt)\n[café.csv](/user_uploads/1/ghi789/caf%C3%A9.csv)&quot;
 }</pre></details>
     </article>
 <article id="image_markdown" class="example" data-unsupported="false" data-search="image_markdown an image with alt text and a caption. ![architecture overview](/user_uploads/1/img123/architecture.png)
@@ -9844,7 +9889,8 @@ Message: [#general &gt; Roadmap](urn:message:38c6b1e8-3017-53c6-b963-1694633751b
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;![Architecture overview](urn:image:60000000-0000-4000-8000-000000000005?name=architecture.png&amp;content_type=image%2Fpng&amp;w=480&amp;h=240)\n\n**Figure 1:** The API and history worker.&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;![Architecture overview](/user_uploads/1/img123/architecture.png)\n\n**Figure 1:** The API and history worker.&quot;
 }</pre></details>
     </article>
 <article id="image_link" class="example" data-unsupported="false" data-search="image_link a plain link to an image can produce an inline image preview in zulip. screenshot: [screen.png](/user_uploads/1/img456/screen.png)
@@ -9899,7 +9945,8 @@ External image: ![diagram.png](urn:image:60000000-0000-4000-8000-000000000007?na
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;Screenshot: ![screen.png](urn:image:60000000-0000-4000-8000-000000000006?name=screen.png&amp;content_type=image%2Fpng)\n\nExternal image: ![diagram.png](urn:image:60000000-0000-4000-8000-000000000007?name=diagram.png&amp;content_type=image%2Fpng)&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;Screenshot: ![screen.png](/user_uploads/1/img456/screen.png)\n\nExternal image: ![diagram.png](https://images.example.test/diagram.png)&quot;
 }</pre></details>
     </article>
 <article id="animated_image" class="example" data-unsupported="false" data-search="animated_image an uploaded animated gif is represented by a markdown file link. [demo.gif](/user_uploads/1/gif123/demo.gif) ![demo.gif](urn:image:60000000-0000-4000-8000-000000000008?name=demo.gif&amp;content_type=image%2fgif)">
@@ -9944,7 +9991,8 @@ External image: ![diagram.png](urn:image:60000000-0000-4000-8000-000000000007?na
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;![demo.gif](urn:image:60000000-0000-4000-8000-000000000008?name=demo.gif&amp;content_type=image%2Fgif)&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;![demo.gif](/user_uploads/1/gif123/demo.gif)&quot;
 }</pre></details>
     </article>
 <article id="video_attachment" class="example" data-unsupported="false" data-search="video_attachment an uploaded video and an external video link. [walkthrough.mp4](/user_uploads/1/video123/walkthrough.mp4)
@@ -9994,7 +10042,8 @@ https://video.example.test/watch/demo</pre></details></section>
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;[walkthrough.mp4](urn:video:60000000-0000-4000-8000-000000000009?name=walkthrough.mp4&amp;content_type=video%2Fmp4)\n[https://video.example.test/watch/demo](urn:url:https://video.example.test/watch/demo)&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;[walkthrough.mp4](/user_uploads/1/video123/walkthrough.mp4)\n[https://video.example.test/watch/demo](https://video.example.test/watch/demo)&quot;
 }</pre></details>
     </article>
 <article id="audio_attachment" class="example" data-unsupported="false" data-search="audio_attachment an uploaded audio recording remains a link in the original markdown. [voice-note.ogg](/user_uploads/1/audio123/voice-note.ogg) [voice-note.ogg](urn:file:60000000-0000-4000-8000-000000000010?name=voice-note.ogg&amp;content_type=audio%2fogg)">
@@ -10039,7 +10088,8 @@ https://video.example.test/watch/demo</pre></details></section>
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;[voice-note.ogg](urn:file:60000000-0000-4000-8000-000000000010?name=voice-note.ogg&amp;content_type=audio%2Fogg)&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;[voice-note.ogg](/user_uploads/1/audio123/voice-note.ogg)&quot;
 }</pre></details>
     </article>
 <article id="emoji" class="example" data-unsupported="true" data-search="emoji unicode emoji, skin tones, standard shortcodes, and a configured custom emoji. looks good 👍🏽! :smile: :+1: :heart:
@@ -10095,7 +10145,8 @@ Custom organization emoji: (Not supported in Workspace: custom emoji party_parro
   },
   &quot;unsupported_features&quot;: [
     &quot;custom_emoji&quot;
-  ]
+  ],
+  &quot;expected_zulip_content&quot;: &quot;Looks good 👍🏽! :smile: :+1: :heart:\nCustom organization emoji: (Not supported in Workspace: custom emoji party_parrot)\n\n[Original message](https://zulip.example.test/#narrow/near/1042)&quot;
 }</pre></details>
     </article>
 <article id="global_times" class="example" data-unsupported="true" data-search="global_times zulip global time markup using an iso timestamp and a unix timestamp. the review starts at &lt;time:2026-10-18t18:00:00+03:00&gt;.
@@ -10148,7 +10199,8 @@ A Unix timestamp also works: (Not supported in Workspace: global time 1496701800
   },
   &quot;unsupported_features&quot;: [
     &quot;global_time&quot;
-  ]
+  ],
+  &quot;expected_zulip_content&quot;: &quot;The review starts at (Not supported in Workspace: global time 2026-10-18T18:00:00+03:00).\nA Unix timestamp also works: (Not supported in Workspace: global time 1496701800).\n\n[Original message](https://zulip.example.test/#narrow/near/1043)&quot;
 }</pre></details>
     </article>
 <article id="me_action" class="example" data-unsupported="true" data-search="me_action a /me action keeps the command in the original markdown. /me is checking **the latest deployment**. not supported in workspace: /me action
@@ -10196,7 +10248,8 @@ A Unix timestamp also works: (Not supported in Workspace: global time 1496701800
   },
   &quot;unsupported_features&quot;: [
     &quot;me_action&quot;
-  ]
+  ],
+  &quot;expected_zulip_content&quot;: &quot;Not supported in Workspace: /me action\n\n[Original message](https://zulip.example.test/#narrow/near/1044)&quot;
 }</pre></details>
     </article>
 <article id="edited_message" class="example" data-unsupported="false" data-search="edited_message current markdown plus previous markdown and edit timestamps. the deployment starts at **18:00**. the deployment starts at **18:00**.">
@@ -10246,7 +10299,8 @@ A Unix timestamp also works: (Not supported in Workspace: global time 1496701800
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;The deployment starts at **18:00**.&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;The deployment starts at **18:00**.&quot;
 }</pre></details>
     </article>
 <article id="reactions" class="example" data-unsupported="false" data-search="reactions emoji reactions are metadata and use three different reaction namespaces. the migration is ready for review. the migration is ready for review.">
@@ -10310,7 +10364,8 @@ A Unix timestamp also works: (Not supported in Workspace: global time 1496701800
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;The migration is ready for review.&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;The migration is ready for review.&quot;
 }</pre></details>
     </article>
 <article id="poll" class="example" data-unsupported="true" data-search="poll a poll command with its initialization and vote stored as json-encoded submessages. /poll which deployment window works best?
@@ -10380,7 +10435,8 @@ Wednesday</pre></details></section>
   },
   &quot;unsupported_features&quot;: [
     &quot;interactive_poll&quot;
-  ]
+  ],
+  &quot;expected_zulip_content&quot;: &quot;Not supported in Workspace: interactive poll\n\n[Original message](https://zulip.example.test/#narrow/near/1047)&quot;
 }</pre></details>
     </article>
 <article id="collaborative_todo_list" class="example" data-unsupported="true" data-search="collaborative_todo_list a collaborative to-do command with task data and a completion event in submessages. /todo release checklist
@@ -10450,7 +10506,8 @@ Restart worker</pre></details></section>
   },
   &quot;unsupported_features&quot;: [
     &quot;collaborative_todo_list&quot;
-  ]
+  ],
+  &quot;expected_zulip_content&quot;: &quot;Not supported in Workspace: collaborative to-do list\n\n[Original message](https://zulip.example.test/#narrow/near/1048)&quot;
 }</pre></details>
     </article>
 <article id="empty_topic" class="example" data-unsupported="false" data-search="empty_topic a channel message with an empty topic when allow_empty_topic_name=true. this message has no topic. this message has no topic.">
@@ -10492,7 +10549,8 @@ Restart worker</pre></details></section>
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;This message has no topic.&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;This message has no topic.&quot;
 }</pre></details>
     </article>
 <article id="resolved_topic" class="example" data-unsupported="false" data-search="resolved_topic a resolved topic uses zulip&#39;s checkmark prefix. all changes are deployed. all changes are deployed.">
@@ -10534,7 +10592,8 @@ Restart worker</pre></details></section>
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;All changes are deployed.&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;All changes are deployed.&quot;
 }</pre></details>
     </article>
 <article id="direct_message" class="example" data-unsupported="false" data-search="direct_message one-to-one incoming direct message; type is private and stream_id is absent. hi @**alice example|9**! can you review [the proposal](https://docs.example.test/proposal)? hi [alice example](urn:user:b7828b6c-13f2-59d3-88ec-8883e8b5acab)! can you review [the proposal](urn:url:https://docs.example.test/proposal)?">
@@ -10593,7 +10652,8 @@ Restart worker</pre></details></section>
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;Hi [Alice Example](urn:user:b7828b6c-13f2-59d3-88ec-8883e8b5acab)! Can you review [the proposal](urn:url:https://docs.example.test/proposal)?&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;Hi @**Alice Example|9**! Can you review [the proposal](https://docs.example.test/proposal)?&quot;
 }</pre></details>
     </article>
 <article id="group_direct_message" class="example" data-unsupported="false" data-search="group_direct_message a group direct message also uses type=private, with more than two participants. **planning notes**
@@ -10674,7 +10734,8 @@ Restart worker</pre></details></section>
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;**Planning notes**\n\n- Alice: API\n- Bob: worker\n- Zoë: UI&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;**Planning notes**\n\n- Alice: API\n- Bob: worker\n- Zoë: UI&quot;
 }</pre></details>
     </article>
 <article id="self_direct_message" class="example" data-unsupported="false" data-search="self_direct_message a direct conversation with oneself has one display_recipient entry. note to self: run `python -m pytest` before the next commit. note to self: run `python -m pytest` before the next commit.">
@@ -10722,7 +10783,8 @@ Restart worker</pre></details></section>
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;Note to self: run `python -m pytest` before the next commit.&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;Note to self: run `python -m pytest` before the next commit.&quot;
 }</pre></details>
     </article>
 <article id="system_bot_message" class="example" data-unsupported="false" data-search="system_bot_message an incoming direct message from a cross-realm system bot. your organization settings have been updated.
@@ -10785,7 +10847,8 @@ Restart worker</pre></details></section>
     &quot;kind&quot;: &quot;markdown&quot;,
     &quot;content&quot;: &quot;Your organization settings have been updated.\n\n[Review settings](urn:url:https://zulip.example.test/#organization/settings)&quot;
   },
-  &quot;unsupported_features&quot;: []
+  &quot;unsupported_features&quot;: [],
+  &quot;expected_zulip_content&quot;: &quot;Your organization settings have been updated.\n\n[Review settings](https://zulip.example.test/#organization/settings)&quot;
 }</pre></details>
     </article>
 <article id="mixed_formatting" class="example" data-unsupported="true" data-search="mixed_formatting several formatting features coexist; zulip references are converted both inside code and in the surrounding markdown. @**bob example|12**, here is the **release summary** for #**general&gt;roadmap**.
@@ -10943,7 +11006,8 @@ Thanks! :+1:
   &quot;unsupported_features&quot;: [
     &quot;inline_latex&quot;,
     &quot;global_time&quot;
-  ]
+  ],
+  &quot;expected_zulip_content&quot;: &quot;@**Bob Example|12**, here is the **release summary** for #**general&gt;Roadmap**.\n\n1. Read [the report](/user_uploads/1/abc123/report.pdf).\n2. Check the formula (Not supported in Workspace: inline LaTeX).\n\n```python\n# This is literal: @**Zoë Example|13** :smile:\nprint(\&quot;ready\&quot;)\n```\n\n```spoiler Internal notes\n&gt; Preserve the original link: [https://docs.example.test/runbook](https://docs.example.test/runbook)\n\nRestart the worker at (Not supported in Workspace: global time 2026-10-18T18:00:00+03:00).\n```\n\n![Deployment diagram](/user_uploads/1/img123/architecture.png)\n\nThanks! :+1:\n\n[Original message](https://zulip.example.test/#narrow/near/1055)&quot;
 }</pre></details>
     </article><p id="empty" class="empty-state" hidden>No examples match your search.</p></main>
 <footer class="footer">Offline preview · No API requests · Fictional users and files · Built from zulip_messages.json</footer>

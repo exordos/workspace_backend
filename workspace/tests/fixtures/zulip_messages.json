@@ -32,7 +32,8 @@
       "kind": "markdown",
       "content": "The deployment finished successfully."
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "The deployment finished successfully."
   },
   {
     "name": "paragraphs_and_line_breaks",
@@ -67,7 +68,8 @@
       "kind": "markdown",
       "content": "First line.\nSecond line.  \nThird line.\n\nA separate paragraph.\n\nFinal paragraph."
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "First line.\nSecond line.  \nThird line.\n\nA separate paragraph.\n\nFinal paragraph."
   },
   {
     "name": "unicode_and_combining_characters",
@@ -102,7 +104,8 @@
       "kind": "markdown",
       "content": "Zoë and José reviewed the café notes. The same accent can be written as é or é.\nA nonbreaking space: first second. Emoji: 👍🏽 👩‍💻 👨‍👩‍👧‍👦."
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "Zoë and José reviewed the café notes. The same accent can be written as é or é.\nA nonbreaking space: first second. Emoji: 👍🏽 👩‍💻 👨‍👩‍👧‍👦."
   },
   {
     "name": "emphasis_and_strikethrough",
@@ -137,7 +140,8 @@
       "kind": "markdown",
       "content": "**Bold** and *italic* and _also italic_ and ~~removed~~.\n\n**Bold with *nested italic* inside**."
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "**Bold** and *italic* and _also italic_ and ~~removed~~.\n\n**Bold with *nested italic* inside**."
   },
   {
     "name": "escaped_markdown",
@@ -178,7 +182,8 @@
       "kind": "markdown",
       "content": "\\*not italic\\* and \\_not italic\\_ and \\~\\~not removed\\~\\~.\n\\@**Bob Example|12** and \\#**general**."
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "\\*not italic\\* and \\_not italic\\_ and \\~\\~not removed\\~\\~.\n\\@**Bob Example|12** and \\#**general**."
   },
   {
     "name": "headings_and_horizontal_rule",
@@ -213,7 +218,8 @@
       "kind": "markdown",
       "content": "# Release notes\n\n## Changes\n\n### Details\n\nA paragraph before the separator.\n\n---\n\nA paragraph after it."
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "# Release notes\n\n## Changes\n\n### Details\n\nA paragraph before the separator.\n\n---\n\nA paragraph after it."
   },
   {
     "name": "bulleted_list",
@@ -248,7 +254,8 @@
       "kind": "markdown",
       "content": "- Review **schema changes**\n- Read the [guide](urn:url:https://docs.example.test/guide)\n- Deploy the release"
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "- Review **schema changes**\n- Read the [guide](https://docs.example.test/guide)\n- Deploy the release"
   },
   {
     "name": "numbered_list",
@@ -283,7 +290,8 @@
       "kind": "markdown",
       "content": "3. Download the archive\n4. Verify its checksum\n5. Extract the files"
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "3. Download the archive\n4. Verify its checksum\n5. Extract the files"
   },
   {
     "name": "nested_lists",
@@ -318,7 +326,8 @@
       "kind": "markdown",
       "content": "- Backend\n    - API\n    - Worker\n- Frontend\n    1. Install dependencies\n    2. Start the application\n\n        Keep the terminal open."
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "- Backend\n    - API\n    - Worker\n- Frontend\n    1. Install dependencies\n    2. Start the application\n\n        Keep the terminal open."
   },
   {
     "name": "table",
@@ -353,7 +362,8 @@
       "kind": "markdown",
       "content": "| Component | State | Owner |\n| :--- | :---: | ---: |\n| **API** | Ready | Alice |\n| Worker | `retry` | Bob |"
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "| Component | State | Owner |\n| :--- | :---: | ---: |\n| **API** | Ready | Alice |\n| Worker | `retry` | Bob |"
   },
   {
     "name": "block_quotes",
@@ -391,7 +401,8 @@
       "kind": "markdown",
       "content": "[unknown](urn:forward:3ba51ad6-176b-5edf-aa00-69ce615772f5?snapshot=T3JpZ2luYWwgcHJvcG9zYWwuCgotIEtlZXAgdGhlIGltcG9ydCBpZGVtcG90ZW50LgotIFByZXNlcnZlIG1lc3NhZ2Ugb3JkZXIuCgo-IEEgcmVwbHkgaW5zaWRlIHRoZSBxdW90ZS4)\n\nMy reply is outside the quote."
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "```quote\nOriginal proposal.\n\n- Keep the import idempotent.\n- Preserve message order.\n\n> A reply inside the quote.\n```\n\nMy reply is outside the quote."
   },
   {
     "name": "fenced_quote",
@@ -429,7 +440,8 @@
       "kind": "markdown",
       "content": "[unknown](urn:forward:c5626519-9906-58e8-b8c8-93611b399bd4?snapshot=UXVvdGVkICoqdGV4dCoqIHdpdGggYSBbcmVmZXJlbmNlXSh1cm46dXJsOmh0dHBzOi8vZG9jcy5leGFtcGxlLnRlc3QvcmVmZXJlbmNlKS4KCkEgc2Vjb25kIHF1b3RlZCBwYXJhZ3JhcGgu)\n\nA reply outside the quotation."
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "```quote\nQuoted **text** with a [reference](https://docs.example.test/reference).\n\nA second quoted paragraph.\n```\n\nA reply outside the quotation."
   },
   {
     "name": "quoted_message_reference",
@@ -470,7 +482,8 @@
       "kind": "markdown",
       "content": "[Alice Example](urn:quote:38c6b1e8-3017-53c6-b963-1694633751bb)\n\nThanks, confirmed."
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "@_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1001):\n```quote\nThe deployment finished successfully.\n```\n\nThanks, confirmed."
   },
   {
     "name": "partial_quoted_message_reference",
@@ -511,7 +524,8 @@
       "kind": "markdown",
       "content": "[Alice Example](urn:quote:38c6b1e8-3017-53c6-b963-1694633751bb?text=deployment%20finished%20successfully.)\n\nThe quoted fragment is enough."
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "@_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1001):\n```quote\ndeployment finished successfully.\n```\n\nThe quoted fragment is enough."
   },
   {
     "name": "nested_message_quote",
@@ -552,7 +566,8 @@
       "kind": "markdown",
       "content": "[Bob Example](urn:quote:e5ccdf1d-ed8f-5d68-b096-ee17baca17f2)\n\nZoë's reply is outside both quotes."
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "@_**Bob Example|12** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1056):\n````quote\n@_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1001):\n```quote\ndeployment finished successfully.\n```\n\nThe quoted fragment is enough.\n````\n\nZoë's reply is outside both quotes."
   },
   {
     "name": "triple_nested_quote",
@@ -593,7 +608,8 @@
       "kind": "markdown",
       "content": "[Zoë Example](urn:quote:ee2ca07c-91c3-5dcc-a28b-47dcb38f902f)\n\nAlice's reply is outside all three quotes."
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "@_**Zoë Example|13** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1057):\n`````quote\n@_**Bob Example|12** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1056):\n````quote\n@_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1001):\n```quote\ndeployment finished successfully.\n```\n\nThe quoted fragment is enough.\n````\n\nZoë's reply is outside both quotes.\n`````\n\nAlice's reply is outside all three quotes."
   },
   {
     "name": "inline_code",
@@ -631,7 +647,8 @@
       "kind": "markdown",
       "content": "Run `python -m pytest`.\nKeep `[Bob Example](urn:user:7af731c9-ccd4-5318-9a12-bab962ee4679)` literal.\nA backtick inside a code span: ``value = `literal` ``."
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "Run `python -m pytest`.\nKeep `@**Bob Example|12**` literal.\nA backtick inside a code span: ``value = `literal` ``."
   },
   {
     "name": "fenced_python",
@@ -666,7 +683,8 @@
       "kind": "markdown",
       "content": "```python\ndef greeting(name: str) -> str:\n    return f\"Hello, {name}!\"\n\nprint(greeting(\"Alice\"))\n```"
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "```python\ndef greeting(name: str) -> str:\n    return f\"Hello, {name}!\"\n\nprint(greeting(\"Alice\"))\n```"
   },
   {
     "name": "fenced_literal_markup",
@@ -716,7 +734,8 @@
       "kind": "markdown",
       "content": "```text\n[Bob Example](urn:user:7af731c9-ccd4-5318-9a12-bab962ee4679)\n[#general > Roadmap](urn:topic:40000000-0000-4000-8000-000000000042)\n[file](urn:file:60000000-0000-4000-8000-000000000002?name=report.pdf&content_type=application%2Fpdf)\n:smile: (Not supported in Workspace: inline LaTeX)\n```\n\nOutside code: [Bob Example](urn:user:7af731c9-ccd4-5318-9a12-bab962ee4679).\n\n[Original message](urn:url:https://zulip.example.test/#narrow/near/1016)"
     },
-    "unsupported_features": ["inline_latex"]
+    "unsupported_features": ["inline_latex"],
+    "expected_zulip_content": "```text\n@**Bob Example|12**\n#**general>Roadmap**\n[file](/user_uploads/1/abc123/report.pdf)\n:smile: (Not supported in Workspace: inline LaTeX)\n```\n\nOutside code: @**Bob Example|12**.\n\n[Original message](https://zulip.example.test/#narrow/near/1016)"
   },
   {
     "name": "nested_code_fences",
@@ -751,7 +770,8 @@
       "kind": "markdown",
       "content": "````markdown\nExample input:\n```python\nprint(\"hello\")\n```\n````"
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "````markdown\nExample input:\n```python\nprint(\"hello\")\n```\n````"
   },
   {
     "name": "incomplete_markdown",
@@ -786,7 +806,8 @@
       "kind": "markdown",
       "content": "An unfinished **emphasis and [link](\n\n```python\nprint(\"unfinished\")"
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "An unfinished **emphasis and [link](\n\n```python\nprint(\"unfinished\")"
   },
   {
     "name": "inline_math",
@@ -821,7 +842,8 @@
       "kind": "markdown",
       "content": "Not supported in Workspace: inline LaTeX\n\n[Original message](urn:url:https://zulip.example.test/#narrow/near/1019)"
     },
-    "unsupported_features": ["inline_latex"]
+    "unsupported_features": ["inline_latex"],
+    "expected_zulip_content": "Not supported in Workspace: inline LaTeX\n\n[Original message](https://zulip.example.test/#narrow/near/1019)"
   },
   {
     "name": "display_math",
@@ -856,7 +878,8 @@
       "kind": "markdown",
       "content": "Not supported in Workspace: LaTeX block\n\n[Original message](urn:url:https://zulip.example.test/#narrow/near/1020)"
     },
-    "unsupported_features": ["block_latex"]
+    "unsupported_features": ["block_latex"],
+    "expected_zulip_content": "Not supported in Workspace: LaTeX block\n\n[Original message](https://zulip.example.test/#narrow/near/1020)"
   },
   {
     "name": "spoiler",
@@ -891,7 +914,8 @@
       "kind": "markdown",
       "content": "```spoiler Release details\nThe **feature flag** is enabled.\n\n- Restart the worker.\n- Check the import.\n```\n\nVisible text after the spoiler."
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "```spoiler Release details\nThe **feature flag** is enabled.\n\n- Restart the worker.\n- Check the import.\n```\n\nVisible text after the spoiler."
   },
   {
     "name": "spoiler_inside_quote",
@@ -929,7 +953,8 @@
       "kind": "markdown",
       "content": "[unknown](urn:forward:0a930c38-3cb9-545d-b611-ff9515f53fc2?snapshot=QSBxdW90ZWQgbWVzc2FnZToKYGBgc3BvaWxlciBTb2x1dGlvbgpUaGUgYW5zd2VyIGlzICoqNDIqKi4KYGBg)"
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "````quote\nA quoted message:\n```spoiler Solution\nThe answer is **42**.\n```\n````"
   },
   {
     "name": "user_mentions_by_id",
@@ -970,7 +995,8 @@
       "kind": "markdown",
       "content": "[Bob Example](urn:user:7af731c9-ccd4-5318-9a12-bab962ee4679), please ask [Zoë Example](urn:user:0b596ff7-0956-5783-9ad4-0660396b0543) to review this.\nTwo different users: [Alex Example](urn:user:a5fbf77f-5146-5f54-9e70-f11517981127) and [Alex Example](urn:user:4284ffb1-3e93-5687-9770-da00fe7038f6)."
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "@**Bob Example|12**, please ask @**Zoë Example|13** to review this.\nTwo different users: @**Alex Example|14** and @**Alex Example|15**."
   },
   {
     "name": "user_mention_by_name",
@@ -1008,7 +1034,8 @@
       "kind": "markdown",
       "content": "Thanks, [Bob Example](urn:user:7af731c9-ccd4-5318-9a12-bab962ee4679)!"
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "Thanks, @**Bob Example**!"
   },
   {
     "name": "silent_user_mention",
@@ -1046,7 +1073,8 @@
       "kind": "markdown",
       "content": "Following (Not supported in Workspace: silent mention of Bob Example)'s suggestion.\n\n[Original message](urn:url:https://zulip.example.test/#narrow/near/1025)"
     },
-    "unsupported_features": ["silent_user_mention"]
+    "unsupported_features": ["silent_user_mention"],
+    "expected_zulip_content": "Following (Not supported in Workspace: silent mention of Bob Example)'s suggestion.\n\n[Original message](https://zulip.example.test/#narrow/near/1025)"
   },
   {
     "name": "user_group_mention",
@@ -1075,13 +1103,17 @@
     },
     "conversion_context": {
       "server_url": "https://zulip.example.test",
-      "original_url": "https://zulip.example.test/#narrow/near/1026"
+      "original_url": "https://zulip.example.test/#narrow/near/1026",
+      "user_group_ids": {
+        "Engineering": 101
+      }
     },
     "expected_payload": {
       "kind": "markdown",
       "content": "(Not supported in Workspace: mention of user group Engineering) please review the migration.\n\n[Original message](urn:url:https://zulip.example.test/#narrow/near/1026)"
     },
-    "unsupported_features": ["user_group_mention"]
+    "unsupported_features": ["user_group_mention"],
+    "expected_zulip_content": "(Not supported in Workspace: mention of user group Engineering) please review the migration.\n\n[Original message](https://zulip.example.test/#narrow/near/1026)"
   },
   {
     "name": "channel_wildcard_mention",
@@ -1116,7 +1148,8 @@
       "kind": "markdown",
       "content": "(Not supported in Workspace: channel-wide mention) the maintenance window starts in ten minutes.\n\n[Original message](urn:url:https://zulip.example.test/#narrow/near/1027)"
     },
-    "unsupported_features": ["channel_wildcard_mention"]
+    "unsupported_features": ["channel_wildcard_mention"],
+    "expected_zulip_content": "(Not supported in Workspace: channel-wide mention) the maintenance window starts in ten minutes.\n\n[Original message](https://zulip.example.test/#narrow/near/1027)"
   },
   {
     "name": "topic_wildcard_mention",
@@ -1151,7 +1184,8 @@
       "kind": "markdown",
       "content": "(Not supported in Workspace: topic-wide mention) the issue is resolved.\n\n[Original message](urn:url:https://zulip.example.test/#narrow/near/1028)"
     },
-    "unsupported_features": ["topic_wildcard_mention"]
+    "unsupported_features": ["topic_wildcard_mention"],
+    "expected_zulip_content": "(Not supported in Workspace: topic-wide mention) the issue is resolved.\n\n[Original message](https://zulip.example.test/#narrow/near/1028)"
   },
   {
     "name": "unresolved_mentions",
@@ -1189,7 +1223,8 @@
     "unsupported_features": [
       "unresolved_user_mention",
       "unresolved_user_group_mention"
-    ]
+    ],
+    "expected_zulip_content": "Please ask (Not supported in Workspace: unresolved user Former member) or (Not supported in Workspace: unresolved user group Missing group) about the old deployment.\n\n[Original message](https://zulip.example.test/#narrow/near/1029)"
   },
   {
     "name": "external_links",
@@ -1224,7 +1259,8 @@
       "kind": "markdown",
       "content": "[Documentation](urn:url:https://docs.example.test/guide?q=one&lang=en#setup)\n[https://example.test/path_(v2)](urn:url:https://example.test/path_(v2))\n[https://example.test/contact](urn:url:https://example.test/contact)\nContact support@example.test."
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "[Documentation](https://docs.example.test/guide?q=one&lang=en#setup)\n[https://example.test/path_(v2)](https://example.test/path_(v2))\n[https://example.test/contact](https://example.test/contact)\nContact support@example.test."
   },
   {
     "name": "links_with_escaped_characters",
@@ -1259,7 +1295,8 @@
       "kind": "markdown",
       "content": "[Release notes (v2)](urn:url:https://docs.example.test/releases/v2%20notes)\n[Report](urn:url:https://files.example.test/reports/annual%20report.pdf?download=1&version=2)"
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "[Release notes (v2)](https://docs.example.test/releases/v2%20notes)\n[Report](https://files.example.test/reports/annual%20report.pdf?download=1&version=2)"
   },
   {
     "name": "channel_topic_and_message_links",
@@ -1303,7 +1340,8 @@
       "kind": "markdown",
       "content": "Channel: [#general](urn:stream:15465556-ef95-57a2-bc7a-d8c5cea801f1)\nTopic: [#general > Roadmap](urn:topic:40000000-0000-4000-8000-000000000042)\nMessage: [#general > Roadmap](urn:message:38c6b1e8-3017-53c6-b963-1694633751bb)"
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "Channel: #**general**\nTopic: #**general>Roadmap**\nMessage: #**general>Roadmap@1001**"
   },
   {
     "name": "internal_message_urls",
@@ -1341,13 +1379,17 @@
       },
       "message_uuids": {
         "1001": "38c6b1e8-3017-53c6-b963-1694633751bb"
+      },
+      "stream_ids": {
+        "general": 42
       }
     },
     "expected_payload": {
       "kind": "markdown",
       "content": "[Original message](urn:message:38c6b1e8-3017-53c6-b963-1694633751bb)\n[Conversation](urn:topic:40000000-0000-4000-8000-000000000042)\n[Search](urn:url:https://zulip.example.test/#narrow/search/deployment)"
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "[Original message](https://zulip.example.test/#narrow/near/1001)\n[Conversation](https://zulip.example.test/#narrow/channel/42-general/topic/Roadmap)\n[Search](https://zulip.example.test/#narrow/search/deployment)"
   },
   {
     "name": "custom_linkifier",
@@ -1391,7 +1433,8 @@
       "kind": "markdown",
       "content": "See [TASK-123](urn:url:https://issues.example.test/TASK-123) and [TASK-456](urn:url:https://issues.example.test/TASK-456) for the implementation."
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "See [TASK-123](https://issues.example.test/TASK-123) and [TASK-456](https://issues.example.test/TASK-456) for the implementation."
   },
   {
     "name": "uploaded_document",
@@ -1429,7 +1472,8 @@
       "kind": "markdown",
       "content": "[deployment-notes.pdf](urn:file:60000000-0000-4000-8000-000000000001?name=deployment-notes.pdf&content_type=application%2Fpdf&size=23142)"
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "[deployment-notes.pdf](/user_uploads/1/abc123/deployment-notes.pdf)"
   },
   {
     "name": "multiple_attachments",
@@ -1469,7 +1513,8 @@
       "kind": "markdown",
       "content": "The requested files:\n\n[report.pdf](urn:file:60000000-0000-4000-8000-000000000002?name=report.pdf&content_type=application%2Fpdf)\n[build log.txt](urn:file:60000000-0000-4000-8000-000000000003?name=build+log.txt&content_type=text%2Fplain)\n[café.csv](urn:file:60000000-0000-4000-8000-000000000004?name=caf%C3%A9.csv&content_type=text%2Fcsv)"
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "The requested files:\n\n[report.pdf](/user_uploads/1/abc123/report.pdf)\n[build log.txt](/user_uploads/1/def456/build%20log.txt)\n[café.csv](/user_uploads/1/ghi789/caf%C3%A9.csv)"
   },
   {
     "name": "image_markdown",
@@ -1507,7 +1552,8 @@
       "kind": "markdown",
       "content": "![Architecture overview](urn:image:60000000-0000-4000-8000-000000000005?name=architecture.png&content_type=image%2Fpng&w=480&h=240)\n\n**Figure 1:** The API and history worker."
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "![Architecture overview](/user_uploads/1/img123/architecture.png)\n\n**Figure 1:** The API and history worker."
   },
   {
     "name": "image_link",
@@ -1546,7 +1592,8 @@
       "kind": "markdown",
       "content": "Screenshot: ![screen.png](urn:image:60000000-0000-4000-8000-000000000006?name=screen.png&content_type=image%2Fpng)\n\nExternal image: ![diagram.png](urn:image:60000000-0000-4000-8000-000000000007?name=diagram.png&content_type=image%2Fpng)"
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "Screenshot: ![screen.png](/user_uploads/1/img456/screen.png)\n\nExternal image: ![diagram.png](https://images.example.test/diagram.png)"
   },
   {
     "name": "animated_image",
@@ -1584,7 +1631,8 @@
       "kind": "markdown",
       "content": "![demo.gif](urn:image:60000000-0000-4000-8000-000000000008?name=demo.gif&content_type=image%2Fgif)"
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "![demo.gif](/user_uploads/1/gif123/demo.gif)"
   },
   {
     "name": "video_attachment",
@@ -1622,7 +1670,8 @@
       "kind": "markdown",
       "content": "[walkthrough.mp4](urn:video:60000000-0000-4000-8000-000000000009?name=walkthrough.mp4&content_type=video%2Fmp4)\n[https://video.example.test/watch/demo](urn:url:https://video.example.test/watch/demo)"
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "[walkthrough.mp4](/user_uploads/1/video123/walkthrough.mp4)\n[https://video.example.test/watch/demo](https://video.example.test/watch/demo)"
   },
   {
     "name": "audio_attachment",
@@ -1660,7 +1709,8 @@
       "kind": "markdown",
       "content": "[voice-note.ogg](urn:file:60000000-0000-4000-8000-000000000010?name=voice-note.ogg&content_type=audio%2Fogg)"
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "[voice-note.ogg](/user_uploads/1/audio123/voice-note.ogg)"
   },
   {
     "name": "emoji",
@@ -1696,7 +1746,8 @@
       "kind": "markdown",
       "content": "Looks good 👍🏽! :smile: :+1: :heart:\nCustom organization emoji: (Not supported in Workspace: custom emoji party_parrot)\n\n[Original message](urn:url:https://zulip.example.test/#narrow/near/1042)"
     },
-    "unsupported_features": ["custom_emoji"]
+    "unsupported_features": ["custom_emoji"],
+    "expected_zulip_content": "Looks good 👍🏽! :smile: :+1: :heart:\nCustom organization emoji: (Not supported in Workspace: custom emoji party_parrot)\n\n[Original message](https://zulip.example.test/#narrow/near/1042)"
   },
   {
     "name": "global_times",
@@ -1731,7 +1782,8 @@
       "kind": "markdown",
       "content": "The review starts at (Not supported in Workspace: global time 2026-10-18T18:00:00+03:00).\nA Unix timestamp also works: (Not supported in Workspace: global time 1496701800).\n\n[Original message](urn:url:https://zulip.example.test/#narrow/near/1043)"
     },
-    "unsupported_features": ["global_time"]
+    "unsupported_features": ["global_time"],
+    "expected_zulip_content": "The review starts at (Not supported in Workspace: global time 2026-10-18T18:00:00+03:00).\nA Unix timestamp also works: (Not supported in Workspace: global time 1496701800).\n\n[Original message](https://zulip.example.test/#narrow/near/1043)"
   },
   {
     "name": "me_action",
@@ -1766,7 +1818,8 @@
       "kind": "markdown",
       "content": "Not supported in Workspace: /me action\n\n[Original message](urn:url:https://zulip.example.test/#narrow/near/1044)"
     },
-    "unsupported_features": ["me_action"]
+    "unsupported_features": ["me_action"],
+    "expected_zulip_content": "Not supported in Workspace: /me action\n\n[Original message](https://zulip.example.test/#narrow/near/1044)"
   },
   {
     "name": "edited_message",
@@ -1809,7 +1862,8 @@
       "kind": "markdown",
       "content": "The deployment starts at **18:00**."
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "The deployment starts at **18:00**."
   },
   {
     "name": "reactions",
@@ -1863,7 +1917,8 @@
       "kind": "markdown",
       "content": "The migration is ready for review."
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "The migration is ready for review."
   },
   {
     "name": "poll",
@@ -1913,7 +1968,8 @@
       "kind": "markdown",
       "content": "Not supported in Workspace: interactive poll\n\n[Original message](urn:url:https://zulip.example.test/#narrow/near/1047)"
     },
-    "unsupported_features": ["interactive_poll"]
+    "unsupported_features": ["interactive_poll"],
+    "expected_zulip_content": "Not supported in Workspace: interactive poll\n\n[Original message](https://zulip.example.test/#narrow/near/1047)"
   },
   {
     "name": "collaborative_todo_list",
@@ -1963,7 +2019,8 @@
       "kind": "markdown",
       "content": "Not supported in Workspace: collaborative to-do list\n\n[Original message](urn:url:https://zulip.example.test/#narrow/near/1048)"
     },
-    "unsupported_features": ["collaborative_todo_list"]
+    "unsupported_features": ["collaborative_todo_list"],
+    "expected_zulip_content": "Not supported in Workspace: collaborative to-do list\n\n[Original message](https://zulip.example.test/#narrow/near/1048)"
   },
   {
     "name": "empty_topic",
@@ -1998,7 +2055,8 @@
       "kind": "markdown",
       "content": "This message has no topic."
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "This message has no topic."
   },
   {
     "name": "resolved_topic",
@@ -2033,7 +2091,8 @@
       "kind": "markdown",
       "content": "All changes are deployed."
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "All changes are deployed."
   },
   {
     "name": "direct_message",
@@ -2083,7 +2142,8 @@
       "kind": "markdown",
       "content": "Hi [Alice Example](urn:user:b7828b6c-13f2-59d3-88ec-8883e8b5acab)! Can you review [the proposal](urn:url:https://docs.example.test/proposal)?"
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "Hi @**Alice Example|9**! Can you review [the proposal](https://docs.example.test/proposal)?"
   },
   {
     "name": "group_direct_message",
@@ -2136,7 +2196,8 @@
       "kind": "markdown",
       "content": "**Planning notes**\n\n- Alice: API\n- Bob: worker\n- Zoë: UI"
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "**Planning notes**\n\n- Alice: API\n- Bob: worker\n- Zoë: UI"
   },
   {
     "name": "self_direct_message",
@@ -2177,7 +2238,8 @@
       "kind": "markdown",
       "content": "Note to self: run `python -m pytest` before the next commit."
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "Note to self: run `python -m pytest` before the next commit."
   },
   {
     "name": "system_bot_message",
@@ -2224,7 +2286,8 @@
       "kind": "markdown",
       "content": "Your organization settings have been updated.\n\n[Review settings](urn:url:https://zulip.example.test/#organization/settings)"
     },
-    "unsupported_features": []
+    "unsupported_features": [],
+    "expected_zulip_content": "Your organization settings have been updated.\n\n[Review settings](https://zulip.example.test/#organization/settings)"
   },
   {
     "name": "mixed_formatting",
@@ -2276,6 +2339,7 @@
       "kind": "markdown",
       "content": "[Bob Example](urn:user:7af731c9-ccd4-5318-9a12-bab962ee4679), here is the **release summary** for [#general > Roadmap](urn:topic:40000000-0000-4000-8000-000000000042).\n\n1. Read [the report](urn:file:60000000-0000-4000-8000-000000000002?name=report.pdf&content_type=application%2Fpdf).\n2. Check the formula (Not supported in Workspace: inline LaTeX).\n\n```python\n# This is literal: [Zoë Example](urn:user:0b596ff7-0956-5783-9ad4-0660396b0543) :smile:\nprint(\"ready\")\n```\n\n```spoiler Internal notes\n> Preserve the original link: [https://docs.example.test/runbook](urn:url:https://docs.example.test/runbook)\n\nRestart the worker at (Not supported in Workspace: global time 2026-10-18T18:00:00+03:00).\n```\n\n![Deployment diagram](urn:image:60000000-0000-4000-8000-000000000005?name=architecture.png&content_type=image%2Fpng&w=480&h=240)\n\nThanks! :+1:\n\n[Original message](urn:url:https://zulip.example.test/#narrow/near/1055)"
     },
-    "unsupported_features": ["inline_latex", "global_time"]
+    "unsupported_features": ["inline_latex", "global_time"],
+    "expected_zulip_content": "@**Bob Example|12**, here is the **release summary** for #**general>Roadmap**.\n\n1. Read [the report](/user_uploads/1/abc123/report.pdf).\n2. Check the formula (Not supported in Workspace: inline LaTeX).\n\n```python\n# This is literal: @**Zoë Example|13** :smile:\nprint(\"ready\")\n```\n\n```spoiler Internal notes\n> Preserve the original link: [https://docs.example.test/runbook](https://docs.example.test/runbook)\n\nRestart the worker at (Not supported in Workspace: global time 2026-10-18T18:00:00+03:00).\n```\n\n![Deployment diagram](/user_uploads/1/img123/architecture.png)\n\nThanks! :+1:\n\n[Original message](https://zulip.example.test/#narrow/near/1055)"
   }
 ]
