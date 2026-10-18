@@ -947,6 +947,7 @@ class ImportHistoryContent(AbstractZulipTaskContent):
                         channel.update_dm(values=values)
                         channel.update()
                 topic_uuid = sys_uuid.uuid5(channel.uuid, data["subject"])
+                topic_name = data["subject"] or "General Topic"
                 topic = ZulipTopic.objects.get_one_or_none(
                     filters={"uuid": filters.EQ(topic_uuid)},
                 )
@@ -954,12 +955,13 @@ class ImportHistoryContent(AbstractZulipTaskContent):
                     topic = ZulipTopic(
                         uuid=topic_uuid,
                         stream_id=channel.stream_id,
-                        name=data["subject"],
+                        name=topic_name,
                         max_id=data["id"],
                     )
                     topic.insert()
-                elif data["id"] > topic.max_id:
-                    topic.max_id = data["id"]
+                elif data["id"] > topic.max_id or topic.name != topic_name:
+                    topic.name = topic_name
+                    topic.max_id = max(topic.max_id, data["id"])
                     topic.update()
                 message = ZulipMessage.objects.get_one_or_none(
                     filters={

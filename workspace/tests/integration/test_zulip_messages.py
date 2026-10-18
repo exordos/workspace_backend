@@ -165,7 +165,7 @@ def test_history_import_synchronizes_direct_and_group_conversations(
     assert channel.stream_uuid.version == 5
     assert message.project_id == account.project_id
     assert message.content.zulip_content == data["content"]
-    assert message.topic.name == ""
+    assert message.topic.name == "General Topic"
     assert message.topic.stream_id is None
     assert message.read is True
     assert message.starred is True
@@ -196,6 +196,66 @@ def test_history_import_synchronizes_direct_and_group_conversations(
         == 2
     )
     assert zulip.close.call_count == 2
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_history_import_names_empty_topics_without_changing_identity(
+    history_account, monkeypatch, existing
+):
+    account = history_account
+    channel = models.ZulipChannel.objects.get_one(
+        filters={"external_account_uuid": filters.EQ(account.uuid)}
+    )
+    topic_uuid = uuid.uuid5(channel.uuid, "")
+    if existing:
+        models.ZulipTopic(
+            uuid=topic_uuid, stream_id=channel.stream_id, name="", max_id=44
+        ).insert()
+    zulip = mock.Mock()
+    zulip.get_messages.return_value = [
+        _message_data(42, subject=""),
+        _message_data(43, subject="General Topic"),
+    ]
+    monkeypatch.setattr(client, "ZulipClient", lambda current: zulip)
+
+    assert _import_history(account).status == "done"
+    empty, named = _messages(account)
+    assert empty.topic.name == named.topic.name == "General Topic"
+    assert empty.topic.uuid == topic_uuid
+    assert named.topic.uuid == uuid.uuid5(channel.uuid, "General Topic")
+    assert empty.topic.uuid != named.topic.uuid
+    assert empty.topic.max_id == (44 if existing else 42)
+    identities = [(message.uuid, message.topic.uuid) for message in (empty, named)]
+
+    assert _import_history(account).status == "done"
+    assert [(message.uuid, message.topic.uuid) for message in _messages(account)] == (
+        identities
+    )
+
+
+def test_empty_topic_name_migration_preserves_existing_topic_identity(_database):
+    with conftest.isolated_migration_database(
+        "0214-Expand-descriptions-to-10000-characters-fa3fa9.py"
+    ):
+        topics = [
+            models.ZulipTopic(stream_id=42, name=name, max_id=44)
+            for name in ("", "General Topic", "Planning")
+        ]
+        for topic in topics:
+            topic.insert()
+        engine = migrations.MigrationEngine(
+            migrations_path=str(conftest.MIGRATIONS_DIR)
+        )
+        engine.apply_migration("0215-Name-empty-Zulip-topics-General-Topic-146c8a.py")
+
+        restored = models.ZulipTopic.objects.get_all()
+        assert {
+            topic.uuid: (topic.name, topic.stream_id, topic.max_id)
+            for topic in restored
+        } == {
+            topic.uuid: (topic.name or "General Topic", topic.stream_id, topic.max_id)
+            for topic in topics
+        }
 
 
 def test_direct_conversation_identity_is_shared_between_accounts(
