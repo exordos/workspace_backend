@@ -135,7 +135,7 @@ def test_history_content_rejects_unbounded_or_reversed_range(first, last):
 
 def test_client_checks_credentials():
     session = mock.Mock()
-    session.get.return_value.json.return_value = {"result": "success", "user_id": 7}
+    session.request.return_value.json.return_value = {"result": "success", "user_id": 7}
     with mock.patch.object(client.requests, "Session", return_value=session):
         zulip = client.ZulipClient(
             external_models.ExternalAccount(
@@ -152,17 +152,18 @@ def test_client_checks_credentials():
         assert zulip.check_connection()["user_id"] == 7
         zulip.close()
     assert session.auth == ("user@example.com", "test-key")
-    assert session.get.call_args_list[0].args == (
+    assert session.request.call_args_list[0].args == (
+        "GET",
         "https://zulip.example.com/api/v1/users/me",
     )
-    session.get.assert_called_once()
+    session.request.assert_called_once()
     session.close.assert_called_once()
 
 
 def test_client_gets_channels_including_archived():
     session = mock.Mock()
     channels = [{"stream_id": 42, "is_archived": True}]
-    session.get.return_value.json.return_value = {
+    session.request.return_value.json.return_value = {
         "result": "success",
         "streams": channels,
     }
@@ -180,7 +181,8 @@ def test_client_gets_channels_including_archived():
         zulip = client.ZulipClient(account)
         assert zulip.get_channels() == channels
         zulip.close()
-    session.get.assert_called_once_with(
+    session.request.assert_called_once_with(
+        "GET",
         "https://zulip.example.com/api/v1/streams",
         params={"exclude_archived": "false"},
         timeout=(5, 30),
@@ -188,7 +190,7 @@ def test_client_gets_channels_including_archived():
     session.close.assert_called_once()
 
 
-def test_client_gets_organization_users():
+def test_client_gets_active_inactive_and_system_users():
     account = mock.Mock(
         settings={
             "server_url": "https://zulip.example.com/",
@@ -197,18 +199,77 @@ def test_client_gets_organization_users():
         }
     )
     session = mock.Mock()
-    users = [{"user_id": 7, "full_name": "User", "email": "user@example.com"}]
-    session.get.return_value.json.return_value = {"result": "success", "members": users}
+    active = {"user_id": 9, "full_name": "User", "email": "user@example.com"}
+    inactive = {"user_id": 8, "full_name": "Inactive", "email": "old@example.com"}
+    bot = {
+        "user_id": 6,
+        "full_name": "Notification Bot",
+        "email": "notification-bot@zulip.com",
+        "is_active": True,
+        "is_system_bot": True,
+    }
+    session.request.return_value.json.side_effect = [
+        {
+            "result": "success",
+            "queue_id": "test-queue",
+            "realm_users": [active],
+            "realm_non_active_users": [inactive],
+            "cross_realm_bots": [bot],
+        },
+        {"result": "success"},
+    ]
     with mock.patch.object(client.requests, "Session", return_value=session):
         zulip = client.ZulipClient(account)
-        assert zulip.get_users() == users
+        assert zulip.get_users() == [
+            {**active, "is_active": True},
+            {**inactive, "is_active": False},
+            bot,
+        ]
         zulip.close()
-    assert session.get.call_args_list == [
+    assert session.request.call_args_list == [
         mock.call(
-            "https://zulip.example.com/api/v1/users", params=None, timeout=(5, 30)
+            "POST",
+            "https://zulip.example.com/api/v1/register",
+            data={"event_types": "[]", "fetch_event_types": '["realm_user"]'},
+            timeout=(5, 30),
+        ),
+        mock.call(
+            "DELETE",
+            "https://zulip.example.com/api/v1/events",
+            data={"queue_id": "test-queue"},
+            timeout=(5, 30),
         ),
     ]
     session.close.assert_called_once_with()
+
+
+def test_user_fetch_deletes_the_event_queue_when_processing_fails():
+    account = mock.Mock(
+        settings={
+            "server_url": "https://zulip.example.com",
+            "email": "user@example.com",
+            "api_key": "test-key",
+        }
+    )
+    session = mock.Mock()
+    session.request.return_value.json.side_effect = [
+        {"result": "success", "queue_id": "test-queue"},
+        {"result": "success"},
+    ]
+    with mock.patch.object(client.requests, "Session", return_value=session):
+        zulip = client.ZulipClient(account)
+        try:
+            with pytest.raises(KeyError, match="realm_users"):
+                zulip.get_users()
+        finally:
+            zulip.close()
+    assert session.request.call_count == 2
+    session.request.assert_called_with(
+        "DELETE",
+        "https://zulip.example.com/api/v1/events",
+        data={"queue_id": "test-queue"},
+        timeout=(5, 30),
+    )
 
 
 @pytest.mark.parametrize(
@@ -223,7 +284,7 @@ def test_client_gets_last_available_message_id(messages, expected):
         }
     )
     session = mock.Mock()
-    session.get.return_value.json.return_value = {
+    session.request.return_value.json.return_value = {
         "result": "success",
         "messages": messages,
     }
@@ -231,7 +292,8 @@ def test_client_gets_last_available_message_id(messages, expected):
         zulip = client.ZulipClient(account)
         assert zulip.get_last_message_id() == expected
         zulip.close()
-    session.get.assert_called_once_with(
+    session.request.assert_called_once_with(
+        "GET",
         "https://zulip.example.com/api/v1/messages",
         params={
             "anchor": "newest",
@@ -564,7 +626,7 @@ def test_client_gets_only_messages_in_the_inclusive_range(first, last):
     )
     session = mock.Mock()
     messages = [{"id": message_id} for message_id in sorted({first, last})]
-    session.get.return_value.json.return_value = {
+    session.request.return_value.json.return_value = {
         "result": "success",
         "messages": [{"id": first - 1}, *messages, {"id": last + 1}],
     }
@@ -572,7 +634,8 @@ def test_client_gets_only_messages_in_the_inclusive_range(first, last):
         zulip = client.ZulipClient(account)
         assert zulip.get_messages(first, last) == messages
         zulip.close()
-    session.get.assert_called_once_with(
+    session.request.assert_called_once_with(
+        "GET",
         "https://zulip.example.com/api/v1/messages",
         params={
             "anchor": first,

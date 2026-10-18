@@ -11,6 +11,7 @@ import psycopg
 import pytest
 import requests
 from restalchemy.common import contexts
+from restalchemy.common import exceptions
 from restalchemy.dm import filters
 from restalchemy.storage.sql import migrations
 
@@ -103,6 +104,8 @@ def test_channel_import_saves_and_updates_metadata_preserving_identifiers(
     ]
     for channel, row, expected_uuid in zip(stored, data, expected_uuids):
         assert channel.external_account_uuid == account.uuid
+        assert channel.channel_type == "channel"
+        assert channel.direct_user_uuid is None
         assert channel.stream_uuid == expected_uuid
         assert channel.stream_uuid.version == 5
         assert {name: getattr(channel, name) for name in row} == row
@@ -118,6 +121,90 @@ def test_channel_import_saves_and_updates_metadata_preserving_identifiers(
     assert updated[0].description == "Updated"
     assert len(updated) == 2
     assert zulip.close.call_count == 2
+
+
+def test_channel_import_preserves_direct_and_group_conversations(
+    channel_import_account, db, monkeypatch
+):
+    account = channel_import_account
+    peer_owner = uuid.uuid4()
+    conftest.seed_workspace_user(db, peer_owner, f"channel-peer-{peer_owner}")
+    peer = external_models.ExternalAccount(
+        project_id=account.project_id,
+        owner_user_uuid=peer_owner,
+        provider="zulip",
+        settings=account.settings,
+    )
+    peer.insert()
+    direct = models.ZulipChannel(
+        external_account_uuid=account.uuid,
+        stream_uuid=uuid.uuid4(),
+        channel_type="private",
+        direct_user_uuid=peer.uuid,
+        **{**_channel_data(43), "stream_id": None},
+    )
+    direct.insert()
+    group = models.ZulipChannel(
+        external_account_uuid=account.uuid,
+        stream_uuid=uuid.uuid4(),
+        channel_type="group",
+        **{**_channel_data(44), "stream_id": None},
+    )
+    group.insert()
+    zulip = mock.Mock()
+    zulip.get_channels.return_value = [_channel_data()]
+    monkeypatch.setattr(client, "ZulipClient", lambda current: zulip)
+    try:
+        assert _run_channel_import(account).status == "done"
+        assert len(_channels(account)) == 3
+        zulip.get_channels.return_value = []
+        assert _run_channel_import(account).status == "done"
+        remaining = _channels(account)
+        assert {row.uuid for row in remaining} == {direct.uuid, group.uuid}
+        assert {row.uuid: row.direct_user_uuid for row in remaining} == {
+            direct.uuid: peer.uuid,
+            group.uuid: None,
+        }
+        peer.delete()
+        assert [row.uuid for row in _channels(account)] == [group.uuid]
+    finally:
+        if (
+            external_models.ExternalAccount.objects.get_one_or_none(
+                filters={"uuid": filters.EQ(peer.uuid)}
+            )
+            is not None
+        ):
+            peer.delete()
+
+
+@pytest.mark.parametrize(
+    "channel_type,direct_user_uuid",
+    [
+        ("private", None),
+        ("channel", uuid.uuid4()),
+        ("group", uuid.uuid4()),
+        ("unknown", None),
+    ],
+)
+def test_channel_rejects_invalid_type_or_direct_identity(
+    channel_type, direct_user_uuid
+):
+    expected_error = (
+        exceptions.TypeError
+        if channel_type == "unknown"
+        else exceptions.ValidationErrorException
+    )
+    with pytest.raises(expected_error):
+        models.ZulipChannel(
+            external_account_uuid=uuid.uuid4(),
+            stream_uuid=uuid.uuid4(),
+            channel_type=channel_type,
+            direct_user_uuid=direct_user_uuid,
+            **{
+                **_channel_data(),
+                "stream_id": None if channel_type in ("private", "group") else 42,
+            },
+        )
 
 
 @pytest.mark.parametrize(
@@ -310,6 +397,98 @@ def test_channel_import_handles_provider_errors(
         assert pending[0].not_before_at is not None
 
 
+def test_channel_type_migration_preserves_channels_and_enforces_direct_references(
+    _database,
+):
+    migration = "0209-Add-Zulip-channel-types-and-direct-account-references-6bdbf2.py"
+    with conftest.isolated_migration_database(
+        "0208-Reserve-descending-priorities-for-history-import-tasks-bc5850.py"
+    ) as database_url:
+        with psycopg.connect(database_url, autocommit=True) as db:
+            project_id = uuid.uuid4()
+            accounts = []
+            for _ in range(2):
+                owner_uuid = uuid.uuid4()
+                conftest.seed_workspace_user(
+                    db, owner_uuid, f"channel-type-{owner_uuid}"
+                )
+                account = external_models.ExternalAccount(
+                    project_id=project_id,
+                    owner_user_uuid=owner_uuid,
+                    provider="zulip",
+                    settings={"server_url": "https://zulip.example.com"},
+                )
+                account.insert()
+                accounts.append(account)
+            source, peer = accounts
+            legacy = models.ZulipChannel(
+                external_account_uuid=source.uuid,
+                stream_uuid=uuid.uuid4(),
+                **_channel_data(),
+            )
+            conftest.seed_legacy_zulip_channel(db, legacy)
+            engine = migrations.MigrationEngine(
+                migrations_path=str(conftest.MIGRATIONS_DIR)
+            )
+            engine.apply_migration(migration)
+            restored = models.ZulipChannel.objects.get_one(
+                filters={"uuid": filters.EQ(legacy.uuid)}
+            )
+            assert restored.channel_type == "channel"
+            assert restored.direct_user_uuid is None
+            assert restored.stream_uuid == legacy.stream_uuid
+            assert restored.stream_id == 42
+            direct = models.ZulipChannel(
+                external_account_uuid=source.uuid,
+                stream_uuid=uuid.uuid4(),
+                channel_type="private",
+                direct_user_uuid=peer.uuid,
+                **{**_channel_data(), "stream_id": None, "date_created": None},
+            )
+            direct.insert()
+            group = models.ZulipChannel(
+                external_account_uuid=source.uuid,
+                stream_uuid=uuid.uuid4(),
+                channel_type="group",
+                **{**_channel_data(), "stream_id": None, "date_created": None},
+            )
+            group.insert()
+            with pytest.raises(psycopg.errors.ForeignKeyViolation):
+                db.execute(
+                    "UPDATE bridge_zulip_v5_channels SET direct_user_uuid=%s WHERE uuid=%s",
+                    (uuid.uuid4(), direct.uuid),
+                )
+            with pytest.raises(psycopg.errors.CheckViolation):
+                db.execute(
+                    "UPDATE bridge_zulip_v5_channels SET direct_user_uuid=NULL WHERE uuid=%s",
+                    (direct.uuid,),
+                )
+            with pytest.raises(psycopg.errors.CheckViolation):
+                db.execute(
+                    "UPDATE bridge_zulip_v5_channels SET channel_type='unknown' WHERE uuid=%s",
+                    (legacy.uuid,),
+                )
+            with pytest.raises(psycopg.errors.CheckViolation):
+                db.execute(
+                    "UPDATE bridge_zulip_v5_channels SET direct_user_uuid=%s WHERE uuid=%s",
+                    (peer.uuid, group.uuid),
+                )
+            peer.delete()
+            assert (
+                models.ZulipChannel.objects.get_one_or_none(
+                    filters={"uuid": filters.EQ(direct.uuid)}
+                )
+                is None
+            )
+            group.delete()
+            engine.rollback_migration(migration)
+            assert db.execute(
+                "SELECT stream_id, name FROM bridge_zulip_v5_channels WHERE uuid=%s",
+                (legacy.uuid,),
+            ).fetchone() == (42, "Channel 42")
+            engine.apply_migration(migration)
+
+
 @pytest.mark.parametrize("action", ["delete_account", "delete_stream", "rollback"])
 def test_channel_account_and_stream_references(_database, action):
     migration = (
@@ -347,13 +526,12 @@ def test_channel_account_and_stream_references(_database, action):
                 history_public_to_subscribers=True,
                 is_archived=False,
             )
-            channel.insert()
-            restored = models.ZulipChannel.objects.get_one(
-                filters={"uuid": filters.EQ(channel.uuid)}
-            )
-            assert restored.external_account_uuid == account.uuid
-            assert restored.stream_uuid == stream_uuid
-            assert restored.stream_id == 42
+            conftest.seed_legacy_zulip_channel(db, channel)
+            assert db.execute(
+                "SELECT external_account_uuid, stream_uuid, stream_id "
+                "FROM bridge_zulip_v5_channels WHERE uuid=%s",
+                (channel.uuid,),
+            ).fetchone() == (account.uuid, stream_uuid, 42)
             for field in ("external_account_uuid", "stream_uuid"):
                 with pytest.raises(psycopg.errors.ForeignKeyViolation):
                     db.execute(
@@ -423,7 +601,7 @@ def test_unmapped_channel_migration_round_trip(_database):
                 for stream_id in (42, 43)
             ]
             for channel in channels:
-                channel.insert()
+                conftest.seed_legacy_zulip_channel(db, channel)
 
             engine.apply_migration(migration)
             db.execute(
@@ -449,13 +627,13 @@ def test_unmapped_channel_migration_round_trip(_database):
                     "UPDATE bridge_zulip_v5_channels SET stream_uuid=NULL WHERE uuid=%s",
                     (channels[0].uuid,),
                 )
-            assert [channel.uuid for channel in _channels(account)] == [
-                channel.uuid for channel in channels
-            ]
+            assert db.execute(
+                "SELECT uuid FROM bridge_zulip_v5_channels ORDER BY stream_id"
+            ).fetchall() == [(channel.uuid,) for channel in channels]
             engine.apply_migration(migration)
-            assert all(
-                channel.stream_uuid == stream_uuid for channel in _channels(account)
-            )
+            assert db.execute(
+                "SELECT stream_uuid FROM bridge_zulip_v5_channels ORDER BY stream_id"
+            ).fetchall() == [(stream_uuid,), (stream_uuid,)]
 
 
 def test_deterministic_channel_uuid_migration_backfills_and_restores_constraints(
@@ -489,7 +667,7 @@ def test_deterministic_channel_uuid_migration_backfills_and_restores_constraints
                 for stream_id in (42, 43)
             ]
             for channel in channels:
-                channel.insert()
+                conftest.seed_legacy_zulip_channel(db, channel)
             db.execute(
                 "UPDATE bridge_zulip_v5_channels SET stream_uuid=NULL WHERE uuid=%s",
                 (channels[0].uuid,),
@@ -505,7 +683,9 @@ def test_deterministic_channel_uuid_migration_backfills_and_restores_constraints
 
             engine.apply_migration(migration)
 
-            assert [channel.stream_uuid for channel in _channels(account)] == expected
+            assert db.execute(
+                "SELECT stream_uuid FROM bridge_zulip_v5_channels ORDER BY stream_id"
+            ).fetchall() == [(stream_uuid,) for stream_uuid in expected]
             assert (
                 db.execute(
                     "SELECT to_jsonb(channel) - 'stream_uuid' "
@@ -540,4 +720,6 @@ def test_deterministic_channel_uuid_migration_backfills_and_restores_constraints
                     (uuid.uuid4(), channels[0].uuid),
                 )
             engine.apply_migration(migration)
-            assert [channel.stream_uuid for channel in _channels(account)] == expected
+            assert db.execute(
+                "SELECT stream_uuid FROM bridge_zulip_v5_channels ORDER BY stream_id"
+            ).fetchall() == [(stream_uuid,) for stream_uuid in expected]

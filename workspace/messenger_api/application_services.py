@@ -70,6 +70,12 @@ class ExternalAccountApplicationService:
         if account.provider == "zulip":
             status = external_models.ExternalAccountStatus.NEW.value
             error_description = None
+        # Keep account and task writes in the same order as the importer.
+        account.update_status(
+            status,
+            error_description=error_description,
+        )
+        if account.provider == "zulip":
             task = zulip_models.Task(
                 project_id=account.project_id,
                 external_account_uuid=account.uuid,
@@ -78,8 +84,4 @@ class ExternalAccountApplicationService:
             )
             task.cancel_pending_tasks(exclude_current=True)
             task.insert(session=session)
-        account.update_status(
-            status,
-            error_description=error_description,
-        )
         return account

@@ -25,11 +25,12 @@ class ZulipClient:
     def close(self) -> None:
         self._session.close()
 
-    def _get(self, path: str, params: dict[str, typing.Any] | None = None) -> dict:
-        response = self._session.get(
+    def _request(self, method: str, path: str, **kwargs: typing.Any) -> dict:
+        response = self._session.request(
+            method,
             self._base_url + path,
-            params=params,
             timeout=(5, 30),
+            **kwargs,
         )
         response.raise_for_status()
         result = response.json()
@@ -37,11 +38,31 @@ class ZulipClient:
             raise ZulipApiError("Zulip API request failed")
         return result
 
+    def _get(self, path: str, params: dict[str, typing.Any] | None = None) -> dict:
+        return self._request("GET", path, params=params)
+
     def check_connection(self) -> dict:
         return self._get("/users/me")
 
     def get_users(self) -> list[dict]:
-        return self._get("/users")["members"]
+        # Unlike /users, registration also includes cross-realm system bots.
+        data = self._request(
+            "POST",
+            "/register",
+            data={"event_types": "[]", "fetch_event_types": '["realm_user"]'},
+        )
+        try:
+            # Registration separates inactive users and omits their is_active flag.
+            return (
+                [{**user, "is_active": True} for user in data["realm_users"]]
+                + [
+                    {**user, "is_active": False}
+                    for user in data["realm_non_active_users"]
+                ]
+                + data["cross_realm_bots"]
+            )
+        finally:
+            self._request("DELETE", "/events", data={"queue_id": data["queue_id"]})
 
     def get_channels(self) -> list[dict]:
         return self._get("/streams", params={"exclude_archived": "false"})["streams"]

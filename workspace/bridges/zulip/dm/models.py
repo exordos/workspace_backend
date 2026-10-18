@@ -89,6 +89,12 @@ class MessageContent(
     )
 
 
+class ZulipChannelType(str, enum.Enum):
+    PRIVATE = "private"
+    GROUP = "group"
+    CHANNEL = "channel"
+
+
 class ZulipChannel(
     models.ModelWithUUID,
     models.ModelWithTimestamp,
@@ -97,10 +103,15 @@ class ZulipChannel(
     __tablename__ = "bridge_zulip_v5_channels"
 
     external_account_uuid = properties.property(types.UUID(), required=True)
+    channel_type = properties.property(
+        types.Enum([channel_type.value for channel_type in ZulipChannelType]),
+        default=ZulipChannelType.CHANNEL.value,
+    )
+    direct_user_uuid = properties.property(types.AllowNone(types.UUID()), default=None)
     stream_uuid = properties.property(types.UUID(), required=True)
     stream_id = properties.property(
-        types.Integer(min_value=1),
-        required=True,
+        types.AllowNone(types.Integer(min_value=1)),
+        default=None,
     )
     name = properties.property(
         types.String(min_length=1),
@@ -115,8 +126,8 @@ class ZulipChannel(
         required=True,
     )
     date_created = properties.property(
-        types.Integer(min_value=0),
-        required=True,
+        types.AllowNone(types.Integer(min_value=0)),
+        default=None,
     )
     creator_id = properties.property(
         types.AllowNone(types.Integer(min_value=1)),
@@ -143,6 +154,17 @@ class ZulipChannel(
         default=None,
     )
 
+    def validate(self) -> None:
+        super().validate()
+        if (self.channel_type == ZulipChannelType.CHANNEL.value) != (
+            self.stream_id is not None
+        ):
+            raise exceptions.ValidationErrorException()
+        if (self.channel_type == ZulipChannelType.PRIVATE.value) != (
+            self.direct_user_uuid is not None
+        ):
+            raise exceptions.ValidationErrorException()
+
 
 class ZulipTopic(
     models.ModelWithUUID,
@@ -152,8 +174,8 @@ class ZulipTopic(
     __tablename__ = "bridge_zulip_v5_topics"
 
     stream_id = properties.property(
-        types.Integer(min_value=1),
-        required=True,
+        types.AllowNone(types.Integer(min_value=1)),
+        default=None,
     )
     name = properties.property(
         types.String(),
@@ -171,7 +193,7 @@ class ZulipMessage(
     models.ModelWithTimestamp,
     orm.SQLStorableMixin,
 ):
-    """A channel message with account-specific flags."""
+    """A message with account-specific flags."""
 
     __tablename__ = "bridge_zulip_v5_messages"
 
@@ -544,9 +566,11 @@ class ImportChannelsContent(AbstractZulipTaskContent):
                 values["stream_uuid"] = sys_uuid.uuid5(
                     server_namespace, str(values["stream_id"])
                 )
+                values["channel_type"] = ZulipChannelType.CHANNEL.value
                 channel = ZulipChannel.objects.get_one_or_none(
                     filters={
                         "external_account_uuid": filters.EQ(account.uuid),
+                        "channel_type": filters.EQ(ZulipChannelType.CHANNEL.value),
                         "stream_id": filters.EQ(values["stream_id"]),
                     },
                 )
@@ -560,7 +584,10 @@ class ImportChannelsContent(AbstractZulipTaskContent):
                     channel.update()
                 stream_ids.add(values["stream_id"])
             for channel in ZulipChannel.objects.get_all(
-                filters={"external_account_uuid": filters.EQ(account.uuid)},
+                filters={
+                    "external_account_uuid": filters.EQ(account.uuid),
+                    "channel_type": filters.EQ(ZulipChannelType.CHANNEL.value),
+                },
             ):
                 if channel.stream_id not in stream_ids:
                     channel.delete()
@@ -614,14 +641,80 @@ class ImportHistoryContent(AbstractZulipTaskContent):
         zulip = client.ZulipClient(account)
         try:
             for data in zulip.get_messages(self.first_message_id, self.last_message_id):
-                if data["type"] != "stream":
-                    continue
-                channel = ZulipChannel.objects.get_one(
-                    filters={
-                        "external_account_uuid": filters.EQ(account.uuid),
-                        "stream_id": filters.EQ(data["stream_id"]),
-                    },
-                )
+                if data["type"] == "stream":
+                    channel = ZulipChannel.objects.get_one(
+                        filters={
+                            "external_account_uuid": filters.EQ(account.uuid),
+                            "channel_type": filters.EQ(ZulipChannelType.CHANNEL.value),
+                            "stream_id": filters.EQ(data["stream_id"]),
+                        },
+                    )
+                else:
+                    if account.external_account_id is None:
+                        raise ExternalAccountIdPendingError(
+                            f"External account {account.uuid} is not verified yet."
+                        )
+                    user_id = int(account.external_account_id.rsplit(":", 1)[1])
+                    recipients = sorted(
+                        data["display_recipient"], key=lambda recipient: recipient["id"]
+                    )
+                    peers = [user for user in recipients if user["id"] != user_id]
+                    channel_type = (
+                        ZulipChannelType.PRIVATE.value
+                        if len(peers) <= 1
+                        else ZulipChannelType.GROUP.value
+                    )
+                    direct_user_uuid = None
+                    if channel_type == ZulipChannelType.PRIVATE.value:
+                        peer_id = (peers or recipients)[0]["id"]
+                        peer = external_models.ExternalAccount.objects.get_one_or_none(
+                            filters={
+                                "project_id": filters.EQ(task.project_id),
+                                "provider": filters.EQ("zulip"),
+                                "external_account_id": filters.EQ(
+                                    f"{hostname}:{peer_id}"
+                                ),
+                            },
+                        )
+                        if peer is None:
+                            raise ExternalAccountIdPendingError(
+                                f"External account {hostname}:{peer_id} "
+                                "has not been imported yet."
+                            )
+                        direct_user_uuid = peer.uuid
+                    members = ",".join(str(user["id"]) for user in recipients)
+                    stream_uuid = sys_uuid.uuid5(server_namespace, f"dm:{members}")
+                    values = {
+                        "channel_type": channel_type,
+                        "direct_user_uuid": direct_user_uuid,
+                        "stream_id": None,
+                        "name": ", ".join(
+                            user["full_name"] for user in peers or recipients
+                        ),
+                        "description": "",
+                        "rendered_description": "",
+                        "date_created": None,
+                        "invite_only": True,
+                        "is_web_public": False,
+                        "history_public_to_subscribers": False,
+                        "is_archived": False,
+                    }
+                    channel = ZulipChannel.objects.get_one_or_none(
+                        filters={
+                            "external_account_uuid": filters.EQ(account.uuid),
+                            "stream_uuid": filters.EQ(stream_uuid),
+                        },
+                    )
+                    if channel is None:
+                        channel = ZulipChannel(
+                            external_account_uuid=account.uuid,
+                            stream_uuid=stream_uuid,
+                            **values,
+                        )
+                        channel.insert()
+                    else:
+                        channel.update_dm(values=values)
+                        channel.update()
                 topic_uuid = sys_uuid.uuid5(channel.uuid, data["subject"])
                 topic = ZulipTopic.objects.get_one_or_none(
                     filters={"uuid": filters.EQ(topic_uuid)},
@@ -629,7 +722,7 @@ class ImportHistoryContent(AbstractZulipTaskContent):
                 if topic is None:
                     topic = ZulipTopic(
                         uuid=topic_uuid,
-                        stream_id=data["stream_id"],
+                        stream_id=channel.stream_id,
                         name=data["subject"],
                         max_id=data["id"],
                     )
@@ -701,6 +794,15 @@ class ImportHistoryContent(AbstractZulipTaskContent):
                     message.update()
         finally:
             zulip.close()
+
+    def on_error(self, task: "Task", error: Exception) -> None:
+        if isinstance(error, ExternalAccountIdPendingError):
+            task.status = TaskStatus.RETRY.value
+            task.next_retry_at = (
+                datetime.datetime.now(datetime.timezone.utc) + TASK_RETRY_DELAY
+            )
+        else:
+            super().on_error(task, error)
 
     def on_done(self, task: "Task") -> None:
         account = external_models.ExternalAccount.objects.get_one(

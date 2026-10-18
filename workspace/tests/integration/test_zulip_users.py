@@ -192,6 +192,78 @@ def test_user_import_creates_linked_profiles_without_credentials_and_updates_the
     assert zulip.close.call_count == 3
 
 
+@pytest.mark.parametrize("include_realm_users", (False, True))
+def test_user_import_always_creates_missing_system_bots(
+    user_import_account, monkeypatch, include_realm_users
+):
+    account = user_import_account
+    bots = [
+        _user_data(
+            user_id,
+            full_name=name,
+            email=email,
+            is_bot=True,
+            is_system_bot=True,
+        )
+        for user_id, name, email in (
+            (1, "Email Gateway", "emailgateway@zulip.com"),
+            (6, "Notification Bot", "notification-bot@zulip.com"),
+        )
+    ]
+    active, inactive = _user_data(8), _user_data(9)
+    del active["is_active"], inactive["is_active"]
+    registration = {
+        "result": "success",
+        "queue_id": "test-queue",
+        "realm_users": [active] if include_realm_users else [],
+        "realm_non_active_users": [inactive] if include_realm_users else [],
+        "cross_realm_bots": bots,
+    }
+    monkeypatch.setattr(
+        client.ZulipClient,
+        "_request",
+        lambda self, method, path, **kwargs: (
+            registration if method == "POST" else {"result": "success"}
+        ),
+    )
+
+    assert _run_user_import(account).status == "done"
+    imported = {row.external_account_id: row for row in _accounts(account)}
+    assert len(imported) == (5 if include_realm_users else 3)
+    for bot in bots:
+        stored = imported[f"{account.get_host()}:{bot['user_id']}"]
+        assert stored.disabled is False
+        assert stored.settings == {
+            "server_url": account.settings["server_url"],
+            "email": bot["email"],
+        }
+        profile = messenger_models.WorkspaceUser.objects.get_one(
+            filters={"uuid": filters.EQ(stored.owner_user_uuid)},
+        )
+        assert profile.first_name == bot["full_name"]
+        assert profile.email == bot["email"]
+        assert profile.source == "zulip"
+        assert profile.disabled is False
+        assert profile.status == "offline"
+    if include_realm_users:
+        assert imported[f"{account.get_host()}:8"].disabled is False
+        assert imported[f"{account.get_host()}:9"].disabled is True
+
+    assert _run_user_import(account).status == "done"
+    assert {row.uuid: row.updated_at for row in _accounts(account)} == {
+        row.uuid: row.updated_at for row in imported.values()
+    }
+    missing = imported[f"{account.get_host()}:6"]
+    missing.delete()
+    assert _run_user_import(account).status == "done"
+    restored = external_models.ExternalAccount.objects.get_one(
+        filters={"uuid": filters.EQ(missing.uuid)},
+    )
+    assert restored.owner_user_uuid == missing.owner_user_uuid
+    assert restored.external_account_id == missing.external_account_id
+    assert restored.settings == missing.settings
+
+
 def test_user_import_repairs_native_profiles_and_tracks_deactivation_and_reactivation(
     user_import_account, db, monkeypatch
 ):

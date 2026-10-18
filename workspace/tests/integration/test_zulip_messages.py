@@ -48,6 +48,7 @@ def history_account(_database, db):
         project_id=uuid.uuid4(),
         owner_user_uuid=owner_uuid,
         provider="zulip",
+        external_account_id="zulip.example.com:7",
         settings={"server_url": "https://zulip.example.com"},
     )
     account.insert()
@@ -87,6 +88,36 @@ def _import_history(account, first=40, last=44):
     return models.Task.objects.get_one(filters={"uuid": filters.EQ(task.uuid)})
 
 
+def _direct_message_data(message_id=43, user_ids=(7, 8), **values):
+    data = _message_data(
+        message_id,
+        type="private",
+        subject="",
+        display_recipient=[
+            {"id": user_id, "full_name": f"User {user_id}"} for user_id in user_ids
+        ],
+        **values,
+    )
+    del data["stream_id"]
+    return data
+
+
+@pytest.fixture
+def direct_peer(history_account, db):
+    owner_uuid = uuid.uuid4()
+    conftest.seed_workspace_user(db, owner_uuid, f"direct-peer-{owner_uuid}")
+    account = external_models.ExternalAccount(
+        project_id=history_account.project_id,
+        owner_user_uuid=owner_uuid,
+        provider="zulip",
+        external_account_id="zulip.example.com:8",
+        settings=history_account.settings,
+    )
+    account.insert()
+    yield account
+    account.delete()
+
+
 def _messages(account):
     return models.ZulipMessage.objects.get_all(
         filters={
@@ -95,6 +126,136 @@ def _messages(account):
         },
         order_by={"message_id": "asc"},
     )
+
+
+@pytest.mark.parametrize(
+    "user_ids,channel_type,name",
+    [
+        ((7, 8), "private", "User 8"),
+        ((8, 7), "private", "User 8"),
+        ((9, 7, 8), "group", "User 8, User 9"),
+        ((7,), "private", "User 7"),
+    ],
+)
+def test_history_import_synchronizes_direct_and_group_conversations(
+    history_account, direct_peer, monkeypatch, user_ids, channel_type, name
+):
+    account = history_account
+    data = _direct_message_data(user_ids=user_ids, flags=["read", "starred"])
+    zulip = mock.Mock()
+    zulip.get_messages.return_value = [data]
+    monkeypatch.setattr(client, "ZulipClient", lambda current: zulip)
+
+    assert _import_history(account).status == "done"
+    (message,) = _messages(account)
+    channel = message.channel
+    assert channel.channel_type == channel_type
+    assert channel.name == name
+    assert channel.stream_id is None
+    assert channel.date_created is None
+    assert channel.invite_only is True
+    assert channel.is_web_public is False
+    expected_peer = account.uuid if user_ids == (7,) else direct_peer.uuid
+    assert channel.direct_user_uuid == (
+        expected_peer if channel_type == "private" else None
+    )
+    namespace = uuid.uuid5(uuid.NAMESPACE_DNS, account.get_host())
+    members = ",".join(str(user_id) for user_id in sorted(user_ids))
+    assert channel.stream_uuid == uuid.uuid5(namespace, f"dm:{members}")
+    assert channel.stream_uuid.version == 5
+    assert message.project_id == account.project_id
+    assert message.content.zulip_content == data["content"]
+    assert message.topic.name == ""
+    assert message.topic.stream_id is None
+    assert message.read is True
+    assert message.starred is True
+    identity = message.uuid, message.message_uuid, channel.uuid, message.topic.uuid
+
+    data["display_recipient"].reverse()
+    data["content"] = "Updated direct message"
+    for user in data["display_recipient"]:
+        user["full_name"] += " renamed"
+    assert _import_history(account).status == "done"
+    (updated,) = _messages(account)
+    assert (
+        updated.uuid,
+        updated.message_uuid,
+        updated.channel.uuid,
+        updated.topic.uuid,
+    ) == identity
+    assert updated.channel.name == ", ".join(
+        f"{peer_name} renamed" for peer_name in name.split(", ")
+    )
+    assert updated.content.zulip_content == "Updated direct message"
+    assert (
+        len(
+            models.ZulipChannel.objects.get_all(
+                filters={"external_account_uuid": filters.EQ(account.uuid)}
+            )
+        )
+        == 2
+    )
+    assert zulip.close.call_count == 2
+
+
+def test_direct_conversation_identity_is_shared_between_accounts(
+    history_account, direct_peer, monkeypatch
+):
+    zulip = mock.Mock()
+    zulip.get_messages.return_value = [_direct_message_data()]
+    monkeypatch.setattr(client, "ZulipClient", lambda current: zulip)
+    assert _import_history(history_account).status == "done"
+    assert _import_history(direct_peer).status == "done"
+    (outgoing,) = _messages(history_account)
+    (incoming,) = _messages(direct_peer)
+    assert outgoing.channel.stream_uuid == incoming.channel.stream_uuid
+    assert outgoing.channel.uuid != incoming.channel.uuid
+    assert outgoing.channel.direct_user_uuid == direct_peer.uuid
+    assert incoming.channel.direct_user_uuid == history_account.uuid
+
+
+@pytest.mark.parametrize("peer_scope", ("missing", "project", "host"))
+def test_direct_messages_wait_for_a_peer_in_the_same_project_and_host(
+    history_account, db, monkeypatch, peer_scope
+):
+    account = history_account
+    other = None
+    if peer_scope != "missing":
+        owner_uuid = uuid.uuid4()
+        conftest.seed_workspace_user(db, owner_uuid, f"other-direct-{owner_uuid}")
+        other = external_models.ExternalAccount(
+            project_id=uuid.uuid4() if peer_scope == "project" else account.project_id,
+            owner_user_uuid=owner_uuid,
+            provider="zulip",
+            external_account_id=(
+                "other.example.com:8" if peer_scope == "host" else "zulip.example.com:8"
+            ),
+            settings=account.settings,
+        )
+        other.insert()
+    zulip = mock.Mock()
+    zulip.get_messages.return_value = [_message_data(), _direct_message_data()]
+    monkeypatch.setattr(client, "ZulipClient", lambda current: zulip)
+    try:
+        before = datetime.datetime.now(datetime.timezone.utc)
+        task = _import_history(account)
+        after = datetime.datetime.now(datetime.timezone.utc)
+        assert task.status == "retry"
+        assert (
+            before + models.TASK_RETRY_DELAY
+            <= task.next_retry_at
+            <= after + models.TASK_RETRY_DELAY
+        )
+        assert "zulip.example.com:8" in task.error_description
+        assert _messages(account) == []
+        channels = models.ZulipChannel.objects.get_all(
+            filters={"external_account_uuid": filters.EQ(account.uuid)}
+        )
+        assert len(channels) == 1
+        assert channels[0].channel_type == "channel"
+    finally:
+        if other is not None:
+            other.delete()
 
 
 def test_history_import_saves_and_updates_messages_without_duplicates(
@@ -123,7 +284,6 @@ def test_history_import_saves_and_updates_messages_without_duplicates(
     zulip = mock.Mock()
     zulip.get_messages.return_value = [
         data,
-        {"id": 43, "type": "private"},
         _message_data(),
     ]
     monkeypatch.setattr(client, "ZulipClient", lambda current_account: zulip)
@@ -229,12 +389,9 @@ def test_history_import_keeps_accounts_and_projects_separate(
         other.delete()
 
 
-@pytest.mark.parametrize("data", [[], [{"id": 42, "type": "private"}]])
-def test_empty_or_private_history_import_succeeds_without_rows(
-    history_account, monkeypatch, data
-):
+def test_empty_history_import_succeeds_without_rows(history_account, monkeypatch):
     zulip = mock.Mock()
-    zulip.get_messages.return_value = data
+    zulip.get_messages.return_value = []
     monkeypatch.setattr(client, "ZulipClient", lambda account: zulip)
 
     assert _import_history(history_account).status == "done"
@@ -389,7 +546,7 @@ def test_message_uuid_and_project_migrations_backfill_and_round_trip(_database):
                     history_public_to_subscribers=True,
                     is_archived=False,
                 )
-                channel.insert()
+                conftest.seed_legacy_zulip_channel(db, channel)
                 message_row_uuid = uuid.uuid4()
                 expected[message_row_uuid] = uuid.UUID(message_uuid)
                 expected_projects[message_row_uuid] = account.project_id
@@ -440,32 +597,34 @@ def test_message_uuid_and_project_migrations_backfill_and_round_trip(_database):
                 content_times[1]
             )
 
-            stored = models.ZulipMessage.objects.get_all()
-            assert {
-                message.uuid: message.project_id for message in stored
-            } == expected_projects
+            stored = db.execute(
+                "SELECT uuid, project_id FROM bridge_zulip_v5_messages ORDER BY uuid"
+            ).fetchall()
+            assert dict(stored) == expected_projects
             with pytest.raises(psycopg.errors.NotNullViolation):
                 db.execute(
                     "UPDATE bridge_zulip_v5_messages SET message_uuid=NULL WHERE uuid=%s",
-                    (stored[0].uuid,),
+                    (stored[0][0],),
                 )
             with pytest.raises(psycopg.errors.NotNullViolation):
                 db.execute(
                     "UPDATE bridge_zulip_v5_messages SET project_id=NULL WHERE uuid=%s",
-                    (stored[0].uuid,),
+                    (stored[0][0],),
                 )
             with pytest.raises(psycopg.errors.ForeignKeyViolation):
                 db.execute(
                     "UPDATE bridge_zulip_v5_messages SET project_id=%s WHERE uuid=%s",
-                    (uuid.uuid4(), stored[0].uuid),
+                    (uuid.uuid4(), stored[0][0]),
                 )
             replacement_uuid = uuid.uuid4()
-            stored[0].message_uuid = replacement_uuid
-            stored[0].update()
-            restored = models.ZulipMessage.objects.get_one(
-                filters={"uuid": filters.EQ(stored[0].uuid)}
+            db.execute(
+                "UPDATE bridge_zulip_v5_messages SET message_uuid=%s WHERE uuid=%s",
+                (replacement_uuid, stored[0][0]),
             )
-            assert restored.message_uuid == replacement_uuid
+            assert db.execute(
+                "SELECT message_uuid FROM bridge_zulip_v5_messages WHERE uuid=%s",
+                (stored[0][0],),
+            ).fetchone() == (replacement_uuid,)
             before = db.execute(
                 "SELECT to_jsonb(message) - 'message_uuid' - 'project_id' "
                 "FROM bridge_zulip_v5_messages AS message ORDER BY uuid"
@@ -493,11 +652,19 @@ def test_message_uuid_and_project_migrations_backfill_and_round_trip(_database):
 
             engine.apply_migration(timestamp_migration)
 
-            assert {
-                message.uuid: message.message_uuid
-                for message in models.ZulipMessage.objects.get_all()
-            } == expected
-            assert {
-                message.uuid: message.project_id
-                for message in models.ZulipMessage.objects.get_all()
-            } == expected_projects
+            assert (
+                dict(
+                    db.execute(
+                        "SELECT uuid, message_uuid FROM bridge_zulip_v5_messages"
+                    ).fetchall()
+                )
+                == expected
+            )
+            assert (
+                dict(
+                    db.execute(
+                        "SELECT uuid, project_id FROM bridge_zulip_v5_messages"
+                    ).fetchall()
+                )
+                == expected_projects
+            )

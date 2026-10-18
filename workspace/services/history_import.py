@@ -51,7 +51,6 @@ class HistoryImportService(basic.BasicService):
             ),
             order_by={"priority": "desc", "created_at": "asc", "uuid": "asc"},
             limit=1,
-            locked=True,
         )
 
     def _execute_task(self, task: models.Task) -> None:

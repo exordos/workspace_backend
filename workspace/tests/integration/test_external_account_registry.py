@@ -3,10 +3,104 @@
 
 """External account registration and bridge initialization."""
 
+import concurrent.futures
+import time
 import uuid as sys_uuid
+
+import psycopg
+import pytest
 
 from workspace.bridges.zulip.dm import models as zulip_models
 from workspace.messenger_api import application_services
+from workspace.tests.integration import conftest
+
+
+@pytest.mark.parametrize("worker_write", ("account", "task"))
+def test_account_update_does_not_deadlock_with_an_import_transaction(
+    api, db, worker_write
+):
+    root = "/v1/messenger/external_accounts/"
+    account_uuid = sys_uuid.uuid4()
+    permissions = tuple(
+        f"workspace.external_account.{action}"
+        for action in ("create", "update", "delete")
+    )
+    path = root + str(account_uuid)
+    created = api.post(
+        root,
+        json={
+            "uuid": str(account_uuid),
+            "provider": "zulip",
+            "settings": {"api_key": "old-key"},
+        },
+        permissions=permissions,
+    )
+    assert created.status_code == 201, created.text
+    task_uuid = db.execute(
+        "SELECT uuid FROM bridge_zulip_v5_tasks WHERE external_account_uuid=%s",
+        (account_uuid,),
+    ).fetchone()[0]
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            with psycopg.connect(conftest.TEST_DB_URL) as worker:
+                worker.execute("SET LOCAL lock_timeout = '3s'")
+                if worker_write == "account":
+                    worker.execute(
+                        "UPDATE m_external_accounts_v2 SET status='backfill' WHERE uuid=%s",
+                        (account_uuid,),
+                    )
+                else:
+                    worker.execute(
+                        "UPDATE bridge_zulip_v5_tasks SET error_description='Processing' WHERE uuid=%s",
+                        (task_uuid,),
+                    )
+                update = executor.submit(
+                    api.put,
+                    path,
+                    json={"settings": {"api_key": "new-key"}},
+                    permissions=permissions,
+                )
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    waiting = db.execute(
+                        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
+                        "WHERE %s = ANY(pg_blocking_pids(pid)))",
+                        (worker.info.backend_pid,),
+                    ).fetchone()[0]
+                    if waiting:
+                        break
+                    time.sleep(0.01)
+                assert waiting, "Account update did not reach the competing transaction"
+                worker.execute(
+                    "INSERT INTO bridge_zulip_v5_channels "
+                    "(uuid, external_account_uuid, stream_uuid, stream_id, name, description, "
+                    "rendered_description, date_created, invite_only, is_web_public, "
+                    "history_public_to_subscribers, is_archived) "
+                    "VALUES (%s, %s, %s, 42, 'Concurrent import', '', '', 0, FALSE, FALSE, TRUE, FALSE)",
+                    (sys_uuid.uuid4(), account_uuid, sys_uuid.uuid4()),
+                )
+                worker.execute(
+                    "UPDATE bridge_zulip_v5_tasks SET status='done', error_description=NULL WHERE uuid=%s",
+                    (task_uuid,),
+                )
+            response = update.result(timeout=5)
+        assert response.status_code == 200, response.text
+        assert response.json()["status"] == "new"
+        assert response.json()["settings"] == {"api_key": "new-key"}
+        assert db.execute(
+            "SELECT status, settings FROM m_external_accounts_v2 WHERE uuid=%s",
+            (account_uuid,),
+        ).fetchone() == ("new", {"api_key": "new-key"})
+        assert db.execute(
+            "SELECT status FROM bridge_zulip_v5_tasks WHERE uuid=%s", (task_uuid,)
+        ).fetchone() == ("done",)
+        assert db.execute(
+            "SELECT COUNT(*) FROM bridge_zulip_v5_tasks "
+            "WHERE external_account_uuid=%s AND status='new'",
+            (account_uuid,),
+        ).fetchone() == (1,)
+    finally:
+        assert api.delete(path, permissions=permissions).status_code == 204
 
 
 def test_zulip_account_creation_queues_connection_initialization(api, db):

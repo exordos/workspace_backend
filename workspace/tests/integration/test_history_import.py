@@ -3,10 +3,8 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
-import concurrent.futures
 import datetime
 import json
-import threading
 from unittest import mock
 import uuid
 
@@ -665,7 +663,7 @@ def test_connection_response_controls_task_and_account_status(
         {"result": "error", "code": code, "msg": message}
     ).encode()
     session = mock.Mock()
-    session.get.return_value = response
+    session.request.return_value = response
     monkeypatch.setattr(client.requests, "Session", lambda: session)
 
     service = history_import.HistoryImportService()
@@ -690,7 +688,12 @@ def test_connection_response_controls_task_and_account_status(
         assert account.status == "error"
         assert account.error_description == description
     service._iteration()
-    session.get.assert_called_once()
+    session.request.assert_called_once_with(
+        "GET",
+        "https://zulip.example.com/api/v1/users/me",
+        params=None,
+        timeout=(5, 30),
+    )
     session.close.assert_called_once()
 
 
@@ -769,7 +772,7 @@ def test_error_hook_controls_the_next_retry_time(task_queue, monkeypatch):
     assert stored.next_retry_at == next_retry_at
 
 
-def test_workers_wait_for_locks_and_skip_leased_tasks(task_queue, monkeypatch):
+def test_worker_skips_leased_tasks(task_queue, monkeypatch):
     monkeypatch.setattr(
         models.InitializeConnectionContent, "on_done", lambda content, task: None
     )
@@ -782,39 +785,12 @@ def test_workers_wait_for_locks_and_skip_leased_tasks(task_queue, monkeypatch):
     )
     ready = task_queue(priority=1)
     executed = []
-    first_started = threading.Event()
-    release_first = threading.Event()
-    second_started = threading.Event()
-    second_finished = threading.Event()
-
-    def execute(content, task):
-        executed.append(task.uuid)
-        if task.uuid == first.uuid:
-            first_started.set()
-            assert release_first.wait(timeout=5)
-
-    def second_iteration():
-        second_started.set()
-        try:
-            history_import.HistoryImportService()._iteration()
-        finally:
-            second_finished.set()
-
-    monkeypatch.setattr(models.InitializeConnectionContent, "execute", execute)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as workers:
-        try:
-            first_worker = workers.submit(
-                history_import.HistoryImportService()._iteration
-            )
-            assert first_started.wait(timeout=5)
-            second_worker = workers.submit(second_iteration)
-            assert second_started.wait(timeout=5)
-            assert not second_finished.wait(timeout=0.1)
-        finally:
-            release_first.set()
-        first_worker.result(timeout=5)
-        second_worker.result(timeout=5)
-
+    monkeypatch.setattr(
+        models.InitializeConnectionContent,
+        "execute",
+        lambda content, task: executed.append(task.uuid),
+    )
+    history_import.HistoryImportService()._iteration()
     history_import.HistoryImportService()._iteration()
     assert executed == [first.uuid, ready.uuid]
     assert _stored(leased).status == "new"

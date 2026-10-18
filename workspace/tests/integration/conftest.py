@@ -455,6 +455,36 @@ def seed_legacy_external_account(conn, account):
     )
 
 
+def seed_legacy_zulip_channel(conn, channel):
+    """Seed channel schemas published before channel types were introduced."""
+    conn.execute(
+        """
+        INSERT INTO bridge_zulip_v5_channels
+            (uuid, external_account_uuid, stream_uuid, stream_id, name, description,
+             rendered_description, date_created, creator_id, invite_only,
+             is_web_public, history_public_to_subscribers, is_archived,
+             message_retention_days)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            channel.uuid,
+            channel.external_account_uuid,
+            channel.stream_uuid,
+            channel.stream_id,
+            channel.name,
+            channel.description,
+            channel.rendered_description,
+            channel.date_created,
+            channel.creator_id,
+            channel.invite_only,
+            channel.is_web_public,
+            channel.history_public_to_subscribers,
+            channel.is_archived,
+            channel.message_retention_days,
+        ),
+    )
+
+
 def seed_workspace_user(conn, user_uuid, username, status="active", last_ping_at=None):
     avatar = messenger_models.build_workspace_user_default_avatar(user_uuid)
     with conn.cursor() as cur:

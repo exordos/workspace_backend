@@ -1174,7 +1174,6 @@ class ExternalAccountController(ExternalResourceController):
         account = self.model.objects.get_one(
             filters=self._owner_filters({"uuid": dm_filters.EQ(uuid)}),
             session=session,
-            locked=True,
         )
         return application_services.ExternalAccountApplicationService.update(
             session,
