@@ -2472,6 +2472,8 @@ def _process_topic_membership_policy_rebuild(
           ON message.project_id = placement.project_id
          AND message.uuid = placement.message_uuid
         WHERE placement.project_id = %s AND placement.topic_uuid = %s
+          AND (message.source_name <> 'zulip'
+               OR placement.uuid <> messenger_uuid_v5(message.uuid, 'zulip-placement'))
           AND message.created_at < %s::timestamptz
           AND (
                 %s::timestamp IS NULL

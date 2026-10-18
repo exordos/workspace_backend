@@ -22,6 +22,7 @@ from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.dm import message_payloads
 from workspace.messenger_api.dm import models as messenger_models
 from workspace.messenger_api.dm import v2_models
+from workspace.services.messenger_workers import v2_projection
 from workspace.tests.integration import conftest
 from workspace.tests.integration import legacy_store
 
@@ -140,6 +141,12 @@ def _placement_states(account):
 
 def _placements(account):
     return v2_models.WorkspaceMessagePlacement.objects.get_all(
+        filters={"project_id": filters.EQ(account.project_id)}
+    )
+
+
+def _user_states(account):
+    return models.ZulipUserMessageState.objects.get_all(
         filters={"project_id": filters.EQ(account.project_id)}
     )
 
@@ -568,6 +575,7 @@ def test_batch_counts_a_shared_key_once_even_without_a_difference(message_source
     with contexts.Context().session_manager():
         state.do()
         _placement_states(account)[0].do()
+        _user_states(account)[0].do()
         assert models.ZulipMessageState.reconcile_batch(1) == 1
     assert _changes(models.ZulipMessageChange, account) == []
     assert _changes(v2_models.WorkspaceMessageChange, account) == []
@@ -587,6 +595,7 @@ def test_concurrent_updates_survive_batch_acknowledgement(
         with contexts.Context().session_manager():
             _states(account)[0].do()
             _placement_states(account)[0].do()
+            _user_states(account)[0].do()
         model = v2_models.WorkspaceMessageChange
         table = "messenger_messages"
     snapshot = _changes(model, account)[0]
@@ -1042,7 +1051,10 @@ def test_message_batch_creates_a_stable_placement_and_checks_both_api_projection
             params={"stream_uuid": str(placement.stream_uuid)},
         )
         assert response.status_code == 200, response.text
-        assert response.json() == []
+        assert [row["uuid"] for row in response.json()] == [str(placement.uuid)]
+        assert response.json()[0]["read"] is True
+        assert response.json()[0]["starred"] is True
+        assert response.json()[0]["mentioned"] is True
     finally:
         api_store.configure_store_factory(legacy_store.LegacyMessengerStoreFactory())
     assert _changes(models.ZulipMessageChange, account) == []
@@ -1053,7 +1065,7 @@ def test_message_batch_creates_a_stable_placement_and_checks_both_api_projection
     for table in ("messenger_user_message_bindings", "messenger_user_message_states"):
         assert db.execute(
             f"SELECT count(*) FROM {table} WHERE project_id = %s", (account.project_id,)
-        ).fetchone() == (0,)
+        ).fetchone() == (1,)
 
 
 @pytest.mark.parametrize("stream_id,subject", ((None, "Another topic"), (43, "")))
@@ -1291,4 +1303,286 @@ def test_parent_cleanup_waits_until_the_placement_has_moved(message_sources):
             }
         )
         is None
+    )
+
+
+def _viewer_rows(account, model):
+    return model.objects.get_all(filters={"project_id": filters.EQ(account.project_id)})
+
+
+def test_imported_user_flags_preserve_local_changes_until_a_new_zulip_snapshot(
+    message_sources,
+):
+    account, source = message_sources()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(10)
+    (state,) = _viewer_rows(account, v2_models.WorkspaceUserMessageState)
+    assert state.read_at == source.updated_at
+    assert state.zulip_source_uuid == source.uuid
+    assert state.zulip_flags_updated_at == source.updated_at
+    state.read_at = None
+    state.starred = False
+    state.pinned = True
+    state.update()
+    assert _user_states(account) == []
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(10)
+    (local,) = _viewer_rows(account, v2_models.WorkspaceUserMessageState)
+    assert local.read_at is None and not local.starred and local.pinned
+    source.mentioned = False
+    source.update()
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(10)
+    (updated,) = _viewer_rows(account, v2_models.WorkspaceUserMessageState)
+    assert updated.read_at is not None and updated.starred
+    assert not updated.mentioned and updated.pinned
+    assert (
+        updated.binding_uuid
+        == _viewer_rows(account, v2_models.WorkspaceUserMessageBinding)[0].uuid
+    )
+
+
+def test_rebinding_switches_message_access_and_authorship(message_sources, db):
+    account, source = message_sources()
+    old_owner = account.owner_user_uuid
+    _prepare(account)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(10)
+    (old_state,) = _viewer_rows(account, v2_models.WorkspaceUserMessageState)
+    new_owner = uuid.uuid4()
+    conftest.seed_workspace_user(db, new_owner, f"rebound-owner-{new_owner}")
+    account.properties["owner_user_uuid"].set_value_force(new_owner)
+    account.update()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(10)
+    (binding,) = _viewer_rows(account, v2_models.WorkspaceUserMessageBinding)
+    (state,) = _viewer_rows(account, v2_models.WorkspaceUserMessageState)
+    assert binding.user_uuid == state.user_uuid == new_owner
+    assert binding.relation_role == "author"
+    assert state.uuid != old_state.uuid
+    assert _messages(account)[0].author_uuid == new_owner
+    assert (
+        _viewer_rows(account, v2_models.WorkspaceUserMessage)[0].user_uuid == new_owner
+    )
+    assert db.execute(
+        "SELECT count(*) FROM messenger_user_message_states WHERE project_id=%s AND user_uuid=%s",
+        (account.project_id, old_owner),
+    ).fetchone() == (0,)
+
+
+def test_imported_false_flags_are_preserved(message_sources):
+    first, source = message_sources()
+    source.read = source.starred = source.mentioned = False
+    source.update()
+    _prepare(first)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(10)
+    (state,) = _viewer_rows(first, v2_models.WorkspaceUserMessageState)
+    assert state.zulip_source_uuid == source.uuid
+    assert state.read_at is None and not state.starred and not state.mentioned
+    assert len(_viewer_rows(first, v2_models.WorkspaceUserMessageBinding)) == 1
+
+
+def test_only_observing_account_owners_receive_message_access(message_sources):
+    first, source = message_sources()
+    second, other = message_sources(
+        project_id=first.project_id, sender_id=8, message_id=99
+    )
+    _prepare(first)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(10)
+    expected = {
+        (uuid.uuid5(first.project_id, str(source.message_uuid)), first.owner_user_uuid),
+        (uuid.uuid5(first.project_id, str(other.message_uuid)), second.owner_user_uuid),
+    }
+    actual = {
+        (row.canonical_message_uuid, row.user_uuid)
+        for row in _viewer_rows(first, v2_models.WorkspaceUserMessage)
+    }
+    assert actual == expected
+
+
+def test_native_history_rebuild_preserves_observed_zulip_access(message_sources):
+    first, source = message_sources()
+    second, other = message_sources(
+        project_id=first.project_id, sender_id=8, message_id=99
+    )
+    _prepare(first)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(10)
+    destination = v2_models.WorkspaceStreamTopic(
+        project_id=first.project_id,
+        stream_uuid=other.channel.stream_uuid,
+        name="Forwarded",
+    )
+    destination.insert()
+    forwarded = v2_models.WorkspaceMessagePlacement(
+        project_id=first.project_id,
+        message_uuid=uuid.uuid5(first.project_id, str(source.message_uuid)),
+        stream_uuid=other.channel.stream_uuid,
+        topic_uuid=destination.uuid,
+    )
+    forwarded.insert()
+    membership = messenger_models.WorkspaceStreamBinding.objects.get_one(
+        filters={
+            "project_id": filters.EQ(second.project_id),
+            "user_uuid": filters.EQ(second.owner_user_uuid),
+            "stream_uuid": filters.EQ(other.channel.stream_uuid),
+        }
+    )
+    membership.role = "owner"
+    membership.update()
+    with contexts.Context().session_manager() as session:
+        assert v2_projection.drain_projection_queue(session, str(uuid.uuid4())) > 0
+        assert (
+            session.execute(
+                "SELECT count(*) FROM messenger_projection_tasks "
+                "WHERE project_id = %s AND status IN ('failed', 'dead_letter')",
+                (first.project_id,),
+            ).fetchone()["count"]
+            == 0
+        )
+    visible = {
+        (row.uuid, row.user_uuid)
+        for row in _viewer_rows(first, v2_models.WorkspaceUserMessage)
+    }
+    assert visible == {
+        (
+            uuid.uuid5(
+                uuid.uuid5(first.project_id, str(source.message_uuid)),
+                "zulip-placement",
+            ),
+            first.owner_user_uuid,
+        ),
+        (
+            uuid.uuid5(
+                uuid.uuid5(first.project_id, str(other.message_uuid)), "zulip-placement"
+            ),
+            second.owner_user_uuid,
+        ),
+        (forwarded.uuid, second.owner_user_uuid),
+    }
+
+
+def test_removing_an_observation_revokes_its_owner_and_cascades_the_state(
+    message_sources,
+):
+    first, source = message_sources()
+    second, copy = message_sources(project_id=first.project_id, sender_id=8)
+    _prepare(first)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(10)
+    assert len(_viewer_rows(first, v2_models.WorkspaceUserMessage)) == 2
+    source.delete()
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(10)
+    assert [
+        row.user_uuid
+        for row in _viewer_rows(first, v2_models.WorkspaceUserMessageBinding)
+    ] == [second.owner_user_uuid]
+    assert [
+        row.user_uuid
+        for row in _viewer_rows(first, v2_models.WorkspaceUserMessageState)
+    ] == [second.owner_user_uuid]
+    assert len(_messages(first)) == 1
+
+
+def test_membership_generation_changes_rebuild_imported_state(message_sources):
+    account, source = message_sources()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(10)
+        models.ZulipMessageState.reconcile_batch(10)
+    (state,) = _viewer_rows(account, v2_models.WorkspaceUserMessageState)
+    state.pinned = True
+    state.update()
+    membership = v2_models.WorkspaceStreamBinding.objects.get_one(
+        filters={
+            "project_id": filters.EQ(account.project_id),
+            "user_uuid": filters.EQ(account.owner_user_uuid),
+            "stream_uuid": filters.EQ(source.channel.stream_uuid),
+        }
+    )
+    membership.properties["membership_generation"].set_value_force(
+        membership.membership_generation + 1
+    )
+    membership.update()
+    assert _viewer_rows(account, v2_models.WorkspaceUserMessage) == []
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(10)
+    (binding,) = _viewer_rows(account, v2_models.WorkspaceUserMessageBinding)
+    (updated,) = _viewer_rows(account, v2_models.WorkspaceUserMessageState)
+    assert (
+        binding.membership_generation
+        == updated.membership_generation
+        == membership.membership_generation
+    )
+    assert updated.uuid == state.uuid
+    assert updated.starred and updated.mentioned and updated.read_at is not None
+    assert not updated.pinned
+    assert len(_viewer_rows(account, v2_models.WorkspaceUserMessage)) == 1
+
+
+def test_user_binding_deletion_owns_state_cleanup_and_reconciliation_repairs_it(
+    message_sources,
+):
+    account, source = message_sources()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(10)
+    (binding,) = _viewer_rows(account, v2_models.WorkspaceUserMessageBinding)
+    binding.delete()
+    assert _viewer_rows(account, v2_models.WorkspaceUserMessageState) == []
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(10)
+    assert (
+        _viewer_rows(account, v2_models.WorkspaceUserMessageBinding)[0].uuid
+        == binding.uuid
+    )
+    assert len(_viewer_rows(account, v2_models.WorkspaceUserMessage)) == 1
+
+
+def test_user_state_failure_rolls_back_all_message_stages(message_sources, monkeypatch):
+    account, source = message_sources()
+    _prepare(account)
+    revision = _changes(models.ZulipMessageChange, account)[0].revision
+
+    def fail_insert(self, *args, **kwargs):
+        raise RuntimeError("Cannot save user flags")
+
+    monkeypatch.setattr(v2_models.WorkspaceUserMessageState, "insert", fail_insert)
+    with pytest.raises(RuntimeError, match="Cannot save user flags"):
+        with contexts.Context().session_manager():
+            models.ZulipMessageState.reconcile_batch(10)
+    assert _messages(account) == _placements(account) == []
+    assert _viewer_rows(account, v2_models.WorkspaceUserMessageBinding) == []
+    assert _changes(models.ZulipMessageChange, account)[0].revision == revision
+
+
+def test_user_message_migration_is_reversible_and_requeues_existing_placements(
+    message_sources, db
+):
+    account, source = message_sources()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        _states(account)[0].do()
+        _placement_states(account)[0].do()
+    engine = migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    migration = "0223-Reconcile-Zulip-user-message-bindings-and-states-6430fc.py"
+    engine.rollback_migration(migration)
+    try:
+        _clear_changes(db, account)
+        assert db.execute(
+            "SELECT to_regclass('bridge_zulip_v5_user_message_states')"
+        ).fetchone() == (None,)
+    finally:
+        engine.apply_migration(engine.get_latest_migration())
+    assert _user_states(account)[0].action == "create"
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(10)
+    assert (
+        _viewer_rows(account, v2_models.WorkspaceUserMessage)[0].user_uuid
+        == account.owner_user_uuid
     )

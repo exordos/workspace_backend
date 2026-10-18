@@ -36,6 +36,7 @@ from restalchemy.storage.sql import utils
 
 from workspace.bridges.zulip import client
 from workspace.common import models as common_models
+from workspace.common import types as common_types
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api.dm import base as messenger_base
 from workspace.messenger_api.dm import external_models
@@ -431,7 +432,7 @@ class ZulipMessageState(
         for project_id, message_uuid in batch:
             projects.setdefault(project_id, []).append(message_uuid)
         for project_id, message_uuids in projects.items():
-            for model in (cls, ZulipMessagePlacementState):
+            for model in (cls, ZulipMessagePlacementState, ZulipUserMessageState):
                 states = model.objects.get_all(
                     filters={
                         "project_id": filters.EQ(project_id),
@@ -528,6 +529,24 @@ class ZulipMessageState(
                 "source_name": filters.EQ(messenger_base.SourceName.ZULIP.value),
             },
         )
+        source = ZulipMessage.objects.get_one(
+            filters={"uuid": filters.EQ(self.source_uuid)}
+        )
+        observer = external_models.ExternalAccount.objects.get_one(
+            filters={"uuid": filters.EQ(source.external_account_uuid)}
+        )
+        author = external_models.ExternalAccount.objects.get_one(
+            filters={
+                "project_id": filters.EQ(self.project_id),
+                "provider": filters.EQ("zulip"),
+                "external_account_id": filters.EQ(
+                    f"{observer.get_host()}:{source.sender_id}"
+                ),
+            }
+        )
+        author_changed = message.author_uuid != author.owner_user_uuid
+        if author_changed:
+            message.properties["author_uuid"].set_value_force(author.owner_user_uuid)
         rows = session.execute(
             "SELECT content.uuid FROM bridge_zulip_v5_messages AS message "
             "JOIN m_external_accounts_v2 AS account "
@@ -553,7 +572,7 @@ class ZulipMessageState(
                 text = content.workspace_content
                 content_hash = content.workspace_content_hash
                 edited_at = content.workspace_content_updated_at
-        if (message.content_hash, message.content_updated_at) != (
+        if author_changed or (message.content_hash, message.content_updated_at) != (
             content_hash,
             edited_at,
         ):
@@ -664,6 +683,139 @@ class ZulipMessagePlacementState(
         placement.delete()
 
 
+class ZulipUserMessageState(
+    models.ModelWithID,
+    models.ModelWithProject,
+    orm.SQLStorableMixin,
+):
+    """Access and imported flags for owners of observed Zulip messages."""
+
+    __tablename__ = "bridge_zulip_v5_user_message_states"
+
+    project_id = properties.property(
+        types.UUID(), required=True, read_only=True, id_property=True
+    )
+    message_uuid = properties.property(
+        types.UUID(), required=True, read_only=True, id_property=True
+    )
+    user_uuid = properties.property(
+        types.UUID(), required=True, read_only=True, id_property=True
+    )
+    placement_uuid = properties.property(types.UUID(), required=True, read_only=True)
+    binding_uuid = properties.property(types.UUID(), required=True, read_only=True)
+    state_uuid = properties.property(types.UUID(), required=True, read_only=True)
+    source_uuid = properties.property(
+        types.AllowNone(types.UUID()), default=None, read_only=True
+    )
+    flags_updated_at = properties.property(
+        types.AllowNone(types.UTCDateTimeZ()), default=None, read_only=True
+    )
+    membership_generation = properties.property(
+        types.AllowNone(types.Integer(min_value=1)), default=None, read_only=True
+    )
+    relation_role = properties.property(
+        types.AllowNone(types.String()), default=None, read_only=True
+    )
+    read = properties.property(
+        types.AllowNone(types.Boolean()), default=None, read_only=True
+    )
+    starred = properties.property(
+        types.AllowNone(types.Boolean()), default=None, read_only=True
+    )
+    mentioned = properties.property(
+        types.AllowNone(types.Boolean()), default=None, read_only=True
+    )
+    action = properties.property(
+        types.Enum(["create", "update", "delete"]), required=True, read_only=True
+    )
+
+    @classmethod
+    def get_id_property(cls) -> dict[str, typing.Any]:
+        return cls.id_properties.copy()
+
+    def get_id(self) -> tuple[sys_uuid.UUID, sys_uuid.UUID, sys_uuid.UUID]:
+        return self.project_id, self.message_uuid, self.user_uuid
+
+    def do(self) -> None:
+        binding = v2_models.WorkspaceUserMessageBinding.objects.get_one_or_none(
+            filters={
+                "project_id": filters.EQ(self.project_id),
+                "uuid": filters.EQ(self.binding_uuid),
+            }
+        )
+        state = v2_models.WorkspaceUserMessageState.objects.get_one_or_none(
+            filters={
+                "project_id": filters.EQ(self.project_id),
+                "uuid": filters.EQ(self.state_uuid),
+            }
+        )
+        if self.action == "delete":
+            if binding is not None:
+                binding.delete()
+            elif state is not None:
+                state.delete()
+            return
+        permissions = {"read": True, "react": True, "star": True, "pin": True}
+        if binding is None:
+            binding = v2_models.WorkspaceUserMessageBinding(
+                uuid=self.binding_uuid,
+                project_id=self.project_id,
+                placement_uuid=self.placement_uuid,
+                user_uuid=self.user_uuid,
+                membership_generation=self.membership_generation,
+                relation_role=self.relation_role,
+                visibility="visible",
+                permissions=permissions,
+            )
+            binding.insert()
+        else:
+            binding.properties["membership_generation"].set_value_force(
+                self.membership_generation
+            )
+            binding.relation_role = self.relation_role
+            binding.visibility = "visible"
+            binding.permissions = permissions
+            binding.update()
+        if state is None:
+            v2_models.WorkspaceUserMessageState(
+                uuid=self.state_uuid,
+                project_id=self.project_id,
+                placement_uuid=self.placement_uuid,
+                user_uuid=self.user_uuid,
+                binding_uuid=binding.uuid,
+                membership_generation=self.membership_generation,
+                zulip_source_uuid=self.source_uuid,
+                zulip_flags_updated_at=self.flags_updated_at,
+                read_at=self.flags_updated_at if self.read else None,
+                starred=self.starred,
+                mentioned=self.mentioned,
+            ).insert()
+        else:
+            new_generation = state.membership_generation != self.membership_generation
+            if (
+                new_generation
+                or state.zulip_source_uuid != self.source_uuid
+                or state.zulip_flags_updated_at is None
+                or state.zulip_flags_updated_at < self.flags_updated_at
+            ):
+                state.read_at = (
+                    (state.read_at or self.flags_updated_at) if self.read else None
+                )
+                state.starred = self.starred
+                state.mentioned = self.mentioned
+                if new_generation:
+                    state.pinned = False
+            state.properties["binding_uuid"].set_value_force(binding.uuid)
+            state.properties["membership_generation"].set_value_force(
+                self.membership_generation
+            )
+            state.properties["zulip_source_uuid"].set_value_force(self.source_uuid)
+            state.properties["zulip_flags_updated_at"].set_value_force(
+                self.flags_updated_at
+            )
+            state.update()
+
+
 class ZulipChannel(
     models.ModelWithUUID,
     models.ModelWithTimestamp,
@@ -765,6 +917,17 @@ class ZulipMessage(
     """A message with account-specific flags."""
 
     __tablename__ = "bridge_zulip_v5_messages"
+
+    created_at = properties.property(
+        common_types.UTCDateTimeWithOffset(),
+        read_only=True,
+        default=lambda: datetime.datetime.now(datetime.timezone.utc),
+    )
+    updated_at = properties.property(
+        common_types.UTCDateTimeWithOffset(),
+        read_only=True,
+        default=lambda: datetime.datetime.now(datetime.timezone.utc),
+    )
 
     external_account_uuid = properties.property(
         types.UUID(),

@@ -11,6 +11,7 @@ the public message UUID is the placement UUID while the canonical UUID stays
 internal.
 """
 
+import datetime
 import typing
 import uuid as sys_uuid
 
@@ -21,6 +22,7 @@ from restalchemy.dm import types
 from restalchemy.storage.sql import orm
 
 from workspace.common import models as common_models
+from workspace.common import types as common_types
 from workspace.messenger_api.dm import base
 from workspace.messenger_api.dm import message_payloads
 
@@ -251,7 +253,28 @@ class WorkspaceUserMessageState(
     membership_generation = properties.property(
         types.Integer(min_value=1), required=True, read_only=True
     )
-    read_at = properties.property(types.AllowNone(types.UTCDateTimeZ()), default=None)
+    binding_uuid = properties.property(
+        types.AllowNone(types.UUID()), default=None, read_only=True
+    )
+    zulip_source_uuid = properties.property(
+        types.AllowNone(types.UUID()), default=None, read_only=True
+    )
+    zulip_flags_updated_at = properties.property(
+        types.AllowNone(types.UTCDateTimeZ()), default=None, read_only=True
+    )
+    created_at = properties.property(
+        common_types.UTCDateTimeWithOffset(),
+        read_only=True,
+        default=lambda: datetime.datetime.now(datetime.timezone.utc),
+    )
+    updated_at = properties.property(
+        common_types.UTCDateTimeWithOffset(),
+        read_only=True,
+        default=lambda: datetime.datetime.now(datetime.timezone.utc),
+    )
+    read_at = properties.property(
+        types.AllowNone(common_types.UTCDateTimeWithOffset()), default=None
+    )
     mentioned = properties.property(types.Boolean(), default=False)
     starred = properties.property(types.Boolean(), default=False)
     pinned = properties.property(types.Boolean(), default=False)
