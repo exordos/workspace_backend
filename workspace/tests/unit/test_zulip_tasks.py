@@ -6,6 +6,7 @@
 import contextlib
 import datetime
 import inspect
+import json
 from unittest import mock
 import uuid
 
@@ -171,11 +172,28 @@ def test_client_checks_credentials():
 
 def test_client_gets_channels_including_archived():
     session = mock.Mock()
-    channels = [{"stream_id": 42, "is_archived": True}]
-    session.request.return_value.json.return_value = {
-        "result": "success",
-        "streams": channels,
-    }
+    channels = [
+        {
+            "stream_id": 42,
+            "is_archived": True,
+            "is_muted": False,
+            "desktop_notifications": None,
+            "push_notifications": False,
+        }
+    ]
+    session.request.return_value.json.side_effect = [
+        {
+            "result": "success",
+            "queue_id": "subscriptions:1",
+            "subscriptions": channels,
+            "user_settings": {
+                "enable_stream_desktop_notifications": True,
+                "enable_stream_push_notifications": False,
+            },
+            "streams": [{"stream_id": 99}],
+        },
+        {"result": "success"},
+    ]
     account = external_models.ExternalAccount(
         project_id=uuid.uuid4(),
         owner_user_uuid=uuid.uuid4(),
@@ -188,15 +206,103 @@ def test_client_gets_channels_including_archived():
     )
     with mock.patch.object(client.requests, "Session", return_value=session):
         zulip = client.ZulipClient(account)
-        assert zulip.get_channels() == channels
+        assert zulip.get_channels() == [
+            {**channels[0], "notification_mode": "all_messages"}
+        ]
         zulip.close()
-    session.request.assert_called_once_with(
-        "GET",
-        "https://zulip.example.com/api/v1/streams",
-        params={"exclude_archived": "false"},
-        timeout=(5, 30),
+    assert session.request.call_args_list[0].args == (
+        "POST",
+        "https://zulip.example.com/api/v1/register",
     )
+    request = session.request.call_args_list[0].kwargs["data"]
+    assert json.loads(request["fetch_event_types"]) == ["subscription"]
+    assert json.loads(request["client_capabilities"]) == {
+        "notification_settings_null": True,
+        "user_settings_object": True,
+        "archived_channels": True,
+    }
+    assert request["event_types"] == "[]"
+    assert session.request.call_args_list[1].args == (
+        "DELETE",
+        "https://zulip.example.com/api/v1/events",
+    )
+    assert session.request.call_args_list[1].kwargs["data"] == {
+        "queue_id": "subscriptions:1"
+    }
     session.close.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "muted,desktop,push,default_desktop,default_push,expected",
+    [
+        (True, True, True, True, True, "mentions_only"),
+        (True, None, None, False, False, "mentions_only"),
+        (False, True, False, False, False, "all_messages"),
+        (False, False, True, False, False, "all_messages"),
+        (False, None, None, True, False, "all_messages"),
+        (False, None, None, False, True, "all_messages"),
+        (False, False, False, True, True, "all_messages"),
+        (False, None, None, False, False, "all_messages"),
+    ],
+)
+def test_subscription_mode_depends_on_muting_not_delivery_settings(
+    muted, desktop, push, default_desktop, default_push, expected
+):
+    session = mock.Mock()
+    session.request.return_value.json.side_effect = [
+        {
+            "result": "success",
+            "queue_id": "subscriptions:1",
+            "subscriptions": [
+                {
+                    "is_muted": muted,
+                    "desktop_notifications": desktop,
+                    "push_notifications": push,
+                }
+            ],
+            "user_settings": {
+                "enable_stream_desktop_notifications": default_desktop,
+                "enable_stream_push_notifications": default_push,
+            },
+        },
+        {"result": "success"},
+    ]
+    with mock.patch.object(client.requests, "Session", return_value=session):
+        zulip = client.ZulipClient(
+            mock.Mock(
+                settings={
+                    "server_url": "https://zulip.example.com",
+                    "email": "owner@example.com",
+                    "api_key": "test-key",
+                }
+            )
+        )
+        assert zulip.get_channels()[0]["notification_mode"] == expected
+        zulip.close()
+
+
+def test_subscription_queue_is_deleted_when_snapshot_processing_fails():
+    session = mock.Mock()
+    session.request.return_value.json.side_effect = [
+        {"result": "success", "queue_id": "subscriptions:1", "subscriptions": [{}]},
+        {"result": "success"},
+    ]
+    with mock.patch.object(client.requests, "Session", return_value=session):
+        zulip = client.ZulipClient(
+            mock.Mock(
+                settings={
+                    "server_url": "https://zulip.example.com",
+                    "email": "owner@example.com",
+                    "api_key": "test-key",
+                }
+            )
+        )
+        with pytest.raises(KeyError, match="is_muted"):
+            zulip.get_channels()
+        zulip.close()
+    assert session.request.call_args_list[-1].kwargs["data"] == {
+        "queue_id": "subscriptions:1"
+    }
 
 
 def test_client_gets_active_inactive_and_system_users():

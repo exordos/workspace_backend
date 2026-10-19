@@ -25,7 +25,7 @@ from workspace.messenger_api.dm import v2_models
 from workspace.tests.integration import conftest
 
 
-def _channel(account, stream_id=42):
+def _channel(account, stream_id=42, connection=None):
     channel = models.ZulipChannel(
         external_account_uuid=account.uuid,
         stream_uuid=uuid.uuid5(
@@ -41,7 +41,10 @@ def _channel(account, stream_id=42):
         history_public_to_subscribers=True,
         is_archived=False,
     )
-    channel.insert()
+    if connection is None:
+        channel.insert()
+    else:
+        conftest.seed_legacy_zulip_channel(connection, channel)
     return channel
 
 
@@ -108,6 +111,34 @@ def _import_history(account, first=40, last=44):
         assert isinstance(restored.content, models.ImportHistoryContent)
         restored.execute()
     return models.Task.objects.get_one(filters={"uuid": filters.EQ(task.uuid)})
+
+
+def test_history_skips_unsubscribed_channels_without_creating_topics(
+    history_account, monkeypatch
+):
+    account = history_account
+    zulip = mock.Mock()
+    zulip.get_messages.return_value = [
+        _message_data(40, stream_id=999, subject="Unsubscribed"),
+        _message_data(42),
+        _message_data(44, stream_id=999, subject="Still unsubscribed"),
+    ]
+    monkeypatch.setattr(client, "ZulipClient", lambda current: zulip)
+    assert _import_history(account).status == "done"
+    messages = models.ZulipMessage.objects.get_all(
+        filters={"project_id": filters.EQ(account.project_id)}
+    )
+    assert [message.message_id for message in messages] == [42]
+    assert (
+        models.ZulipTopic.objects.get_all(filters={"name": filters.EQ("Unsubscribed")})
+        == []
+    )
+    assert [
+        channel.stream_id
+        for channel in models.ZulipChannel.objects.get_all(
+            filters={"external_account_uuid": filters.EQ(account.uuid)}
+        )
+    ] == [42]
 
 
 def _direct_message_data(message_id=43, user_ids=(7, 8), **values):
@@ -327,7 +358,8 @@ def test_topic_identity_migration_merges_accounts_and_preserves_messages(_databa
                 settings={"server_url": "https://zulip.example.com"},
             )
             account.insert()
-            channel = _channel(account)
+            with psycopg.connect(database_url, autocommit=True) as connection:
+                channel = _channel(account, connection=connection)
             for message_id, subject in enumerate(("Planning", "", "General Topic"), 42):
                 canonical_uuid = uuid.uuid5(channel.stream_uuid, subject)
                 topic = models.ZulipTopic(
@@ -875,9 +907,7 @@ def test_empty_history_import_succeeds_without_rows(history_account, monkeypatch
     zulip.close.assert_called_once_with()
 
 
-@pytest.mark.parametrize(
-    "phase", ["timeout", "401", "503", "validation", "close", "channel"]
-)
+@pytest.mark.parametrize("phase", ["timeout", "401", "503", "validation", "close"])
 def test_history_import_errors_roll_back_partial_changes(
     history_account, monkeypatch, db, phase
 ):
@@ -911,8 +941,6 @@ def test_history_import_errors_roll_back_partial_changes(
         zulip.get_messages.return_value[1]["sender_id"] = 0
     elif phase == "close":
         zulip.close.side_effect = RuntimeError("Close failed")
-    else:
-        zulip.get_messages.return_value[1]["stream_id"] = 999
 
     task = _import_history(account)
 

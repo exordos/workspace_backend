@@ -4,6 +4,7 @@
 # not use this file except in compliance with the License.
 
 import datetime
+from unittest import mock
 import uuid
 
 import psycopg
@@ -13,6 +14,7 @@ from restalchemy.dm import filters
 from restalchemy.storage import exceptions as storage_exceptions
 from restalchemy.storage.sql import migrations
 
+from workspace.bridges.zulip import client
 from workspace.bridges.zulip.dm import models
 from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.dm import event_payloads
@@ -54,6 +56,10 @@ def stream_state_account(_database, db):
     )
     db.execute(
         "DELETE FROM bridge_zulip_v5_topic_changes WHERE project_id = %s",
+        (account.project_id,),
+    )
+    db.execute(
+        "DELETE FROM bridge_zulip_v5_message_counter_changes WHERE project_id=%s",
         (account.project_id,),
     )
 
@@ -173,6 +179,7 @@ def test_binding_states_show_only_required_actions(
             user_uuid=account.owner_user_uuid,
             binding_uuid=binding_uuid,
             action=action,
+            notification_mode=None,
         )
         assert state.get_id() == (
             account.project_id,
@@ -308,7 +315,7 @@ def test_binding_state_preserves_identity_across_leave_and_rejoin(
     ).fetchone() == ("stream.created",)
 
 
-@pytest.mark.parametrize("action", ["create", "delete"])
+@pytest.mark.parametrize("action", ["create", "update", "delete"])
 def test_binding_state_uses_current_transaction(stream_state_account, db, action):
     account = stream_state_account
     stream_uuid = uuid.uuid4()
@@ -319,6 +326,8 @@ def test_binding_state_uses_current_transaction(stream_state_account, db, action
         conftest.seed_user_stream_binding(
             db, account.project_id, stream_uuid, account.owner_user_uuid
         )
+        if action == "update":
+            _channel(account, stream_uuid, notification_mode="muted")
     (state,) = _binding_states(account)
     with pytest.raises(RuntimeError, match="Rollback binding"):
         with contexts.Context().session_manager():
@@ -331,6 +340,235 @@ def test_binding_state_uses_current_transaction(stream_state_account, db, action
         "SELECT count(*) FROM m_workspace_visible_events WHERE project_id = %s",
         (account.project_id,),
     ).fetchone() == (0,)
+    assert (
+        models.ZulipMessageCounterChange.objects.get_all(
+            filters={"project_id": filters.EQ(account.project_id)}
+        )
+        == []
+    )
+
+
+@pytest.mark.parametrize(
+    "initial,changed",
+    [
+        ("muted", "mentions_only"),
+        ("mentions_only", "all_messages"),
+        ("all_messages", "muted"),
+    ],
+)
+def test_subscription_notifications_create_and_update_the_existing_binding(
+    stream_state_account, db, initial, changed
+):
+    account = stream_state_account
+    stream_uuid = uuid.uuid4()
+    _stream(db, account, stream_uuid, "zulip")
+    channel = _channel(account, stream_uuid)
+    channel.notification_mode = initial
+    channel.update()
+    with contexts.Context().session_manager():
+        (state,) = _binding_states(account)
+        state.do()
+    binding = v2_models.WorkspaceStreamBinding.objects.get_one(
+        filters={"project_id": filters.EQ(account.project_id)}
+    )
+    assert binding.notification_mode == initial
+    identity = binding.uuid, binding.membership_generation, binding.role
+    channel.notification_mode = changed
+    channel.update()
+    (state,) = _binding_states(account)
+    assert state.action == "update" and state.notification_mode == changed
+    with contexts.Context().session_manager():
+        state.do()
+    updated = v2_models.WorkspaceStreamBinding.objects.get_one(
+        filters={"project_id": filters.EQ(account.project_id)}
+    )
+    assert updated.notification_mode == changed
+    assert (updated.uuid, updated.membership_generation, updated.role) == identity
+    assert _binding_states(account) == []
+    (counter,) = models.ZulipMessageCounterChange.objects.get_all(
+        filters={"project_id": filters.EQ(account.project_id)}
+    )
+    assert counter.scope_kind == "user-stream" and counter.scope_uuid == stream_uuid
+    assert (
+        messenger_models.WorkspaceStreamBinding.objects.get_one(
+            filters={"project_id": filters.EQ(account.project_id)}
+        ).notification_mode
+        == changed
+    )
+
+
+@pytest.mark.parametrize(
+    "muted,previous,expected",
+    [(False, "mentions_only", "all_messages"), (True, "muted", "mentions_only")],
+)
+def test_subscription_snapshot_repairs_notification_modes_from_channel_muting(
+    stream_state_account, db, monkeypatch, muted, previous, expected
+):
+    account = stream_state_account
+    account.settings = {
+        **account.settings,
+        "email": "agent@example.com",
+        "api_key": "test-key",
+    }
+    account.update()
+    stream_uuid = uuid.uuid5(uuid.uuid5(uuid.NAMESPACE_DNS, account.get_host()), "24")
+    _stream(db, account, stream_uuid, "zulip")
+    channel = _channel(
+        account, stream_uuid, stream_id=24, name="TokenTech", notification_mode=previous
+    )
+    with contexts.Context().session_manager():
+        _binding_states(account)[0].do()
+    binding = v2_models.WorkspaceStreamBinding.objects.get_one(
+        filters={"project_id": filters.EQ(account.project_id)}
+    )
+    http = mock.Mock()
+    http.request.return_value.json.side_effect = [
+        {
+            "result": "success",
+            "queue_id": "subscriptions:1",
+            "subscriptions": [
+                {
+                    **channel.as_plain_dict(),
+                    "is_muted": muted,
+                    "desktop_notifications": None,
+                    "push_notifications": None,
+                }
+            ],
+            "user_settings": {
+                "enable_stream_desktop_notifications": False,
+                "enable_stream_push_notifications": False,
+            },
+        },
+        {"result": "success"},
+    ]
+    monkeypatch.setattr(client.requests, "Session", lambda: http)
+    task = models.Task(
+        project_id=account.project_id,
+        external_account_uuid=account.uuid,
+        content=models.ImportChannelsContent(),
+    )
+    task.insert()
+    with contexts.Context().session_manager():
+        task.execute()
+        assert task.status == "done", task.error_description
+        (state,) = _binding_states(account)
+        assert state.action == "update" and state.notification_mode == expected
+        state.do()
+    restored = models.ZulipChannel.objects.get_one(
+        filters={"uuid": filters.EQ(channel.uuid)}
+    )
+    assert restored.notification_mode == expected
+    updated = v2_models.WorkspaceStreamBinding.objects.get_one(
+        filters={"project_id": filters.EQ(account.project_id)}
+    )
+    assert updated.notification_mode == expected
+    assert (updated.uuid, updated.membership_generation) == (
+        binding.uuid,
+        binding.membership_generation,
+    )
+    assert _binding_states(account) == []
+    http.close.assert_called_once()
+
+
+def test_subscription_migration_preserves_bindings_and_reschedules_snapshots(
+    stream_state_account, db
+):
+    account = stream_state_account
+    stream_uuid = uuid.uuid4()
+    _stream(db, account, stream_uuid, "zulip")
+    channel = _channel(account, stream_uuid)
+    with contexts.Context().session_manager():
+        _binding_states(account)[0].do()
+    binding = v2_models.WorkspaceStreamBinding.objects.get_one(
+        filters={"project_id": filters.EQ(account.project_id)}
+    )
+    task = models.Task(
+        project_id=account.project_id,
+        external_account_uuid=account.uuid,
+        priority=models.TASK_PRIORITY_IMPORT_CHANNELS,
+        not_before_at=datetime.datetime.now(datetime.timezone.utc)
+        + datetime.timedelta(minutes=15),
+        content=models.ImportChannelsContent(),
+    )
+    task.insert()
+    engine = migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    migration = "0226-Import-Zulip-subscriptions-and-notification-preferences-e30387.py"
+    engine.rollback_migration(migration)
+    try:
+        assert (
+            db.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name='bridge_zulip_v5_channels' AND column_name='notification_mode'"
+            ).fetchone()
+            is None
+        )
+        assert db.execute(
+            "SELECT uuid FROM bridge_zulip_v5_channels WHERE uuid=%s", (channel.uuid,)
+        ).fetchone() == (channel.uuid,)
+    finally:
+        engine.apply_migration(engine.get_latest_migration())
+    restored = models.ZulipChannel.objects.get_one(
+        filters={"uuid": filters.EQ(channel.uuid)}
+    )
+    assert restored.notification_mode is None and _binding_states(account) == []
+    assert (
+        v2_models.WorkspaceStreamBinding.objects.get_one(
+            filters={"uuid": filters.EQ(binding.uuid)}
+        ).as_plain_dict()
+        == binding.as_plain_dict()
+    )
+    pending = models.Task.objects.get_one(filters={"uuid": filters.EQ(task.uuid)})
+    assert pending.status == "new" and pending.not_before_at is None
+
+
+def test_unverified_notification_snapshot_preserves_local_preferences(
+    stream_state_account, db
+):
+    account = stream_state_account
+    stream_uuid = uuid.uuid4()
+    _stream(db, account, stream_uuid, "zulip")
+    channel = _channel(account, stream_uuid)
+    with contexts.Context().session_manager():
+        _binding_states(account)[0].do()
+    db.execute(
+        "UPDATE messenger_stream_bindings SET notification_mode='muted' WHERE project_id=%s",
+        (account.project_id,),
+    )
+    assert channel.notification_mode is None and _binding_states(account) == []
+
+
+def test_unsubscribing_revokes_only_the_accounts_stream_binding(
+    stream_state_account, db
+):
+    first = stream_state_account
+    stream_uuid = uuid.uuid4()
+    _stream(db, first, stream_uuid, "zulip")
+    channel = _channel(first, stream_uuid)
+    owner = uuid.uuid4()
+    conftest.seed_workspace_user(db, owner, f"subscription-owner-{owner}")
+    other = external_models.ExternalAccount(
+        project_id=first.project_id,
+        owner_user_uuid=owner,
+        provider="zulip",
+        settings=first.settings,
+    )
+    other.insert()
+    _channel(other, stream_uuid)
+    with contexts.Context().session_manager():
+        models.ZulipProjectUserState.objects.get_all(
+            filters={"project_id": filters.EQ(first.project_id)}
+        )[0].do()
+        for state in _binding_states(first):
+            state.do()
+    channel.delete()
+    (state,) = _binding_states(first)
+    assert state.action == "delete" and state.user_uuid == first.owner_user_uuid
+    with contexts.Context().session_manager():
+        state.do()
+    memberships = v2_models.WorkspaceStreamBinding.objects.get_all(
+        filters={"project_id": filters.EQ(first.project_id), "active": filters.EQ(True)}
+    )
+    assert [binding.user_uuid for binding in memberships] == [owner]
 
 
 @pytest.mark.parametrize(

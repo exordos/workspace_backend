@@ -1631,6 +1631,49 @@ def _refresh_counters():
     return task
 
 
+@pytest.mark.parametrize(
+    "mode,mentioned,active",
+    [
+        ("mentions_only", False, 0),
+        ("mentions_only", True, 1),
+        ("muted", False, 0),
+        ("muted", True, 0),
+    ],
+)
+def test_subscription_notifications_queue_topic_and_stream_counter_refresh(
+    message_sources, mode, mentioned, active
+):
+    account, source = message_sources()
+    source.read = False
+    source.mentioned = mentioned
+    source.update()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(100)
+    _refresh_counters()
+    (before,) = _viewer_rows(account, v2_models.WorkspaceStreamBinding)
+    assert before.active_unread_count == 1
+    source.channel.notification_mode = mode
+    source.channel.update()
+    with contexts.Context().session_manager():
+        (state,) = models.ZulipStreamBindingState.objects.get_all(
+            filters={"project_id": filters.EQ(account.project_id)}
+        )
+        state.do()
+    changes = _changes(models.ZulipMessageCounterChange, account)
+    assert {row.scope_uuid for row in changes} == {
+        source.channel.stream_uuid,
+        source.topic.uuid,
+    }
+    (pending,) = _viewer_rows(account, v2_models.WorkspaceStreamBinding)
+    assert pending.notification_mode == mode and pending.active_unread_count == 1
+    _refresh_counters()
+    (stream,) = _viewer_rows(account, v2_models.WorkspaceStreamBinding)
+    (topic,) = _viewer_rows(account, v2_models.WorkspaceUserTopicBinding)
+    assert stream.active_unread_count == topic.active_unread_count == active
+    assert stream.passive_unread_count == topic.passive_unread_count == 1 - active
+
+
 def test_counter_refresh_combines_imports_and_updates_previews_and_folders(
     message_sources, db
 ):

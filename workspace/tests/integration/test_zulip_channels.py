@@ -49,6 +49,7 @@ def _channel_data(stream_id=42, **values):
         "history_public_to_subscribers": True,
         "is_archived": False,
         "message_retention_days": None,
+        "notification_mode": "all_messages",
         **values,
     }
 
@@ -431,13 +432,11 @@ def test_channel_type_migration_preserves_channels_and_enforces_direct_reference
                 migrations_path=str(conftest.MIGRATIONS_DIR)
             )
             engine.apply_migration(migration)
-            restored = models.ZulipChannel.objects.get_one(
-                filters={"uuid": filters.EQ(legacy.uuid)}
-            )
-            assert restored.channel_type == "channel"
-            assert restored.direct_user_uuid is None
-            assert restored.stream_uuid == legacy.stream_uuid
-            assert restored.stream_id == 42
+            assert db.execute(
+                "SELECT channel_type, direct_user_uuid, stream_uuid, stream_id "
+                "FROM bridge_zulip_v5_channels WHERE uuid=%s",
+                (legacy.uuid,),
+            ).fetchone() == ("channel", None, legacy.stream_uuid, 42)
             direct = models.ZulipChannel(
                 external_account_uuid=source.uuid,
                 stream_uuid=uuid.uuid4(),
@@ -445,14 +444,28 @@ def test_channel_type_migration_preserves_channels_and_enforces_direct_reference
                 direct_user_uuid=peer.uuid,
                 **{**_channel_data(), "stream_id": None, "date_created": None},
             )
-            direct.insert()
             group = models.ZulipChannel(
                 external_account_uuid=source.uuid,
                 stream_uuid=uuid.uuid4(),
                 channel_type="group",
                 **{**_channel_data(), "stream_id": None, "date_created": None},
             )
-            group.insert()
+            for channel in (direct, group):
+                db.execute(
+                    "INSERT INTO bridge_zulip_v5_channels "
+                    "(uuid, external_account_uuid, stream_uuid, channel_type, "
+                    "direct_user_uuid, name, description, rendered_description, "
+                    "invite_only, is_web_public, history_public_to_subscribers, is_archived) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, '', '', false, false, true, false)",
+                    (
+                        channel.uuid,
+                        channel.external_account_uuid,
+                        channel.stream_uuid,
+                        channel.channel_type,
+                        channel.direct_user_uuid,
+                        channel.name,
+                    ),
+                )
             with pytest.raises(psycopg.errors.ForeignKeyViolation):
                 db.execute(
                     "UPDATE bridge_zulip_v5_channels SET direct_user_uuid=%s WHERE uuid=%s",
@@ -475,9 +488,10 @@ def test_channel_type_migration_preserves_channels_and_enforces_direct_reference
                 )
             peer.delete()
             assert (
-                models.ZulipChannel.objects.get_one_or_none(
-                    filters={"uuid": filters.EQ(direct.uuid)}
-                )
+                db.execute(
+                    "SELECT uuid FROM bridge_zulip_v5_channels WHERE uuid=%s",
+                    (direct.uuid,),
+                ).fetchone()
                 is None
             )
             group.delete()

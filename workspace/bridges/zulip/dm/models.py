@@ -293,8 +293,20 @@ class ZulipStreamBindingState(
         types.UUID(), required=True, read_only=True, id_property=True
     )
     binding_uuid = properties.property(types.UUID(), required=True, read_only=True)
+    notification_mode = properties.property(
+        types.AllowNone(
+            types.Enum(
+                [
+                    mode.value
+                    for mode in messenger_models.WorkspaceStreamNotificationMode
+                ]
+            )
+        ),
+        default=None,
+        read_only=True,
+    )
     action = properties.property(
-        types.Enum(["create", "delete"]), required=True, read_only=True
+        types.Enum(["create", "update", "delete"]), required=True, read_only=True
     )
 
     @classmethod
@@ -307,6 +319,7 @@ class ZulipStreamBindingState(
     def do(self) -> None:
         {
             "create": self.create_workspace_binding,
+            "update": self.update_workspace_binding,
             "delete": self.delete_workspace_binding,
         }[self.action]()
 
@@ -321,6 +334,55 @@ class ZulipStreamBindingState(
             binding_uuids={str(self.user_uuid): self.binding_uuid},
             session=contexts.Context().get_session(),
         )
+        if self.notification_mode is not None:
+            self.update_workspace_binding()
+
+    def update_workspace_binding(self) -> None:
+        session = contexts.Context().get_session()
+        messenger_helpers._lock_workspace_project_event_writes(self.project_id, session)
+        messenger_helpers._lock_workspace_stream_binding(
+            self.project_id, self.binding_uuid, session
+        )
+        binding = v2_models.WorkspaceStreamBinding.objects.get_one(
+            filters={
+                "project_id": filters.EQ(self.project_id),
+                "uuid": filters.EQ(self.binding_uuid),
+            }
+        )
+        if binding.notification_mode == self.notification_mode:
+            return
+        session.execute(
+            "UPDATE messenger_stream_bindings SET notification_mode=%s, "
+            "notification_updated_at=NOW(), updated_at=NOW() "
+            "WHERE project_id=%s AND uuid=%s AND active",
+            (self.notification_mode, self.project_id, self.binding_uuid),
+        )
+        topic_uuids = (
+            messenger_helpers._normalize_workspace_user_stream_topic_notification_modes(
+                project_id=self.project_id,
+                user_uuid=self.user_uuid,
+                stream_uuid=self.stream_uuid,
+                notification_mode=self.notification_mode,
+                session=session,
+            )
+        )
+        ZulipMessageCounterChange.mark_many(
+            {
+                (self.project_id, self.user_uuid, self.stream_uuid, None),
+                *(
+                    (self.project_id, self.user_uuid, self.stream_uuid, topic)
+                    for topic in topic_uuids
+                ),
+            }
+        )
+        stream = v2_models.WorkspaceUserStream.objects.get_one(
+            filters={
+                "project_id": filters.EQ(self.project_id),
+                "uuid": filters.EQ(self.stream_uuid),
+                "user_uuid": filters.EQ(self.user_uuid),
+            }
+        )
+        messenger_events.create_stream_updated_event(stream, session=session)
 
     def delete_workspace_binding(self) -> None:
         messenger_helpers.delete_workspace_stream_binding(
@@ -525,7 +587,9 @@ class ZulipMessageCounterChange(
     @classmethod
     def mark_many(
         cls,
-        scopes: set[tuple[sys_uuid.UUID, sys_uuid.UUID, sys_uuid.UUID, sys_uuid.UUID]],
+        scopes: set[
+            tuple[sys_uuid.UUID, sys_uuid.UUID, sys_uuid.UUID, sys_uuid.UUID | None]
+        ],
     ) -> None:
         if not scopes:
             return
@@ -540,6 +604,7 @@ class ZulipMessageCounterChange(
             )
             for project, user, stream, topic in scopes
             for kind, scope in (("user-stream", stream), ("user-topic", topic))
+            if scope is not None
         }
         columns = list(zip(*rows))
         contexts.Context().get_session().execute(
@@ -1059,6 +1124,18 @@ class ZulipChannel(
     orm.SQLStorableMixin,
 ):
     __tablename__ = "bridge_zulip_v5_channels"
+
+    notification_mode = properties.property(
+        types.AllowNone(
+            types.Enum(
+                [
+                    mode.value
+                    for mode in messenger_models.WorkspaceStreamNotificationMode
+                ]
+            )
+        ),
+        default=None,
+    )
 
     external_account_uuid = properties.property(types.UUID(), required=True)
     channel_type = properties.property(
@@ -1621,6 +1698,7 @@ class ImportChannelsContent(AbstractZulipTaskContent):
                         "history_public_to_subscribers",
                         "is_archived",
                         "message_retention_days",
+                        "notification_mode",
                     )
                 }
                 values["stream_uuid"] = sys_uuid.uuid5(
@@ -1702,13 +1780,15 @@ class ImportHistoryContent(AbstractZulipTaskContent):
         try:
             for data in zulip.get_messages(self.first_message_id, self.last_message_id):
                 if data["type"] == "stream":
-                    channel = ZulipChannel.objects.get_one(
+                    channel = ZulipChannel.objects.get_one_or_none(
                         filters={
                             "external_account_uuid": filters.EQ(account.uuid),
                             "channel_type": filters.EQ(ZulipChannelType.CHANNEL.value),
                             "stream_id": filters.EQ(data["stream_id"]),
                         },
                     )
+                    if channel is None:
+                        continue
                 else:
                     if account.external_account_id is None:
                         raise ExternalAccountIdPendingError(

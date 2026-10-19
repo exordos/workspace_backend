@@ -3,6 +3,7 @@
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License.
 
+import json
 import typing
 
 import requests
@@ -65,7 +66,35 @@ class ZulipClient:
             self._request("DELETE", "/events", data={"queue_id": data["queue_id"]})
 
     def get_channels(self) -> list[dict]:
-        return self._get("/streams", params={"exclude_archived": "false"})["streams"]
+        data = self._request(
+            "POST",
+            "/register",
+            data={
+                "event_types": "[]",
+                "fetch_event_types": '["subscription"]',
+                "client_capabilities": json.dumps(
+                    {
+                        "notification_settings_null": True,
+                        "user_settings_object": True,
+                        "archived_channels": True,
+                    }
+                ),
+            },
+        )
+        try:
+            # Workspace modes classify unread messages, independently of popup
+            # delivery settings. Muted Zulip channels still notify on mentions.
+            return [
+                {
+                    **subscription,
+                    "notification_mode": (
+                        "mentions_only" if subscription["is_muted"] else "all_messages"
+                    ),
+                }
+                for subscription in data["subscriptions"]
+            ]
+        finally:
+            self._request("DELETE", "/events", data={"queue_id": data["queue_id"]})
 
     def get_last_message_id(self) -> int:
         messages = self._get(
