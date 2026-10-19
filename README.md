@@ -48,6 +48,13 @@ The history import service executes durable bridge tasks in priority order. The
 `[history_import] step_interval` option controls idle checks (default: three
 seconds); successful work continues immediately.
 
+Message reconciliation acknowledges the revisions it read before processing.
+Migration 0236 prevents its own writes from marking those messages again, scoped
+to the current connection and batch of project/message pairs. Concurrent writers
+and changes outside that batch still advance revisions and remain queued. The
+scope is restored before acknowledgement and rolls back with failed processing.
+Messages that still differ after processing keep their original queue entries.
+
 The Zulip realtime service runs one asyncio poller per verified, enabled account
 with an API key. It reconciles accounts at startup, on PostgreSQL notifications,
 and every `[zulip_realtime] step_interval` seconds (default: one second). Changing

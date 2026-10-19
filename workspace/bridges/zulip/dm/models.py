@@ -861,36 +861,70 @@ class ZulipMessageState(
             for change in model.objects.get_all(limit=limit):
                 changes.setdefault(change.get_id(), []).append(change)
         batch = dict(list(changes.items())[:limit])
+        if not batch:
+            return 0
         projects = {}
         for project_id, message_uuid in batch:
             projects.setdefault(project_id, []).append(message_uuid)
         counter_scopes = set()
+        # Suppress only our own marks for this batch. Other connections still
+        # advance revisions, so acknowledgement below cannot consume their work.
+        with utils.savepoint(name="zulip_message_reconciliation") as session:
+            previous_batch = session.execute(
+                "SELECT current_setting('workspace.zulip_reconciliation_batch', true) AS value"
+            ).fetchone()["value"]
+            session.execute(
+                "SELECT set_config('workspace.zulip_reconciliation_batch', %s, true)",
+                (json.dumps([f"{project}:{message}" for project, message in batch]),),
+            )
+            for project_id, message_uuids in projects.items():
+                for model in (cls, ZulipMessagePlacementState, ZulipUserMessageState):
+                    states = model.objects.get_all(
+                        filters={
+                            "project_id": filters.EQ(project_id),
+                            "message_uuid": filters.In(message_uuids),
+                        },
+                    )
+                    if not states:
+                        continue
+                    changed_uuids = list({state.message_uuid for state in states})
+                    counter_scopes.update(
+                        ZulipMessageCounterChange.message_scopes(
+                            project_id, changed_uuids
+                        )
+                    )
+                    for state in states:
+                        state.do()
+                    counter_scopes.update(
+                        ZulipMessageCounterChange.message_scopes(
+                            project_id, changed_uuids
+                        )
+                    )
+            session.execute(
+                "SELECT set_config('workspace.zulip_reconciliation_batch', %s, true)",
+                (previous_batch or "",),
+            )
+        ZulipMessageCounterChange.mark_many(counter_scopes)
+        # A write can affect another message sharing source data. Keep its
+        # original mark if any reconciliation stage still has a difference.
+        unreconciled = set()
         for project_id, message_uuids in projects.items():
             for model in (cls, ZulipMessagePlacementState, ZulipUserMessageState):
-                states = model.objects.get_all(
-                    filters={
-                        "project_id": filters.EQ(project_id),
-                        "message_uuid": filters.In(message_uuids),
-                    },
+                unreconciled.update(
+                    (state.project_id, state.message_uuid)
+                    for state in model.objects.get_all(
+                        filters={
+                            "project_id": filters.EQ(project_id),
+                            "message_uuid": filters.In(message_uuids),
+                        },
+                    )
                 )
-                if not states:
-                    continue
-                changed_uuids = list({state.message_uuid for state in states})
-                counter_scopes.update(
-                    ZulipMessageCounterChange.message_scopes(project_id, changed_uuids)
-                )
-                for state in states:
-                    state.do()
-                counter_scopes.update(
-                    ZulipMessageCounterChange.message_scopes(project_id, changed_uuids)
-                )
-        ZulipMessageCounterChange.mark_many(counter_scopes)
         for model in change_models:
             pending = [
                 change
                 for changes in batch.values()
                 for change in changes
-                if type(change) is model
+                if type(change) is model and change.get_id() not in unreconciled
             ]
             if pending:
                 model.acknowledge_many(pending)

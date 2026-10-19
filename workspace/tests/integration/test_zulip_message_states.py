@@ -604,6 +604,259 @@ def test_batch_counts_a_shared_key_once_even_without_a_difference(message_source
         assert models.ZulipMessageState.reconcile_batch(1) == 0
 
 
+@pytest.mark.parametrize("change", ("create", "content", "flags", "delete"))
+def test_message_batch_does_not_requeue_its_own_reconciled_writes(
+    message_sources, db, change
+):
+    account, source = message_sources()
+    _prepare(account)
+    if change != "create":
+        with contexts.Context().session_manager():
+            models.ZulipMessageState.reconcile_batch(1)
+        _clear_changes(db, account)
+        if change == "content":
+            source.content.workspace_content = "Updated source content"
+            source.content.workspace_content_updated_at += datetime.timedelta(days=1)
+            source.content.update()
+        elif change == "flags":
+            source.read = False
+            source.update()
+        else:
+            source.delete()
+    with contexts.Context().session_manager():
+        assert models.ZulipMessageState.reconcile_batch(1) == 1
+    assert _states(account) == _placement_states(account) == _user_states(account) == []
+    assert _changes(models.ZulipMessageChange, account) == []
+    assert _changes(v2_models.WorkspaceMessageChange, account) == []
+    with contexts.Context().session_manager():
+        assert models.ZulipMessageState.reconcile_batch(1) == 0
+
+
+@pytest.mark.parametrize("side", ("zulip", "workspace"))
+def test_external_revision_survives_reconciliations_own_writes(
+    message_sources, db, monkeypatch, side
+):
+    account, source = message_sources()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(1)
+    _clear_changes(db, account)
+    source.content.workspace_content = "Source edit"
+    source.content.workspace_content_updated_at += datetime.timedelta(days=1)
+    source.content.update()
+    model = (
+        models.ZulipMessageChange
+        if side == "zulip"
+        else v2_models.WorkspaceMessageChange
+    )
+    reconcile = models.ZulipMessageState.do
+    revisions = []
+
+    def edit_before_reconciliation(state):
+        with psycopg.connect(conftest.TEST_DB_URL, autocommit=True) as writer:
+            writer.execute("SET statement_timeout = '3s'")
+            edited_at = datetime.datetime(2030, 1, 1, tzinfo=datetime.timezone.utc)
+            if side == "zulip":
+                writer.execute(
+                    "UPDATE bridge_zulip_v5_message_contents SET workspace_content = %s, "
+                    "workspace_content_hash = %s, workspace_content_updated_at = %s WHERE uuid = %s",
+                    (
+                        "Concurrent edit",
+                        hashlib.sha256(b"Concurrent edit").hexdigest(),
+                        edited_at,
+                        source.content.uuid,
+                    ),
+                )
+            else:
+                _write_workspace_content(
+                    writer, _messages(account)[0], "Concurrent edit", edited_at
+                )
+            revisions.append(
+                writer.execute(
+                    f"SELECT revision FROM {model.__tablename__} WHERE project_id = %s",
+                    (account.project_id,),
+                ).fetchone()[0]
+            )
+        reconcile(state)
+
+    monkeypatch.setattr(models.ZulipMessageState, "do", edit_before_reconciliation)
+    with contexts.Context().session_manager():
+        assert models.ZulipMessageState.reconcile_batch(1) == 1
+    assert _messages(account)[0].payload.content == "Concurrent edit"
+    assert _changes(model, account)[0].revision == revisions[0]
+    monkeypatch.setattr(models.ZulipMessageState, "do", reconcile)
+    with contexts.Context().session_manager():
+        assert models.ZulipMessageState.reconcile_batch(1) == 1
+    assert _changes(model, account) == []
+
+
+@pytest.mark.parametrize("same_project", (True, False))
+def test_reconciliation_still_tracks_other_messages_in_its_transaction(
+    message_sources, db, monkeypatch, same_project
+):
+    account, source = message_sources()
+    other_account, other = message_sources(
+        project_id=account.project_id if same_project else None,
+        message_id=43 if same_project else 42,
+        sender_id=8 if same_project else 7,
+        stream_id=42 if same_project else 43,
+    )
+    _prepare(account)
+    _prepare(other_account)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(10)
+    _clear_changes(db, account)
+    _clear_changes(db, other_account)
+    source.content.workspace_content = "Selected message edit"
+    source.content.workspace_content_updated_at += datetime.timedelta(days=1)
+    source.content.update()
+    reconcile = models.ZulipMessageState.do
+
+    def update_other_message(state):
+        reconcile(state)
+        other.read = False
+        other.update()
+
+    monkeypatch.setattr(models.ZulipMessageState, "do", update_other_message)
+    with contexts.Context().session_manager():
+        assert models.ZulipMessageState.reconcile_batch(1) == 1
+    (pending,) = _changes(models.ZulipMessageChange, other_account)
+    assert pending.message_uuid == uuid.uuid5(
+        other_account.project_id, str(other.message_uuid)
+    )
+    assert _user_states(other_account)[0].message_uuid == pending.message_uuid
+
+
+def test_failed_batch_restores_tracking_in_the_surviving_transaction(
+    message_sources, monkeypatch
+):
+    account, source = message_sources()
+    _prepare(account)
+    (original,) = _changes(models.ZulipMessageChange, account)
+
+    def fail(state):
+        contexts.Context().get_session().execute("SELECT 1 / 0")
+
+    monkeypatch.setattr(models.ZulipMessageState, "do", fail)
+    with contexts.Context().session_manager() as session:
+        session.execute(
+            "SELECT set_config('workspace.zulip_reconciliation_batch', %s, true)",
+            ('["previous-scope"]',),
+        )
+        with pytest.raises(psycopg.errors.DivisionByZero):
+            models.ZulipMessageState.reconcile_batch(1)
+        assert (
+            session.execute(
+                "SELECT current_setting('workspace.zulip_reconciliation_batch') AS value"
+            ).fetchone()["value"]
+            == '["previous-scope"]'
+        )
+        source.read = False
+        source.update()
+    assert _changes(models.ZulipMessageChange, account)[0].revision > original.revision
+    assert _messages(account) == []
+
+
+def test_successful_batch_restores_tracking_before_transaction_commit(message_sources):
+    account, source = message_sources()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        assert models.ZulipMessageState.reconcile_batch(1) == 1
+        assert _changes(models.ZulipMessageChange, account) == []
+        assert _changes(v2_models.WorkspaceMessageChange, account) == []
+        source.read = False
+        source.update()
+        (message,) = _messages(account)
+        message.payload = message_payloads.MarkdownPayload(content="Later local edit")
+        message.update()
+    assert len(_changes(models.ZulipMessageChange, account)) == 1
+    assert len(_changes(v2_models.WorkspaceMessageChange, account)) == 1
+
+
+def test_full_message_batch_drains_without_an_echo_batch(message_sources):
+    account, source = message_sources()
+    for message_id in range(43, 58):
+        message_sources(
+            project_id=account.project_id, message_id=message_id, sender_id=message_id
+        )
+    _prepare(account)
+    with contexts.Context().session_manager():
+        assert models.ZulipMessageState.reconcile_batch(16) == 16
+    assert len(_messages(account)) == len(_placements(account)) == 16
+    assert _changes(models.ZulipMessageChange, account) == []
+    assert _changes(v2_models.WorkspaceMessageChange, account) == []
+    with contexts.Context().session_manager():
+        assert models.ZulipMessageState.reconcile_batch(16) == 0
+
+
+def test_batch_keeps_changes_when_its_writes_leave_another_message_different(
+    message_sources, db
+):
+    account, source = message_sources()
+    _, other = message_sources(
+        project_id=account.project_id, message_id=43, sender_id=8
+    )
+    other.content = source.content
+    other.update()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(10)
+    _clear_changes(db, account)
+    message = v2_models.WorkspaceMessage.objects.get_one(
+        filters={
+            "uuid": filters.EQ(uuid.uuid5(account.project_id, str(source.message_uuid)))
+        }
+    )
+    _write_workspace_content(
+        db,
+        message,
+        "Local edit",
+        datetime.datetime(2030, 1, 1, tzinfo=datetime.timezone.utc),
+    )
+    other.read = False
+    other.update()
+    with contexts.Context().session_manager():
+        assert models.ZulipMessageState.reconcile_batch(10) == 2
+    other_uuid = uuid.uuid5(account.project_id, str(other.message_uuid))
+    assert [state.message_uuid for state in _states(account)] == [other_uuid]
+    assert [
+        change.message_uuid for change in _changes(models.ZulipMessageChange, account)
+    ] == [other_uuid]
+    with contexts.Context().session_manager():
+        assert models.ZulipMessageState.reconcile_batch(10) == 1
+    assert _states(account) == []
+    assert _changes(models.ZulipMessageChange, account) == []
+    assert _changes(v2_models.WorkspaceMessageChange, account) == []
+
+
+def test_reconciliation_tracking_migration_is_reversible(message_sources):
+    account, source = message_sources()
+    _prepare(account)
+    engine = migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    migration = (
+        "0236-Avoid-self-generated-Zulip-message-reconciliation-changes-50c353.py"
+    )
+    engine.rollback_migration(migration)
+    try:
+        with contexts.Context().session_manager():
+            assert models.ZulipMessageState.reconcile_batch(1) == 1
+        (pending,) = _changes(v2_models.WorkspaceMessageChange, account)
+    finally:
+        engine.apply_migration(engine.get_latest_migration())
+    assert (
+        _changes(v2_models.WorkspaceMessageChange, account)[0].revision
+        == pending.revision
+    )
+    with contexts.Context().session_manager():
+        assert models.ZulipMessageState.reconcile_batch(1) == 1
+    source.read = False
+    source.update()
+    with contexts.Context().session_manager():
+        assert models.ZulipMessageState.reconcile_batch(1) == 1
+    assert _changes(models.ZulipMessageChange, account) == []
+    assert _changes(v2_models.WorkspaceMessageChange, account) == []
+
+
 @pytest.mark.parametrize("side", ("zulip", "workspace"))
 def test_concurrent_updates_survive_batch_acknowledgement(
     message_sources, db, monkeypatch, side
@@ -779,7 +1032,7 @@ def test_content_reconciliation_uses_the_last_edit_and_preserves_creation_time(
     with contexts.Context().session_manager():
         assert models.ZulipMessageState.reconcile_batch(10) == 1
     with contexts.Context().session_manager():
-        assert models.ZulipMessageState.reconcile_batch(10) == 1
+        assert models.ZulipMessageState.reconcile_batch(10) == 0
     assert _changes(models.ZulipMessageChange, account) == []
     assert _changes(v2_models.WorkspaceMessageChange, account) == []
 
@@ -1081,9 +1334,9 @@ def test_message_batch_creates_a_stable_placement_and_checks_canonical_api_proje
     finally:
         api_store.configure_store_factory(store_factory.build_store_factory())
     assert _changes(models.ZulipMessageChange, account) == []
-    assert len(_changes(v2_models.WorkspaceMessageChange, account)) == 1
+    assert _changes(v2_models.WorkspaceMessageChange, account) == []
     with contexts.Context().session_manager():
-        assert models.ZulipMessageState.reconcile_batch(1) == 1
+        assert models.ZulipMessageState.reconcile_batch(1) == 0
     assert _changes(v2_models.WorkspaceMessageChange, account) == []
     for table in ("messenger_user_message_bindings", "messenger_user_message_states"):
         assert db.execute(
