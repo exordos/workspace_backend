@@ -21,9 +21,9 @@ import sys
 from oslo_config import cfg
 from gcl_looper.services import hub
 from restalchemy.common import config_opts as ra_config_opts
-from restalchemy.storage.sql import engines
 
 from workspace.common import config
+from workspace.common import database
 from workspace.common import file_storage_opts
 from workspace.common import log as infra_log
 from workspace.common import messenger_worker_opts
@@ -85,7 +85,9 @@ def build_worker_services() -> tuple[agents.MessengerWorkerAgent, ...]:
             ),
         )
         service.add_setup(
-            lambda: engines.engine_factory.configure_postgresql_factory(conf=CONF)
+            lambda: database.configure_postgresql(
+                "workspace-messenger-worker", conf=CONF
+            )
         )
         services.append(service)
     return tuple(services)

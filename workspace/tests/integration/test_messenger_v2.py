@@ -10,13 +10,18 @@ import datetime
 import itertools
 import json
 import threading
+import urllib.parse
 import uuid as sys_uuid
 
 import psycopg
 import pytest
+from oslo_config import cfg
+from restalchemy.common import config_opts as ra_config_opts
 from restalchemy.common import contexts
+from restalchemy.storage.sql import engines
 from restalchemy.storage.sql import migrations as ra_migrations
 
+from workspace.common import database
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.api import store_factory
 from workspace.messenger_api.dm import models as messenger_models
@@ -195,6 +200,69 @@ def test_concurrent_first_requests_share_one_iam_user_import(db, monkeypatch):
             (user_uuid,),
         )
         assert cursor.fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("timezone", ("UTC", "Europe/Moscow", "America/New_York"))
+def test_native_message_timestamps_use_utc(api, timezone):
+    parts = urllib.parse.urlsplit(conftest.TEST_DB_URL)
+    query = dict(urllib.parse.parse_qsl(parts.query))
+    query["options"] = f"{query.get('options', '')} -c timezone={timezone}".strip()
+    connection_url = urllib.parse.urlunsplit(
+        parts._replace(
+            query=urllib.parse.urlencode(query, quote_via=urllib.parse.quote)
+        )
+    )
+    with psycopg.connect(connection_url) as connection:
+        assert connection.execute("SHOW TIME ZONE").fetchone() == (timezone,)
+
+    conf = cfg.ConfigOpts()
+    ra_config_opts.register_posgresql_db_opts(conf)
+    conf.set_override("connection_url", connection_url, group="db")
+    engines.engine_factory.destroy_all_engines()
+    try:
+        database.configure_postgresql("workspace-api", conf=conf)
+        response = api.post(STREAMS, json={"name": "UTC timestamps"})
+        assert response.status_code == 201, response.text
+        stream = response.json()
+
+        before = datetime.datetime.now(datetime.timezone.utc)
+        response = api.post(
+            MESSAGES,
+            json={
+                "stream_uuid": stream["uuid"],
+                "payload": {"kind": "markdown", "content": "UTC timestamp check"},
+            },
+        )
+        after = datetime.datetime.now(datetime.timezone.utc)
+        assert response.status_code == 201, response.text
+        message = response.json()
+        for field in ("created_at", "updated_at"):
+            value = datetime.datetime.fromisoformat(
+                message[field].replace("Z", "+00:00")
+            )
+            assert before <= value <= after
+
+        before = datetime.datetime.now(datetime.timezone.utc)
+        response = api.put(
+            f"{MESSAGES}{message['uuid']}",
+            json={"payload": {"kind": "markdown", "content": "Edited UTC check"}},
+        )
+        after = datetime.datetime.now(datetime.timezone.utc)
+        assert response.status_code == 200, response.text
+        updated = response.json()
+        assert updated["created_at"] == message["created_at"]
+        assert (
+            before
+            <= datetime.datetime.fromisoformat(
+                updated["updated_at"].replace("Z", "+00:00")
+            )
+            <= after
+        )
+        assert api.get(f"{MESSAGES}{message['uuid']}").json() == updated
+        assert _drain() >= 1
+    finally:
+        engines.engine_factory.destroy_all_engines()
+        engines.engine_factory.configure_factory(db_url=conftest.TEST_DB_URL)
 
 
 def test_native_v2_cutover_preserves_v1_http_and_event_contract(api, workspace_api, db):

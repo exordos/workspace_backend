@@ -16,25 +16,27 @@ from workspace.cmd import workspace_api
 from workspace.common import database
 
 
-def test_database_application_name_replaces_only_process_identity():
-    connection_url = (
-        "postgresql://user:pass@db/workspace"
-        "?options=-c%20work_mem%3D32MB%20-c%20jit%3Doff&application_name=old"
+@pytest.mark.parametrize(
+    "options",
+    ("", "-c work_mem=32MB -c jit=off", "-c timezone=Europe/Moscow"),
+)
+def test_database_connection_uses_utc_and_preserves_process_options(options):
+    connection_url = "postgresql://user:pass@db/workspace?" + urllib.parse.urlencode(
+        {"options": options, "application_name": "old"}
     )
 
-    result = database.connection_url_with_application_name(
+    result = database.connection_url_for_process(
         connection_url,
         "workspace-api",
     )
 
     query = urllib.parse.parse_qs(urllib.parse.urlsplit(result).query)
+    expected_options = f"{options} -c timezone=UTC".strip()
     assert query == {
-        "options": ["-c work_mem=32MB -c jit=off"],
+        "options": [expected_options],
         "application_name": ["workspace-api"],
     }
-    assert psycopg.conninfo.conninfo_to_dict(result)["options"] == (
-        "-c work_mem=32MB -c jit=off"
-    )
+    assert psycopg.conninfo.conninfo_to_dict(result)["options"] == expected_options
 
 
 def test_free_workspace_worker_serves_settings_while_peer_is_delayed(monkeypatch):

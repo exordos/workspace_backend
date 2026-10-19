@@ -25,6 +25,7 @@ from restalchemy.common import config_opts as ra_config_opts
 from restalchemy.storage.sql import engines
 
 from workspace.common import config
+from workspace.common import database
 from workspace.common import log as infra_log
 from workspace.messenger_api import websocket_service
 from workspace.messenger_api.api import store as api_store
@@ -102,7 +103,7 @@ def main() -> None:
             CONF[DOMAIN].workers,
         )
 
-    engines.engine_factory.configure_postgresql_factory(conf=CONF)
+    database.configure_postgresql("workspace-messenger-events", conf=CONF)
     api_store.configure_store_factory(store_factory.build_store_factory())
     iam_driver = drivers.HttpDriver(
         CONF.iam.iam_endpoint,
