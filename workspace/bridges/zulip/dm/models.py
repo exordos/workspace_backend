@@ -15,11 +15,13 @@
 #    under the License.
 
 import abc
+import contextlib
 import datetime
 import enum
 import hashlib
 import json
 import logging
+import time
 import typing
 import uuid as sys_uuid
 
@@ -51,7 +53,9 @@ from workspace.messenger_api.dm import v2_models
 
 
 LOG = logging.getLogger(__name__)
+# Preserve the validation bound for archived task payloads.
 MAX_HISTORY_MESSAGES = 5000
+HISTORY_BATCH_SIZE = 100
 TASK_PRIORITY_IMPORT_HISTORY = 10_000
 TASK_PRIORITY_IMPORT_HISTORY_MIN = 10
 TASK_PRIORITY_IMPORT_CHANNELS = 450_000
@@ -61,7 +65,7 @@ TASK_PRIORITY_INITIALIZE_CONNECTION = 600_000
 TASK_PRIORITY_REALTIME_MESSAGE = 300_000
 TASK_PRIORITY_REALTIME_EDIT = 250_000
 TASK_PRIORITY_REALTIME_FLAGS = 550_000
-TASK_PRIORITY_RECONCILIATION = 400_000
+TASK_PRIORITY_RECONCILIATION = 200_000
 TASK_PRIORITY_REFRESH_MESSAGE_COUNTERS = 700_000
 TASK_RETRY_DELAY = datetime.timedelta(minutes=1)
 TASK_CHANNEL_SYNC_INTERVAL = datetime.timedelta(minutes=15)
@@ -1799,7 +1803,7 @@ class FullBackfillContent(AbstractZulipTaskContent):
         ).insert()
         for index, first_message_id in enumerate(
             reversed(
-                range(first_message_id, self.last_message_id + 1, MAX_HISTORY_MESSAGES)
+                range(first_message_id, self.last_message_id + 1, HISTORY_BATCH_SIZE)
             )
         ):
             Task(
@@ -1813,7 +1817,7 @@ class FullBackfillContent(AbstractZulipTaskContent):
                 content=ImportHistoryContent(
                     first_message_id=first_message_id,
                     last_message_id=min(
-                        first_message_id + MAX_HISTORY_MESSAGES - 1,
+                        first_message_id + HISTORY_BATCH_SIZE - 1,
                         self.last_message_id,
                     ),
                     since=self.since,
@@ -2467,7 +2471,7 @@ class RefreshMessageFlagsContent(AbstractZulipTaskContent):
         if not rows:
             return
         first = rows[0]["message_id"]
-        last = min(rows[-1]["message_id"], first + MAX_HISTORY_MESSAGES - 1)
+        last = min(rows[-1]["message_id"], first + HISTORY_BATCH_SIZE - 1)
         wanted = {row["message_id"] for row in rows if row["message_id"] <= last}
         zulip = client.ZulipClient(account)
         try:
@@ -2808,6 +2812,12 @@ class Task(
     lease_expires_at = properties.property(
         types.AllowNone(types.UTCDateTimeZ()), default=None
     )
+    execution_time = properties.property(
+        types.AllowNone(types.Float(min_value=0.0)), default=None
+    )
+    queue_wait_time = properties.property(
+        types.AllowNone(types.Float(min_value=0.0)), default=None
+    )
 
     def __init__(self, **kwargs: object) -> None:
         super().__init__(**kwargs)
@@ -2856,7 +2866,50 @@ class Task(
             self.properties["updated_at"].set_value_force(now)
         return len(cancelled)
 
+    @contextlib.contextmanager
+    def track_execution(self) -> typing.Iterator[None]:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        queued_at = self.created_at if self.execution_time is None else self.updated_at
+        ready_at = max(
+            value
+            for value in (
+                queued_at,
+                self.not_before_at,
+                self.next_retry_at,
+                self.lease_expires_at,
+            )
+            if value is not None
+        )
+        self.queue_wait_time = (self.queue_wait_time or 0.0) + max(
+            0.0, (now - ready_at).total_seconds()
+        )
+        started = time.monotonic()
+        try:
+            yield
+        finally:
+            self.execution_time = (
+                (self.execution_time or 0.0) + time.monotonic() - started
+            )
+            finished = datetime.datetime.now(datetime.timezone.utc)
+            self.properties["updated_at"].set_value_force(finished)
+            # Persist only timing fields: a failed send claim must not overwrite
+            # a task status changed by another transaction.
+            contexts.Context().get_session().execute(
+                "UPDATE bridge_zulip_v5_tasks SET execution_time=%s, queue_wait_time=%s, "
+                "updated_at=%s WHERE uuid=%s",
+                (
+                    self.execution_time,
+                    self.queue_wait_time,
+                    finished.replace(tzinfo=None),
+                    self.uuid,
+                ),
+            )
+
     def execute(self) -> None:
+        with self.track_execution():
+            self._execute()
+
+    def _execute(self) -> None:
         source_event_uuid = self.backfill_uuid or self.realtime_event_uuid
         if source_event_uuid is not None:
             # Match API and subscription registration lock order: account first,

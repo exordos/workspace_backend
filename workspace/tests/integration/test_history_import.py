@@ -63,6 +63,90 @@ def _http_error(status_code, code="BAD_REQUEST", **details):
     return requests.HTTPError("Provider request failed", response=response)
 
 
+def test_execution_and_queue_timings_are_persisted_across_retries(
+    task_queue, db, monkeypatch
+):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    task = task_queue(
+        created_at=now - datetime.timedelta(seconds=100),
+        not_before_at=now - datetime.timedelta(seconds=40),
+    )
+    clock = {"value": 10.0}
+
+    def execute(content, current):
+        clock["value"] += 2.5
+        if current.execution_time is None:
+            raise RuntimeError("Retry this attempt")
+
+    def retry(content, current, error):
+        current.status = "retry"
+        current.next_retry_at = datetime.datetime.now(
+            datetime.timezone.utc
+        ) + datetime.timedelta(seconds=3)
+
+    monkeypatch.setattr(models.time, "monotonic", lambda: clock["value"])
+    monkeypatch.setattr(models.InitializeConnectionContent, "execute", execute)
+    monkeypatch.setattr(models.InitializeConnectionContent, "on_error", retry)
+    monkeypatch.setattr(
+        models.InitializeConnectionContent, "on_done", lambda content, current: None
+    )
+    with contexts.Context().session_manager():
+        task.execute()
+    first = _stored(task)
+    assert first.status == "retry"
+    assert first.execution_time == 2.5
+    assert first.queue_wait_time == pytest.approx(40.0, abs=0.5)
+    db.execute(
+        "UPDATE bridge_zulip_v5_tasks SET updated_at = %s, next_retry_at = %s WHERE uuid = %s",
+        (
+            (now - datetime.timedelta(seconds=30)).replace(tzinfo=None),
+            (now - datetime.timedelta(seconds=10)).replace(tzinfo=None),
+            task.uuid,
+        ),
+    )
+    current = _stored(task)
+    with contexts.Context().session_manager():
+        current.execute()
+    finished = _stored(task)
+    assert finished.status == "done"
+    assert finished.execution_time == 5.0
+    assert finished.queue_wait_time == pytest.approx(50.0, abs=1.0)
+
+
+def test_task_timings_roll_back_with_task_work(task_queue, monkeypatch):
+    task = task_queue()
+    monkeypatch.setattr(
+        models.InitializeConnectionContent, "execute", lambda content, current: None
+    )
+    monkeypatch.setattr(
+        models.InitializeConnectionContent, "on_done", lambda content, current: None
+    )
+    with pytest.raises(RuntimeError, match="Rollback timings"):
+        with contexts.Context().session_manager():
+            task.execute()
+            assert task.execution_time is not None
+            raise RuntimeError("Rollback timings")
+    restored = _stored(task)
+    assert restored.status == "new"
+    assert restored.execution_time is restored.queue_wait_time is None
+
+
+def test_timing_migration_preserves_unknown_history_and_round_trips(task_queue, db):
+    task = task_queue(status="done")
+    engine = migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    migration = "0238-Track-bridge-task-execution-and-queue-wait-times-5f55e9.py"
+    engine.rollback_migration(migration)
+    try:
+        assert db.execute(
+            "SELECT status FROM bridge_zulip_v5_tasks WHERE uuid = %s", (task.uuid,)
+        ).fetchone() == ("done",)
+    finally:
+        engine.apply_migration(migration)
+    restored = _stored(task)
+    assert restored.status == "done"
+    assert restored.execution_time is restored.queue_wait_time is None
+
+
 @pytest.mark.parametrize("status", ["new", "error"])
 def test_backfill_starts_only_after_realtime_queue_registration(
     task_queue, monkeypatch, status
@@ -147,7 +231,7 @@ def test_backfill_starts_only_after_realtime_queue_registration(
             "status": filters.EQ("new"),
         }
     )
-    assert len(pending) == 5
+    assert len(pending) == 103
     assert all(child.project_id == task.project_id for child in pending)
     (user_sync,) = [
         child
@@ -181,12 +265,12 @@ def test_backfill_starts_only_after_realtime_queue_registration(
     assert [
         (child.content.first_message_id, child.content.last_message_id)
         for child in history
-    ] == [(10001, 10005), (5001, 10000), (1, 5000)]
+    ] == [(10001, 10005), *[(first, first + 99) for first in range(9901, 0, -100)]]
     assert all(
         newer.created_at < older.created_at
         for newer, older in zip(history, history[1:])
     )
-    assert [child.priority for child in history] == [10_000, 9_999, 9_998]
+    assert [child.priority for child in history] == list(range(10_000, 9_899, -1))
     assert first_sync.project_id == account.project_id
     assert first_sync.priority == models.TASK_PRIORITY_IMPORT_USERS == 500_000
     assert first_sync.not_before_at is None
@@ -203,7 +287,7 @@ def test_backfill_starts_only_after_realtime_queue_registration(
             "status": filters.In(["new", "waiting"]),
         }
     )
-    assert len(pending) == 5
+    assert len(pending) == 103
     (next_sync,) = [
         child
         for child in pending
@@ -222,9 +306,8 @@ def test_backfill_starts_only_after_realtime_queue_registration(
     assert _stored(history[0]).status == "done"
     zulip.get_messages.assert_called_once_with(10001, 10005)
     assert _stored(next_sync).status == "waiting"
-    service._iteration()
-    service._iteration()
-    service._iteration()
+    for child in history[1:]:
+        service._iteration()
 
     assert _stored(next_sync).status == "waiting"
     assert all(_stored(child).status == "done" for child in history)
@@ -234,10 +317,9 @@ def test_backfill_starts_only_after_realtime_queue_registration(
     zulip.get_users.assert_called_once_with()
     assert zulip.get_messages.call_args_list == [
         mock.call(10001, 10005),
-        mock.call(5001, 10000),
-        mock.call(1, 5000),
+        *[mock.call(first, first + 99) for first in range(9901, 0, -100)],
     ]
-    assert zulip.close.call_count == 6
+    assert zulip.close.call_count == len(history) + 3
     assert (
         external_models.ExternalAccount.objects.get_one(
             filters={"uuid": account.uuid}

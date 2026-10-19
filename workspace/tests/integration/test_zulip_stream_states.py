@@ -1110,15 +1110,16 @@ def test_reconciliation_batches_and_schedules_continuation(
     assert followup.content.interval == task.content.interval
     assert task.external_account_uuid is followup.external_account_uuid is None
     assert task.project_id is followup.project_id is None
-    assert followup.priority == models.TASK_PRIORITY_RECONCILIATION
+    assert followup.priority == models.TASK_PRIORITY_RECONCILIATION == 200_000
     assert followup.priority > max(
         models.TASK_PRIORITY_IMPORT_HISTORY,
-        models.TASK_PRIORITY_IMPORT_CHANNELS,
         models.TASK_PRIORITY_FULL_BACKFILL,
-        models.TASK_PRIORITY_REALTIME_MESSAGE,
     )
     assert followup.priority < min(
         models.TASK_PRIORITY_IMPORT_USERS,
+        models.TASK_PRIORITY_IMPORT_CHANNELS,
+        models.TASK_PRIORITY_REALTIME_MESSAGE,
+        models.TASK_PRIORITY_REALTIME_EDIT,
         models.TASK_PRIORITY_INITIALIZE_CONNECTION,
     )
     if 2 * count < batch_size:

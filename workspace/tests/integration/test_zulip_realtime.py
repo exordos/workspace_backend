@@ -203,7 +203,7 @@ def test_active_only_after_all_backfill_children_finish(
     zulip.get_messages.return_value = []
     monkeypatch.setattr(client, "ZulipClient", lambda current: zulip)
     service = history_import.HistoryImportService()
-    for _index in range(10):
+    for _index in range(120):
         group = models.Task.objects.get_all(
             filters={"backfill_uuid": filters.EQ(event.uuid)}
         )
@@ -220,12 +220,14 @@ def test_active_only_after_all_backfill_children_finish(
     if imported:
         since = datetime.datetime.fromisoformat(event.payload["since"])
         zulip.get_first_message_id_since.assert_called_once_with(since)
-        assert zulip.get_messages.call_args_list == [mock.call(7001, 10005)]
+        assert zulip.get_messages.call_args_list == [
+            mock.call(10001, 10005),
+            *[mock.call(first, first + 99) for first in range(9901, 7000, -100)],
+        ]
     else:
         assert zulip.get_messages.call_args_list == [
             mock.call(10001, 10005),
-            mock.call(5001, 10000),
-            mock.call(1, 5000),
+            *[mock.call(first, first + 99) for first in range(9901, 0, -100)],
         ]
     # Catalog refreshes are not members of the completed group.
     periodic = models.Task.objects.get_all(
@@ -522,7 +524,7 @@ def test_partial_monthly_backfill_recovery_does_not_activate_early(
 ):
     account.properties["has_completed_backfill"].set_value_force(True)
     account.update()
-    register(account, maximum=5001)
+    register(account, maximum=101)
     dispatch()
     zulip = mock.Mock()
     zulip.get_first_message_id_since.return_value = 1

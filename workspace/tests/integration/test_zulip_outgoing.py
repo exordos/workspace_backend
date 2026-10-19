@@ -170,9 +170,13 @@ def test_outbox_send_uses_author_and_server_date_without_echo_duplicate(outgoing
         42, remote["content"], "General", "sender-queue", str(delivery.uuid)
     )
     assert tasks(account)[0].status == "retry"
+    first_attempt = tasks(account)[0]
+    assert first_attempt.execution_time > 0
+    assert first_attempt.queue_wait_time >= 0
     ready(tasks(account)[0])
     service._iteration()
     assert tasks(account)[0].status == "done"
+    assert tasks(account)[0].execution_time > first_attempt.execution_time
     canonical = v2_models.WorkspaceMessage.objects.get_one(
         filters={"project_id": filters.EQ(account.project_id)}
     )

@@ -47,6 +47,17 @@ with two HTTP workers by default.
 The history import service executes durable bridge tasks in priority order. The
 `[history_import] step_interval` option controls idle checks (default: three
 seconds); successful work continues immediately.
+Ready tasks run by priority descending, then `created_at` ascending, with UUID
+as the final tiebreaker.
+History import tasks cover at most 100 consecutive message IDs, newest ranges
+first. Migration 0237 splits unfinished larger tasks, preserving their priority,
+schedule, status, account, cutoff, and backfill/event links. The original tasks
+are cancelled and detached from backfill completion tracking.
+
+Migration 0238 adds nullable `execution_time` and `queue_wait_time` fields in
+seconds. They accumulate execution and ready-queue waiting across attempts,
+including send preparation. Scheduled delays, retry delays, and active leases
+do not count as queue waiting. Existing tasks retain `NULL` until measured.
 
 Message reconciliation acknowledges the revisions it read before processing.
 Migration 0236 prevents its own writes from marking those messages again, scoped
@@ -102,8 +113,8 @@ attempt commits before the HTTP request; an ambiguous send outcome waits for
 local echo rather than automatically posting another message. Once an ID is
 known, metadata fetches can be retried independently of sending.
 
-Priorities are numeric: users 500000, channels 450000, reconciliation (including
-topics) 400000, realtime message creation 300000, realtime edits 250000, and
+Priorities are numeric: users 500000, channels 450000, realtime message creation
+300000, realtime edits 250000, reconciliation (including topics) 200000, and
 history batches 10000 or lower. Missing prerequisites retry after three seconds;
 there are no task dependency chains. Superseded edit tasks do not overwrite a
 newer local edit.

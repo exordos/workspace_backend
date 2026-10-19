@@ -93,11 +93,12 @@ class HistoryImportService(basic.BasicService):
             tasks = self._get_tasks()
             for task in tasks:
                 if isinstance(task.content, models.SendMessageContent):
-                    try:
-                        if task.content.prepare(task):
-                            prepared.append(task)
-                    except Exception as error:
-                        task.on_error(error)
+                    with task.track_execution():
+                        try:
+                            if task.content.prepare(task):
+                                prepared.append(task)
+                        except Exception as error:
+                            task.on_error(error)
                 else:
                     self._execute_task(task)
         # Commit the send attempt before HTTP: a crash must not replay POST.

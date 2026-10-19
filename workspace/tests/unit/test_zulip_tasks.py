@@ -26,6 +26,7 @@ def _task_storage(monkeypatch):
     monkeypatch.setattr(models.utils, "savepoint", contextlib.nullcontext)
     update = mock.Mock()
     monkeypatch.setattr(models.Task, "update", update)
+    monkeypatch.setattr(models.contexts.Context, "get_session", mock.Mock())
     return update
 
 
@@ -45,6 +46,8 @@ def test_task_is_concrete_with_priority_and_retry_status():
     assert task.error_description is None
     assert task.not_before_at is None
     assert task.next_retry_at is None
+    assert task.execution_time is None
+    assert task.queue_wait_time is None
     assert [status.value for status in models.TaskStatus] == [
         "new",
         "waiting",
@@ -116,7 +119,7 @@ def test_history_content_parameters_cannot_be_changed():
             setattr(history, name, value)
 
 
-def test_content_restores_through_kind_selector():
+def test_legacy_history_content_remains_readable_through_kind_selector():
     content = models.TASK_CONTENT_TYPE.from_simple_type(
         {
             "kind": "import_history",
@@ -536,9 +539,9 @@ def test_client_finds_backfill_boundary_by_exact_date(offset, expected):
     [
         (0, []),
         (1, [(1, 1)]),
-        (5000, [(1, 5000)]),
-        (5001, [(5001, 5001), (1, 5000)]),
-        (10005, [(10001, 10005), (5001, 10000), (1, 5000)]),
+        (100, [(1, 100)]),
+        (101, [(101, 101), (1, 100)]),
+        (205, [(201, 205), (101, 200), (1, 100)]),
     ],
 )
 def test_full_backfill_creates_user_channel_and_bounded_history_tasks(
@@ -591,14 +594,14 @@ def test_history_priorities_stop_decreasing_at_the_minimum(monkeypatch):
         mock.patch.object(external_models.ExternalAccount, "objects"),
         mock.patch.object(models.Task, "insert", autospec=True) as insert,
     ):
-        models.FullBackfillContent(last_message_id=20_001).execute(task)
+        models.FullBackfillContent(last_message_id=401).execute(task)
     history = [call.args[0] for call in insert.call_args_list[2:]]
     assert [child.priority for child in history] == [12, 11, 10, 10, 10]
     assert [child.content.first_message_id for child in history] == [
-        20_001,
-        15_001,
-        10_001,
-        5_001,
+        401,
+        301,
+        201,
+        101,
         1,
     ]
     assert all(
@@ -673,6 +676,38 @@ def test_task_executes_connection_content():
         uuid.uuid5(uuid.NAMESPACE_DNS, "zulip.example.com"), "user:7"
     )
     insert.assert_not_called()
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_task_timings_accumulate_and_exclude_scheduled_retry_delays(fails):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    task = _task()
+    task.execution_time = 1.5
+    task.queue_wait_time = 4.0
+    task.properties["updated_at"].set_value_force(now - datetime.timedelta(seconds=100))
+    task.not_before_at = now - datetime.timedelta(seconds=20)
+    task.next_retry_at = now - datetime.timedelta(seconds=10)
+
+    def retry(current_task, error):
+        current_task.status = "retry"
+        current_task.next_retry_at = now + datetime.timedelta(seconds=3)
+
+    with (
+        mock.patch.object(models.time, "monotonic", side_effect=[10.0, 12.5]),
+        mock.patch.object(
+            models.InitializeConnectionContent,
+            "execute",
+            side_effect=RuntimeError("Failed") if fails else None,
+        ),
+        mock.patch.object(models.InitializeConnectionContent, "on_done"),
+        mock.patch.object(
+            models.InitializeConnectionContent, "on_error", side_effect=retry
+        ),
+    ):
+        task.execute()
+    assert task.execution_time == 4.0
+    assert task.queue_wait_time == pytest.approx(14.0, abs=0.5)
+    assert task.status == ("retry" if fails else "done")
 
 
 def test_success_calls_task_and_content_hooks_with_the_task(_task_storage):
@@ -885,7 +920,7 @@ def test_history_content_passes_bounds_and_closes_the_client():
     task = models.Task(
         project_id=uuid.uuid4(),
         external_account_uuid=uuid.uuid4(),
-        content=models.ImportHistoryContent(first_message_id=1, last_message_id=5000),
+        content=models.ImportHistoryContent(first_message_id=1, last_message_id=100),
     )
     account = mock.Mock(
         settings={"server_url": "https://zulip.example.com"},
@@ -904,5 +939,5 @@ def test_history_content_passes_bounds_and_closes_the_client():
     selected = accounts.get_one.call_args.kwargs["filters"]
     assert selected["uuid"].value == task.external_account_uuid
     assert selected["project_id"].value == task.project_id
-    zulip.get_messages.assert_called_once_with(1, 5000)
+    zulip.get_messages.assert_called_once_with(1, 100)
     zulip.close.assert_called_once_with()
