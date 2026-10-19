@@ -334,6 +334,8 @@ def isolated_migration_database(migration, *, current_models=False):
                         ADD COLUMN IF NOT EXISTS realtime_event_uuid UUID,
                         ADD COLUMN IF NOT EXISTS execution_time DOUBLE PRECISION,
                         ADD COLUMN IF NOT EXISTS queue_wait_time DOUBLE PRECISION;
+                    ALTER TABLE bridge_zulip_v5_message_contents
+                        ADD COLUMN IF NOT EXISTS conversion_version INTEGER NOT NULL DEFAULT 0;
                     ALTER TABLE messenger_user_message_states
                         ADD COLUMN IF NOT EXISTS read_updated_at TIMESTAMP WITHOUT TIME ZONE,
                         ADD COLUMN IF NOT EXISTS starred_updated_at TIMESTAMP WITHOUT TIME ZONE;

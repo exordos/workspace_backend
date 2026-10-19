@@ -8,6 +8,7 @@ import hashlib
 import json
 from unittest import mock
 import uuid
+import urllib.parse
 
 import psycopg
 import pytest
@@ -868,6 +869,7 @@ def test_history_import_keeps_accounts_and_projects_separate(
         project_id=uuid.uuid4(),
         owner_user_uuid=account.owner_user_uuid,
         provider="zulip",
+        external_account_id=f"{urllib.parse.urlsplit(server_url).hostname}:7",
         settings={"server_url": server_url},
     )
     other.insert()

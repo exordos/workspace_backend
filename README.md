@@ -102,13 +102,40 @@ history tasks commit together; Messenger projection processing remains independe
 Migration 0233 starts this subscription with new events, without sending retained
 outbox history. The history service executes `send_message` and `edit_message`
 tasks using the author's verified external account for the destination channel
-or direct conversation. Markdown content is passed through unchanged, and Zulip
-messages are sent with `read_by_sender=true`.
+or direct conversation. Markdown content is converted in both directions through
+`workspace/bridges/zulip/content_conversion.py`. Its context resolves the current
+external-account owner, channels, topics, and public message placement UUIDs from
+persisted data in the request project and Zulip server. Outgoing references use
+the destination server's identifiers. References to messages awaiting delivery
+retry until their Zulip IDs are known; unsupported outgoing identities fail
+before a send attempt is marked. Zulip messages use `read_by_sender=true`.
+
+Uploaded Zulip attachments are copied into Workspace file storage with the
+destination stream's access rules. Workspace attachments are uploaded to Zulip
+once per destination stream, with persisted file mappings for retries and echoes.
+Temporary download URLs are fetched without forwarding Zulip API credentials.
+Externally hosted media retain their original URLs. Full and partial quotes use
+persisted message identities; outgoing quotes require the sender's access to the
+referenced message. Missing incoming targets retain a provider URL or quoted
+snapshot instead of an invented internal identity. Features that Workspace
+cannot represent retain an explicit notice and a link to the original message.
+Malformed URLs, reference URNs, and Base64 or UTF-8 quote snapshots remain verbatim
+as text. A parsing failure affects only that element; conversion continues for
+the rest of the message.
+
+Migration 0241 schedules bounded conversion of existing imported content without
+changing the provider's edit timestamps or overwriting newer local edits. Failed
+records retry independently. Disconnected accounts can convert stored text;
+attachments without local copies retain their provider URLs until a later import
+can download them. Only `markdown` payloads enter the conversion path.
 
 Delivery bindings retain the Workspace UUID and the Zulip message ID. After
 delivery, the canonical message and placement creation dates are updated to the
 Zulip timestamp, and a Messenger update event is published. Local echo and later
-imports update the original message instead of creating a duplicate. A send
+imports update the original message instead of creating a duplicate. Persisted
+Workspace/Zulip content snapshots preserve the original Workspace representation
+when its own send or edit returns as an echo. Later provider edits are converted
+back to Workspace, and older observations cannot overwrite a newer one. A send
 attempt commits before the HTTP request; an ambiguous send outcome waits for
 local echo rather than automatically posting another message. Once an ID is
 known, metadata fetches can be retried independently of sending.
@@ -121,7 +148,7 @@ newer local edit.
 Future read and reaction tasks must also run below message creation priority
 and retry when the target message has not been created yet.
 
-Unicode reaction identities use `workspace/common/unicode_emoji.json`. Its separate
+Unicode reactions and message shortcodes use `workspace/common/unicode_emoji.json`. Its separate
 Workspace and Zulip dictionaries preserve shortcode meanings across providers;
 conversion uses Unicode codes, including skin tones, ZWJ sequences, and keycaps.
 The catalog records its Zulip and emojibase versions. Regenerate it from the

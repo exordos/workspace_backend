@@ -6,6 +6,7 @@
 import datetime
 import json
 import typing
+import urllib.parse
 
 import aiohttp
 import requests
@@ -71,6 +72,23 @@ class ZulipClient:
 
     def edit_message(self, message_id: int, content: str) -> None:
         self._request("PATCH", f"/messages/{message_id}", data={"content": content})
+
+    def upload_file(self, name: str, data: bytes, content_type: str) -> str:
+        return self._request(
+            "POST", "/user_uploads", files={"filename": (name, data, content_type)}
+        )["url"]
+
+    def download_file(self, path: str) -> tuple[bytes, str]:
+        temporary = self._get(path)["url"]
+        url = urllib.parse.urljoin(
+            self._base_url.removesuffix("/api/v1") + "/", temporary
+        )
+        # Temporary links may point at object storage. Never forward API credentials.
+        with requests.Session() as session:
+            session.trust_env = False
+            response = session.get(url, timeout=(5, 30))
+            response.raise_for_status()
+            return response.content, response.headers["Content-Type"].split(";", 1)[0]
 
     def update_message_flags(
         self, message_ids: list[int], flag: str, value: bool

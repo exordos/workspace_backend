@@ -39,6 +39,7 @@ from restalchemy.storage.sql import orm
 from restalchemy.storage.sql import utils
 
 from workspace.bridges.zulip import client
+from workspace.bridges.zulip import content_conversion
 from workspace.bridges.zulip.dm import flags as message_flags
 from workspace.bridges.zulip.dm import reactions as message_reactions
 from workspace.common import models as common_models
@@ -91,6 +92,8 @@ class MessageContent(
 ):
     __tablename__ = "bridge_zulip_v5_message_contents"
 
+    conversion_version = properties.property(types.Integer(min_value=0), default=0)
+
     zulip_content = properties.property(
         types.String(max_length=10000),
         required=True,
@@ -115,6 +118,21 @@ class MessageContent(
         types.UTCDateTimeZ(),
         required=True,
     )
+
+    def convert(self, converter, data, stream_uuid, zulip):
+        delivered = converter.delivered_content(data["id"])
+        if delivered is not None:
+            self.workspace_content = delivered["content"]
+            self.workspace_content_updated_at = delivered["content_updated_at"].replace(
+                tzinfo=datetime.timezone.utc
+            )
+        elif self.workspace_content_updated_at <= self.zulip_content_updated_at:
+            self.workspace_content = converter.to_workspace(
+                {**data, "content": self.zulip_content}, stream_uuid, zulip
+            )
+            self.workspace_content_updated_at = self.zulip_content_updated_at
+        self.conversion_version = content_conversion.VERSION
+        self.update()
 
 
 class ZulipChannelType(str, enum.Enum):
@@ -1112,7 +1130,10 @@ class ZulipMessageState(
         content_hash = message.content_hash
         edited_at = message.content_updated_at
         for content in contents:
-            if content.workspace_content_updated_at > edited_at:
+            if content.workspace_content_updated_at > edited_at or (
+                content.workspace_content_updated_at == edited_at
+                and content.conversion_version == content_conversion.VERSION
+            ):
                 text = content.workspace_content
                 content_hash = content.workspace_content_hash
                 edited_at = content.workspace_content_updated_at
@@ -1126,7 +1147,10 @@ class ZulipMessageState(
                 max(message.updated_at, edited_at)
             )
             # Preserve the edit time instead of dating the synchronization itself.
-            orm.SQLStorableMixin.update(message)
+            with content_conversion.preserve_source_edit_time(
+                session, self.project_id, self.message_uuid
+            ):
+                orm.SQLStorableMixin.update(message)
         for content in contents:
             if (
                 content.workspace_content_hash,
@@ -2123,6 +2147,10 @@ class ImportHistoryContent(AbstractZulipTaskContent):
                 "project_id": filters.EQ(task.project_id),
             },
         )
+        if account.external_account_id is None:
+            raise ExternalAccountIdPendingError(
+                "Waiting for the importing account's Zulip identity"
+            )
         hostname = account.get_host()
         server_namespace = sys_uuid.uuid5(sys_uuid.NAMESPACE_DNS, hostname)
         zulip = client.ZulipClient(account)
@@ -2152,6 +2180,7 @@ class ImportHistoryContent(AbstractZulipTaskContent):
             pending_senders = (
                 MessageDelivery.pending_sender_ids(account) if messages else set()
             )
+            imported_contents = []
             for data in messages:
                 if (
                     self.since is not None
@@ -2166,8 +2195,8 @@ class ImportHistoryContent(AbstractZulipTaskContent):
                             "uuid": filters.EQ(delivery.message_uuid),
                         }
                     )
+                    delivery.observe(data, observer=account, zulip=zulip)
                     if local.source_name == "native":
-                        delivery.observe(data)
                         continue
                 elif data["sender_id"] in pending_senders:
                     raise DeliveryPendingError(
@@ -2297,6 +2326,7 @@ class ImportHistoryContent(AbstractZulipTaskContent):
                     content.insert()
                 else:
                     content = message.content
+                    source_changed = content_hash != content.zulip_content_hash
                     if content_updated_at < content.zulip_content_updated_at:
                         for field in (
                             "zulip_content",
@@ -2312,7 +2342,10 @@ class ImportHistoryContent(AbstractZulipTaskContent):
                         ):
                             del content_values[field]
                     content.update_dm(values=content_values)
+                    if source_changed and "zulip_content" in content_values:
+                        content.conversion_version = 0
                     content.update()
+                imported_contents.append((content, data, channel.stream_uuid))
                 values = {
                     "message_uuid": sys_uuid.uuid5(server_namespace, str(data["id"])),
                     "message_id": data["id"],
@@ -2351,11 +2384,17 @@ class ImportHistoryContent(AbstractZulipTaskContent):
                             del values[field]
                     message.update_dm(values=values)
                     message.update()
+            if imported_contents:
+                converter = content_conversion.ConversionContext(account)
+                for content, data, stream_uuid in imported_contents:
+                    content.convert(converter, data, stream_uuid, zulip)
         finally:
             zulip.close()
 
     def on_error(self, task: "Task", error: Exception) -> None:
-        if isinstance(error, DeliveryPendingError):
+        if isinstance(
+            error, (DeliveryPendingError, content_conversion.ConversionPendingError)
+        ):
             task.status = TaskStatus.RETRY.value
             task.next_retry_at = datetime.datetime.now(
                 datetime.timezone.utc
@@ -2571,6 +2610,58 @@ class OutboundMessageContent(AbstractTaskContent):
         types.String(max_length=40000), required=True, read_only=True
     )
 
+    def prepare_content(self, task, delivery):
+        session = contexts.Context().get_session()
+        snapshot = session.execute(
+            "SELECT zulip_content FROM bridge_zulip_v5_content_snapshots WHERE uuid=%s",
+            (task.uuid,),
+        ).fetchone()
+        if snapshot is not None:
+            return snapshot["zulip_content"]
+        account = delivery.account()
+        zulip = client.ZulipClient(account)
+        try:
+            converter = content_conversion.ConversionContext(account, session=session)
+            text = converter.to_zulip(
+                {"kind": "markdown", "content": self.content},
+                delivery.stream_uuid,
+                zulip,
+            )
+        finally:
+            zulip.close()
+        if len(text) > 10000:
+            raise ValueError("Converted Zulip message exceeds 10000 characters")
+        session.execute(
+            """INSERT INTO bridge_zulip_v5_content_snapshots
+                   (uuid, delivery_uuid, workspace_content, zulip_content)
+               VALUES (%s,%s,%s,%s)""",
+            (task.uuid, delivery.uuid, self.content, text),
+        )
+        return text
+
+    def ready_to_prepare(self, task):
+        row = (
+            contexts.Context()
+            .get_session()
+            .execute(
+                "SELECT status, lease_expires_at FROM bridge_zulip_v5_tasks WHERE uuid=%s FOR UPDATE",
+                (task.uuid,),
+            )
+            .fetchone()
+        )
+        return row["status"] in ("new", "waiting", "retry") and (
+            row["lease_expires_at"] is None
+            or row["lease_expires_at"]
+            <= datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+        )
+
+    def claim(self, task):
+        task.lease_owner = sys_uuid.uuid4()
+        task.lease_expires_at = datetime.datetime.now(
+            datetime.timezone.utc
+        ) + datetime.timedelta(minutes=2)
+        task.update()
+
     def delivery(self, task: "Task") -> "MessageDelivery":
         session = contexts.Context().get_session()
         session.execute(
@@ -2607,7 +2698,13 @@ class OutboundMessageContent(AbstractTaskContent):
         if isinstance(error, SubscriptionChangedError):
             task.status = TaskStatus.CANCEL.value
         elif isinstance(
-            error, (DeliveryPendingError, requests.Timeout, requests.ConnectionError)
+            error,
+            (
+                DeliveryPendingError,
+                content_conversion.ConversionPendingError,
+                requests.Timeout,
+                requests.ConnectionError,
+            ),
         ) or (
             isinstance(error, requests.HTTPError)
             and (
@@ -2626,20 +2723,7 @@ class SendMessageContent(OutboundMessageContent):
 
     def prepare(self, task: "Task") -> bool:
         delivery = self.delivery(task)
-        now = datetime.datetime.now(datetime.timezone.utc)
-        row = (
-            contexts.Context()
-            .get_session()
-            .execute(
-                "SELECT status, lease_expires_at FROM bridge_zulip_v5_tasks WHERE uuid=%s FOR UPDATE",
-                (task.uuid,),
-            )
-            .fetchone()
-        )
-        if row["status"] not in ("new", "waiting", "retry") or (
-            row["lease_expires_at"] is not None
-            and row["lease_expires_at"] > now.replace(tzinfo=None)
-        ):
+        if not self.ready_to_prepare(task):
             return False
         self._submit = not delivery.sending and delivery.zulip_message_id is None
         if self._submit:
@@ -2648,11 +2732,10 @@ class SendMessageContent(OutboundMessageContent):
                 raise DeliveryPendingError(
                     "Waiting for the sender's realtime subscription"
                 )
+            self.prepare_content(task, delivery)
             delivery.sending = True
             delivery.update()
-        task.lease_owner = sys_uuid.uuid4()
-        task.lease_expires_at = now + datetime.timedelta(minutes=2)
-        task.update()
+        self.claim(task)
         return True
 
     def execute(self, task: "Task") -> None:
@@ -2675,9 +2758,18 @@ class SendMessageContent(OutboundMessageContent):
                         "Waiting for the sender's realtime subscription"
                     )
                 self._submit = False
+                text = (
+                    contexts.Context()
+                    .get_session()
+                    .execute(
+                        "SELECT zulip_content FROM bridge_zulip_v5_content_snapshots WHERE uuid=%s",
+                        (task.uuid,),
+                    )
+                    .fetchone()["zulip_content"]
+                )
                 delivery.zulip_message_id = zulip.send_message(
                     delivery.recipient["to"],
-                    self.content,
+                    text,
                     delivery.topic_name,
                     subscription.queue_id,
                     str(delivery.uuid),
@@ -2705,6 +2797,23 @@ class SendMessageContent(OutboundMessageContent):
 class EditMessageContent(OutboundMessageContent):
     KIND = "edit_message"
 
+    def prepare(self, task):
+        delivery = self.delivery(task)
+        if not self.ready_to_prepare(task):
+            return False
+        if delivery.zulip_message_id is None or delivery.delivered_at is None:
+            raise DeliveryPendingError("Waiting for message delivery before editing")
+        message = v2_models.WorkspaceMessage.objects.get_one(
+            filters={
+                "uuid": filters.EQ(delivery.message_uuid),
+                "project_id": filters.EQ(task.project_id),
+            }
+        )
+        if message.payload.content == self.content:
+            self.prepare_content(task, delivery)
+        self.claim(task)
+        return True
+
     def execute(self, task: "Task") -> None:
         delivery = self.delivery(task)
         if delivery.zulip_message_id is None or delivery.delivered_at is None:
@@ -2717,15 +2826,103 @@ class EditMessageContent(OutboundMessageContent):
         )
         if message.payload.content != self.content:
             return
+        text = self.prepare_content(task, delivery)
         zulip = client.ZulipClient(delivery.account())
         try:
-            zulip.edit_message(delivery.zulip_message_id, self.content)
+            zulip.edit_message(delivery.zulip_message_id, text)
             (data,) = zulip.get_messages(
                 delivery.zulip_message_id, delivery.zulip_message_id
             )
             delivery.observe(data)
         finally:
             zulip.close()
+
+
+class ConvertMessageContent(AbstractTaskContent):
+    KIND = "convert_message_content"
+
+    batch_size = properties.property(
+        types.Integer(min_value=1, max_value=100), default=100
+    )
+    after_uuid = properties.property(types.AllowNone(types.UUID()), default=None)
+    content_uuid = properties.property(types.AllowNone(types.UUID()), default=None)
+
+    def execute(self, task):
+        rows = (
+            contexts.Context()
+            .get_session()
+            .execute(
+                """SELECT DISTINCT ON (content.uuid) content.uuid, observed.external_account_uuid,
+                      observed.message_id, observed.sender_id, observed.timestamp,
+                      channel.stream_uuid
+               FROM bridge_zulip_v5_message_contents AS content
+               JOIN bridge_zulip_v5_messages AS observed ON observed.content=content.uuid
+               JOIN bridge_zulip_v5_channels AS channel ON channel.uuid=observed.channel
+               WHERE content.conversion_version < %s
+                 AND (%s::uuid IS NULL OR content.uuid > %s)
+                 AND (%s::uuid IS NULL OR content.uuid = %s)
+               ORDER BY content.uuid LIMIT %s""",
+                (
+                    content_conversion.VERSION,
+                    self.after_uuid,
+                    self.after_uuid,
+                    self.content_uuid,
+                    self.content_uuid,
+                    self.batch_size,
+                ),
+            )
+            .fetchall()
+        )
+        converters = {}
+        for row in rows:
+            try:
+                with utils.savepoint():
+                    account_uuid = row["external_account_uuid"]
+                    if account_uuid not in converters:
+                        account = external_models.ExternalAccount.objects.get_one(
+                            filters={"uuid": filters.EQ(account_uuid)}
+                        )
+                        converters[account_uuid] = content_conversion.ConversionContext(
+                            account
+                        )
+                    content = MessageContent.objects.get_one(
+                        filters={"uuid": filters.EQ(row["uuid"])}
+                    )
+                    content.convert(
+                        converters[account_uuid],
+                        {
+                            "id": row["message_id"],
+                            "sender_id": row["sender_id"],
+                            "timestamp": row["timestamp"],
+                        },
+                        row["stream_uuid"],
+                        None,
+                    )
+            except Exception:
+                if self.content_uuid is not None:
+                    raise
+                LOG.exception(
+                    "Failed to convert stored Zulip message content %s", row["uuid"]
+                )
+                Task(
+                    priority=150000,
+                    not_before_at=datetime.datetime.now(datetime.timezone.utc)
+                    + datetime.timedelta(seconds=10),
+                    content=ConvertMessageContent(content_uuid=row["uuid"]),
+                ).insert()
+        if len(rows) == self.batch_size:
+            Task(
+                priority=150000,
+                content=ConvertMessageContent(
+                    batch_size=self.batch_size, after_uuid=rows[-1]["uuid"]
+                ),
+            ).insert()
+
+    def on_error(self, task, error):
+        task.status = TaskStatus.RETRY.value
+        task.next_retry_at = datetime.datetime.now(
+            datetime.timezone.utc
+        ) + datetime.timedelta(seconds=10)
 
 
 class RefreshMessageCountersContent(AbstractTaskContent):
@@ -2810,6 +3007,7 @@ class ReconciliationContent(AbstractTaskContent):
 
 
 TASK_CONTENT_TYPE = types_dynamic.KindModelSelectorType(
+    types_dynamic.KindModelType(ConvertMessageContent),
     types_dynamic.KindModelType(UpdateReactionContent),
     types_dynamic.KindModelType(UpdateMessageFlagsContent),
     types_dynamic.KindModelType(RefreshMessageFlagsContent),
@@ -3517,6 +3715,15 @@ class MessageDelivery(
     delivered_at = properties.property(
         types.AllowNone(types.UTCDateTimeZ()), default=None
     )
+    content_observed_at = properties.property(
+        types.AllowNone(types.UTCDateTimeZ()), default=None
+    )
+    observed_zulip_content = properties.property(
+        types.AllowNone(types.String(max_length=10000)), default=None
+    )
+    observed_workspace_content = properties.property(
+        types.AllowNone(types.String(max_length=40000)), default=None
+    )
 
     def account(self, sending: bool = True) -> external_models.ExternalAccount:
         account = external_models.ExternalAccount.objects.get_one(
@@ -3702,7 +3909,7 @@ class MessageDelivery(
         delivery.insert()
         return delivery
 
-    def observe(self, data: dict) -> None:
+    def observe(self, data: dict, observer=None, zulip=None) -> None:
         account = self.account(sending=False)
         if data["sender_id"] != int(account.external_account_id.rsplit(":", 1)[1]):
             raise SubscriptionChangedError()
@@ -3712,7 +3919,6 @@ class MessageDelivery(
         self.delivered_at = datetime.datetime.fromtimestamp(
             data["timestamp"], datetime.timezone.utc
         )
-        self.update()
         session = contexts.Context().get_session()
         message = v2_models.WorkspaceMessage.objects.get_one(
             filters={
@@ -3720,11 +3926,32 @@ class MessageDelivery(
                 "uuid": filters.EQ(self.message_uuid),
             }
         )
-        if message.source_name != "native":
-            return
         edited_at = datetime.datetime.fromtimestamp(
             data.get("last_edit_timestamp", data["timestamp"]), datetime.timezone.utc
         )
+        if (
+            self.content_observed_at is not None
+            and edited_at < self.content_observed_at
+        ):
+            return
+        previous_content = self.observed_workspace_content
+        self.content_observed_at = edited_at
+        self.observed_zulip_content = data["content"]
+        self.update()
+        snapshot = session.execute(
+            """SELECT workspace_content FROM bridge_zulip_v5_content_snapshots
+               WHERE delivery_uuid=%s AND zulip_content=%s
+               ORDER BY created_at DESC, uuid DESC LIMIT 1""",
+            (self.uuid, data["content"]),
+        ).fetchone()
+        if snapshot is not None:
+            text = snapshot["workspace_content"]
+        else:
+            text = content_conversion.ConversionContext(
+                observer or account
+            ).to_workspace(data, self.stream_uuid, zulip)
+        self.observed_workspace_content = text
+        self.update()
         pending_edits = Task.objects.get_all(
             filters={
                 "project_id": filters.EQ(self.project_id),
@@ -3735,8 +3962,9 @@ class MessageDelivery(
             },
             limit=1,
         )
-        replace_content = message.payload.content == data["content"] or (
-            not pending_edits
+        replace_content = message.payload.content == text or (
+            (snapshot is None or previous_content == message.payload.content)
+            and not pending_edits
             and (
                 message.content_updated_at is None
                 or edited_at >= message.content_updated_at
@@ -3745,12 +3973,18 @@ class MessageDelivery(
         changed = message.created_at != self.delivered_at or (
             replace_content
             and (
-                message.payload.content != data["content"]
+                message.payload.content != text
                 or message.content_updated_at != edited_at
             )
         )
         if not changed:
             return
+        with content_conversion.preserve_source_edit_time(
+            session, self.project_id, self.message_uuid
+        ):
+            self._update_observed_message(session, replace_content, text, edited_at)
+
+    def _update_observed_message(self, session, replace_content, text, edited_at):
         session.execute(
             """
             UPDATE messenger_messages SET created_at=%s, updated_at=NOW() AT TIME ZONE 'UTC',
@@ -3761,7 +3995,7 @@ class MessageDelivery(
             (
                 messenger_helpers._database_timestamp(self.delivered_at),
                 replace_content,
-                json.dumps({"kind": "markdown", "content": data["content"]}),
+                json.dumps({"kind": "markdown", "content": text}),
                 replace_content,
                 messenger_helpers._database_timestamp(edited_at),
                 self.project_id,

@@ -111,6 +111,10 @@ def test_conversion_preserves_file_count_and_identity(example, context):
             ["https://zulip.example.test/user_uploads/1/abc/file.pdf?download=1"],
         ),
         (
+            "[file](https://[2001:db8::1]:8443/user_uploads/1/abc/file.pdf)",
+            ["https://[2001:db8::1]:8443/user_uploads/1/abc/file.pdf"],
+        ),
+        (
             "![image](https://images.example.test/preview)",
             ["https://images.example.test/preview"],
         ),
@@ -133,6 +137,42 @@ def test_conversion_preserves_file_count_and_identity(example, context):
 )
 def test_zulip_file_extraction(content, expected):
     assert message_conversion.get_zulip_files({"content": content}, {}) == expected
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://[broken/user_uploads/file.pdf",
+        "https://broken]/user_uploads/file.pdf",
+        "https://[not-an-ip]/user_uploads/file.pdf",
+        "https://example.test／user_uploads/file.pdf",
+    ],
+)
+@pytest.mark.parametrize(
+    "formatting", ["{url}", "<{url}>", "[file]({url})", '![image]({url} "Image")']
+)
+def test_malformed_urls_preserve_text_and_other_references(url, formatting):
+    source = formatting.format(url=url)
+    user_uuid = "11111111-1111-4111-8111-111111111111"
+    file_url = "/user_uploads/1/abc/report.pdf"
+    file_urn = "urn:file:22222222-2222-4222-8222-222222222222"
+    context = {
+        "server_url": "https://zulip.example.test",
+        "mention_uuids": {"id:12": user_uuid},
+        "user_ids": {user_uuid: (12, "Bob")},
+        "files": {file_url: file_urn},
+    }
+    content = f"{source}\n@**Bob|12** [report]({file_url})"
+    message = {"id": 1, "content": content}
+
+    assert message_conversion.get_zulip_files(
+        message, context, include_quotes=True
+    ) == [file_url]
+    payload = message_conversion.zulip_to_workspace(message, context)
+    assert payload["content"] == (
+        f"{source}\n[Bob](urn:user:{user_uuid}) [report]({file_urn})"
+    )
+    assert message_conversion.workspace_to_zulip(payload, context) == content
 
 
 @pytest.mark.parametrize("kind", ["file", "image", "video"])
@@ -285,6 +325,14 @@ def test_unsupported_content_keeps_this_messages_attachments(prefix):
             "Read https://example.test/a_(b).",
             "Read [https://example.test/a_(b)](urn:url:https://example.test/a_(b)).",
         ),
+        (
+            "[guide](https://[2001:db8::1]:8443/a)",
+            "[guide](urn:url:https://[2001:db8::1]:8443/a)",
+        ),
+        (
+            "https://[::1]/a",
+            "[https://[::1]/a](urn:url:https://[::1]/a)",
+        ),
         (r"\@**Bob|12**", r"\@**Bob|12**"),
         (r"\\@**Bob|12**", r"\\[Bob](urn:user:11111111-1111-4111-8111-111111111111)"),
         (
@@ -321,6 +369,61 @@ def test_same_message_id_on_another_server_is_an_external_link():
     )
 
 
+@pytest.mark.parametrize(
+    "origin", ["https://zulip.example.test:9443", "http://zulip.example.test"]
+)
+def test_quote_on_another_origin_does_not_reuse_a_local_message_id(origin):
+    context = {
+        "server_url": "https://zulip.example.test",
+        "strict_identities": True,
+        "current_message_uuid": "22222222-2222-4222-8222-222222222222",
+        "message_uuids": {"1001": "11111111-1111-4111-8111-111111111111"},
+        "messages": {"1001": {"content": "Quoted text"}},
+    }
+    url = f"{origin}/#narrow/near/1001"
+    payload = message_conversion.zulip_to_workspace(
+        {
+            "id": 2,
+            "content": f"@_**Alice|7** [said]({url}):\n```quote\nQuoted text\n```",
+        },
+        context,
+    )
+    assert "urn:quote:" not in payload["content"]
+    assert "urn:forward:" in payload["content"]
+    assert f"urn:url:{url}" in payload["content"]
+
+
+def test_malformed_quote_links_preserve_the_source_and_converted_snapshot():
+    user_uuid = "11111111-1111-4111-8111-111111111111"
+    url = "https://[broken/#narrow/near/1001"
+    context = {
+        "server_url": "https://zulip.example.test",
+        "strict_identities": True,
+        "current_message_uuid": "22222222-2222-4222-8222-222222222222",
+        "message_uuids": {"1001": user_uuid},
+        "mention_uuids": {"id:12": user_uuid},
+    }
+    snapshot = (
+        base64.urlsafe_b64encode(
+            f"https://[broken/ [Bob](urn:user:{user_uuid})".encode()
+        )
+        .decode()
+        .rstrip("=")
+    )
+    message = {
+        "id": 2,
+        "content": f"@_**Alice|7** [said]({url}):\n```quote\nhttps://[broken/ @**Bob|12**\n```",
+    }
+
+    assert (
+        message_conversion.get_zulip_files(message, context, include_quotes=True) == []
+    )
+    assert message_conversion.zulip_to_workspace(message, context)["content"] == (
+        f"[unknown](urn:forward:{context['current_message_uuid']}?snapshot={snapshot})"
+        f"\n@_**Alice|7** [said]({url}):"
+    )
+
+
 def test_partial_quote_without_original_message_keeps_quoted_text():
     example = next(
         case for case in EXAMPLES if case["name"] == "partial_quoted_message_reference"
@@ -347,6 +450,64 @@ def test_reverse_conversion_requires_identity_and_attachment_mappings(kind):
         message_conversion.workspace_to_zulip(
             payload, {"server_url": "https://zulip.example.test"}
         )
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "https://[broken/",
+        "urn:url:https://[broken/",
+        "urn:unknown:value",
+        "urn:user:not-a-uuid",
+        "urn:stream:" + "-" * 36,
+        "urn:topic:" + "a" * 36,
+        "urn:message:" + "a" * 36,
+        "urn:quote:" + "-" * 36,
+        "urn:file:not-a-uuid",
+        "urn:forward:11111111-1111-4111-8111-111111111111",
+        "urn:forward:11111111-1111-4111-8111-111111111111?snapshot=",
+        "urn:forward:11111111-1111-4111-8111-111111111111?snapshot=invalid!",
+        "urn:forward:11111111-1111-4111-8111-111111111111?snapshot=_w",
+    ],
+)
+def test_unparseable_workspace_elements_remain_text(target):
+    user_uuid = "22222222-2222-4222-8222-222222222222"
+    original = f'[broken](<{target}> "Keep this")'
+    payload = {
+        "kind": "markdown",
+        "content": f"{original} [Bob](urn:user:{user_uuid})",
+    }
+    context = {"mention_uuids": {"id:12": user_uuid}}
+
+    assert (
+        message_conversion.workspace_reference_text(payload["content"])
+        == (payload["content"])
+    )
+    assert message_conversion.get_workspace_files(payload, include_quotes=True) == []
+    assert message_conversion.workspace_to_zulip(payload, context) == (
+        f"{original} @**Bob|12**"
+    )
+
+
+def test_unparseable_element_inside_a_forward_does_not_block_other_references():
+    user_uuid = "22222222-2222-4222-8222-222222222222"
+    malformed = (
+        "[broken](urn:forward:11111111-1111-4111-8111-111111111111?snapshot=invalid!)"
+    )
+    snapshot = f"{malformed} [Bob](urn:user:{user_uuid})"
+    encoded = base64.urlsafe_b64encode(snapshot.encode()).decode().rstrip("=")
+    content = f"[quote](urn:forward:{user_uuid}?snapshot={encoded})"
+    context = {"mention_uuids": {"id:12": user_uuid}}
+
+    assert message_conversion.workspace_reference_text(content) == (
+        content + "\n" + snapshot
+    )
+    assert (
+        message_conversion.workspace_to_zulip(
+            {"kind": "markdown", "content": content}, context
+        )
+        == f"```quote\n{malformed} @**Bob|12**\n```"
+    )
 
 
 def test_reverse_conversion_rejects_encrypted_content():

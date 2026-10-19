@@ -92,7 +92,7 @@ class HistoryImportService(basic.BasicService):
             self._ensure_reconciliation_task()
             tasks = self._get_tasks()
             for task in tasks:
-                if isinstance(task.content, models.SendMessageContent):
+                if isinstance(task.content, models.OutboundMessageContent):
                     with task.track_execution():
                         try:
                             if task.content.prepare(task):

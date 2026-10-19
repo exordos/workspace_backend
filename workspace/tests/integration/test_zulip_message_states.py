@@ -830,7 +830,7 @@ def test_batch_keeps_changes_when_its_writes_leave_another_message_different(
     assert _changes(v2_models.WorkspaceMessageChange, account) == []
 
 
-def test_reconciliation_tracking_migration_is_reversible(message_sources):
+def test_reconciliation_tracking_migration_is_reversible(message_sources, db):
     account, source = message_sources()
     _prepare(account)
     engine = migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
@@ -839,6 +839,9 @@ def test_reconciliation_tracking_migration_is_reversible(message_sources):
     )
     engine.rollback_migration(migration)
     try:
+        db.execute(
+            "ALTER TABLE bridge_zulip_v5_message_contents ADD COLUMN conversion_version INTEGER NOT NULL DEFAULT 0"
+        )
         with contexts.Context().session_manager():
             assert models.ZulipMessageState.reconcile_batch(1) == 1
         (pending,) = _changes(v2_models.WorkspaceMessageChange, account)

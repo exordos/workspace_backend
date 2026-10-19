@@ -86,7 +86,7 @@ def outgoing(api, db, scheduled_reconciliation, monkeypatch):
         "id": 12345,
         "sender_id": 7,
         "timestamp": int(datetime.datetime.now(datetime.timezone.utc).timestamp()) + 10,
-        "content": "Raw **message** [user](urn:user:unchanged)",
+        "content": "Raw **message**",
         "type": "stream",
         "stream_id": 42,
         "subject": "General",

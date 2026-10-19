@@ -32,6 +32,10 @@ MIGRATION = "0187-Process-only-Markdown-message-content-90458e.py"
 def content_migration_database(_database, http_server):
     with conftest.isolated_migration_database(MIGRATION) as database_url:
         with psycopg.connect(database_url, autocommit=True) as connection:
+            # The current IAM model includes this independent, later catalog field.
+            connection.execute(
+                "ALTER TABLE m_workspace_users ADD COLUMN disabled BOOLEAN NOT NULL DEFAULT FALSE"
+            )
             client = conftest.ApiClient(
                 base_url=http_server,
                 user_uuid=sys_uuid.uuid4(),
