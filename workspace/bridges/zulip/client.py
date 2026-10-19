@@ -85,6 +85,24 @@ class ZulipClient:
             },
         )
 
+    def update_reaction(
+        self,
+        message_id: int,
+        emoji_name: str,
+        emoji_code: str,
+        reaction_type: str,
+        present: bool,
+    ) -> dict:
+        return self._request(
+            "POST" if present else "DELETE",
+            f"/messages/{message_id}/reactions",
+            data={
+                "emoji_name": emoji_name,
+                "emoji_code": emoji_code,
+                "reaction_type": reaction_type,
+            },
+        )
+
     def get_users(self) -> list[dict]:
         # Unlike /users, registration also includes cross-realm system bots.
         data = self._request(

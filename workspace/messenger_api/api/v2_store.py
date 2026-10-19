@@ -17,6 +17,7 @@ from restalchemy.dm import filters as dm_filters
 from workspace.messenger_api.api import resource_projection
 from workspace.messenger_api.api import sql_canonical_store
 from workspace.messenger_api.api import store as api_store
+from workspace.common import emoji
 from workspace.messenger_api.dm import base
 from workspace.messenger_api.dm import helpers
 from workspace.messenger_api.dm import message_payloads
@@ -1165,6 +1166,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         self,
         values: dict[str, typing.Any],
     ) -> dict[str, typing.Any]:
+        values = {**values, "emoji_name": emoji.normalize_name(values["emoji_name"])}
         message = self._message(values["message_uuid"])
         reaction_uuid = sys_uuid.UUID(str(values.get("uuid") or sys_uuid.uuid4()))
         session = contexts.Context().get_session()
@@ -1329,6 +1331,11 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 raise ra_exceptions.ValidationErrorException()
             old_message = self._message(reaction.message_uuid)
             message = self._message(values.get("message_uuid", reaction.message_uuid))
+            if "emoji_name" in values:
+                values = {
+                    **values,
+                    "emoji_name": emoji.normalize_name(values["emoji_name"]),
+                }
             session.execute(
                 """
                 UPDATE messenger_message_reaction_facts

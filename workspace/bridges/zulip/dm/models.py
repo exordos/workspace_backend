@@ -38,6 +38,7 @@ from restalchemy.storage.sql import utils
 
 from workspace.bridges.zulip import client
 from workspace.bridges.zulip.dm import flags as message_flags
+from workspace.bridges.zulip.dm import reactions as message_reactions
 from workspace.common import models as common_models
 from workspace.common import types as common_types
 from workspace.messenger_api import events as messenger_events
@@ -2031,6 +2032,7 @@ class ImportHistoryContent(AbstractZulipTaskContent):
             observed_flags = message_flags.observe_snapshot(
                 account, messages, observed_at
             )
+            message_reactions.observe_snapshot(account, messages, observed_at)
             deliveries = (
                 {
                     delivery.zulip_message_id: delivery
@@ -2354,7 +2356,34 @@ class UpdateMessageFlagsContent(AbstractZulipTaskContent):
             super().on_error(task, error)
 
 
+class UpdateReactionContent(AbstractZulipTaskContent):
+    KIND = "update_reaction"
+
+    intent_uuid = properties.property(types.UUID(), required=True, read_only=True)
+    reaction_message_uuid = properties.property(
+        types.UUID(), required=True, read_only=True
+    )
+    changed_at = properties.property(
+        types.UTCDateTimeZ(), required=True, read_only=True
+    )
+    present = properties.property(types.Boolean(), required=True, read_only=True)
+    account_revision = properties.property(
+        types.String(), required=True, read_only=True
+    )
+
+    def execute(self, task: "Task") -> None:
+        message_reactions.send(self, task)
+
+    def on_error(self, task: "Task", error: Exception) -> None:
+        if isinstance(error, SubscriptionChangedError):
+            task.status = TaskStatus.CANCEL.value
+        else:
+            super().on_error(task, error)
+
+
 class RefreshMessageFlagsContent(AbstractZulipTaskContent):
+    """Refresh flags and reactions on known messages, including old history."""
+
     KIND = "refresh_message_flags"
 
     after_message_id = properties.property(types.Integer(min_value=0), default=0)
@@ -2411,6 +2440,9 @@ class RefreshMessageFlagsContent(AbstractZulipTaskContent):
             observed_at = datetime.datetime.now(datetime.timezone.utc)
             data = zulip.get_messages(first, last)
             message_flags.observe_snapshot(
+                account, [row for row in data if row["id"] in wanted], observed_at
+            )
+            message_reactions.observe_snapshot(
                 account, [row for row in data if row["id"] in wanted], observed_at
             )
         finally:
@@ -2658,6 +2690,7 @@ class ReconciliationContent(AbstractTaskContent):
         if processed < self.batch_size:
             processed += ZulipMessageState.reconcile_batch(self.batch_size - processed)
         message_flags.FlagChange.reconcile_batch(self.batch_size)
+        message_reactions.ReactionChange.reconcile_batch(self.batch_size)
         not_before_at = None
         if processed < self.batch_size:
             not_before_at = datetime.datetime.now(
@@ -2677,6 +2710,7 @@ class ReconciliationContent(AbstractTaskContent):
 
 
 TASK_CONTENT_TYPE = types_dynamic.KindModelSelectorType(
+    types_dynamic.KindModelType(UpdateReactionContent),
     types_dynamic.KindModelType(UpdateMessageFlagsContent),
     types_dynamic.KindModelType(RefreshMessageFlagsContent),
     types_dynamic.KindModelType(SendMessageContent),
@@ -3061,6 +3095,19 @@ class RealtimeEvent(
             priority = TASK_PRIORITY_INITIALIZE_CONNECTION
         elif kind in ("message", "update_message"):
             if kind == "message":
+                if "reactions" in self.payload["message"]:
+                    account = external_models.ExternalAccount.objects.get_one(
+                        filters={
+                            "uuid": filters.EQ(self.external_account_uuid),
+                            "project_id": filters.EQ(self.project_id),
+                        }
+                    )
+                    RealtimeSubscription.lock_account(account)
+                    if self.current_subscription() is None:
+                        return
+                    message_reactions.observe_snapshot(
+                        account, [self.payload["message"]], self.created_at
+                    )
                 if "flags" in self.payload:
                     account = external_models.ExternalAccount.objects.get_one(
                         filters={
@@ -3165,6 +3212,38 @@ class RealtimeEvent(
                     )
                     for message_id in sorted(set(message_ids) - known - {0})
                 ]
+        elif kind == "reaction":
+            account = external_models.ExternalAccount.objects.get_one(
+                filters={
+                    "project_id": filters.EQ(self.project_id),
+                    "uuid": filters.EQ(self.external_account_uuid),
+                }
+            )
+            RealtimeSubscription.lock_account(account)
+            if self.current_subscription() is None:
+                return
+            message_reactions.record_event(
+                account, self.payload, self.created_at, self.event_id, self.queue_id
+            )
+            actor = external_models.ExternalAccount.objects.get_one_or_none(
+                filters={
+                    "project_id": filters.EQ(self.project_id),
+                    "provider": filters.EQ("zulip"),
+                    "external_account_id": filters.EQ(
+                        f"{account.get_host()}:{self.payload['user_id']}"
+                    ),
+                }
+            )
+            if actor is None:
+                contents.append(ImportUsersContent(periodic=False))
+            remote = message_reactions.message_for(account, self.payload["message_id"])
+            if remote["canonical_message_uuid"] is None:
+                contents.append(
+                    ImportHistoryContent(
+                        first_message_id=self.payload["message_id"],
+                        last_message_id=self.payload["message_id"],
+                    )
+                )
         elif kind == "realm_user":
             contents = [ImportUsersContent(periodic=False)]
             priority = TASK_PRIORITY_IMPORT_USERS

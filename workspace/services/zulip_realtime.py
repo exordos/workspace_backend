@@ -19,6 +19,7 @@ from restalchemy.dm import filters
 
 from workspace.bridges.zulip import client
 from workspace.bridges.zulip.dm import flags as message_flags
+from workspace.bridges.zulip.dm import reactions as message_reactions
 from workspace.bridges.zulip.dm import models
 from workspace.messenger_api.dm import external_models
 
@@ -164,10 +165,17 @@ class ZulipRealtimeService:
                     flags_changed = await self._database(
                         message_flags.FlagChange.reconcile_batch, 16
                     )
+                    reactions_changed = await self._database(
+                        message_reactions.ReactionChange.reconcile_batch, 16
+                    )
                     event_processed = await self._database(
                         models.WorkspaceEvent.dispatch_one
                     )
-                    if not flags_changed and not event_processed:
+                    if (
+                        not flags_changed
+                        and not reactions_changed
+                        and not event_processed
+                    ):
                         break
                 else:
                     await asyncio.sleep(0)
@@ -194,7 +202,7 @@ class ZulipRealtimeService:
                             self._accounts_changed.set()
                         if notification.payload in ("events", ""):
                             self._events_ready.set()
-                        if notification.payload in ("flags", ""):
+                        if notification.payload in ("flags", "reactions", ""):
                             self._workspace_events_ready.set()
             except Exception:
                 LOG.exception("Failed to listen for Zulip realtime notifications")
