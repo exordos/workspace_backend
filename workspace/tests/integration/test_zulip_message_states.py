@@ -1610,6 +1610,303 @@ def test_user_message_migration_is_reversible_and_requeues_existing_placements(
     )
 
 
+def _reconcile_topic_preferences():
+    for _ in range(5):
+        with contexts.Context().session_manager():
+            processed = models.ZulipTopicState.reconcile_batch(100)
+        if not processed:
+            return
+    pytest.fail("Topic preferences did not converge")
+
+
+@pytest.mark.parametrize(
+    "policy,stream_mode,mentioned,mode,active",
+    [
+        (0, "all_messages", False, "default", 1),
+        (0, "mentions_only", False, "default", 0),
+        (1, "all_messages", False, "mute", 0),
+        (1, "all_messages", True, "mute", 1),
+        (2, "mentions_only", False, "unmute", 1),
+        (2, "all_messages", False, "unmute", 1),
+        (3, "mentions_only", False, "follow", 1),
+    ],
+)
+def test_topic_notifications_import_modes_and_zulip_counter_semantics(
+    message_sources, policy, stream_mode, mentioned, mode, active
+):
+    account, source = message_sources()
+    source.read = False
+    source.mentioned = mentioned
+    source.update()
+    source.channel.notification_mode = stream_mode
+    source.channel.update()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(100)
+        models.ZulipTopicNotification.import_snapshot(
+            source.channel,
+            [
+                {
+                    "topic_name": "gEnErAl",
+                    "visibility_policy": policy,
+                    "last_updated": 1691057093,
+                }
+            ],
+        )
+    _reconcile_topic_preferences()
+    (binding,) = _viewer_rows(account, v2_models.WorkspaceUserTopicBinding)
+    assert binding.notification_mode == mode
+    (topic,) = _viewer_rows(account, v2_models.WorkspaceUserTopic)
+    assert topic.notification_mode == mode
+    _refresh_counters()
+    (topic,) = _viewer_rows(account, v2_models.WorkspaceUserTopicBinding)
+    (stream,) = _viewer_rows(account, v2_models.WorkspaceStreamBinding)
+    assert topic.active_unread_count == stream.active_unread_count == active
+    assert topic.passive_unread_count == stream.passive_unread_count == 1 - active
+    assert _topic_changes(account) == []
+
+
+def test_channel_notification_changes_preserve_explicit_zulip_topic_unmuting(
+    message_sources,
+):
+    account, source = message_sources()
+    source.channel.notification_mode = "mentions_only"
+    source.channel.update()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(100)
+        models.ZulipTopicNotification.import_snapshot(
+            source.channel,
+            [{"topic_name": "General", "visibility_policy": 2, "last_updated": 42}],
+        )
+    _reconcile_topic_preferences()
+    source.channel.notification_mode = "all_messages"
+    source.channel.update()
+    with contexts.Context().session_manager():
+        (state,) = models.ZulipStreamBindingState.objects.get_all(
+            filters={"project_id": filters.EQ(account.project_id)}
+        )
+        state.do()
+    assert (
+        _viewer_rows(account, v2_models.WorkspaceUserTopicBinding)[0].notification_mode
+        == "unmute"
+    )
+
+
+def test_failed_topic_preference_event_rolls_back_binding_and_acknowledgement(
+    message_sources, monkeypatch
+):
+    account, source = message_sources()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(100)
+        models.ZulipTopicNotification.import_snapshot(
+            source.channel,
+            [{"topic_name": "General", "visibility_policy": 3, "last_updated": 42}],
+        )
+    pending = _topic_changes(account)
+    with monkeypatch.context() as patched:
+        patched.setattr(
+            models.messenger_events,
+            "create_topic_updated_event",
+            mock.Mock(side_effect=RuntimeError("Cannot publish topic preference")),
+        )
+        with pytest.raises(RuntimeError, match="Cannot publish topic preference"):
+            with contexts.Context().session_manager():
+                models.ZulipTopicState.reconcile_batch(100)
+    assert (
+        _viewer_rows(account, v2_models.WorkspaceUserTopicBinding)[0].notification_mode
+        == "default"
+    )
+    assert [row.revision for row in _topic_changes(account)] == [
+        row.revision for row in pending
+    ]
+    _reconcile_topic_preferences()
+    assert (
+        _viewer_rows(account, v2_models.WorkspaceUserTopicBinding)[0].notification_mode
+        == "follow"
+    )
+
+
+def test_topic_preferences_are_account_scoped_and_reset_when_removed(message_sources):
+    first, source = message_sources()
+    second, other = message_sources(project_id=first.project_id, sender_id=8)
+    _prepare(first)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(100)
+        for copy, policy in ((source, 3), (other, 1)):
+            models.ZulipTopicNotification.import_snapshot(
+                copy.channel,
+                [
+                    {
+                        "topic_name": "General",
+                        "visibility_policy": policy,
+                        "last_updated": 42,
+                    }
+                ],
+            )
+    _reconcile_topic_preferences()
+    bindings = _viewer_rows(first, v2_models.WorkspaceUserTopicBinding)
+    assert {row.user_uuid: row.notification_mode for row in bindings} == {
+        first.owner_user_uuid: "follow",
+        second.owner_user_uuid: "mute",
+    }
+    with contexts.Context().session_manager():
+        models.ZulipTopicNotification.import_snapshot(source.channel, [])
+    _reconcile_topic_preferences()
+    bindings = _viewer_rows(first, v2_models.WorkspaceUserTopicBinding)
+    assert {row.user_uuid: row.notification_mode for row in bindings} == {
+        first.owner_user_uuid: "default",
+        second.owner_user_uuid: "mute",
+    }
+
+
+def test_topic_preferences_imported_before_history_apply_after_bindings_appear(
+    message_sources,
+):
+    account, source = message_sources()
+    with contexts.Context().session_manager():
+        models.ZulipTopicNotification.import_snapshot(
+            source.channel,
+            [{"topic_name": "General", "visibility_policy": 3, "last_updated": 42}],
+        )
+    _prepare(account)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(100)
+    _reconcile_topic_preferences()
+    assert (
+        _viewer_rows(account, v2_models.WorkspaceUserTopicBinding)[0].notification_mode
+        == "follow"
+    )
+
+
+def test_empty_topic_preferences_do_not_apply_to_literal_general_topic(message_sources):
+    account, source = message_sources()
+    empty = models.ZulipTopic(
+        uuid=uuid.uuid5(source.channel.stream_uuid, ""),
+        stream_id=42,
+        name="General Topic",
+        max_id=42,
+    )
+    empty.insert()
+    source.topic = empty
+    source.update()
+    named = models.ZulipTopic(
+        uuid=uuid.uuid5(source.channel.stream_uuid, "General Topic"),
+        stream_id=42,
+        name="General Topic",
+        max_id=43,
+    )
+    named.insert()
+    models.ZulipMessage(
+        project_id=account.project_id,
+        external_account_uuid=account.uuid,
+        message_uuid=uuid.uuid4(),
+        message_id=43,
+        sender_id=7,
+        timestamp=source.timestamp,
+        channel=source.channel,
+        topic=named,
+        content=source.content,
+    ).insert()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(100)
+        models.ZulipTopicNotification.import_snapshot(
+            source.channel,
+            [{"topic_name": "", "visibility_policy": 3, "last_updated": 42}],
+        )
+    _reconcile_topic_preferences()
+    assert {
+        row.topic_uuid: row.notification_mode
+        for row in _viewer_rows(account, v2_models.WorkspaceUserTopicBinding)
+    } == {empty.uuid: "follow", named.uuid: "default"}
+
+
+def test_topic_preferences_follow_a_rebound_external_account(message_sources, db):
+    account, source = message_sources()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(100)
+        models.ZulipTopicNotification.import_snapshot(
+            source.channel,
+            [{"topic_name": "General", "visibility_policy": 3, "last_updated": 42}],
+        )
+    _reconcile_topic_preferences()
+    owner = uuid.uuid4()
+    conftest.seed_workspace_user(db, owner, f"rebound-preferences-{owner}")
+    account.properties["owner_user_uuid"].set_value_force(owner)
+    account.update()
+    task = models.Task(
+        priority=models.TASK_PRIORITY_RECONCILIATION,
+        content=models.ReconciliationContent(),
+    )
+    task.insert()
+    with contexts.Context().session_manager():
+        task.execute()
+        assert task.status == "done", task.error_description
+    _reconcile_topic_preferences()
+    binding = v2_models.WorkspaceUserTopicBinding.objects.get_one(
+        filters={
+            "project_id": filters.EQ(account.project_id),
+            "user_uuid": filters.EQ(owner),
+        }
+    )
+    assert binding.notification_mode == "follow"
+
+
+def test_topic_notification_migration_renames_dm_topics_without_changing_identity(
+    message_sources, db
+):
+    account, source = message_sources()
+    source.channel.update_dm(
+        values={
+            "channel_type": "private",
+            "stream_id": None,
+            "direct_user_uuid": account.uuid,
+        }
+    )
+    source.channel.update()
+    source.topic.name = "General Topic"
+    source.topic.stream_id = None
+    source.topic.update()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(100)
+    (binding,) = _viewer_rows(account, v2_models.WorkspaceUserTopicBinding)
+    engine = migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    migration = "0227-Reconcile-Zulip-topic-notification-preferences-4a77fd.py"
+    engine.rollback_migration(migration)
+    try:
+        assert db.execute(
+            "SELECT to_regclass('bridge_zulip_v5_topic_notifications')"
+        ).fetchone() == (None,)
+        assert db.execute(
+            "SELECT name FROM bridge_zulip_v5_topics WHERE uuid=%s",
+            (source.topic.uuid,),
+        ).fetchone() == ("General Topic",)
+    finally:
+        engine.apply_migration(engine.get_latest_migration())
+    topic = v2_models.WorkspaceStreamTopic.objects.get_one(
+        filters={
+            "project_id": filters.EQ(account.project_id),
+            "uuid": filters.EQ(source.topic.uuid),
+        }
+    )
+    assert topic.name == "Zulip" and topic.stream_uuid == source.channel.stream_uuid
+    restored = models.ZulipTopic.objects.get_one(
+        filters={"uuid": filters.EQ(source.topic.uuid)}
+    )
+    assert restored.name == "Zulip"
+    assert (
+        _viewer_rows(account, v2_models.WorkspaceUserTopicBinding)[0].uuid
+        == binding.uuid
+    )
+    assert {
+        row.scope_uuid for row in _changes(models.ZulipMessageCounterChange, account)
+    } == {source.channel.stream_uuid, source.topic.uuid}
+
+
 def _refresh_counters():
     task = models.Task(
         priority=models.TASK_PRIORITY_REFRESH_MESSAGE_COUNTERS,

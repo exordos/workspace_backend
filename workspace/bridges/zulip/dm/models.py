@@ -357,15 +357,14 @@ class ZulipStreamBindingState(
             "WHERE project_id=%s AND uuid=%s AND active",
             (self.notification_mode, self.project_id, self.binding_uuid),
         )
-        topic_uuids = (
-            messenger_helpers._normalize_workspace_user_stream_topic_notification_modes(
+        topic_uuids = [
+            topic.uuid
+            for topic in messenger_helpers._get_workspace_stream_topics(
                 project_id=self.project_id,
-                user_uuid=self.user_uuid,
                 stream_uuid=self.stream_uuid,
-                notification_mode=self.notification_mode,
                 session=session,
             )
-        )
+        ]
         ZulipMessageCounterChange.mark_many(
             {
                 (self.project_id, self.user_uuid, self.stream_uuid, None),
@@ -474,6 +473,13 @@ class ZulipTopicState(
                 },
             ):
                 state.do()
+            for state in ZulipTopicNotificationState.objects.get_all(
+                filters={
+                    "project_id": filters.EQ(project_id),
+                    "topic_uuid": filters.In(topic_uuids),
+                },
+            ):
+                state.do()
         if changes:
             ZulipTopicChange.acknowledge_many(changes)
         return len(changes)
@@ -508,6 +514,55 @@ class ZulipTopicState(
             },
         )
         topic.delete()
+
+
+class ZulipTopicNotificationState(models.ModelWithID, orm.SQLStorableMixin):
+    __tablename__ = "bridge_zulip_v5_topic_notification_states"
+
+    project_id = properties.property(
+        types.UUID(), required=True, read_only=True, id_property=True
+    )
+    user_uuid = properties.property(
+        types.UUID(), required=True, read_only=True, id_property=True
+    )
+    topic_uuid = properties.property(
+        types.UUID(), required=True, read_only=True, id_property=True
+    )
+    stream_uuid = properties.property(types.UUID(), required=True, read_only=True)
+    notification_mode = properties.property(
+        types.Enum(
+            [mode.value for mode in messenger_models.WorkspaceTopicNotificationMode]
+        ),
+        required=True,
+        read_only=True,
+    )
+
+    @classmethod
+    def get_id_property(cls) -> dict[str, typing.Any]:
+        return cls.id_properties.copy()
+
+    def get_id(self) -> tuple[sys_uuid.UUID, sys_uuid.UUID, sys_uuid.UUID]:
+        return self.project_id, self.user_uuid, self.topic_uuid
+
+    def do(self) -> None:
+        session = contexts.Context().get_session()
+        messenger_helpers._lock_workspace_project_event_writes(self.project_id, session)
+        session.execute(
+            "UPDATE messenger_user_topic_bindings SET notification_mode=%s, updated_at=NOW() "
+            "WHERE project_id=%s AND user_uuid=%s AND topic_uuid=%s",
+            (self.notification_mode, self.project_id, self.user_uuid, self.topic_uuid),
+        )
+        ZulipMessageCounterChange.mark_many(
+            {(self.project_id, self.user_uuid, self.stream_uuid, self.topic_uuid)}
+        )
+        topic = v2_models.WorkspaceUserTopic.objects.get_one(
+            filters={
+                "project_id": filters.EQ(self.project_id),
+                "user_uuid": filters.EQ(self.user_uuid),
+                "uuid": filters.EQ(self.topic_uuid),
+            }
+        )
+        messenger_events.create_topic_updated_event(topic, session=session)
 
 
 class ZulipMessageChange(v2_models.WorkspaceMessageChange):
@@ -1125,6 +1180,8 @@ class ZulipChannel(
 ):
     __tablename__ = "bridge_zulip_v5_channels"
 
+    topic_notifications_synced = properties.property(types.Boolean(), default=False)
+
     notification_mode = properties.property(
         types.AllowNone(
             types.Enum(
@@ -1199,6 +1256,42 @@ class ZulipChannel(
             self.direct_user_uuid is not None
         ):
             raise exceptions.ValidationErrorException()
+
+
+class ZulipTopicNotification(models.ModelWithUUID, orm.SQLStorableMixin):
+    __tablename__ = "bridge_zulip_v5_topic_notifications"
+
+    channel_uuid = properties.property(types.UUID(), required=True, read_only=True)
+    topic_name = properties.property(types.String(), required=True, read_only=True)
+    visibility_policy = properties.property(
+        types.Integer(min_value=0, max_value=3), required=True
+    )
+    last_updated = properties.property(types.Integer(min_value=0), required=True)
+
+    @classmethod
+    def import_snapshot(cls, channel: "ZulipChannel", values: list[dict]) -> None:
+        previous = {
+            row.topic_name: row
+            for row in cls.objects.get_all(
+                filters={"channel_uuid": filters.EQ(channel.uuid)}
+            )
+        }
+        for data in values:
+            name = data["topic_name"].lower()
+            row = previous.pop(name, None)
+            fields = {
+                "visibility_policy": data["visibility_policy"],
+                "last_updated": data["last_updated"],
+            }
+            if row is None:
+                cls(channel_uuid=channel.uuid, topic_name=name, **fields).insert()
+            else:
+                row.update_dm(values=fields)
+                row.update()
+        for row in previous.values():
+            row.delete()
+        channel.topic_notifications_synced = True
+        channel.update()
 
 
 class ZulipTopic(
@@ -1682,6 +1775,9 @@ class ImportChannelsContent(AbstractZulipTaskContent):
         server_namespace = sys_uuid.uuid5(sys_uuid.NAMESPACE_DNS, hostname)
         zulip = client.ZulipClient(account)
         try:
+            topic_notifications = {}
+            for data in zulip.get_topic_notifications():
+                topic_notifications.setdefault(data["stream_id"], []).append(data)
             stream_ids = set()
             for data in zulip.get_channels():
                 values = {
@@ -1713,13 +1809,17 @@ class ImportChannelsContent(AbstractZulipTaskContent):
                     },
                 )
                 if channel is None:
-                    ZulipChannel(
+                    channel = ZulipChannel(
                         external_account_uuid=account.uuid,
                         **values,
-                    ).insert()
+                    )
+                    channel.insert()
                 else:
                     channel.update_dm(values=values)
                     channel.update()
+                ZulipTopicNotification.import_snapshot(
+                    channel, topic_notifications.get(values["stream_id"], [])
+                )
                 stream_ids.add(values["stream_id"])
             for channel in ZulipChannel.objects.get_all(
                 filters={
@@ -1856,7 +1956,11 @@ class ImportHistoryContent(AbstractZulipTaskContent):
                         channel.update_dm(values=values)
                         channel.update()
                 topic_uuid = sys_uuid.uuid5(channel.stream_uuid, data["subject"])
-                topic_name = data["subject"] or "General Topic"
+                topic_name = (
+                    data["subject"] or "General Topic"
+                    if channel.channel_type == ZulipChannelType.CHANNEL.value
+                    else "Zulip"
+                )
                 topic = ZulipTopic.objects.get_one_or_none(
                     filters={"uuid": filters.EQ(topic_uuid)},
                 )

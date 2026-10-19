@@ -423,6 +423,8 @@ def test_subscription_snapshot_repairs_notification_modes_from_channel_muting(
     )
     http = mock.Mock()
     http.request.return_value.json.side_effect = [
+        {"result": "success", "queue_id": "topics:1", "user_topics": []},
+        {"result": "success"},
         {
             "result": "success",
             "queue_id": "subscriptions:1",

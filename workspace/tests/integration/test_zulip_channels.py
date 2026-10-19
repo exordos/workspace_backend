@@ -92,6 +92,7 @@ def test_channel_import_saves_and_updates_metadata_preserving_identifiers(
         ),
     ]
     zulip = mock.Mock()
+    zulip.get_topic_notifications.return_value = []
     zulip.get_channels.return_value = [{**row, "first_message_id": 7} for row in data]
     monkeypatch.setattr(client, "ZulipClient", lambda current_account: zulip)
 
@@ -153,6 +154,7 @@ def test_channel_import_preserves_direct_and_group_conversations(
     )
     group.insert()
     zulip = mock.Mock()
+    zulip.get_topic_notifications.return_value = []
     zulip.get_channels.return_value = [_channel_data()]
     monkeypatch.setattr(client, "ZulipClient", lambda current: zulip)
     try:
@@ -227,6 +229,7 @@ def test_channel_stream_uuid_depends_on_hostname_and_id_not_the_account(
     )
     other_account.insert()
     zulip = mock.Mock()
+    zulip.get_topic_notifications.return_value = []
     zulip.get_channels.return_value = [_channel_data()]
     monkeypatch.setattr(client, "ZulipClient", lambda current_account: zulip)
     try:
@@ -247,6 +250,7 @@ def test_channel_stream_uuid_depends_on_hostname_and_id_not_the_account(
 
 def test_empty_channel_import_succeeds(channel_import_account, monkeypatch):
     zulip = mock.Mock()
+    zulip.get_topic_notifications.return_value = []
     zulip.get_channels.return_value = []
     monkeypatch.setattr(client, "ZulipClient", lambda account: zulip)
 
@@ -268,6 +272,7 @@ def test_channel_import_removes_missing_channels_only_from_its_account(
     )
     other_account.insert()
     zulip = mock.Mock()
+    zulip.get_topic_notifications.return_value = []
     zulip.get_channels.return_value = [_channel_data(42), _channel_data(43)]
     monkeypatch.setattr(client, "ZulipClient", lambda current_account: zulip)
     try:
@@ -299,12 +304,15 @@ def test_channel_import_removes_missing_channels_only_from_its_account(
         other_account.delete()
 
 
-@pytest.mark.parametrize("phase", ["fetch", "validation", "close"])
+@pytest.mark.parametrize(
+    "phase", ["fetch", "validation", "close", "topic_fetch", "topic_validation"]
+)
 def test_failed_channel_import_preserves_previous_channels(
     channel_import_account, monkeypatch, phase
 ):
     account = channel_import_account
     zulip = mock.Mock()
+    zulip.get_topic_notifications.return_value = []
     zulip.get_channels.return_value = [_channel_data(), _channel_data(43)]
     monkeypatch.setattr(client, "ZulipClient", lambda current_account: zulip)
     assert _run_channel_import(account).status == "done"
@@ -314,12 +322,23 @@ def test_failed_channel_import_preserves_previous_channels(
         zulip.get_channels.side_effect = requests.Timeout("Timed out")
     elif phase == "validation":
         zulip.get_channels.return_value.append(_channel_data(44, name=""))
+    elif phase == "topic_fetch":
+        zulip.get_topic_notifications.side_effect = requests.Timeout("Timed out")
+    elif phase == "topic_validation":
+        zulip.get_topic_notifications.return_value = [
+            {
+                "stream_id": 42,
+                "topic_name": "General",
+                "visibility_policy": 4,
+                "last_updated": 42,
+            }
+        ]
     else:
         zulip.close.side_effect = RuntimeError("Close failed")
 
     task = _run_channel_import(account)
 
-    assert task.status == ("retry" if phase == "fetch" else "error")
+    assert task.status == ("retry" if phase in ("fetch", "topic_fetch") else "error")
     stored = _channels(account)
     assert [channel.uuid for channel in stored] == [
         channel.uuid for channel in previous
@@ -347,6 +366,7 @@ def test_channel_import_handles_provider_errors(
         ).encode()
         error = requests.HTTPError("Failed", response=response)
     zulip = mock.Mock()
+    zulip.get_topic_notifications.return_value = []
     zulip.get_channels.side_effect = error
     monkeypatch.setattr(client, "ZulipClient", lambda account: zulip)
 

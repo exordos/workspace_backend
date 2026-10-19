@@ -85,6 +85,7 @@ def test_successful_connection_starts_full_backfill_and_periodic_catalog_sync(
     }
     zulip.get_last_message_id.return_value = 10005
     zulip.get_channels.return_value = []
+    zulip.get_topic_notifications.return_value = []
     zulip.get_users.return_value = []
     zulip.get_messages.return_value = []
     monkeypatch.setattr(client, "ZulipClient", lambda account: zulip)

@@ -108,6 +108,27 @@ class ZulipClient:
         )["messages"]
         return messages[-1]["id"] if messages else 0
 
+    def get_topic_notifications(self) -> list[dict]:
+        data = self._request(
+            "POST",
+            "/register",
+            data={
+                "event_types": "[]",
+                "fetch_event_types": '["user_topic"]',
+                "client_capabilities": json.dumps(
+                    {
+                        "notification_settings_null": True,
+                        "user_settings_object": True,
+                        "empty_topic_name": True,
+                    }
+                ),
+            },
+        )
+        try:
+            return data["user_topics"]
+        finally:
+            self._request("DELETE", "/events", data={"queue_id": data["queue_id"]})
+
     def get_messages(self, first_message_id: int, last_message_id: int) -> list[dict]:
         messages = self._get(
             "/messages",

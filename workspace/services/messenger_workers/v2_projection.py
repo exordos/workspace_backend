@@ -1176,10 +1176,11 @@ def _refresh_recipient_counters(
                    count(state.uuid) FILTER (WHERE state.read_at IS NULL) AS unread_count,
                    count(state.uuid) FILTER (
                        WHERE state.read_at IS NULL AND CASE
-                           WHEN topic_binding.notification_mode = 'mute' THEN false
+                           WHEN topic_binding.notification_mode = 'mute'
+                               THEN stream.source_name = 'zulip' AND state.mentioned
                            WHEN topic_binding.notification_mode = 'follow' THEN true
                            WHEN topic_binding.notification_mode = 'unmute'
-                               THEN state.mentioned
+                               THEN stream.source_name = 'zulip' OR state.mentioned
                            WHEN target.notification_mode = 'all_messages' THEN true
                            WHEN target.notification_mode = 'mentions_only'
                                THEN state.mentioned
@@ -1189,6 +1190,8 @@ def _refresh_recipient_counters(
                    (array_agg(placement.uuid ORDER BY message.created_at DESC,
                               placement.uuid DESC))[1] AS last_message_uuid
             FROM messenger_stream_bindings AS target
+            JOIN messenger_streams AS stream
+              ON stream.project_id = target.project_id AND stream.uuid = target.stream_uuid
             LEFT JOIN messenger_message_placements AS placement
               ON placement.project_id = target.project_id
              AND placement.stream_uuid = target.stream_uuid
@@ -1255,10 +1258,11 @@ def _refresh_recipient_counters(
                    count(state.uuid) FILTER (WHERE state.read_at IS NULL) AS unread_count,
                    count(state.uuid) FILTER (
                        WHERE state.read_at IS NULL AND CASE
-                           WHEN target.notification_mode = 'mute' THEN false
+                           WHEN target.notification_mode = 'mute'
+                               THEN stream.source_name = 'zulip' AND state.mentioned
                            WHEN target.notification_mode = 'follow' THEN true
                            WHEN target.notification_mode = 'unmute'
-                               THEN state.mentioned
+                               THEN stream.source_name = 'zulip' OR state.mentioned
                            WHEN stream_binding.notification_mode = 'all_messages'
                                THEN true
                            WHEN stream_binding.notification_mode = 'mentions_only'
@@ -1272,6 +1276,8 @@ def _refresh_recipient_counters(
             JOIN messenger_topics AS topic
               ON topic.project_id = target.project_id
              AND topic.uuid = target.topic_uuid
+            JOIN messenger_streams AS stream
+              ON stream.project_id = topic.project_id AND stream.uuid = topic.stream_uuid
             JOIN messenger_stream_bindings AS stream_binding
               ON stream_binding.project_id = topic.project_id
              AND stream_binding.stream_uuid = topic.stream_uuid

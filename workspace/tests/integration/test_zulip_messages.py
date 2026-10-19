@@ -218,7 +218,8 @@ def test_history_import_synchronizes_direct_and_group_conversations(
     assert channel.stream_uuid.version == 5
     assert message.project_id == account.project_id
     assert message.content.zulip_content == data["content"]
-    assert message.topic.name == "General Topic"
+    assert message.topic.name == "Zulip"
+    assert message.topic.uuid == uuid.uuid5(channel.stream_uuid, "")
     assert message.topic.stream_id is None
     assert message.read is True
     assert message.starred is True

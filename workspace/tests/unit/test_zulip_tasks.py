@@ -305,6 +305,75 @@ def test_subscription_queue_is_deleted_when_snapshot_processing_fails():
     }
 
 
+@pytest.mark.parametrize(
+    "topics",
+    [
+        [],
+        [
+            {
+                "stream_id": 24,
+                "topic_name": "",
+                "visibility_policy": 3,
+                "last_updated": 42,
+            },
+            {
+                "stream_id": 24,
+                "topic_name": "Planning",
+                "visibility_policy": 1,
+                "last_updated": 43,
+            },
+        ],
+    ],
+)
+def test_client_gets_personal_topic_notifications_with_raw_empty_names(topics):
+    session = mock.Mock()
+    session.request.return_value.json.side_effect = [
+        {"result": "success", "queue_id": "topics:1", "user_topics": topics},
+        {"result": "success"},
+    ]
+    account = mock.Mock(
+        settings={
+            "server_url": "https://zulip.example.com",
+            "email": "agent@example.com",
+            "api_key": "test-key",
+        }
+    )
+    with mock.patch.object(client.requests, "Session", return_value=session):
+        zulip = client.ZulipClient(account)
+        assert zulip.get_topic_notifications() == topics
+        zulip.close()
+    request = session.request.call_args_list[0]
+    assert request.args == ("POST", "https://zulip.example.com/api/v1/register")
+    assert json.loads(request.kwargs["data"]["fetch_event_types"]) == ["user_topic"]
+    assert json.loads(request.kwargs["data"]["client_capabilities"])["empty_topic_name"]
+    assert session.request.call_args_list[1].args == (
+        "DELETE",
+        "https://zulip.example.com/api/v1/events",
+    )
+    session.close.assert_called_once()
+
+
+def test_topic_notification_queue_is_deleted_when_snapshot_is_missing():
+    session = mock.Mock()
+    session.request.return_value.json.side_effect = [
+        {"result": "success", "queue_id": "topics:1"},
+        {"result": "success"},
+    ]
+    account = mock.Mock(
+        settings={
+            "server_url": "https://zulip.example.com",
+            "email": "agent@example.com",
+            "api_key": "test-key",
+        }
+    )
+    with mock.patch.object(client.requests, "Session", return_value=session):
+        zulip = client.ZulipClient(account)
+        with pytest.raises(KeyError, match="user_topics"):
+            zulip.get_topic_notifications()
+        zulip.close()
+    assert session.request.call_args_list[1].kwargs["data"] == {"queue_id": "topics:1"}
+
+
 def test_client_gets_active_inactive_and_system_users():
     account = mock.Mock(
         settings={
