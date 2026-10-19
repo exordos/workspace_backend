@@ -24,6 +24,7 @@ from workspace.messenger_api.dm import external_models
 
 LOG = logging.getLogger(__name__)
 EVENTS_CHANNEL = "workspace_zulip_realtime"
+WORKSPACE_EVENTS_CHANNEL = "workspace_projection_tasks"
 
 
 class ZulipRealtimeService:
@@ -35,6 +36,7 @@ class ZulipRealtimeService:
         self._stopping = asyncio.Event()
         self._accounts_changed = asyncio.Event()
         self._events_ready = asyncio.Event()
+        self._workspace_events_ready = asyncio.Event()
         self._pollers: dict[
             tuple[sys_uuid.UUID, sys_uuid.UUID], tuple[str, asyncio.Task[None]]
         ] = {}
@@ -72,6 +74,7 @@ class ZulipRealtimeService:
         supervisors = [
             asyncio.create_task(self._watch_accounts()),
             asyncio.create_task(self._consume_events()),
+            asyncio.create_task(self._consume_workspace_events()),
             asyncio.create_task(self._listen_notifications()),
         ]
         try:
@@ -152,6 +155,20 @@ class ZulipRealtimeService:
                 LOG.exception("Failed to consume the Zulip event inbox")
             await self._wait(self._events_ready)
 
+    async def _consume_workspace_events(self) -> None:
+        while True:
+            self._workspace_events_ready.clear()
+            try:
+                for _index in range(100):
+                    if not await self._database(models.WorkspaceEvent.dispatch_one):
+                        break
+                else:
+                    await asyncio.sleep(0)
+                    continue
+            except Exception:
+                LOG.exception("Failed to consume Workspace events for Zulip")
+            await self._wait(self._workspace_events_ready)
+
     async def _listen_notifications(self) -> None:
         while True:
             try:
@@ -161,7 +178,11 @@ class ZulipRealtimeService:
                     application_name="workspace-zulip-realtime-listener",
                 ) as connection:
                     await connection.execute(f"LISTEN {EVENTS_CHANNEL}")
+                    await connection.execute(f"LISTEN {WORKSPACE_EVENTS_CHANNEL}")
                     async for notification in connection.notifies():
+                        if notification.channel == WORKSPACE_EVENTS_CHANNEL:
+                            self._workspace_events_ready.set()
+                            continue
                         if notification.payload in ("accounts", ""):
                             self._accounts_changed.set()
                         if notification.payload in ("events", ""):

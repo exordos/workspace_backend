@@ -50,12 +50,6 @@ class HistoryImportService(basic.BasicService):
                     content=content,
                 ).insert()
 
-    def _process_task(self) -> bool:
-        tasks = self._get_tasks()
-        for task in tasks:
-            self._execute_task(task)
-        return bool(tasks)
-
     def _get_tasks(self) -> list[models.Task]:
         now = datetime.datetime.now(datetime.timezone.utc)
         return models.Task.objects.get_all(
@@ -93,8 +87,22 @@ class HistoryImportService(basic.BasicService):
         )
 
     def _iteration(self) -> None:
+        prepared = []
         with contexts.Context().session_manager():
             self._ensure_reconciliation_task()
-            processed = self._process_task()
-        if processed:
+            tasks = self._get_tasks()
+            for task in tasks:
+                if isinstance(task.content, models.SendMessageContent):
+                    try:
+                        if task.content.prepare(task):
+                            prepared.append(task)
+                    except Exception as error:
+                        task.on_error(error)
+                else:
+                    self._execute_task(task)
+        # Commit the send attempt before HTTP: a crash must not replay POST.
+        for task in prepared:
+            with contexts.Context().session_manager():
+                self._execute_task(task)
+        if tasks:
             self.boost(iterations=2)

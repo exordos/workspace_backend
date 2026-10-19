@@ -52,11 +52,12 @@ LOG = logging.getLogger(__name__)
 MAX_HISTORY_MESSAGES = 5000
 TASK_PRIORITY_IMPORT_HISTORY = 10_000
 TASK_PRIORITY_IMPORT_HISTORY_MIN = 10
-TASK_PRIORITY_IMPORT_CHANNELS = 50_000
+TASK_PRIORITY_IMPORT_CHANNELS = 450_000
 TASK_PRIORITY_IMPORT_USERS = 500_000
 TASK_PRIORITY_FULL_BACKFILL = 100_000
 TASK_PRIORITY_INITIALIZE_CONNECTION = 600_000
-TASK_PRIORITY_REALTIME_MESSAGE = 200_000
+TASK_PRIORITY_REALTIME_MESSAGE = 300_000
+TASK_PRIORITY_REALTIME_EDIT = 250_000
 TASK_PRIORITY_RECONCILIATION = 400_000
 TASK_PRIORITY_REFRESH_MESSAGE_COUNTERS = 700_000
 TASK_RETRY_DELAY = datetime.timedelta(minutes=1)
@@ -2020,12 +2021,47 @@ class ImportHistoryContent(AbstractZulipTaskContent):
         server_namespace = sys_uuid.uuid5(sys_uuid.NAMESPACE_DNS, hostname)
         zulip = client.ZulipClient(account)
         try:
-            for data in zulip.get_messages(self.first_message_id, self.last_message_id):
+            messages = zulip.get_messages(self.first_message_id, self.last_message_id)
+            deliveries = (
+                {
+                    delivery.zulip_message_id: delivery
+                    for delivery in MessageDelivery.objects.get_all(
+                        filters={
+                            "project_id": filters.EQ(task.project_id),
+                            "hostname": filters.EQ(account.get_host()),
+                            "zulip_message_id": filters.In(
+                                [data["id"] for data in messages]
+                            ),
+                        }
+                    )
+                }
+                if messages
+                else {}
+            )
+            pending_senders = (
+                MessageDelivery.pending_sender_ids(account) if messages else set()
+            )
+            for data in messages:
                 if (
                     self.since is not None
                     and data["timestamp"] < self.since.timestamp()
                 ):
                     continue
+                delivery = deliveries.get(data["id"])
+                if delivery is not None:
+                    local = v2_models.WorkspaceMessage.objects.get_one(
+                        filters={
+                            "project_id": filters.EQ(task.project_id),
+                            "uuid": filters.EQ(delivery.message_uuid),
+                        }
+                    )
+                    if local.source_name == "native":
+                        delivery.observe(data)
+                        continue
+                elif data["sender_id"] in pending_senders:
+                    raise DeliveryPendingError(
+                        "Waiting for the outgoing message identity before import"
+                    )
                 if data["type"] == "stream":
                     channel = ZulipChannel.objects.get_one_or_none(
                         filters={
@@ -2207,13 +2243,185 @@ class ImportHistoryContent(AbstractZulipTaskContent):
             zulip.close()
 
     def on_error(self, task: "Task", error: Exception) -> None:
-        if isinstance(error, ExternalAccountIdPendingError):
+        if isinstance(error, DeliveryPendingError):
+            task.status = TaskStatus.RETRY.value
+            task.next_retry_at = datetime.datetime.now(
+                datetime.timezone.utc
+            ) + datetime.timedelta(seconds=3)
+        elif isinstance(error, ExternalAccountIdPendingError):
             task.status = TaskStatus.RETRY.value
             task.next_retry_at = (
                 datetime.datetime.now(datetime.timezone.utc) + TASK_RETRY_DELAY
             )
         else:
             super().on_error(task, error)
+
+
+class DeliveryPendingError(Exception):
+    pass
+
+
+class OutboundMessageContent(AbstractTaskContent):
+    delivery_uuid = properties.property(types.UUID(), required=True, read_only=True)
+    content = properties.property(
+        types.String(max_length=40000), required=True, read_only=True
+    )
+
+    def delivery(self, task: "Task") -> "MessageDelivery":
+        session = contexts.Context().get_session()
+        session.execute(
+            "SELECT uuid FROM m_external_accounts_v2 WHERE uuid=%s AND project_id=%s FOR UPDATE",
+            (task.external_account_uuid, task.project_id),
+        )
+        session.execute(
+            "SELECT uuid FROM bridge_zulip_v5_deliveries WHERE uuid=%s FOR UPDATE",
+            (self.delivery_uuid,),
+        )
+        delivery = MessageDelivery.objects.get_one(
+            filters={
+                "uuid": filters.EQ(self.delivery_uuid),
+                "project_id": filters.EQ(task.project_id),
+            }
+        )
+        delivery.account()
+        if delivery.external_account_uuid != task.external_account_uuid:
+            raise SubscriptionChangedError()
+        return delivery
+
+    def on_error(self, task: "Task", error: Exception) -> None:
+        if (
+            isinstance(self, SendMessageContent)
+            and isinstance(error, requests.HTTPError)
+            and 400 <= error.response.status_code < 500
+        ):
+            delivery = MessageDelivery.objects.get_one(
+                filters={"uuid": filters.EQ(self.delivery_uuid)}
+            )
+            if delivery.zulip_message_id is None:
+                delivery.sending = False
+                delivery.update()
+        if isinstance(error, SubscriptionChangedError):
+            task.status = TaskStatus.CANCEL.value
+        elif isinstance(
+            error, (DeliveryPendingError, requests.Timeout, requests.ConnectionError)
+        ) or (
+            isinstance(error, requests.HTTPError)
+            and (
+                error.response.status_code in (408, 429)
+                or error.response.status_code >= 500
+            )
+        ):
+            task.status = TaskStatus.RETRY.value
+            task.next_retry_at = datetime.datetime.now(
+                datetime.timezone.utc
+            ) + datetime.timedelta(seconds=3)
+
+
+class SendMessageContent(OutboundMessageContent):
+    KIND = "send_message"
+
+    def prepare(self, task: "Task") -> bool:
+        delivery = self.delivery(task)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        row = (
+            contexts.Context()
+            .get_session()
+            .execute(
+                "SELECT status, lease_expires_at FROM bridge_zulip_v5_tasks WHERE uuid=%s FOR UPDATE",
+                (task.uuid,),
+            )
+            .fetchone()
+        )
+        if row["status"] not in ("new", "waiting", "retry") or (
+            row["lease_expires_at"] is not None
+            and row["lease_expires_at"] > now.replace(tzinfo=None)
+        ):
+            return False
+        self._submit = not delivery.sending and delivery.zulip_message_id is None
+        if self._submit:
+            subscription = RealtimeSubscription.for_account(delivery.account())
+            if subscription is None:
+                raise DeliveryPendingError(
+                    "Waiting for the sender's realtime subscription"
+                )
+            delivery.sending = True
+            delivery.update()
+        task.lease_owner = sys_uuid.uuid4()
+        task.lease_expires_at = now + datetime.timedelta(minutes=2)
+        task.update()
+        return True
+
+    def execute(self, task: "Task") -> None:
+        delivery = self.delivery(task)
+        if delivery.delivered_at is not None:
+            return
+        if delivery.zulip_message_id is None and not getattr(self, "_submit", False):
+            # The attempt marker commits before HTTP. After a lost response or
+            # worker crash, wait for local echo instead of posting a duplicate.
+            raise DeliveryPendingError(
+                "Waiting for the Zulip send result or local echo"
+            )
+        account = delivery.account()
+        zulip = client.ZulipClient(account)
+        try:
+            if delivery.zulip_message_id is None:
+                subscription = RealtimeSubscription.for_account(account)
+                if subscription is None:
+                    raise DeliveryPendingError(
+                        "Waiting for the sender's realtime subscription"
+                    )
+                self._submit = False
+                delivery.zulip_message_id = zulip.send_message(
+                    delivery.recipient["to"],
+                    self.content,
+                    delivery.topic_name,
+                    subscription.queue_id,
+                    str(delivery.uuid),
+                )
+                delivery.update()
+            else:
+                (data,) = zulip.get_messages(
+                    delivery.zulip_message_id, delivery.zulip_message_id
+                )
+                delivery.observe(data)
+        finally:
+            zulip.close()
+
+    def on_done(self, task: "Task") -> None:
+        delivery = MessageDelivery.objects.get_one(
+            filters={"uuid": filters.EQ(self.delivery_uuid)}
+        )
+        if delivery.delivered_at is None:
+            task.status = TaskStatus.RETRY.value
+            task.next_retry_at = datetime.datetime.now(
+                datetime.timezone.utc
+            ) + datetime.timedelta(seconds=3)
+
+
+class EditMessageContent(OutboundMessageContent):
+    KIND = "edit_message"
+
+    def execute(self, task: "Task") -> None:
+        delivery = self.delivery(task)
+        if delivery.zulip_message_id is None or delivery.delivered_at is None:
+            raise DeliveryPendingError("Waiting for message delivery before editing")
+        message = v2_models.WorkspaceMessage.objects.get_one(
+            filters={
+                "uuid": filters.EQ(delivery.message_uuid),
+                "project_id": filters.EQ(task.project_id),
+            }
+        )
+        if message.payload.content != self.content:
+            return
+        zulip = client.ZulipClient(delivery.account())
+        try:
+            zulip.edit_message(delivery.zulip_message_id, self.content)
+            (data,) = zulip.get_messages(
+                delivery.zulip_message_id, delivery.zulip_message_id
+            )
+            delivery.observe(data)
+        finally:
+            zulip.close()
 
 
 class RefreshMessageCountersContent(AbstractTaskContent):
@@ -2296,6 +2504,8 @@ class ReconciliationContent(AbstractTaskContent):
 
 
 TASK_CONTENT_TYPE = types_dynamic.KindModelSelectorType(
+    types_dynamic.KindModelType(SendMessageContent),
+    types_dynamic.KindModelType(EditMessageContent),
     types_dynamic.KindModelType(InitializeConnectionContent),
     types_dynamic.KindModelType(FullBackfillContent),
     types_dynamic.KindModelType(ActualizeBackfillContent),
@@ -2673,11 +2883,42 @@ class RealtimeEvent(
             priority = TASK_PRIORITY_INITIALIZE_CONNECTION
         elif kind in ("message", "update_message"):
             if kind == "message":
+                if "local_message_id" in self.payload:
+                    delivery = MessageDelivery.objects.get_one_or_none(
+                        filters={
+                            "uuid": filters.EQ(
+                                sys_uuid.UUID(self.payload["local_message_id"])
+                            ),
+                            "project_id": filters.EQ(self.project_id),
+                            "external_account_uuid": filters.EQ(
+                                self.external_account_uuid
+                            ),
+                        }
+                    )
+                    if delivery is not None:
+                        delivery.observe(self.payload["message"])
+                        for task in Task.objects.get_all(
+                            filters={
+                                "project_id": filters.EQ(self.project_id),
+                                "content": filters.JSONFields(
+                                    {
+                                        "kind": "send_message",
+                                        "delivery_uuid": str(delivery.uuid),
+                                    }
+                                ),
+                                "status": filters.In(["error", "retry"]),
+                            }
+                        ):
+                            task.status = TaskStatus.RETRY.value
+                            task.next_retry_at = None
+                            task.update()
                 message_ids = [self.payload["message"]["id"]]
             elif "message_ids" in self.payload:
                 message_ids = self.payload["message_ids"]
             else:
                 message_ids = [self.payload["message_id"]]
+            if kind == "update_message":
+                priority = TASK_PRIORITY_REALTIME_EDIT
             contents = [
                 ImportHistoryContent(
                     first_message_id=message_id, last_message_id=message_id
@@ -2689,7 +2930,7 @@ class RealtimeEvent(
             priority = TASK_PRIORITY_IMPORT_USERS
         elif kind in ("subscription", "stream", "user_topic"):
             contents = [ImportChannelsContent(periodic=False)]
-            priority = TASK_PRIORITY_IMPORT_USERS
+            priority = TASK_PRIORITY_IMPORT_CHANNELS
         for index, content in enumerate(contents):
             Task(
                 uuid=sys_uuid.uuid5(self.uuid, f"task:{index}"),
@@ -2709,7 +2950,7 @@ class RealtimeEvent(
             .execute(
                 """
             SELECT uuid FROM bridge_zulip_v5_events
-            WHERE processed_at IS NULL AND (next_retry_at IS NULL OR next_retry_at <= NOW())
+            WHERE processed_at IS NULL AND (next_retry_at IS NULL OR next_retry_at <= NOW() AT TIME ZONE 'UTC')
             ORDER BY created_at, uuid LIMIT 1 FOR UPDATE SKIP LOCKED
         """,
                 (),
@@ -2759,3 +3000,417 @@ class RealtimeEvent(
         )
         RealtimeSubscription.lock_account(account)
         account.update_status(external_models.ExternalAccountStatus.ACTIVE.value)
+
+
+class MessageDelivery(
+    models.ModelWithUUID,
+    models.ModelWithProject,
+    models.ModelWithTimestamp,
+    orm.SQLStorableMixin,
+):
+    """Bind a Workspace message and destination to the author's Zulip account."""
+
+    __tablename__ = "bridge_zulip_v5_deliveries"
+
+    message_uuid = properties.property(types.UUID(), required=True)
+    stream_uuid = properties.property(types.UUID(), required=True)
+    external_account_uuid = properties.property(types.UUID(), required=True)
+    hostname = properties.property(types.String(), required=True)
+    external_account_id = properties.property(types.String(), required=True)
+    recipient = properties.property(types.Dict(), required=True)
+    topic_name = properties.property(types.AllowNone(types.String()), default=None)
+    sending = properties.property(types.Boolean(), default=False)
+    zulip_message_id = properties.property(
+        types.AllowNone(types.Integer(min_value=1)), default=None
+    )
+    delivered_at = properties.property(
+        types.AllowNone(types.UTCDateTimeZ()), default=None
+    )
+
+    def account(self, sending: bool = True) -> external_models.ExternalAccount:
+        account = external_models.ExternalAccount.objects.get_one(
+            filters={
+                "uuid": filters.EQ(self.external_account_uuid),
+                "project_id": filters.EQ(self.project_id),
+            }
+        )
+        message = v2_models.WorkspaceMessage.objects.get_one(
+            filters={
+                "uuid": filters.EQ(self.message_uuid),
+                "project_id": filters.EQ(self.project_id),
+            }
+        )
+        if (
+            account.owner_user_uuid != message.author_uuid
+            or message.deleted_at is not None
+            or account.provider != "zulip"
+            or account.get_host() != self.hostname
+            or account.external_account_id != self.external_account_id
+            or (sending and not account.can_stream())
+        ):
+            raise SubscriptionChangedError()
+        return account
+
+    @classmethod
+    def pending_sender_ids(cls, account: external_models.ExternalAccount) -> set[int]:
+        return {
+            int(delivery.external_account_id.rsplit(":", 1)[1])
+            for delivery in cls.objects.get_all(
+                filters={
+                    "project_id": filters.EQ(account.project_id),
+                    "hostname": filters.EQ(account.get_host()),
+                    "zulip_message_id": filters.Is(None),
+                    "sending": filters.EQ(True),
+                }
+            )
+        }
+
+    @classmethod
+    def route(
+        cls,
+        project_id: sys_uuid.UUID,
+        placement: v2_models.WorkspaceMessagePlacement,
+        message: v2_models.WorkspaceMessage,
+    ) -> "MessageDelivery":
+        session = contexts.Context().get_session()
+        # Serialize all events for this local message without borrowing another
+        # observer's credentials when several accounts see the same channel.
+        session.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            (f"zulip-delivery:{project_id}:{message.uuid}:{placement.stream_uuid}",),
+        )
+        delivery = cls.objects.get_one_or_none(
+            filters={
+                "project_id": filters.EQ(project_id),
+                "message_uuid": filters.EQ(message.uuid),
+                "stream_uuid": filters.EQ(placement.stream_uuid),
+            }
+        )
+        if delivery is not None:
+            delivery.account()
+            return delivery
+        accounts = external_models.ExternalAccount.objects.get_all(
+            filters={
+                "project_id": filters.EQ(project_id),
+                "owner_user_uuid": filters.EQ(message.author_uuid),
+                "provider": filters.EQ("zulip"),
+                "disabled": filters.EQ(False),
+            }
+        )
+        channels = (
+            ZulipChannel.objects.get_all(
+                filters={
+                    "external_account_uuid": filters.In(
+                        [account.uuid for account in accounts]
+                    ),
+                    "stream_uuid": filters.EQ(placement.stream_uuid),
+                }
+            )
+            if accounts
+            else []
+        )
+        routes = [
+            (account, channel)
+            for account in accounts
+            for channel in channels
+            if channel.external_account_uuid == account.uuid and account.can_stream()
+        ]
+        if len(routes) != 1:
+            raise DeliveryPendingError(
+                "Waiting for an unambiguous sender account and Zulip channel"
+            )
+        account, channel = routes[0]
+        topic = v2_models.WorkspaceStreamTopic.objects.get_one(
+            filters={
+                "project_id": filters.EQ(project_id),
+                "uuid": filters.EQ(placement.topic_uuid),
+            }
+        )
+        if channel.channel_type == ZulipChannelType.CHANNEL.value:
+            recipient = channel.stream_id
+            topic_name = (
+                ""
+                if topic.uuid == sys_uuid.uuid5(channel.stream_uuid, "")
+                else topic.name
+            )
+        else:
+            topic_name = None
+            if channel.channel_type == ZulipChannelType.PRIVATE.value:
+                peer = external_models.ExternalAccount.objects.get_one(
+                    filters={
+                        "project_id": filters.EQ(project_id),
+                        "uuid": filters.EQ(channel.direct_user_uuid),
+                    }
+                )
+                if peer.provider != "zulip" or peer.get_host() != account.get_host():
+                    raise SubscriptionChangedError()
+                recipient = [int(peer.external_account_id.rsplit(":", 1)[1])]
+            else:
+                members = session.execute(
+                    "SELECT user_uuid FROM messenger_stream_bindings WHERE project_id=%s AND stream_uuid=%s AND active",
+                    (project_id, placement.stream_uuid),
+                ).fetchall()
+                peers = external_models.ExternalAccount.objects.get_all(
+                    filters={
+                        "project_id": filters.EQ(project_id),
+                        "provider": filters.EQ("zulip"),
+                        "owner_user_uuid": filters.In(
+                            [row["user_uuid"] for row in members]
+                        ),
+                    }
+                )
+                recipient = sorted(
+                    {
+                        int(peer.external_account_id.rsplit(":", 1)[1])
+                        for peer in peers
+                        if peer.external_account_id is not None
+                        and peer.get_host() == account.get_host()
+                    }
+                )
+                namespace = sys_uuid.uuid5(sys_uuid.NAMESPACE_DNS, account.get_host())
+                if (
+                    sys_uuid.uuid5(namespace, "dm:" + ",".join(map(str, recipient)))
+                    != channel.stream_uuid
+                ):
+                    raise DeliveryPendingError(
+                        "Waiting for the complete Zulip group recipient list"
+                    )
+        delivery = cls(
+            project_id=project_id,
+            message_uuid=message.uuid,
+            stream_uuid=placement.stream_uuid,
+            external_account_uuid=account.uuid,
+            hostname=account.get_host(),
+            external_account_id=account.external_account_id,
+            recipient={"to": recipient},
+            topic_name=topic_name,
+        )
+        if message.source_name == "zulip":
+            source = session.execute(
+                """
+                SELECT observed.message_id, observed.timestamp, observed.sender_id
+                FROM bridge_zulip_v5_messages observed JOIN m_external_accounts_v2 account
+                  ON account.uuid=observed.external_account_uuid AND account.project_id=observed.project_id
+                WHERE observed.project_id=%s AND messenger_uuid_v5(observed.project_id, observed.message_uuid::text)=%s
+                  AND rtrim(account.settings->>'server_url','/')=%s ORDER BY observed.updated_at DESC LIMIT 1
+            """,
+                (project_id, message.uuid, account.settings["server_url"].rstrip("/")),
+            ).fetchone()
+            if source is None:
+                raise DeliveryPendingError(
+                    "Waiting for the imported Zulip message identity"
+                )
+            if source["sender_id"] != int(
+                account.external_account_id.rsplit(":", 1)[1]
+            ):
+                raise SubscriptionChangedError()
+            delivery.zulip_message_id = source["message_id"]
+            delivery.delivered_at = datetime.datetime.fromtimestamp(
+                source["timestamp"], datetime.timezone.utc
+            )
+        delivery.insert()
+        return delivery
+
+    def observe(self, data: dict) -> None:
+        account = self.account(sending=False)
+        if data["sender_id"] != int(account.external_account_id.rsplit(":", 1)[1]):
+            raise SubscriptionChangedError()
+        if self.zulip_message_id is not None and self.zulip_message_id != data["id"]:
+            raise SubscriptionChangedError()
+        self.zulip_message_id = data["id"]
+        self.delivered_at = datetime.datetime.fromtimestamp(
+            data["timestamp"], datetime.timezone.utc
+        )
+        self.update()
+        session = contexts.Context().get_session()
+        message = v2_models.WorkspaceMessage.objects.get_one(
+            filters={
+                "project_id": filters.EQ(self.project_id),
+                "uuid": filters.EQ(self.message_uuid),
+            }
+        )
+        if message.source_name != "native":
+            return
+        edited_at = datetime.datetime.fromtimestamp(
+            data.get("last_edit_timestamp", data["timestamp"]), datetime.timezone.utc
+        )
+        pending_edits = Task.objects.get_all(
+            filters={
+                "project_id": filters.EQ(self.project_id),
+                "content": filters.JSONFields(
+                    {"kind": "edit_message", "delivery_uuid": str(self.uuid)}
+                ),
+                "status": filters.In(["new", "waiting", "retry"]),
+            },
+            limit=1,
+        )
+        replace_content = message.payload.content == data["content"] or (
+            not pending_edits
+            and (
+                message.content_updated_at is None
+                or edited_at >= message.content_updated_at
+            )
+        )
+        changed = message.created_at != self.delivered_at or (
+            replace_content
+            and (
+                message.payload.content != data["content"]
+                or message.content_updated_at != edited_at
+            )
+        )
+        if not changed:
+            return
+        session.execute(
+            """
+            UPDATE messenger_messages SET created_at=%s, updated_at=NOW() AT TIME ZONE 'UTC',
+                payload=CASE WHEN %s THEN %s::jsonb ELSE payload END,
+                content_updated_at=CASE WHEN %s THEN %s ELSE content_updated_at END
+            WHERE project_id=%s AND uuid=%s
+        """,
+            (
+                messenger_helpers._database_timestamp(self.delivered_at),
+                replace_content,
+                json.dumps({"kind": "markdown", "content": data["content"]}),
+                replace_content,
+                messenger_helpers._database_timestamp(edited_at),
+                self.project_id,
+                self.message_uuid,
+            ),
+        )
+        session.execute(
+            "UPDATE messenger_message_placements SET created_at=%s, updated_at=NOW() AT TIME ZONE 'UTC' WHERE project_id=%s AND message_uuid=%s",
+            (
+                messenger_helpers._database_timestamp(self.delivered_at),
+                self.project_id,
+                self.message_uuid,
+            ),
+        )
+        session.execute(
+            """
+            INSERT INTO messenger_domain_outbox_events(uuid, project_id, event_kind, scope_kind, scope_key, payload)
+            VALUES (%s,%s,'delivery_snapshot_event','message',%s,%s::jsonb)
+        """,
+            (
+                sys_uuid.uuid4(),
+                self.project_id,
+                f"{self.project_id}:{self.message_uuid}",
+                json.dumps(
+                    {
+                        "source_kind": "message.updated",
+                        "canonical_message_uuid": str(self.message_uuid),
+                    }
+                ),
+            ),
+        )
+
+
+class WorkspaceEvent(
+    models.ModelWithUUID,
+    models.ModelWithProject,
+    models.ModelWithTimestamp,
+    orm.SQLStorableMixin,
+):
+    """Independent delivery receipts for the existing Messenger domain outbox."""
+
+    __tablename__ = "bridge_zulip_v5_workspace_events"
+
+    processed_at = properties.property(
+        types.AllowNone(types.UTCDateTimeZ()), default=None
+    )
+    attempts = properties.property(types.Integer(min_value=0), default=0)
+    next_retry_at = properties.property(
+        types.AllowNone(types.UTCDateTimeZ()), default=None
+    )
+    error_description = properties.property(
+        types.AllowNone(types.String()), default=None
+    )
+
+    def dispatch(self) -> None:
+        outbox = v2_models.WorkspaceDomainOutboxEvent.objects.get_one(
+            filters={
+                "uuid": filters.EQ(self.uuid),
+                "project_id": filters.EQ(self.project_id),
+            }
+        )
+        placement = v2_models.WorkspaceMessagePlacement.objects.get_one_or_none(
+            filters={
+                "uuid": filters.EQ(sys_uuid.UUID(outbox.payload["placement_uuid"])),
+                "project_id": filters.EQ(self.project_id),
+            }
+        )
+        if placement is None:
+            return
+        stream = v2_models.WorkspaceStream.objects.get_one(
+            filters={
+                "uuid": filters.EQ(placement.stream_uuid),
+                "project_id": filters.EQ(self.project_id),
+            }
+        )
+        if stream.source_name != "zulip":
+            return
+        message = v2_models.WorkspaceMessage.objects.get_one(
+            filters={
+                "uuid": filters.EQ(placement.message_uuid),
+                "project_id": filters.EQ(self.project_id),
+            }
+        )
+        if message.deleted_at is not None or message.payload.kind != "markdown":
+            return
+        delivery = MessageDelivery.route(self.project_id, placement, message)
+        creating = outbox.payload["source_kind"] == "message.created"
+        content = (
+            SendMessageContent(
+                delivery_uuid=delivery.uuid, content=message.payload.content
+            )
+            if creating
+            else EditMessageContent(
+                delivery_uuid=delivery.uuid, content=message.payload.content
+            )
+        )
+        task_uuid = sys_uuid.uuid5(
+            delivery.uuid, "send" if creating else f"edit:{message.content_updated_at}"
+        )
+        if (
+            Task.objects.get_one_or_none(filters={"uuid": filters.EQ(task_uuid)})
+            is None
+        ):
+            Task(
+                uuid=task_uuid,
+                project_id=self.project_id,
+                external_account_uuid=delivery.external_account_uuid,
+                priority=TASK_PRIORITY_REALTIME_MESSAGE
+                if creating
+                else TASK_PRIORITY_REALTIME_EDIT,
+                content=content,
+            ).insert()
+
+    @classmethod
+    def dispatch_one(cls) -> bool:
+        row = (
+            contexts.Context()
+            .get_session()
+            .execute("""
+            SELECT uuid FROM bridge_zulip_v5_workspace_events
+            WHERE processed_at IS NULL AND (next_retry_at IS NULL OR next_retry_at<=NOW() AT TIME ZONE 'UTC')
+            ORDER BY created_at, uuid LIMIT 1 FOR UPDATE SKIP LOCKED
+        """)
+            .fetchone()
+        )
+        if row is None:
+            return False
+        event = cls.objects.get_one(filters={"uuid": filters.EQ(row["uuid"])})
+        now = datetime.datetime.now(datetime.timezone.utc)
+        try:
+            with utils.savepoint():
+                event.dispatch()
+        except Exception as error:
+            LOG.exception("Failed to dispatch Workspace event %s to Zulip", event.uuid)
+            event.attempts += 1
+            event.error_description = str(error)
+            event.next_retry_at = now + datetime.timedelta(seconds=3)
+        else:
+            event.processed_at = now
+            event.error_description = None
+            event.next_retry_at = None
+        event.update()
+        return True

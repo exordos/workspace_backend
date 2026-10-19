@@ -569,7 +569,7 @@ def test_full_backfill_creates_user_channel_and_bounded_history_tasks(
     assert isinstance(children[0].content, models.ImportUsersContent)
     assert children[0].priority == models.TASK_PRIORITY_IMPORT_USERS
     assert isinstance(children[1].content, models.ImportChannelsContent)
-    assert children[1].priority == models.TASK_PRIORITY_IMPORT_CHANNELS == 50_000
+    assert children[1].priority == models.TASK_PRIORITY_IMPORT_CHANNELS == 450_000
     assert [
         (child.content.first_message_id, child.content.last_message_id)
         for child in children[2:]

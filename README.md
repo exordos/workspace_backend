@@ -77,6 +77,32 @@ notifications. Saved queues resume after a service restart; an expired Zulip
 queue is registered again and schedules a new backfill. Run one realtime service
 instance for this database.
 
+The same realtime service independently subscribes to new message creation and
+edit records in `messenger_domain_outbox_events`, using the existing
+`workspace_projection_tasks` notification channel. Subscriber receipts and
+history tasks commit together; Messenger projection processing remains independent.
+Migration 0233 starts this subscription with new events, without sending retained
+outbox history. The history service executes `send_message` and `edit_message`
+tasks using the author's verified external account for the destination channel
+or direct conversation. Markdown content is passed through unchanged, and Zulip
+messages are sent with `read_by_sender=true`.
+
+Delivery bindings retain the Workspace UUID and the Zulip message ID. After
+delivery, the canonical message and placement creation dates are updated to the
+Zulip timestamp, and a Messenger update event is published. Local echo and later
+imports update the original message instead of creating a duplicate. A send
+attempt commits before the HTTP request; an ambiguous send outcome waits for
+local echo rather than automatically posting another message. Once an ID is
+known, metadata fetches can be retried independently of sending.
+
+Priorities are numeric: users 500000, channels 450000, reconciliation (including
+topics) 400000, realtime message creation 300000, realtime edits 250000, and
+history batches 10000 or lower. Missing prerequisites retry after three seconds;
+there are no task dependency chains. Superseded edit tasks do not overwrite a
+newer local edit.
+Future read and reaction tasks must also run below message creation priority
+and retry when the target message has not been created yet.
+
 Nginx exposes:
 
 - Common REST API: `/api/workspace/v1/{users,services,me,events,epoch}/...`

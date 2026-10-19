@@ -49,6 +49,29 @@ class ZulipClient:
     def check_connection(self) -> dict:
         return self._get("/users/me")
 
+    def send_message(
+        self,
+        recipient: int | list[int],
+        content: str,
+        topic: str | None,
+        queue_id: str,
+        local_id: str,
+    ) -> int:
+        data = {
+            "type": "direct" if topic is None else "channel",
+            "to": json.dumps(recipient),
+            "content": content,
+            "read_by_sender": "true",
+            "queue_id": queue_id,
+            "local_id": local_id,
+        }
+        if topic is not None:
+            data["topic"] = topic
+        return self._request("POST", "/messages", data=data)["id"]
+
+    def edit_message(self, message_id: int, content: str) -> None:
+        self._request("PATCH", f"/messages/{message_id}", data={"content": content})
+
     def get_users(self) -> list[dict]:
         # Unlike /users, registration also includes cross-realm system bots.
         data = self._request(
