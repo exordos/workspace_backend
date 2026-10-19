@@ -424,7 +424,8 @@ def test_channel_type_migration_preserves_channels_and_enforces_direct_reference
 ):
     migration = "0209-Add-Zulip-channel-types-and-direct-account-references-6bdbf2.py"
     with conftest.isolated_migration_database(
-        "0208-Reserve-descending-priorities-for-history-import-tasks-bc5850.py"
+        "0208-Reserve-descending-priorities-for-history-import-tasks-bc5850.py",
+        current_models=True,
     ) as database_url:
         with psycopg.connect(database_url, autocommit=True) as db:
             project_id = uuid.uuid4()
@@ -531,7 +532,8 @@ def test_channel_account_and_stream_references(_database, action):
         "0200-Add-account-and-workspace-stream-references-to-Zulip-channels-e707ec.py"
     )
     with conftest.isolated_migration_database(
-        "0199-Scope-external-accounts-and-Zulip-tasks-to-projects-4fb70b.py"
+        "0199-Scope-external-accounts-and-Zulip-tasks-to-projects-4fb70b.py",
+        current_models=True,
     ) as database_url:
         engine = migrations.MigrationEngine(
             migrations_path=str(conftest.MIGRATIONS_DIR)
@@ -612,7 +614,8 @@ def test_channel_account_and_stream_references(_database, action):
 def test_unmapped_channel_migration_round_trip(_database):
     migration = "0201-Allow-unmapped-Zulip-channels-and-enforce-account-stream-identity-42e7cb.py"
     with conftest.isolated_migration_database(
-        "0200-Add-account-and-workspace-stream-references-to-Zulip-channels-e707ec.py"
+        "0200-Add-account-and-workspace-stream-references-to-Zulip-channels-e707ec.py",
+        current_models=True,
     ) as database_url:
         engine = migrations.MigrationEngine(
             migrations_path=str(conftest.MIGRATIONS_DIR)
@@ -679,7 +682,8 @@ def test_deterministic_channel_uuid_migration_backfills_and_restores_constraints
 ):
     migration = "0202-Generate-required-Zulip-channel-stream-UUIDs-from-server-identity-e4f31c.py"
     with conftest.isolated_migration_database(
-        "0201-Allow-unmapped-Zulip-channels-and-enforce-account-stream-identity-42e7cb.py"
+        "0201-Allow-unmapped-Zulip-channels-and-enforce-account-stream-identity-42e7cb.py",
+        current_models=True,
     ) as database_url:
         engine = migrations.MigrationEngine(
             migrations_path=str(conftest.MIGRATIONS_DIR)

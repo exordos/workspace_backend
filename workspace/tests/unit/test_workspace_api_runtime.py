@@ -8,6 +8,7 @@ import threading
 import urllib.parse
 from unittest import mock
 
+import psycopg.conninfo
 import pytest
 import webob
 
@@ -18,7 +19,7 @@ from workspace.common import database
 def test_database_application_name_replaces_only_process_identity():
     connection_url = (
         "postgresql://user:pass@db/workspace"
-        "?options=-c%20work_mem%3D32MB&application_name=old"
+        "?options=-c%20work_mem%3D32MB%20-c%20jit%3Doff&application_name=old"
     )
 
     result = database.connection_url_with_application_name(
@@ -28,9 +29,12 @@ def test_database_application_name_replaces_only_process_identity():
 
     query = urllib.parse.parse_qs(urllib.parse.urlsplit(result).query)
     assert query == {
-        "options": ["-c work_mem=32MB"],
+        "options": ["-c work_mem=32MB -c jit=off"],
         "application_name": ["workspace-api"],
     }
+    assert psycopg.conninfo.conninfo_to_dict(result)["options"] == (
+        "-c work_mem=32MB -c jit=off"
+    )
 
 
 def test_free_workspace_worker_serves_settings_while_peer_is_delayed(monkeypatch):

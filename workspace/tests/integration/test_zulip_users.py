@@ -175,10 +175,15 @@ def test_connection_rebinds_imported_account_preserving_identity_and_references(
         ).direct_user_uuid
         == imported.uuid
     )
-    (backfill,) = models.Task.objects.get_all(
-        filters={"external_account_uuid": filters.EQ(imported.uuid), "status": "new"}
+    assert (
+        models.Task.objects.get_all(
+            filters={
+                "external_account_uuid": filters.EQ(imported.uuid),
+                "status": "new",
+            }
+        )
+        == []
     )
-    assert isinstance(backfill.content, models.FullBackfillContent)
     events = db.execute(
         "SELECT action, payload->>'uuid' FROM m_workspace_events "
         "WHERE project_id=%s AND user_uuid=%s AND object_type='external_account' "
@@ -401,10 +406,15 @@ def test_unbinding_restores_imported_profile_and_preserves_external_account(
         ).source
         == "zulip"
     )
-    (backfill,) = models.Task.objects.get_all(
-        filters={"external_account_uuid": filters.EQ(imported.uuid), "status": "cancel"}
+    assert (
+        models.Task.objects.get_all(
+            filters={
+                "external_account_uuid": filters.EQ(imported.uuid),
+                "status": "cancel",
+            }
+        )
+        == []
     )
-    assert isinstance(backfill.content, models.FullBackfillContent)
     assert (
         api.get(
             f"/v1/messenger/external_accounts/{imported.uuid}",
@@ -626,7 +636,8 @@ def test_connection_does_not_claim_external_identity_from_another_scope(
 def test_hidden_profile_directory_migration_can_be_applied_and_rolled_back(_database):
     migration = "0210-Hide-rebound-Zulip-profiles-from-the-user-directory-751a1a.py"
     with conftest.isolated_migration_database(
-        "0209-Add-Zulip-channel-types-and-direct-account-references-6bdbf2.py"
+        "0209-Add-Zulip-channel-types-and-direct-account-references-6bdbf2.py",
+        current_models=True,
     ):
         user = messenger_models.WorkspaceUser(
             username=f"hidden-{uuid.uuid4()}", source="hidden"
@@ -1191,7 +1202,8 @@ def test_failed_user_import_rolls_back_new_profiles_and_accounts(
 def test_external_account_identity_migration_and_lookup_index(_database):
     migration = "0206-Add-provider-account-identity-to-external-accounts-812e0e.py"
     with conftest.isolated_migration_database(
-        "0205-Store-Zulip-message-content-timestamps-as-UTC-for-ORM-ee88ee.py"
+        "0205-Store-Zulip-message-content-timestamps-as-UTC-for-ORM-ee88ee.py",
+        current_models=True,
     ) as database_url:
         engine = migrations.MigrationEngine(
             migrations_path=str(conftest.MIGRATIONS_DIR)

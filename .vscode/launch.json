@@ -63,6 +63,21 @@
             "subProcess": true
         },
         {
+            "name": "Python Debugger: Zulip Realtime",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${workspaceFolder}/.tox/develop/bin/python",
+            "module": "workspace.cmd.zulip_realtime",
+            "cwd": "${workspaceFolder}",
+            "args": [
+                "--config-file",
+                "${workspaceFolder}/etc/workspace/workspace.local.conf"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "subProcess": true
+        },
+        {
             "name": "Python Debugger: Apply Migrations",
             "type": "debugpy",
             "request": "launch",
@@ -125,7 +140,8 @@
                 "Python Debugger: Workspace API",
                 "Python Debugger: Messenger Events",
                 "Python Debugger: Messenger Worker",
-                "Python Debugger: History Import"
+                "Python Debugger: History Import",
+                "Python Debugger: Zulip Realtime"
             ],
             "stopAll": true
         }

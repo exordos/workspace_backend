@@ -306,7 +306,7 @@ def _database():
 
 
 @contextlib.contextmanager
-def isolated_migration_database(migration):
+def isolated_migration_database(migration, *, current_models=False):
     """Own a disposable database for tests of a published schema revision."""
     database_name = "workspace_migration_" + sys_uuid.uuid4().hex
     database_url = (
@@ -321,6 +321,18 @@ def isolated_migration_database(migration):
         engines.engine_factory.configure_factory(db_url=database_url)
         engine = ra_migrations.MigrationEngine(migrations_path=str(MIGRATIONS_DIR))
         engine.apply_migration(migration)
+        if current_models:
+            # These fields are independent of the historical migration under
+            # test. Keep current ORM fixtures usable without applying 0231,
+            # which would retire the compatibility tables being tested.
+            with psycopg.connect(database_url, autocommit=True) as connection:
+                connection.execute("""
+                    ALTER TABLE m_external_accounts_v2 ADD COLUMN IF NOT EXISTS
+                        has_completed_backfill BOOLEAN NOT NULL DEFAULT FALSE;
+                    ALTER TABLE bridge_zulip_v5_tasks
+                        ADD COLUMN IF NOT EXISTS backfill_uuid UUID,
+                        ADD COLUMN IF NOT EXISTS realtime_event_uuid UUID;
+                """)
         yield database_url
     finally:
         engines.engine_factory.destroy_all_engines()
@@ -420,7 +432,7 @@ def _test_database_url(_database, request, monkeypatch):
             yield TEST_DB_URL
         api_store.configure_store_factory(store_factory.build_store_factory())
         return
-    with isolated_migration_database(baseline) as database_url:
+    with isolated_migration_database(baseline, current_models=True) as database_url:
         api_store.configure_store_factory(legacy_store.LegacyMessengerStoreFactory())
         with monkeypatch.context() as patch:
             patch.setitem(globals(), "TEST_DB_URL", database_url)

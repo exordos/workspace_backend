@@ -38,15 +38,44 @@ Direct local services:
 - Workspace REST API: `http://127.0.0.1:21084/v1`
 - Messenger worker: `workspace-messenger-worker`
 - History import service: `workspace-history-import`
+- Zulip realtime service: `workspace-zulip-realtime`
 - Workspace OpenAPI spec: `http://127.0.0.1:21084/specifications/3.0.3`
 
 The single `workspace-api` process serves all REST resources, including Messenger,
 with two HTTP workers by default.
 
-The history import service calls `HistoryImportService.step()` on each iteration.
-The scaffold has an empty step method; import logic will be added there. The
-`[history_import] step_interval` option sets the minimum period, defaulting to
-three seconds.
+The history import service executes durable bridge tasks in priority order. The
+`[history_import] step_interval` option controls idle checks (default: three
+seconds); successful work continues immediately.
+
+The Zulip realtime service runs one asyncio poller per verified, enabled account
+with an API key. It reconciles accounts at startup, on PostgreSQL notifications,
+and every `[zulip_realtime] step_interval` seconds (default: one second). Changing
+credentials or account ownership replaces the poller; disabling or disconnecting
+an account stops it. Synchronous database work uses a bounded executor and short
+transactions, independent of the long-polling requests.
+
+Pollers subscribe to every Zulip event type. Raw events, including heartbeat and
+currently unsupported types, are stored in `bridge_zulip_v5_events` atomically
+with the subscription cursor. A subscriber in the same service schedules history
+tasks for messages, message edits, user changes, subscription/channel changes,
+and topic notification changes. Other event types remain stored without creating
+history tasks. Event consumption and task creation also commit together.
+
+Registering a new Zulip queue enqueues an internal `full_backfill` event for an
+account that has never completed import, or `actualize_backfill` for an imported
+account. The latter covers the preceding 30 days. Both use the message boundary
+returned by queue registration; neither fetches a later upper boundary. The API
+only schedules connection verification, which no longer starts backfill.
+An account becomes `active` after every task in its backfill group succeeds.
+Periodic catalog refreshes do not reset that status. Migration 0232 sets
+`has_completed_backfill` only for existing Zulip accounts in `backfill` state.
+
+PostgreSQL channel `workspace_zulip_realtime` carries wakeups (`accounts` or
+`events`); durable data stays in the database. Periodic checks recover missed
+notifications. Saved queues resume after a service restart; an expired Zulip
+queue is registered again and schedules a new backfill. Run one realtime service
+instance for this database.
 
 Nginx exposes:
 

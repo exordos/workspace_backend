@@ -22,7 +22,11 @@ def connection_url_with_application_name(connection_url: str, name: str) -> str:
         if key != "application_name"
     ]
     query.append(("application_name", name))
-    return urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
+    return urllib.parse.urlunsplit(
+        parts._replace(
+            query=urllib.parse.urlencode(query, quote_via=urllib.parse.quote),
+        )
+    )
 
 
 def configure_postgresql(

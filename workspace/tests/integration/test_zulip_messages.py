@@ -289,7 +289,7 @@ def test_history_import_names_empty_topics_without_changing_identity(
 
 def test_empty_topic_name_migration_preserves_existing_topic_identity(_database):
     with conftest.isolated_migration_database(
-        "0214-Expand-descriptions-to-10000-characters-fa3fa9.py"
+        "0214-Expand-descriptions-to-10000-characters-fa3fa9.py", current_models=True
     ):
         topics = [
             models.ZulipTopic(stream_id=42, name=name, max_id=44)
@@ -332,7 +332,7 @@ def test_direct_conversation_identity_is_shared_between_accounts(
 @pytest.mark.pre_retirement_schema
 def test_topic_identity_migration_merges_accounts_and_preserves_messages(_database):
     with conftest.isolated_migration_database(
-        "0215-Name-empty-Zulip-topics-General-Topic-146c8a.py"
+        "0215-Name-empty-Zulip-topics-General-Topic-146c8a.py", current_models=True
     ) as database_url:
         project_id = uuid.uuid4()
         now = datetime.datetime.now(datetime.timezone.utc)
@@ -989,7 +989,8 @@ def test_message_uuid_and_project_migrations_backfill_and_round_trip(_database):
         "0205-Store-Zulip-message-content-timestamps-as-UTC-for-ORM-ee88ee.py"
     )
     with conftest.isolated_migration_database(
-        "0202-Generate-required-Zulip-channel-stream-UUIDs-from-server-identity-e4f31c.py"
+        "0202-Generate-required-Zulip-channel-stream-UUIDs-from-server-identity-e4f31c.py",
+        current_models=True,
     ) as database_url:
         engine = migrations.MigrationEngine(
             migrations_path=str(conftest.MIGRATIONS_DIR)

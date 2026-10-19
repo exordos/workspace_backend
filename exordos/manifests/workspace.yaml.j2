@@ -364,6 +364,10 @@ resources:
           step_interval = 3
 
 
+          [zulip_realtime]
+          step_interval = 1
+
+
           [messenger_worker_agent]
           event_retention_seconds = 259200
           event_prune_interval_seconds = 300
@@ -516,6 +520,21 @@ resources:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       name: workspace-history-import
       path: /usr/bin/workspace-history-import --config-file /etc/workspace/workspace.conf
+      user: root
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_backend:uuid
+      service_type:
+        kind: simple
+        count: 1
+      target_status: enabled
+      before:
+        - kind: shell
+          command: /usr/local/bin/workspace-bootstrap
+    workspace_zulip_realtime:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace-zulip-realtime
+      path: /usr/bin/workspace-zulip-realtime --config-file /etc/workspace/workspace.conf
       user: root
       target:
         kind: node

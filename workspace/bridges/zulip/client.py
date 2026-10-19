@@ -3,16 +3,20 @@
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License.
 
+import datetime
 import json
 import typing
 
+import aiohttp
 import requests
 
 from workspace.messenger_api.dm import external_models
 
 
 class ZulipApiError(Exception):
-    pass
+    def __init__(self, code: str, message: str = "Zulip API request failed") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class ZulipClient:
@@ -36,7 +40,7 @@ class ZulipClient:
         response.raise_for_status()
         result = response.json()
         if result["result"] != "success":
-            raise ZulipApiError("Zulip API request failed")
+            raise ZulipApiError(result["code"], result["msg"])
         return result
 
     def _get(self, path: str, params: dict[str, typing.Any] | None = None) -> dict:
@@ -146,3 +150,78 @@ class ZulipClient:
             for message in messages
             if first_message_id <= message["id"] <= last_message_id
         ]
+
+    def get_first_message_id_since(self, since: datetime.datetime) -> int | None:
+        messages = self._get(
+            "/messages",
+            params={
+                "anchor": "date",
+                "anchor_date": since.isoformat(),
+                "num_before": 0,
+                "num_after": 0,
+                "apply_markdown": "false",
+            },
+        )["messages"]
+        # Date anchors fall back to the newest message if none follow the date.
+        if messages and messages[0]["timestamp"] >= since.timestamp():
+            return messages[0]["id"]
+        return None
+
+
+class AsyncZulipClient:
+    def __init__(self, account: external_models.ExternalAccount) -> None:
+        settings = account.settings
+        self._base_url = settings["server_url"].rstrip("/") + "/api/v1"
+        self._session = aiohttp.ClientSession(
+            auth=aiohttp.BasicAuth(settings["email"], settings["api_key"]),
+            timeout=aiohttp.ClientTimeout(total=30, connect=5),
+            trust_env=False,
+        )
+
+    async def close(self) -> None:
+        await self._session.close()
+
+    async def _request(self, method: str, path: str, **kwargs: typing.Any) -> dict:
+        async with self._session.request(
+            method, self._base_url + path, **kwargs
+        ) as response:
+            result = await response.json()
+            if result["result"] != "success":
+                raise ZulipApiError(result["code"], result["msg"])
+            response.raise_for_status()
+            return result
+
+    async def register_queue(self) -> dict:
+        # Omit event_types to subscribe to every event; fetch only the boundary
+        # and realm timeout needed to start history import and long polling.
+        return await self._request(
+            "POST",
+            "/register",
+            data={
+                "fetch_event_types": '["message", "realm"]',
+                "apply_markdown": "false",
+                "client_capabilities": json.dumps(
+                    {
+                        "empty_topic_name": True,
+                        "notification_settings_null": True,
+                        "user_settings_object": True,
+                        "archived_channels": True,
+                    }
+                ),
+            },
+        )
+
+    async def get_events(
+        self, queue_id: str, last_event_id: int, timeout: int
+    ) -> list[dict]:
+        result = await self._request(
+            "GET",
+            "/events",
+            params={
+                "queue_id": queue_id,
+                "last_event_id": last_event_id,
+                "dont_block": "false",
+            },
+            timeout=aiohttp.ClientTimeout(total=timeout, connect=5),
+        )
+        return result["events"]

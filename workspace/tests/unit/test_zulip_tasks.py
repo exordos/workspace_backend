@@ -491,6 +491,47 @@ def test_client_gets_last_available_message_id(messages, expected):
 
 
 @pytest.mark.parametrize(
+    "offset,expected", [(None, None), (-1, None), (0, 42), (1, 42)]
+)
+def test_client_finds_backfill_boundary_by_exact_date(offset, expected):
+    since = datetime.datetime(2026, 9, 19, 7, 0, 46, tzinfo=datetime.timezone.utc)
+    messages = (
+        [] if offset is None else [{"id": 42, "timestamp": since.timestamp() + offset}]
+    )
+    account = mock.Mock(
+        settings={
+            "server_url": "https://zulip.example.com/",
+            "email": "user@example.com",
+            "api_key": "test-key",
+        }
+    )
+    session = mock.Mock()
+    session.request.return_value.json.return_value = {
+        "result": "success",
+        "messages": messages,
+    }
+    with mock.patch.object(client.requests, "Session", return_value=session):
+        zulip = client.ZulipClient(account)
+        try:
+            assert zulip.get_first_message_id_since(since) == expected
+        finally:
+            zulip.close()
+    session.request.assert_called_once_with(
+        "GET",
+        "https://zulip.example.com/api/v1/messages",
+        params={
+            "anchor": "date",
+            "anchor_date": since.isoformat(),
+            "num_before": 0,
+            "num_after": 0,
+            "apply_markdown": "false",
+        },
+        timeout=(5, 30),
+    )
+    session.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
     "last_message_id,expected_ranges",
     [
         (0, []),
@@ -506,14 +547,13 @@ def test_full_backfill_creates_user_channel_and_bounded_history_tasks(
     task = models.Task(
         project_id=uuid.uuid4(),
         external_account_uuid=uuid.uuid4(),
-        content=models.TASK_CONTENT_TYPE.from_simple_type({"kind": "full_backfill"}),
+        content=models.TASK_CONTENT_TYPE.from_simple_type(
+            {"kind": "full_backfill", "last_message_id": last_message_id}
+        ),
     )
-    zulip = mock.Mock()
-    zulip.check_connection.return_value = {"user_id": 7}
-    zulip.get_last_message_id.return_value = last_message_id
     with (
         mock.patch.object(external_models.ExternalAccount, "objects"),
-        mock.patch.object(client, "ZulipClient", return_value=zulip),
+        mock.patch.object(client, "ZulipClient") as constructor,
         mock.patch.object(models.Task, "insert", autospec=True) as insert,
     ):
         task.content.execute(task)
@@ -540,22 +580,18 @@ def test_full_backfill_creates_user_channel_and_bounded_history_tasks(
     assert [child.priority for child in children[2:]] == list(
         range(10_000, 10_000 - len(expected_ranges), -1)
     )
-    zulip.get_last_message_id.assert_called_once_with()
-    zulip.close.assert_called_once_with()
+    constructor.assert_not_called()
 
 
 def test_history_priorities_stop_decreasing_at_the_minimum(monkeypatch):
     assert models.TASK_PRIORITY_IMPORT_HISTORY_MIN == 10
     monkeypatch.setattr(models, "TASK_PRIORITY_IMPORT_HISTORY", 12)
     task = _task()
-    zulip = mock.Mock()
-    zulip.get_last_message_id.return_value = 20_001
     with (
         mock.patch.object(external_models.ExternalAccount, "objects"),
-        mock.patch.object(client, "ZulipClient", return_value=zulip),
         mock.patch.object(models.Task, "insert", autospec=True) as insert,
     ):
-        models.FullBackfillContent().execute(task)
+        models.FullBackfillContent(last_message_id=20_001).execute(task)
     history = [call.args[0] for call in insert.call_args_list[2:]]
     assert [child.priority for child in history] == [12, 11, 10, 10, 10]
     assert [child.content.first_message_id for child in history] == [
@@ -592,6 +628,7 @@ def test_task_executes_connection_content():
             "api_key": "test-key",
         },
         properties={"external_account_id": mock.Mock()},
+        external_account_id=None,
         disabled=False,
         get_host=mock.Mock(return_value="zulip.example.com"),
     )
@@ -635,13 +672,7 @@ def test_task_executes_connection_content():
     assert profile.uuid == uuid.uuid5(
         uuid.uuid5(uuid.NAMESPACE_DNS, "zulip.example.com"), "user:7"
     )
-    insert.assert_called_once()
-    followup = insert.call_args.args[0]
-    assert followup.project_id == task.project_id
-    assert followup.external_account_uuid == task.external_account_uuid
-    assert followup.priority == models.TASK_PRIORITY_FULL_BACKFILL
-    assert followup.not_before_at is None
-    assert isinstance(followup.content, models.FullBackfillContent)
+    insert.assert_not_called()
 
 
 def test_success_calls_task_and_content_hooks_with_the_task(_task_storage):

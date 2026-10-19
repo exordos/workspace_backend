@@ -64,7 +64,7 @@ def _http_error(status_code, code="BAD_REQUEST", **details):
 
 
 @pytest.mark.parametrize("status", ["new", "error"])
-def test_successful_connection_starts_full_backfill_and_periodic_catalog_sync(
+def test_backfill_starts_only_after_realtime_queue_registration(
     task_queue, monkeypatch, status
 ):
     task = task_queue()
@@ -106,10 +106,37 @@ def test_successful_connection_starts_full_backfill_and_periodic_catalog_sync(
             "status": filters.EQ("new"),
         }
     )
-    assert len(pending) == 1
-    full_backfill = pending[0]
+    assert pending == []
+    account.settings = {
+        "server_url": "https://zulip.example.com",
+        "email": "owner@example.com",
+        "api_key": "test",
+    }
+    account.update()
+    with contexts.Context().session_manager():
+        models.RealtimeSubscription.register(
+            account,
+            {
+                "queue_id": "test-queue",
+                "last_event_id": -1,
+                "max_message_id": 10005,
+                "event_queue_longpoll_timeout_seconds": 90,
+            },
+            datetime.datetime.now(datetime.timezone.utc),
+        )
+    assert (
+        models.Task.objects.get_all(
+            filters={"external_account_uuid": account.uuid, "status": "new"}
+        )
+        == []
+    )
+    with contexts.Context().session_manager():
+        assert models.RealtimeEvent.dispatch_one()
+    (full_backfill,) = models.Task.objects.get_all(
+        filters={"external_account_uuid": account.uuid, "status": "new"}
+    )
     assert isinstance(full_backfill.content, models.FullBackfillContent)
-    assert full_backfill.priority == models.TASK_PRIORITY_FULL_BACKFILL
+    assert full_backfill.priority == models.TASK_PRIORITY_INITIALIZE_CONNECTION
 
     service._iteration()
 
@@ -161,7 +188,7 @@ def test_successful_connection_starts_full_backfill_and_periodic_catalog_sync(
     )
     assert [child.priority for child in history] == [10_000, 9_999, 9_998]
     assert first_sync.project_id == account.project_id
-    assert first_sync.priority == models.TASK_PRIORITY_IMPORT_CHANNELS == 50_000
+    assert first_sync.priority == models.TASK_PRIORITY_IMPORT_USERS == 500_000
     assert first_sync.not_before_at is None
     assert isinstance(first_sync.content, models.ImportChannelsContent)
 
@@ -202,7 +229,7 @@ def test_successful_connection_starts_full_backfill_and_periodic_catalog_sync(
     assert _stored(next_sync).status == "waiting"
     assert all(_stored(child).status == "done" for child in history)
     zulip.check_connection.assert_called_once_with()
-    zulip.get_last_message_id.assert_called_once_with()
+    zulip.get_last_message_id.assert_not_called()
     zulip.get_channels.assert_called_once_with()
     zulip.get_users.assert_called_once_with()
     assert zulip.get_messages.call_args_list == [
@@ -210,7 +237,13 @@ def test_successful_connection_starts_full_backfill_and_periodic_catalog_sync(
         mock.call(5001, 10000),
         mock.call(1, 5000),
     ]
-    assert zulip.close.call_count == 7
+    assert zulip.close.call_count == 6
+    assert (
+        external_models.ExternalAccount.objects.get_one(
+            filters={"uuid": account.uuid}
+        ).status
+        == "active"
+    )
 
 
 @pytest.mark.parametrize("phase", ["fetch", "auth", "close", "queue"])
@@ -222,7 +255,11 @@ def test_failed_full_backfill_does_not_leave_partial_child_tasks(
         project_id=initial.project_id,
         external_account_uuid=initial.external_account_uuid,
         priority=models.TASK_PRIORITY_FULL_BACKFILL,
-        content=models.FullBackfillContent(),
+        content=models.ActualizeBackfillContent(
+            last_message_id=10005,
+            since=datetime.datetime.now(datetime.timezone.utc)
+            - datetime.timedelta(days=30),
+        ),
     )
     task.insert()
     zulip = mock.Mock()
@@ -231,12 +268,14 @@ def test_failed_full_backfill_does_not_leave_partial_child_tasks(
         "full_name": "Owner",
         "email": "owner@example.com",
     }
-    zulip.get_last_message_id.return_value = 10005
+    zulip.get_first_message_id_since.return_value = 1
     monkeypatch.setattr(client, "ZulipClient", lambda account: zulip)
     if phase == "fetch":
-        zulip.get_last_message_id.side_effect = requests.Timeout("Timed out")
+        zulip.get_first_message_id_since.side_effect = requests.Timeout("Timed out")
     elif phase == "auth":
-        zulip.get_last_message_id.side_effect = _http_error(401, "INVALID_API_KEY")
+        zulip.get_first_message_id_since.side_effect = _http_error(
+            401, "INVALID_API_KEY"
+        )
     elif phase == "close":
         zulip.close.side_effect = RuntimeError("Close failed")
     else:
@@ -261,7 +300,7 @@ def test_failed_full_backfill_does_not_leave_partial_child_tasks(
     zulip.close.assert_called_once_with()
 
 
-@pytest.mark.parametrize("phase", ["check", "close", "status", "queue"])
+@pytest.mark.parametrize("phase", ["check", "close", "status"])
 def test_failed_connection_does_not_queue_full_backfill(task_queue, monkeypatch, phase):
     task = task_queue()
     zulip = mock.Mock()
