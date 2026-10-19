@@ -1335,7 +1335,7 @@ def _viewer_rows(account, model):
     return model.objects.get_all(filters={"project_id": filters.EQ(account.project_id)})
 
 
-def test_imported_user_flags_preserve_local_changes_until_a_new_zulip_snapshot(
+def test_imported_user_flags_preserve_local_changes_when_mentions_change(
     message_sources,
 ):
     account, source = message_sources()
@@ -1360,7 +1360,7 @@ def test_imported_user_flags_preserve_local_changes_until_a_new_zulip_snapshot(
     with contexts.Context().session_manager():
         models.ZulipMessageState.reconcile_batch(10)
     (updated,) = _viewer_rows(account, v2_models.WorkspaceUserMessageState)
-    assert updated.read_at is not None and updated.starred
+    assert updated.read_at is None and not updated.starred
     assert not updated.mentioned and updated.pinned
     assert (
         updated.binding_uuid

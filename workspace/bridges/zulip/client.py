@@ -72,6 +72,19 @@ class ZulipClient:
     def edit_message(self, message_id: int, content: str) -> None:
         self._request("PATCH", f"/messages/{message_id}", data={"content": content})
 
+    def update_message_flags(
+        self, message_ids: list[int], flag: str, value: bool
+    ) -> dict:
+        return self._request(
+            "POST",
+            "/messages/flags",
+            data={
+                "messages": json.dumps(message_ids),
+                "flag": flag,
+                "op": "add" if value else "remove",
+            },
+        )
+
     def get_users(self) -> list[dict]:
         # Unlike /users, registration also includes cross-realm system bots.
         data = self._request(

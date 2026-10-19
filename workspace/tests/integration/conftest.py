@@ -332,6 +332,9 @@ def isolated_migration_database(migration, *, current_models=False):
                     ALTER TABLE bridge_zulip_v5_tasks
                         ADD COLUMN IF NOT EXISTS backfill_uuid UUID,
                         ADD COLUMN IF NOT EXISTS realtime_event_uuid UUID;
+                    ALTER TABLE messenger_user_message_states
+                        ADD COLUMN IF NOT EXISTS read_updated_at TIMESTAMP WITHOUT TIME ZONE,
+                        ADD COLUMN IF NOT EXISTS starred_updated_at TIMESTAMP WITHOUT TIME ZONE;
                 """)
         yield database_url
     finally:

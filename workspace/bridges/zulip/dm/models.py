@@ -37,6 +37,7 @@ from restalchemy.storage.sql import orm
 from restalchemy.storage.sql import utils
 
 from workspace.bridges.zulip import client
+from workspace.bridges.zulip.dm import flags as message_flags
 from workspace.common import models as common_models
 from workspace.common import types as common_types
 from workspace.messenger_api import events as messenger_events
@@ -58,6 +59,7 @@ TASK_PRIORITY_FULL_BACKFILL = 100_000
 TASK_PRIORITY_INITIALIZE_CONNECTION = 600_000
 TASK_PRIORITY_REALTIME_MESSAGE = 300_000
 TASK_PRIORITY_REALTIME_EDIT = 250_000
+TASK_PRIORITY_REALTIME_FLAGS = 550_000
 TASK_PRIORITY_RECONCILIATION = 400_000
 TASK_PRIORITY_REFRESH_MESSAGE_COUNTERS = 700_000
 TASK_RETRY_DELAY = datetime.timedelta(minutes=1)
@@ -1188,7 +1190,8 @@ class ZulipUserMessageState(
             filters={
                 "project_id": filters.EQ(self.project_id),
                 "uuid": filters.EQ(self.state_uuid),
-            }
+            },
+            locked=True,
         )
         if self.action == "delete":
             if binding is not None:
@@ -1233,18 +1236,10 @@ class ZulipUserMessageState(
             ).insert()
         else:
             new_generation = state.membership_generation != self.membership_generation
-            if (
-                new_generation
-                or state.zulip_source_uuid != self.source_uuid
-                or state.zulip_flags_updated_at is None
-                or state.zulip_flags_updated_at < self.flags_updated_at
-            ):
-                state.read_at = (
-                    (state.read_at or self.flags_updated_at) if self.read else None
-                )
-                state.starred = self.starred
-                if new_generation:
-                    state.pinned = False
+            if new_generation:
+                state.read_updated_at = None
+                state.starred_updated_at = None
+                state.pinned = False
             # Notification preferences can change without a new flags snapshot.
             state.mentioned = self.mentioned
             state.properties["binding_uuid"].set_value_force(binding.uuid)
@@ -1796,6 +1791,16 @@ class ActualizeBackfillContent(FullBackfillContent):
 
     since = properties.property(types.UTCDateTimeZ(), required=True, read_only=True)
 
+    def execute(self, task: "Task") -> None:
+        super().execute(task)
+        Task(
+            project_id=task.project_id,
+            external_account_uuid=task.external_account_uuid,
+            realtime_event_uuid=task.realtime_event_uuid or task.backfill_uuid,
+            priority=TASK_PRIORITY_IMPORT_HISTORY_MIN,
+            content=RefreshMessageFlagsContent(last_message_id=self.last_message_id),
+        ).insert()
+
 
 class ImportUsersContent(AbstractZulipTaskContent):
     KIND = "import_users"
@@ -2021,7 +2026,11 @@ class ImportHistoryContent(AbstractZulipTaskContent):
         server_namespace = sys_uuid.uuid5(sys_uuid.NAMESPACE_DNS, hostname)
         zulip = client.ZulipClient(account)
         try:
+            observed_at = datetime.datetime.now(datetime.timezone.utc)
             messages = zulip.get_messages(self.first_message_id, self.last_message_id)
+            observed_flags = message_flags.observe_snapshot(
+                account, messages, observed_at
+            )
             deliveries = (
                 {
                     delivery.zulip_message_id: delivery
@@ -2226,6 +2235,7 @@ class ImportHistoryContent(AbstractZulipTaskContent):
                             "historical",
                         )
                     },
+                    **observed_flags[data["id"]],
                 }
                 if message is None:
                     ZulipMessage(
@@ -2259,6 +2269,168 @@ class ImportHistoryContent(AbstractZulipTaskContent):
 
 class DeliveryPendingError(Exception):
     pass
+
+
+class UpdateMessageFlagsContent(AbstractZulipTaskContent):
+    KIND = "update_message_flags"
+
+    state_uuid = properties.property(types.UUID(), required=True, read_only=True)
+    flag = properties.property(
+        types.Enum(message_flags.FLAGS), required=True, read_only=True
+    )
+    value = properties.property(types.Boolean(), required=True, read_only=True)
+    changed_at = properties.property(
+        types.UTCDateTimeZ(), required=True, read_only=True
+    )
+    account_revision = properties.property(
+        types.String(), required=True, read_only=True
+    )
+
+    def execute(self, task: "Task") -> None:
+        message_flags.lock_state(
+            task.project_id, self.state_uuid, task.external_account_uuid
+        )
+        account = external_models.ExternalAccount.objects.get_one(
+            filters={
+                "uuid": filters.EQ(task.external_account_uuid),
+                "project_id": filters.EQ(task.project_id),
+            }
+        )
+        if (
+            not account.can_stream()
+            or account.realtime_revision() != self.account_revision
+        ):
+            raise SubscriptionChangedError()
+        targets = message_flags.flag_states(
+            task.project_id, self.state_uuid, account.uuid, self.flag
+        )
+        if not targets:
+            return
+        target = targets[0]
+        changed_at = self.changed_at.replace(tzinfo=None)
+        if (
+            target["local_updated_at"] != changed_at
+            or target["local_value"] != self.value
+            or (
+                target["remote_updated_at"] is not None
+                and target["remote_updated_at"] >= changed_at
+            )
+        ):
+            return
+        batch = message_flags.outgoing_batch(
+            task.project_id, account.uuid, self.state_uuid, self.flag, self.value
+        )
+        if not batch:
+            return
+        message_ids = sorted({row["message_id"] for row in batch})
+        zulip = client.ZulipClient(account)
+        try:
+            result = zulip.update_message_flags(message_ids, self.flag, self.value)
+            if result.get("ignored_because_not_subscribed_channels"):
+                raise client.ZulipApiError(
+                    "NOT_SUBSCRIBED",
+                    "Cannot mark messages in unsubscribed Zulip channels as unread",
+                )
+            by_time = {}
+            for row in batch:
+                by_time.setdefault(row["local_updated_at"], set()).add(
+                    row["message_id"]
+                )
+            for observed_at, ids in sorted(by_time.items()):
+                message_flags.record(
+                    account,
+                    sorted(ids),
+                    self.flag,
+                    self.value,
+                    observed_at.replace(tzinfo=datetime.timezone.utc),
+                )
+        finally:
+            zulip.close()
+
+    def on_error(self, task: "Task", error: Exception) -> None:
+        if isinstance(error, SubscriptionChangedError):
+            task.status = TaskStatus.CANCEL.value
+        else:
+            super().on_error(task, error)
+
+
+class RefreshMessageFlagsContent(AbstractZulipTaskContent):
+    KIND = "refresh_message_flags"
+
+    after_message_id = properties.property(types.Integer(min_value=0), default=0)
+    last_message_id = properties.property(types.Integer(min_value=0), required=True)
+
+    def execute(self, task: "Task") -> None:
+        account = external_models.ExternalAccount.objects.get_one(
+            filters={
+                "project_id": filters.EQ(task.project_id),
+                "uuid": filters.EQ(task.external_account_uuid),
+            }
+        )
+        if not account.can_stream():
+            raise SubscriptionChangedError()
+        rows = (
+            contexts.Context()
+            .get_session()
+            .execute(
+                """SELECT message_id FROM (
+                   (SELECT DISTINCT message_id FROM bridge_zulip_v5_message_flags
+                    WHERE project_id=%s AND external_account_uuid=%s
+                      AND message_id > %s AND message_id <= %s
+                    ORDER BY message_id LIMIT 100)
+                   UNION
+                   (SELECT delivery.zulip_message_id AS message_id
+                    FROM bridge_zulip_v5_deliveries AS delivery
+                    JOIN bridge_zulip_v5_channels AS channel
+                      ON channel.external_account_uuid=%s AND channel.stream_uuid=delivery.stream_uuid
+                    WHERE delivery.project_id=%s AND delivery.hostname=%s
+                      AND delivery.zulip_message_id > %s AND delivery.zulip_message_id <= %s
+                    ORDER BY delivery.zulip_message_id LIMIT 100)
+               ) AS known ORDER BY message_id LIMIT 100""",
+                (
+                    task.project_id,
+                    account.uuid,
+                    self.after_message_id,
+                    self.last_message_id,
+                    account.uuid,
+                    task.project_id,
+                    account.get_host(),
+                    self.after_message_id,
+                    self.last_message_id,
+                ),
+            )
+            .fetchall()
+        )
+        if not rows:
+            return
+        first = rows[0]["message_id"]
+        last = min(rows[-1]["message_id"], first + MAX_HISTORY_MESSAGES - 1)
+        wanted = {row["message_id"] for row in rows if row["message_id"] <= last}
+        zulip = client.ZulipClient(account)
+        try:
+            observed_at = datetime.datetime.now(datetime.timezone.utc)
+            data = zulip.get_messages(first, last)
+            message_flags.observe_snapshot(
+                account, [row for row in data if row["id"] in wanted], observed_at
+            )
+        finally:
+            zulip.close()
+        Task(
+            uuid=sys_uuid.uuid5(task.uuid, str(last)),
+            project_id=task.project_id,
+            external_account_uuid=account.uuid,
+            priority=task.priority,
+            realtime_event_uuid=task.realtime_event_uuid,
+            content=RefreshMessageFlagsContent(
+                after_message_id=last, last_message_id=self.last_message_id
+            ),
+        ).insert()
+
+    def on_error(self, task: "Task", error: Exception) -> None:
+        if isinstance(error, SubscriptionChangedError):
+            task.status = TaskStatus.CANCEL.value
+        else:
+            super().on_error(task, error)
 
 
 class OutboundMessageContent(AbstractTaskContent):
@@ -2485,6 +2657,7 @@ class ReconciliationContent(AbstractTaskContent):
             processed += ZulipTopicState.reconcile_batch(self.batch_size - processed)
         if processed < self.batch_size:
             processed += ZulipMessageState.reconcile_batch(self.batch_size - processed)
+        message_flags.FlagChange.reconcile_batch(self.batch_size)
         not_before_at = None
         if processed < self.batch_size:
             not_before_at = datetime.datetime.now(
@@ -2504,6 +2677,8 @@ class ReconciliationContent(AbstractTaskContent):
 
 
 TASK_CONTENT_TYPE = types_dynamic.KindModelSelectorType(
+    types_dynamic.KindModelType(UpdateMessageFlagsContent),
+    types_dynamic.KindModelType(RefreshMessageFlagsContent),
     types_dynamic.KindModelType(SendMessageContent),
     types_dynamic.KindModelType(EditMessageContent),
     types_dynamic.KindModelType(InitializeConnectionContent),
@@ -2793,11 +2968,13 @@ class RealtimeSubscription(
         expected: external_models.ExternalAccount,
         generation: sys_uuid.UUID,
         events: list[dict],
+        received_at: datetime.datetime | None = None,
     ) -> int:
         account = cls.lock_account(expected)
         subscription = cls.for_account(account)
         if subscription is None or subscription.generation != generation:
             raise SubscriptionChangedError()
+        received_at = received_at or datetime.datetime.now(datetime.timezone.utc)
         for event in events:
             if event["id"] <= subscription.last_event_id:
                 continue
@@ -2808,6 +2985,7 @@ class RealtimeSubscription(
                 generation=generation,
                 queue_id=subscription.queue_id,
                 event_id=event["id"],
+                created_at=received_at,
                 source="zulip",
                 payload=event,
             ).insert()
@@ -2883,6 +3061,22 @@ class RealtimeEvent(
             priority = TASK_PRIORITY_INITIALIZE_CONNECTION
         elif kind in ("message", "update_message"):
             if kind == "message":
+                if "flags" in self.payload:
+                    account = external_models.ExternalAccount.objects.get_one(
+                        filters={
+                            "uuid": filters.EQ(self.external_account_uuid),
+                            "project_id": filters.EQ(self.project_id),
+                        }
+                    )
+                    for flag in message_flags.FLAGS:
+                        message_flags.record(
+                            account,
+                            [self.payload["message"]["id"]],
+                            flag,
+                            flag in self.payload["flags"],
+                            self.created_at,
+                            self.event_id,
+                        )
                 if "local_message_id" in self.payload:
                     delivery = MessageDelivery.objects.get_one_or_none(
                         filters={
@@ -2925,6 +3119,52 @@ class RealtimeEvent(
                 )
                 for message_id in sorted(set(message_ids))
             ]
+        elif kind == "update_message_flags":
+            flag = self.payload["flag"]
+            if flag in message_flags.FLAGS:
+                account = external_models.ExternalAccount.objects.get_one(
+                    filters={
+                        "uuid": filters.EQ(self.external_account_uuid),
+                        "project_id": filters.EQ(self.project_id),
+                    }
+                )
+                message_ids = (
+                    [0] if self.payload.get("all", False) else self.payload["messages"]
+                )
+                message_flags.record(
+                    account,
+                    message_ids,
+                    flag,
+                    self.payload["op"] == "add",
+                    self.created_at,
+                    self.event_id,
+                )
+                known = {
+                    row.message_id
+                    for row in ZulipMessage.objects.get_all(
+                        filters={
+                            "project_id": filters.EQ(self.project_id),
+                            "external_account_uuid": filters.EQ(account.uuid),
+                            "message_id": filters.In(message_ids),
+                        }
+                    )
+                }
+                known.update(
+                    row.zulip_message_id
+                    for row in MessageDelivery.objects.get_all(
+                        filters={
+                            "project_id": filters.EQ(self.project_id),
+                            "hostname": filters.EQ(account.get_host()),
+                            "zulip_message_id": filters.In(message_ids),
+                        }
+                    )
+                )
+                contents = [
+                    ImportHistoryContent(
+                        first_message_id=message_id, last_message_id=message_id
+                    )
+                    for message_id in sorted(set(message_ids) - known - {0})
+                ]
         elif kind == "realm_user":
             contents = [ImportUsersContent(periodic=False)]
             priority = TASK_PRIORITY_IMPORT_USERS
@@ -2951,7 +3191,7 @@ class RealtimeEvent(
                 """
             SELECT uuid FROM bridge_zulip_v5_events
             WHERE processed_at IS NULL AND (next_retry_at IS NULL OR next_retry_at <= NOW() AT TIME ZONE 'UTC')
-            ORDER BY created_at, uuid LIMIT 1 FOR UPDATE SKIP LOCKED
+            ORDER BY created_at, event_id NULLS FIRST, uuid LIMIT 1 FOR UPDATE SKIP LOCKED
         """,
                 (),
             )

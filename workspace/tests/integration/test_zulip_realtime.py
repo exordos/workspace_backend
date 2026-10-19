@@ -271,6 +271,7 @@ def test_old_generation_and_disabled_account_cannot_accept_events(account):
 def test_async_worker_acknowledges_saved_events_and_stops_disabled_poller(account):
     async def scenario():
         registration_count = 0
+        response_sent_at = None
         acknowledged = asyncio.Event()
         hanging = asyncio.Event()
         service = zulip_realtime.ZulipRealtimeService(
@@ -293,8 +294,10 @@ def test_async_worker_acknowledges_saved_events_and_stops_disabled_poller(accoun
             )
 
         async def get_events(request):
+            nonlocal response_sent_at
             cursor = int(request.query["last_event_id"])
             if cursor == -1:
+                response_sent_at = datetime.datetime.now(datetime.timezone.utc)
                 return aiohttp.web.json_response(
                     {
                         "result": "success",
@@ -309,6 +312,16 @@ def test_async_worker_acknowledges_saved_events_and_stops_disabled_poller(accoun
                 models.RealtimeSubscription.for_account, account
             )
             assert subscription.last_event_id == 5
+            received = await service._database(
+                lambda: models.RealtimeEvent.objects.get_all(
+                    filters={
+                        "external_account_uuid": filters.EQ(account.uuid),
+                        "source": filters.EQ("zulip"),
+                    }
+                ),
+            )
+            assert len({event.created_at for event in received}) == 1
+            assert received[0].created_at >= response_sent_at
             acknowledged.set()
             await hanging.wait()
             return aiohttp.web.json_response({"result": "success", "events": []})

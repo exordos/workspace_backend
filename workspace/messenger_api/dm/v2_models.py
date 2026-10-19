@@ -326,6 +326,12 @@ class WorkspaceUserMessageState(
     read_at = properties.property(
         types.AllowNone(common_types.UTCDateTimeWithOffset()), default=None
     )
+    read_updated_at = properties.property(
+        types.AllowNone(types.UTCDateTimeZ()), default=None
+    )
+    starred_updated_at = properties.property(
+        types.AllowNone(types.UTCDateTimeZ()), default=None
+    )
     mentioned = properties.property(types.Boolean(), default=False)
     starred = properties.property(types.Boolean(), default=False)
     pinned = properties.property(types.Boolean(), default=False)

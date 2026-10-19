@@ -18,6 +18,7 @@ from restalchemy.common import contexts
 from restalchemy.dm import filters
 
 from workspace.bridges.zulip import client
+from workspace.bridges.zulip.dm import flags as message_flags
 from workspace.bridges.zulip.dm import models
 from workspace.messenger_api.dm import external_models
 
@@ -160,7 +161,13 @@ class ZulipRealtimeService:
             self._workspace_events_ready.clear()
             try:
                 for _index in range(100):
-                    if not await self._database(models.WorkspaceEvent.dispatch_one):
+                    flags_changed = await self._database(
+                        message_flags.FlagChange.reconcile_batch, 16
+                    )
+                    event_processed = await self._database(
+                        models.WorkspaceEvent.dispatch_one
+                    )
+                    if not flags_changed and not event_processed:
                         break
                 else:
                     await asyncio.sleep(0)
@@ -187,6 +194,8 @@ class ZulipRealtimeService:
                             self._accounts_changed.set()
                         if notification.payload in ("events", ""):
                             self._events_ready.set()
+                        if notification.payload in ("flags", ""):
+                            self._workspace_events_ready.set()
             except Exception:
                 LOG.exception("Failed to listen for Zulip realtime notifications")
                 await asyncio.sleep(self._step_interval)
@@ -219,11 +228,13 @@ class ZulipRealtimeService:
                         subscription.last_event_id,
                         subscription.longpoll_timeout,
                     )
+                    received_at = datetime.datetime.now(datetime.timezone.utc)
                     subscription.last_event_id = await self._database(
                         models.RealtimeSubscription.append_events,
                         account,
                         subscription.generation,
                         events,
+                        received_at,
                     )
                     delay = 1.0
                 except models.SubscriptionChangedError:
