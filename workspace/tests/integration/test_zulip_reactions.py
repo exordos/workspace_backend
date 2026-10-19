@@ -18,6 +18,7 @@ from restalchemy.dm import filters
 from workspace.bridges.zulip import client
 from workspace.bridges.zulip.dm import models
 from workspace.bridges.zulip.dm import reactions
+from workspace.common import emoji
 from workspace.messenger_api.dm import v2_models
 from workspace.tests.integration import conftest
 from workspace.tests.integration import test_messenger_v2 as messenger_tests
@@ -165,9 +166,12 @@ def test_snapshot_removes_disappeared_reactions(imported):
     assert facts(account) == [] and pending(account) == []
 
 
-def test_local_add_and_remove_are_durable_and_use_the_actor_account(imported, api):
+@pytest.mark.parametrize("name", ["+1", "thumbs_up", "👍", "👍\ufe0f"])
+def test_local_add_and_remove_are_durable_and_use_the_actor_account(
+    imported, api, name
+):
     account, source, _state, _subscription, zulip, constructor = imported
-    public = add(api, imported, name="+1")
+    public = add(api, imported, name=name)
     assert public["emoji_name"] == "thumbs_up"
     assert reactions.ReactionIntent.objects.get_one(
         filters={"project_id": filters.EQ(account.project_id)}
@@ -684,6 +688,102 @@ def test_non_json_server_failure_remains_retryable(imported, api):
     assert task.status == "retry"
 
 
+def test_symbol_migration_requeues_a_failed_intent_and_preserves_its_time(imported, db):
+    account, source, state, _subscription, zulip, _constructor = imported
+    placement = v2_models.WorkspaceMessagePlacement.objects.get_one(
+        filters={"uuid": filters.EQ(state.placement_uuid)}
+    )
+    fact = v2_models.WorkspaceMessageReactionFact(
+        project_id=account.project_id,
+        canonical_message_uuid=placement.message_uuid,
+        placement_uuid=placement.uuid,
+        user_uuid=account.owner_user_uuid,
+        emoji_name="👍",
+    )
+    fact.insert()
+    db.execute(
+        "UPDATE bridge_zulip_v5_reaction_intents SET error_description='Unsupported Unicode emoji: 👍' WHERE project_id=%s",
+        (account.project_id,),
+    )
+    (before,) = reactions.ReactionIntent.objects.get_all(
+        filters={"project_id": filters.EQ(account.project_id)}
+    )
+    db.execute(
+        "DELETE FROM bridge_zulip_v5_reaction_changes WHERE project_id=%s",
+        (account.project_id,),
+    )
+    path = next(conftest.MIGRATIONS_DIR.glob("0239-*.py"))
+    spec = importlib.util.spec_from_file_location("symbol_reaction_migration", path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    for _index in range(2):
+        with contexts.Context().session_manager() as session:
+            migration.migration_step.upgrade(session)
+    (after,) = reactions.ReactionIntent.objects.get_all(
+        filters={"project_id": filters.EQ(account.project_id)}
+    )
+    assert after.emoji_name == "thumbs_up" and after.error_description is None
+    assert after.uuid == before.uuid and after.changed_at == before.changed_at
+    (normalized,) = facts(account)
+    assert normalized.uuid == fact.uuid and normalized.emoji_name == "thumbs_up"
+    reconcile()
+    (task,) = pending(account)
+    with contexts.Context().session_manager():
+        task.execute()
+    assert task.status == "done"
+    zulip.update_reaction.assert_called_once_with(
+        source.message_id, "+1", "1f44d", "unicode_emoji", True
+    )
+    receive(imported)
+    assert [row.uuid for row in facts(account)] == [fact.uuid]
+    messenger_tests._drain()
+    message = v2_models.WorkspaceMessage.objects.get_one(
+        filters={"project_id": filters.EQ(account.project_id)}
+    )
+    assert message.reactions == {"thumbs_up": 1}
+    assert message.reaction_users == {"thumbs_up": [str(account.owner_user_uuid)]}
+
+
+@pytest.mark.parametrize("latest_name", ["👍", "thumbs_up"])
+@pytest.mark.parametrize("present", [True, False])
+def test_symbol_migration_merges_aliases_using_the_latest_intent(
+    imported, db, latest_name, present
+):
+    account, _source, state, *_rest = imported
+    placement = v2_models.WorkspaceMessagePlacement.objects.get_one(
+        filters={"uuid": filters.EQ(state.placement_uuid)}
+    )
+    for name in ("👍", "thumbs_up"):
+        v2_models.WorkspaceMessageReactionFact(
+            project_id=account.project_id,
+            canonical_message_uuid=placement.message_uuid,
+            placement_uuid=placement.uuid,
+            user_uuid=account.owner_user_uuid,
+            emoji_name=name,
+        ).insert()
+    latest = datetime.datetime.now(datetime.timezone.utc)
+    db.execute(
+        """UPDATE bridge_zulip_v5_reaction_intents SET present=%s,changed_at=%s
+           WHERE project_id=%s AND emoji_name=%s""",
+        (present, latest.replace(tzinfo=None), account.project_id, latest_name),
+    )
+    path = next(conftest.MIGRATIONS_DIR.glob("0239-*.py"))
+    spec = importlib.util.spec_from_file_location("symbol_reaction_merge", path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    with contexts.Context().session_manager() as session:
+        migration.migration_step.upgrade(session)
+    (intent,) = reactions.ReactionIntent.objects.get_all(
+        filters={"project_id": filters.EQ(account.project_id)}
+    )
+    assert intent.emoji_name == "thumbs_up" and intent.present == present
+    assert intent.changed_at == latest
+    assert len(facts(account)) == 1
+    reconcile()
+    assert bool(facts(account)) == present
+    assert len(pending(account)) == 1 and pending(account)[0].content.present == present
+
+
 def test_unknown_actor_waits_for_user_import(imported, message_sources, db):
     account, *_rest = imported
     receive(imported, data=reaction(user_id=9))
@@ -703,3 +803,138 @@ def test_unknown_actor_waits_for_user_import(imported, message_sources, db):
     )
     reconcile()
     assert facts(account)[0].user_uuid == actor.owner_user_uuid
+
+
+@pytest.mark.parametrize(
+    "symbol,canonical,code,remote_name",
+    [
+        ("❤️", "heart", "2764", "heart"),
+        ("1️⃣", "one", "0031-20e3", "one"),
+        ("🏳️‍🌈", "rainbow_flag", "1f3f3-200d-1f308", "rainbow_flag"),
+        ("computer", "computer", "1f5a5", "desktop_computer"),
+        ("🌆", "city_dusk", "1f306", "sunset"),
+    ],
+)
+def test_unicode_conversion_round_trips_without_changing_the_emoji(
+    imported, api, symbol, canonical, code, remote_name
+):
+    account, source, _state, _subscription, zulip, _constructor = imported
+    created = add(api, imported, symbol)
+    assert created["emoji_name"] == canonical
+    reconcile()
+    with contexts.Context().session_manager():
+        pending(account)[0].execute()
+    zulip.update_reaction.assert_called_once_with(
+        source.message_id, remote_name, code, "unicode_emoji", True
+    )
+    receive(imported, data=reaction(name=remote_name, code=code))
+    assert [str(fact.uuid) for fact in facts(account)] == [created["uuid"]]
+    assert api.delete(f"{REACTIONS}{created['uuid']}").status_code == 204
+    reconcile()
+    with contexts.Context().session_manager():
+        pending(account)[0].execute()
+    assert zulip.update_reaction.call_args.args == (
+        source.message_id,
+        remote_name,
+        code,
+        "unicode_emoji",
+        False,
+    )
+    assert facts(account) == []
+
+
+def test_skin_tones_remain_distinct_and_use_observed_server_support(imported, api):
+    account, source, _state, _subscription, zulip, _constructor = imported
+    toned = add(api, imported, "👍🏻")
+    assert toned["emoji_name"] == "+1_tone1"
+    reconcile()
+    assert pending(account) == []
+    (intent,) = reactions.ReactionIntent.objects.get_all(
+        filters={"project_id": filters.EQ(account.project_id)}
+    )
+    assert intent.error_description == "Unsupported Unicode emoji: +1_tone1"
+    # A newer server may report an emoji absent from the pinned Zulip catalog.
+    receive(imported, data=reaction(name="remote_tone_alias", code="1f44d-1f3fb"))
+    assert str(facts(account)[0].uuid) == toned["uuid"]
+    intent = reactions.ReactionIntent.objects.get_one(
+        filters={"uuid": filters.EQ(intent.uuid)}
+    )
+    assert intent.error_description is None
+    base = add(api, imported, "👍")
+    assert base["emoji_name"] == "thumbs_up"
+    assert len(facts(account)) == 2
+    assert api.delete(f"{REACTIONS}{toned['uuid']}").status_code == 204
+    reconcile()
+    with contexts.Context().session_manager():
+        for task in pending(account):
+            task.execute()
+    assert any(
+        call.args
+        == (
+            source.message_id,
+            "remote_tone_alias",
+            "1f44d-1f3fb",
+            "unicode_emoji",
+            False,
+        )
+        for call in zulip.update_reaction.call_args_list
+    )
+    assert [fact.emoji_name for fact in facts(account)] == ["thumbs_up"]
+
+
+def test_unknown_unicode_code_keeps_its_identity_across_import_and_removal(
+    imported, api
+):
+    account, source, _state, _subscription, zulip, _constructor = imported
+    code, symbol = "1f600-200d-1f4bb", "😀‍💻"
+    receive(imported, data=reaction(name="thumbs_up", code=code))
+    (fact,) = facts(account)
+    assert fact.emoji_name == symbol
+    api.project_id, api.user_uuid = account.project_id, account.owner_user_uuid
+    assert api.delete(f"{REACTIONS}{fact.uuid}").status_code == 204
+    reconcile()
+    with contexts.Context().session_manager():
+        pending(account)[0].execute()
+    zulip.update_reaction.assert_called_once_with(
+        source.message_id, "thumbs_up", code, "unicode_emoji", False
+    )
+
+
+@pytest.mark.parametrize("symbol", ["👍🏻", "👩🏽‍💻", "🕐"])
+def test_complete_unicode_migration_merges_old_symbols_without_losing_intent(
+    imported, db, symbol
+):
+    account, _source, state, *_rest = imported
+    placement = v2_models.WorkspaceMessagePlacement.objects.get_one(
+        filters={"uuid": filters.EQ(state.placement_uuid)}
+    )
+    canonical = emoji.normalize_name(symbol)
+    for name in (symbol, canonical):
+        v2_models.WorkspaceMessageReactionFact(
+            project_id=account.project_id,
+            canonical_message_uuid=placement.message_uuid,
+            placement_uuid=placement.uuid,
+            user_uuid=account.owner_user_uuid,
+            emoji_name=name,
+        ).insert()
+    changed_at = datetime.datetime.now(datetime.timezone.utc)
+    db.execute(
+        "UPDATE bridge_zulip_v5_reaction_intents SET present=false,changed_at=%s "
+        "WHERE project_id=%s AND emoji_name=%s",
+        (changed_at.replace(tzinfo=None), account.project_id, symbol),
+    )
+    path = next(conftest.MIGRATIONS_DIR.glob("0240-*.py"))
+    spec = importlib.util.spec_from_file_location("complete_unicode_migration", path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    with contexts.Context().session_manager() as session:
+        migration.migration_step.upgrade(session)
+    (intent,) = reactions.ReactionIntent.objects.get_all(
+        filters={"project_id": filters.EQ(account.project_id)}
+    )
+    assert intent.emoji_name == canonical and not intent.present
+    assert intent.changed_at == changed_at
+    assert [fact.emoji_name for fact in facts(account)] == [canonical]
+    reconcile()
+    assert facts(account) == []
+    assert pending(account) == []

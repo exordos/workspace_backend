@@ -25,6 +25,7 @@ from workspace.messenger_api.dm import v2_models
 from workspace.services.messenger_workers import v2_projection
 from workspace.services import history_import
 from workspace.tests.integration import conftest
+from workspace.tests.integration import test_messenger_v2 as messenger_tests
 
 
 @pytest.fixture
@@ -2990,3 +2991,143 @@ def test_empty_topic_queue_does_not_scan_source_messages(message_sources, db):
             check(child)
 
     check(plan["Plan"])
+
+
+def _message_events(api, account):
+    response = api.get(
+        "/v1/events/",
+        user=account.owner_user_uuid,
+        project=account.project_id,
+        params={"page_limit": 500},
+    )
+    assert response.status_code == 200, response.text
+    return [
+        event["payload"]
+        for event in response.json()
+        if event["payload"]["kind"].startswith("message.")
+    ]
+
+
+def test_message_reconciliation_publishes_complete_lifecycle_once(message_sources, api):
+    account, source = message_sources()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        assert models.ZulipMessageState.reconcile_batch(100) == 1
+        assert models.ZulipMessageState.reconcile_batch(100) == 0
+    placement = _placements(account)[0]
+    (created,) = _message_events(api, account)
+    assert created["kind"] == "message.created"
+    assert created["uuid"] == str(placement.uuid)
+    assert created["author_uuid"] == str(account.owner_user_uuid)
+    assert created["payload"]["content"] == source.content.workspace_content
+    assert created["read"] and created["starred"] and created["mentioned"]
+
+    source.content.workspace_content = "Edited in Zulip"
+    source.content.workspace_content_updated_at += datetime.timedelta(days=1)
+    source.content.update()
+    with contexts.Context().session_manager():
+        assert models.ZulipMessageState.reconcile_batch(100) == 1
+        assert models.ZulipMessageState.reconcile_batch(100) == 0
+    _created, updated = _message_events(api, account)
+    assert updated["kind"] == "message.updated"
+    assert updated["uuid"] == str(placement.uuid)
+    assert updated["payload"]["content"] == "Edited in Zulip"
+    assert updated["read"] and updated["starred"] and updated["mentioned"]
+
+    source.delete()
+    with contexts.Context().session_manager():
+        assert models.ZulipMessageState.reconcile_batch(100) == 1
+        assert models.ZulipMessageState.reconcile_batch(100) == 0
+    _created, _updated, deleted = _message_events(api, account)
+    assert deleted["kind"] == "message.deleted"
+    assert deleted["uuid"] == str(placement.uuid)
+    assert deleted["stream_uuid"] == str(placement.stream_uuid)
+    assert deleted["topic_uuid"] == str(placement.topic_uuid)
+    assert deleted["source"] == {"kind": "zulip"}
+    assert _messages(account) == _placements(account) == []
+    messenger_tests._drain()
+    assert _message_events(api, account) == [_created, _updated, deleted]
+
+
+def test_message_reconciliation_does_not_publish_unchanged_observations(
+    message_sources, api
+):
+    account, source = message_sources()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(100)
+    before = _message_events(api, account)
+    source.update()
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(100)
+    assert _message_events(api, account) == before
+
+
+def test_message_events_follow_each_observers_access(message_sources, api):
+    first, source = message_sources()
+    second, copy = message_sources(project_id=first.project_id, sender_id=8)
+    _prepare(first)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(100)
+    assert [event["kind"] for event in _message_events(api, first)] == [
+        "message.created"
+    ]
+    assert [event["kind"] for event in _message_events(api, second)] == [
+        "message.created"
+    ]
+    source.delete()
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(100)
+    assert len(_messages(second)) == 1
+    assert [event["kind"] for event in _message_events(api, first)] == [
+        "message.created",
+        "message.deleted",
+    ]
+    assert [event["kind"] for event in _message_events(api, second)] == [
+        "message.created"
+    ]
+    copy.delete()
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(100)
+    assert _messages(second) == []
+    assert [event["kind"] for event in _message_events(api, second)] == [
+        "message.created",
+        "message.deleted",
+    ]
+
+
+def test_message_event_failure_rolls_back_reconciliation(message_sources, api):
+    account, source = message_sources()
+    _prepare(account)
+    with mock.patch.object(
+        models.messenger_events,
+        "create_compact_message_events",
+        side_effect=RuntimeError("event storage failed"),
+    ):
+        with pytest.raises(RuntimeError, match="event storage failed"):
+            with contexts.Context().session_manager():
+                models.ZulipMessageState.reconcile_batch(100)
+    assert _messages(account) == _placements(account) == []
+    assert _message_events(api, account) == []
+    assert len(_changes(models.ZulipMessageChange, account)) == 1
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(100)
+    assert [event["kind"] for event in _message_events(api, account)] == [
+        "message.created"
+    ]
+
+
+def test_imported_message_events_are_fenced_to_the_membership_generation(
+    message_sources, db, api
+):
+    account, source = message_sources()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(100)
+    assert len(_message_events(api, account)) == 1
+    db.execute(
+        "UPDATE messenger_stream_bindings SET membership_generation = "
+        "membership_generation + 1 WHERE project_id = %s AND user_uuid = %s",
+        (account.project_id, account.owner_user_uuid),
+    )
+    assert _message_events(api, account) == []

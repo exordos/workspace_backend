@@ -881,7 +881,11 @@ class ZulipMessageState(
                 "SELECT set_config('workspace.zulip_reconciliation_batch', %s, true)",
                 (json.dumps([f"{project}:{message}" for project, message in batch]),),
             )
-            for project_id, message_uuids in projects.items():
+            for project_id, message_uuids in sorted(projects.items()):
+                messenger_helpers._lock_workspace_project_event_writes(
+                    project_id, session
+                )
+                before = cls._workspace_messages(project_id, message_uuids)
                 for model in (cls, ZulipMessagePlacementState, ZulipUserMessageState):
                     states = model.objects.get_all(
                         filters={
@@ -904,6 +908,12 @@ class ZulipMessageState(
                             project_id, changed_uuids
                         )
                     )
+                cls._publish_message_events(
+                    project_id,
+                    before,
+                    cls._workspace_messages(project_id, message_uuids),
+                    session,
+                )
             session.execute(
                 "SELECT set_config('workspace.zulip_reconciliation_batch', %s, true)",
                 (previous_batch or "",),
@@ -933,6 +943,58 @@ class ZulipMessageState(
             if pending:
                 model.acknowledge_many(pending)
         return len(batch)
+
+    @classmethod
+    def _workspace_messages(cls, project_id, message_uuids):
+        return {
+            (message.uuid, message.user_uuid): message
+            for message in v2_models.WorkspaceUserMessage.objects.get_all(
+                filters={
+                    "project_id": filters.EQ(project_id),
+                    "canonical_message_uuid": filters.In(message_uuids),
+                    "visible": filters.EQ(True),
+                },
+                order_by={"uuid": "asc", "user_uuid": "asc"},
+            )
+        }
+
+    @classmethod
+    def _publish_message_events(cls, project_id, before, after, session):
+        # Read projections include each recipient's flags and access. Publish
+        # only after content, placement and viewer state agree, and retain the
+        # previous projection for rows removed by cascading deletes.
+        created, updated, deleted = {}, {}, {}
+        for key, message in after.items():
+            previous = before.get(key)
+            if previous is None:
+                created.setdefault(message.uuid, []).append(message)
+            elif dict(previous) != dict(message):
+                updated.setdefault(message.uuid, []).append(message)
+        for key, message in before.items():
+            if key not in after:
+                deleted.setdefault(message.uuid, []).append(message)
+        for messages in deleted.values():
+            message = messages[0]
+            messenger_events.create_message_deleted_events(
+                project_id,
+                [row.user_uuid for row in messages],
+                message.uuid,
+                message.stream_uuid,
+                message.topic_uuid,
+                message.author_uuid,
+                message.source_name,
+                message.source,
+                session=session,
+                compact=True,
+            )
+        for messages in created.values():
+            messenger_events.create_compact_message_events(
+                project_id, messages, session=session
+            )
+        for messages in updated.values():
+            messenger_events.create_message_updated_events(
+                project_id, messages, session=session, compact=True
+            )
 
     def do(self) -> None:
         {
@@ -3253,6 +3315,29 @@ class RealtimeEvent(
                 )
                 for message_id in sorted(set(message_ids))
             ]
+        elif kind == "delete_message":
+            account = external_models.ExternalAccount.objects.get_one(
+                filters={
+                    "uuid": filters.EQ(self.external_account_uuid),
+                    "project_id": filters.EQ(self.project_id),
+                }
+            )
+            RealtimeSubscription.lock_account(account)
+            if self.current_subscription() is None:
+                return
+            message_ids = (
+                self.payload["message_ids"]
+                if "message_ids" in self.payload
+                else [self.payload["message_id"]]
+            )
+            for message in ZulipMessage.objects.get_all(
+                filters={
+                    "project_id": filters.EQ(self.project_id),
+                    "external_account_uuid": filters.EQ(account.uuid),
+                    "message_id": filters.In(message_ids),
+                }
+            ):
+                message.delete()
         elif kind == "update_message_flags":
             flag = self.payload["flag"]
             if flag in message_flags.FLAGS:

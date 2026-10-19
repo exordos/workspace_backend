@@ -244,27 +244,38 @@ def remote_state(message, user_id, code):
     )
 
 
+def _unicode_identity(name, observations):
+    code = emoji.code_for_name(name)
+    for row in observations:
+        if row["reaction_type"] == "unicode_emoji" and (
+            (code is not None and emoji.normalize_code(row["emoji_code"]) == code)
+            or emoji.name_for_code(row["emoji_code"], row["emoji_name"]) == name
+        ):
+            # Existing reactions retain the exact code and alias the server
+            # supplied, including emoji introduced after our pinned catalog.
+            return row["emoji_code"], row["emoji_name"]
+    if code in emoji.ZULIP_NAME_BY_CODE:
+        return code, emoji.ZULIP_NAME_BY_CODE[code]
+    return None
+
+
 def _schedule(intent, observations):
     from workspace.bridges.zulip.dm import models as zulip_models
 
-    code = emoji.CODE_BY_NAME.get(intent.emoji_name)
-    if code is None:
-        code = next(
-            (
-                row["emoji_code"]
-                for row in observations
-                if row["reaction_type"] == "unicode_emoji"
-                and row["emoji_name"] == intent.emoji_name
-            ),
-            None,
-        )
-    if code is None:
+    identity = _unicode_identity(intent.emoji_name, observations)
+    if identity is None:
         description = f"Unsupported Unicode emoji: {intent.emoji_name}"
         _session().execute(
             "UPDATE bridge_zulip_v5_reaction_intents SET error_description=%s WHERE uuid=%s AND error_description IS DISTINCT FROM %s",
             (description, intent.uuid, description),
         )
         return False
+    code, _name = identity
+    _session().execute(
+        "UPDATE bridge_zulip_v5_reaction_intents SET error_description=NULL "
+        "WHERE uuid=%s AND error_description IS NOT NULL",
+        (intent.uuid,),
+    )
     targets = _targets(
         intent.project_id, intent.canonical_message_uuid, intent.user_uuid
     )
@@ -509,22 +520,25 @@ def send(content, task):
         )
     ):
         raise zulip_models.SubscriptionChangedError()
-    code = emoji.CODE_BY_NAME.get(intent.emoji_name)
-    if code is None:
-        code = (
-            _session()
-            .execute(
-                "SELECT emoji_code FROM bridge_zulip_v5_reactions WHERE reaction_message_uuid=%s AND reaction_type='unicode_emoji' AND emoji_name=%s LIMIT 1",
-                (message["uuid"], intent.emoji_name),
-            )
-            .fetchone()["emoji_code"]
+    observations = (
+        _session()
+        .execute(
+            "SELECT emoji_code,emoji_name,reaction_type FROM bridge_zulip_v5_reactions "
+            "WHERE reaction_message_uuid=%s",
+            (message["uuid"],),
         )
+        .fetchall()
+    )
+    identity = _unicode_identity(intent.emoji_name, observations)
+    if identity is None:
+        raise ValueError(f"Unsupported Unicode emoji: {intent.emoji_name}")
+    code, observed_name = identity
     user_id = int(account.external_account_id.rsplit(":", 1)[1])
     value, at, name = remote_state(message, user_id, code)
     if value == intent.present or (at is not None and at >= _naive(intent.changed_at)):
         return
     zulip = client.ZulipClient(account)
-    name = name or emoji.ZULIP_NAME_BY_CODE.get(code, intent.emoji_name)
+    name = name or observed_name
     try:
         try:
             zulip.update_reaction(

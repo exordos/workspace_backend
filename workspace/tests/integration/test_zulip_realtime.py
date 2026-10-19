@@ -23,6 +23,10 @@ from workspace.messenger_api.dm import external_models
 from workspace.services import history_import
 from workspace.services import zulip_realtime
 from workspace.tests.integration import conftest
+from workspace.tests.integration import test_zulip_message_states as message_tests
+
+
+message_sources = message_tests.message_sources
 
 
 @pytest.fixture
@@ -141,6 +145,85 @@ def test_raw_events_and_cursor_commit_together_and_replay_is_idempotent(
             models.Task.objects.get_all(filters={"external_account_uuid": account.uuid})
         )
         == 1
+    )
+
+
+@pytest.mark.parametrize("bulk", (False, True))
+def test_message_deletion_events_remove_only_the_observers_copy(
+    message_sources, api, bulk
+):
+    account, source = message_sources()
+    other, copy = message_sources(project_id=account.project_id, sender_id=8)
+    account.settings = {
+        **account.settings,
+        "email": "owner@example.com",
+        "api_key": "test",
+    }
+    account.status = "active"
+    account.update()
+    message_tests._prepare(account)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(100)
+    subscription = register(account, maximum=source.message_id)
+    payload = {
+        "id": 1,
+        "type": "delete_message",
+        "message_type": "stream",
+        "stream_id": source.channel.stream_id,
+        "topic": source.topic.name,
+        **(
+            {"message_ids": [source.message_id, source.message_id + 100]}
+            if bulk
+            else {"message_id": source.message_id}
+        ),
+    }
+    for _index in range(2):
+        with contexts.Context().session_manager():
+            models.RealtimeSubscription.append_events(
+                account, subscription.generation, [payload]
+            )
+        while dispatch():
+            pass
+        with contexts.Context().session_manager():
+            models.ZulipMessageState.reconcile_batch(100)
+    assert (
+        models.ZulipMessage.objects.get_all(
+            filters={"external_account_uuid": filters.EQ(account.uuid)}
+        )
+        == []
+    )
+    assert models.ZulipMessage.objects.get_one(filters={"uuid": filters.EQ(copy.uuid)})
+    assert len(message_tests._messages(other)) == 1
+    assert [event["kind"] for event in message_tests._message_events(api, account)] == [
+        "message.created",
+        "message.deleted",
+    ]
+    assert [event["kind"] for event in message_tests._message_events(api, other)] == [
+        "message.created"
+    ]
+
+
+def test_stale_subscription_cannot_delete_an_imported_message(message_sources):
+    account, source = message_sources()
+    account.settings = {
+        **account.settings,
+        "email": "owner@example.com",
+        "api_key": "test",
+    }
+    account.status = "active"
+    account.update()
+    subscription = register(account, maximum=source.message_id)
+    with contexts.Context().session_manager():
+        models.RealtimeSubscription.append_events(
+            account,
+            subscription.generation,
+            [{"id": 1, "type": "delete_message", "message_id": source.message_id}],
+        )
+    register(account, queue_id="replacement", maximum=source.message_id)
+    while dispatch():
+        pass
+    assert models.ZulipMessage.objects.get_one(
+        filters={"uuid": filters.EQ(source.uuid)}
     )
 
 

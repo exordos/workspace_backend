@@ -1,8 +1,9 @@
 Unicode reaction shortcode data
 
-Derived from Zulip 12.1 tools/setup/emoji/emoji_names.py (Apache-2.0),
-emojibase-data/en/shortcodes/emojibase.json (MIT), and Workspace shortcode preferences.
-The derived data selects Workspace display names and preserves original Zulip names.
+Derived from Zulip 12.1.2's published emoji_api.json (Apache-2.0),
+emojibase-data 17.0.0 en/shortcodes/emojibase.json (MIT), and Workspace shortcode preferences.
+The versioned catalog preserves separate Workspace and Zulip shortcode namespaces,
+including the complete emojibase Unicode sequences and all provider aliases.
 
 
                                  Apache License

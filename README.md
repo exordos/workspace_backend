@@ -121,6 +121,25 @@ newer local edit.
 Future read and reaction tasks must also run below message creation priority
 and retry when the target message has not been created yet.
 
+Unicode reaction identities use `workspace/common/unicode_emoji.json`. Its separate
+Workspace and Zulip dictionaries preserve shortcode meanings across providers;
+conversion uses Unicode codes, including skin tones, ZWJ sequences, and keycaps.
+The catalog records its Zulip and emojibase versions. Regenerate it from the
+server's published `emoji_api.json` and the installed Workspace UI dependencies:
+
+```sh
+.tox/develop/bin/python tools/sync_emoji.py \
+  --zulip-data https://zulip.example.com/static/generated/emoji/emoji_api.json \
+  --zulip-version 12.1.2 --ui ../workspace_ui
+```
+
+Existing Workspace canonical names remain stable during regeneration. Unicode
+support in Workspace is independent of the connected Zulip version: unsupported
+Zulip reactions remain local and retain an explicit synchronization error. When
+a server reports an additional Unicode emoji, its observed code and name can be
+used to update that reaction without guessing or losing modifiers. Migration
+0240 normalizes existing symbol/shortcode duplicates and preserves intent times.
+
 Nginx exposes:
 
 - Common REST API: `/api/workspace/v1/{users,services,me,events,epoch}/...`
