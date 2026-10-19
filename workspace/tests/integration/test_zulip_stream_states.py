@@ -329,6 +329,12 @@ def test_binding_state_uses_current_transaction(stream_state_account, db, action
         if action == "update":
             _channel(account, stream_uuid, notification_mode="muted")
     (state,) = _binding_states(account)
+    counter_changes = [
+        change.as_plain_dict()
+        for change in models.ZulipMessageCounterChange.objects.get_all(
+            filters={"project_id": filters.EQ(account.project_id)}
+        )
+    ]
     with pytest.raises(RuntimeError, match="Rollback binding"):
         with contexts.Context().session_manager():
             state.do()
@@ -340,12 +346,12 @@ def test_binding_state_uses_current_transaction(stream_state_account, db, action
         "SELECT count(*) FROM m_workspace_visible_events WHERE project_id = %s",
         (account.project_id,),
     ).fetchone() == (0,)
-    assert (
-        models.ZulipMessageCounterChange.objects.get_all(
+    assert [
+        change.as_plain_dict()
+        for change in models.ZulipMessageCounterChange.objects.get_all(
             filters={"project_id": filters.EQ(account.project_id)}
         )
-        == []
-    )
+    ] == counter_changes
 
 
 @pytest.mark.parametrize(

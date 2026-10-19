@@ -10,6 +10,10 @@ trigger creates exactly one durable task for every outbox row.  This module
 processes tasks under a fenced scope lease and retains bounded derivation for
 operator repair.  All projection writes and the corresponding public event
 snapshot commit in the same worker transaction.
+
+Imported Zulip counters reconcile bounded viewer-message changes into unread
+and mentioned totals per topic and membership epoch. Notification modes use
+these totals; native streams retain their authoritative history-based repair.
 """
 
 import datetime
@@ -43,6 +47,8 @@ EVENT_LOCK_CONTENTION_BASE_DELAY_SECONDS = 0.1
 EVENT_LOCK_CONTENTION_MAX_DELAY_SECONDS = 3.0
 GLOBAL_ADMISSION_LOCK_TIMEOUT = "500ms"
 REACTION_COALESCE_LIMIT = 128
+PREVIEW_CANDIDATE_LIMIT = 1000
+COUNTER_DELTA_BATCH_SIZE = 1000
 PROJECTION_PROJECT_GATE_PREFIX = "messenger-v2-projection-project-v1"
 PROJECTION_PROJECT_ADMISSION_PREFIX = "messenger-v2-projection-admission-v1"
 PROJECTION_PROJECT_ADMISSION_SCOPE_KIND = "project-admission"
@@ -1157,177 +1163,220 @@ def _refresh_recipient_counters(
     topic_uuid: object,
     user_uuids: typing.Iterable[object],
     scope_kind: str,
-) -> None:
+) -> bool:
     recipients = [_uuid(value) for value in user_uuids]
     if not recipients:
-        return
+        return False
     if scope_kind == "user-stream":
-        session.execute(
-            """
-        UPDATE messenger_stream_bindings AS binding
-        SET unread_count = snapshot.unread_count,
-            active_unread_count = snapshot.active_unread_count,
-            passive_unread_count =
-                snapshot.unread_count - snapshot.active_unread_count,
-            last_message_uuid = snapshot.last_message_uuid,
-            updated_at = NOW()
-        FROM (
-            SELECT target.user_uuid,
-                   count(state.uuid) FILTER (WHERE state.read_at IS NULL) AS unread_count,
-                   count(state.uuid) FILTER (
-                       WHERE state.read_at IS NULL AND CASE
-                           WHEN topic_binding.notification_mode = 'mute'
-                               THEN stream.source_name = 'zulip' AND state.mentioned
-                           WHEN topic_binding.notification_mode = 'follow' THEN true
-                           WHEN topic_binding.notification_mode = 'unmute'
-                               THEN stream.source_name = 'zulip' OR state.mentioned
-                           WHEN target.notification_mode = 'all_messages' THEN true
-                           WHEN target.notification_mode = 'mentions_only'
-                               THEN state.mentioned
-                           ELSE false
-                       END
-                   ) AS active_unread_count,
-                   (array_agg(placement.uuid ORDER BY message.created_at DESC,
-                              placement.uuid DESC))[1] AS last_message_uuid
+        table = "messenger_stream_bindings"
+        scope_column = "stream_uuid"
+        scope_uuid = stream_uuid
+        targets = """
+            SELECT target.uuid, target.project_id, target.user_uuid,
+                   target.stream_uuid AS scope_uuid, target.stream_uuid, target.membership_generation
             FROM messenger_stream_bindings AS target
             JOIN messenger_streams AS stream
               ON stream.project_id = target.project_id AND stream.uuid = target.stream_uuid
-            LEFT JOIN messenger_message_placements AS placement
-              ON placement.project_id = target.project_id
-             AND placement.stream_uuid = target.stream_uuid
-             AND EXISTS (
-                 SELECT 1 FROM messenger_user_message_bindings AS access
-                 JOIN messenger_user_message_states AS personal
-                   ON personal.project_id = access.project_id
-                  AND personal.user_uuid = access.user_uuid
-                  AND personal.placement_uuid = access.placement_uuid
-                  AND personal.membership_generation = access.membership_generation
-                 WHERE access.project_id = placement.project_id
-                   AND access.placement_uuid = placement.uuid
-                   AND access.user_uuid = target.user_uuid
-                   AND access.membership_generation = target.membership_generation
-                   AND access.visibility = 'visible'
-             )
-             AND EXISTS (
-                 SELECT 1 FROM messenger_messages AS visible_message
-                 WHERE visible_message.project_id = placement.project_id
-                   AND visible_message.uuid = placement.message_uuid
-                   AND visible_message.deleted_at IS NULL
-             )
-             AND EXISTS (
-                 SELECT 1 FROM messenger_topics AS visible_topic
-                 WHERE visible_topic.project_id = placement.project_id
-                   AND visible_topic.uuid = placement.topic_uuid
-                   AND visible_topic.deleted_at IS NULL
-             )
-            LEFT JOIN messenger_messages AS message
-              ON message.project_id = placement.project_id
-             AND message.uuid = placement.message_uuid
-            LEFT JOIN messenger_user_message_states AS state
-              ON state.project_id = placement.project_id
-             AND state.placement_uuid = placement.uuid
-             AND state.user_uuid = target.user_uuid
-             AND state.membership_generation = target.membership_generation
+            WHERE target.project_id = %s AND target.stream_uuid = %s
+              AND target.user_uuid = ANY(%s::uuid[]) AND target.active
+        """
+    elif scope_kind == "user-topic":
+        table = "messenger_user_topic_bindings"
+        scope_column = "topic_uuid"
+        scope_uuid = topic_uuid
+        targets = """
+            SELECT target.uuid, target.project_id, target.user_uuid,
+                   target.topic_uuid AS scope_uuid, membership.stream_uuid, membership.membership_generation
+            FROM messenger_user_topic_bindings AS target
+            JOIN messenger_topics AS topic
+              ON topic.project_id = target.project_id AND topic.uuid = target.topic_uuid
+            JOIN messenger_streams AS stream
+              ON stream.project_id = topic.project_id AND stream.uuid = topic.stream_uuid
+            JOIN messenger_stream_bindings AS membership
+              ON membership.project_id = topic.project_id
+             AND membership.stream_uuid = topic.stream_uuid
+             AND membership.user_uuid = target.user_uuid AND membership.active
+            WHERE target.project_id = %s AND target.topic_uuid = %s
+              AND target.user_uuid = ANY(%s::uuid[])
+        """
+    else:
+        raise ValueError(f"Unsupported counter scope {scope_kind}")
+
+    stream = session.execute(
+        "SELECT source_name FROM messenger_streams WHERE project_id = %s AND uuid = %s",
+        (project_id, stream_uuid),
+    ).fetchone()
+    pending = False
+    if stream is not None and stream["source_name"] == "zulip":
+        for user_uuid in recipients:
+            more = v2_models.WorkspaceMessageCounterChange.reconcile_batch(
+                project_id, user_uuid, stream_uuid, COUNTER_DELTA_BATCH_SIZE
+            )
+            pending = pending or more
+        unread_query = f"""
+            SELECT user_uuid, sum(unread_count) AS unread_count,
+                   sum(active_unread_count) AS active_unread_count
+            FROM messenger_topic_counter_totals
+            WHERE project_id = %s AND {scope_column} = %s AND user_uuid = ANY(%s::uuid[])
+            GROUP BY user_uuid
+        """
+    else:
+        unread_query = f"""
+            SELECT state.user_uuid, count(*) AS unread_count,
+                   count(*) FILTER (WHERE CASE
+                       WHEN topic_binding.notification_mode = 'mute'
+                           THEN stream.source_name = 'zulip' AND state.mentioned
+                       WHEN topic_binding.notification_mode = 'follow' THEN true
+                       WHEN topic_binding.notification_mode = 'unmute'
+                           THEN stream.source_name = 'zulip' OR state.mentioned
+                       WHEN membership.notification_mode = 'all_messages' THEN true
+                       WHEN membership.notification_mode = 'mentions_only' THEN state.mentioned
+                       ELSE false
+                   END) AS active_unread_count
+            FROM messenger_user_message_states AS state
+            JOIN messenger_message_placements AS placement
+              ON placement.project_id = state.project_id AND placement.uuid = state.placement_uuid
+            JOIN messenger_messages AS message
+              ON message.project_id = placement.project_id AND message.uuid = placement.message_uuid
+             AND message.deleted_at IS NULL
+            JOIN messenger_topics AS topic
+              ON topic.project_id = placement.project_id AND topic.uuid = placement.topic_uuid
+             AND topic.deleted_at IS NULL
+            JOIN messenger_user_message_bindings AS access
+              ON access.project_id = state.project_id AND access.user_uuid = state.user_uuid
+             AND access.placement_uuid = state.placement_uuid
+             AND access.membership_generation = state.membership_generation
+             AND access.visibility = 'visible'
+            JOIN messenger_stream_bindings AS membership
+              ON membership.project_id = placement.project_id
+             AND membership.stream_uuid = placement.stream_uuid
+             AND membership.user_uuid = state.user_uuid
+             AND membership.membership_generation = state.membership_generation
+             AND membership.active
+            JOIN messenger_streams AS stream
+              ON stream.project_id = membership.project_id AND stream.uuid = membership.stream_uuid
             LEFT JOIN messenger_user_topic_bindings AS topic_binding
               ON topic_binding.project_id = placement.project_id
              AND topic_binding.topic_uuid = placement.topic_uuid
-             AND topic_binding.user_uuid = target.user_uuid
-            WHERE target.project_id = %s AND target.stream_uuid = %s
-              AND target.user_uuid = ANY(%s::uuid[]) AND target.active
-            GROUP BY target.user_uuid
-        ) AS snapshot
-        WHERE binding.project_id = %s AND binding.stream_uuid = %s
-          AND binding.user_uuid = snapshot.user_uuid
-            """,
-            (project_id, stream_uuid, recipients, project_id, stream_uuid),
-        )
-        return
-    if scope_kind != "user-topic":
-        raise ValueError(f"Unsupported counter scope {scope_kind}")
-    session.execute(
+             AND topic_binding.user_uuid = state.user_uuid
+            WHERE state.project_id = %s AND placement.{scope_column} = %s
+              AND state.user_uuid = ANY(%s::uuid[]) AND state.read_at IS NULL
+            GROUP BY state.user_uuid
         """
-        UPDATE messenger_user_topic_bindings AS binding
+
+    visible_joins = """
+        JOIN messenger_topics AS topic
+          ON topic.project_id = placement.project_id AND topic.uuid = placement.topic_uuid
+         AND topic.deleted_at IS NULL
+        JOIN messenger_user_message_states AS personal
+          ON personal.project_id = placement.project_id
+         AND personal.placement_uuid = placement.uuid AND personal.user_uuid = target.user_uuid
+         AND personal.membership_generation = target.membership_generation
+        JOIN messenger_user_message_bindings AS access
+          ON access.project_id = personal.project_id AND access.user_uuid = personal.user_uuid
+         AND access.placement_uuid = personal.placement_uuid
+         AND access.membership_generation = personal.membership_generation
+         AND access.visibility = 'visible'
+    """
+    # A standalone SELECT permits parallel aggregation; UPDATE would disable it.
+    snapshots = session.execute(
+        f"""
+        WITH unread AS ({unread_query})
+        SELECT target.uuid, target.stream_uuid, target.membership_generation,
+               COALESCE(unread.unread_count, 0) AS unread_count,
+               COALESCE(unread.active_unread_count, 0) AS active_unread_count,
+               COALESCE(recent_preview.uuid, older_preview.uuid) AS last_message_uuid
+        FROM ({targets}) AS target
+        LEFT JOIN unread ON unread.user_uuid = target.user_uuid
+        LEFT JOIN LATERAL (
+            -- A visible placement supplies a safe lower date bound. Imported
+            -- placements already have the source date, so the canonical date
+            -- index can find the preview without sorting the entire history.
+            SELECT message.created_at
+            FROM messenger_message_placements AS placement
+            JOIN messenger_messages AS message
+              ON message.project_id = placement.project_id AND message.uuid = placement.message_uuid
+             AND message.deleted_at IS NULL
+            {visible_joins}
+            WHERE placement.project_id = target.project_id
+              AND placement.{scope_column} = target.scope_uuid
+            ORDER BY placement.created_at DESC, placement.uuid DESC
+            LIMIT 1
+        ) AS preview_floor ON true
+        LEFT JOIN LATERAL (
+            SELECT copy.uuid
+            FROM (
+                SELECT message.uuid, message.created_at
+                FROM messenger_messages AS message
+                WHERE message.project_id = target.project_id AND message.deleted_at IS NULL
+                  AND message.created_at >= preview_floor.created_at
+                ORDER BY message.created_at DESC
+                FETCH FIRST {PREVIEW_CANDIDATE_LIMIT} ROWS WITH TIES
+            ) AS recent
+            CROSS JOIN LATERAL (
+                SELECT placement.uuid
+                FROM messenger_message_placements AS placement
+                {visible_joins}
+                WHERE placement.project_id = target.project_id
+                  AND placement.message_uuid = recent.uuid
+                  AND placement.{scope_column} = target.scope_uuid
+                ORDER BY placement.uuid DESC
+                LIMIT 1
+            ) AS copy
+            ORDER BY recent.created_at DESC, copy.uuid DESC
+            LIMIT 1
+        ) AS recent_preview ON true
+        LEFT JOIN LATERAL (
+            -- Old scopes may have no messages in the recent project window.
+            -- Sort only that scope instead of scanning the whole project.
+            SELECT placement.uuid
+            FROM messenger_message_placements AS placement
+            JOIN messenger_messages AS message
+              ON message.project_id = placement.project_id AND message.uuid = placement.message_uuid
+             AND message.deleted_at IS NULL
+            {visible_joins}
+            WHERE recent_preview.uuid IS NULL
+              AND placement.project_id = target.project_id
+              AND placement.{scope_column} = target.scope_uuid
+            ORDER BY message.created_at DESC, placement.uuid DESC
+            LIMIT 1
+        ) AS older_preview ON true
+        """,
+        (project_id, scope_uuid, recipients, project_id, scope_uuid, recipients),
+    ).fetchall()
+    if not snapshots:
+        return pending
+    session.execute(
+        f"""
+        UPDATE {table} AS binding
         SET unread_count = snapshot.unread_count,
             active_unread_count = snapshot.active_unread_count,
-            passive_unread_count =
-                snapshot.unread_count - snapshot.active_unread_count,
-            last_message_uuid = snapshot.last_message_uuid,
-            updated_at = NOW()
-        FROM (
-            SELECT target.user_uuid,
-                   count(state.uuid) FILTER (WHERE state.read_at IS NULL) AS unread_count,
-                   count(state.uuid) FILTER (
-                       WHERE state.read_at IS NULL AND CASE
-                           WHEN target.notification_mode = 'mute'
-                               THEN stream.source_name = 'zulip' AND state.mentioned
-                           WHEN target.notification_mode = 'follow' THEN true
-                           WHEN target.notification_mode = 'unmute'
-                               THEN stream.source_name = 'zulip' OR state.mentioned
-                           WHEN stream_binding.notification_mode = 'all_messages'
-                               THEN true
-                           WHEN stream_binding.notification_mode = 'mentions_only'
-                               THEN state.mentioned
-                           ELSE false
-                       END
-                   ) AS active_unread_count,
-                   (array_agg(placement.uuid ORDER BY message.created_at DESC,
-                              placement.uuid DESC))[1] AS last_message_uuid
-            FROM messenger_user_topic_bindings AS target
-            JOIN messenger_topics AS topic
-              ON topic.project_id = target.project_id
-             AND topic.uuid = target.topic_uuid
-            JOIN messenger_streams AS stream
-              ON stream.project_id = topic.project_id AND stream.uuid = topic.stream_uuid
-            JOIN messenger_stream_bindings AS stream_binding
-              ON stream_binding.project_id = topic.project_id
-             AND stream_binding.stream_uuid = topic.stream_uuid
-             AND stream_binding.user_uuid = target.user_uuid
-             AND stream_binding.active
-            LEFT JOIN messenger_message_placements AS placement
-              ON placement.project_id = target.project_id
-             AND placement.topic_uuid = target.topic_uuid
-             AND EXISTS (
-                 SELECT 1 FROM messenger_user_message_bindings AS access
-                 JOIN messenger_user_message_states AS personal
-                   ON personal.project_id = access.project_id
-                  AND personal.user_uuid = access.user_uuid
-                  AND personal.placement_uuid = access.placement_uuid
-                  AND personal.membership_generation = access.membership_generation
-                 WHERE access.project_id = placement.project_id
-                   AND access.placement_uuid = placement.uuid
-                   AND access.user_uuid = target.user_uuid
-                   AND access.membership_generation = stream_binding.membership_generation
-                   AND access.visibility = 'visible'
-             )
-             AND EXISTS (
-                 SELECT 1 FROM messenger_messages AS visible_message
-                 WHERE visible_message.project_id = placement.project_id
-                   AND visible_message.uuid = placement.message_uuid
-                   AND visible_message.deleted_at IS NULL
-             )
-             AND EXISTS (
-                 SELECT 1 FROM messenger_topics AS visible_topic
-                 WHERE visible_topic.project_id = placement.project_id
-                   AND visible_topic.uuid = placement.topic_uuid
-                   AND visible_topic.deleted_at IS NULL
-             )
-            LEFT JOIN messenger_messages AS message
-              ON message.project_id = placement.project_id
-             AND message.uuid = placement.message_uuid
-            LEFT JOIN messenger_user_message_states AS state
-              ON state.project_id = placement.project_id
-             AND state.placement_uuid = placement.uuid
-             AND state.user_uuid = target.user_uuid
-             AND state.membership_generation = stream_binding.membership_generation
-            WHERE target.project_id = %s AND target.topic_uuid = %s
-              AND target.user_uuid = ANY(%s::uuid[])
-            GROUP BY target.user_uuid
-        ) AS snapshot
-        WHERE binding.project_id = %s AND binding.topic_uuid = %s
-          AND binding.user_uuid = snapshot.user_uuid
+            passive_unread_count = snapshot.unread_count - snapshot.active_unread_count,
+            last_message_uuid = snapshot.last_message_uuid, updated_at = NOW()
+        FROM unnest(%s::uuid[], %s::bigint[], %s::bigint[], %s::uuid[],
+                    %s::integer[], %s::uuid[])
+             AS snapshot(uuid, unread_count, active_unread_count, last_message_uuid,
+                         membership_generation, stream_uuid)
+        WHERE binding.project_id = %s AND binding.uuid = snapshot.uuid
+          AND EXISTS (
+              SELECT 1 FROM messenger_stream_bindings AS membership
+              WHERE membership.project_id = binding.project_id
+                AND membership.stream_uuid = snapshot.stream_uuid
+                AND membership.user_uuid = binding.user_uuid AND membership.active
+                AND membership.membership_generation = snapshot.membership_generation
+          )
         """,
-        (project_id, topic_uuid, recipients, project_id, topic_uuid),
+        (
+            [row["uuid"] for row in snapshots],
+            [row["unread_count"] for row in snapshots],
+            [row["active_unread_count"] for row in snapshots],
+            [row["last_message_uuid"] for row in snapshots],
+            [row["membership_generation"] for row in snapshots],
+            [row["stream_uuid"] for row in snapshots],
+            project_id,
+        ),
     )
+    return pending
 
 
 def _emit_unread_snapshots(
@@ -2092,7 +2141,7 @@ def _process_read_counters(
                 task["project_id"],
             ),
         )
-    _refresh_recipient_counters(
+    pending = _refresh_recipient_counters(
         session,
         task["project_id"],
         _uuid(payload["stream_uuid"]),
@@ -2100,6 +2149,17 @@ def _process_read_counters(
         [user_uuid],
         task["scope_kind"],
     )
+    if pending:
+        _enqueue_counter_outbox_events(
+            session,
+            source_event_uuid=task["outbox_event_uuid"],
+            project_id=task["project_id"],
+            source_kind="zulip.reconciled",
+            user_uuid=user_uuid,
+            stream_uuid=_uuid(payload["stream_uuid"]),
+            topic_uuid=topic_uuid,
+            include_topic=topic_uuid is not None,
+        )
     if task["scope_kind"] == "user-stream":
         _enqueue_folder_outbox_events(
             session,

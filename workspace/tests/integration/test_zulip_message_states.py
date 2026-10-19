@@ -2032,6 +2032,245 @@ def test_counter_refresh_combines_imports_and_updates_previews_and_folders(
     )
 
 
+@pytest.mark.parametrize("large_active", [False, True])
+def test_unread_counters_remain_exact_above_one_thousand_and_recount_after_reads(
+    message_sources, db, large_active
+):
+    account, source = message_sources()
+    source.channel.notification_mode = "mentions_only"
+    source.channel.update()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(100)
+    (original,) = _placements(account)
+    generated = [uuid.uuid4() for _ in range(1220)]
+    db.execute(
+        """
+        WITH generated AS MATERIALIZED (
+            SELECT uuid, number::integer
+            FROM unnest(%s::uuid[]) WITH ORDINALITY AS generated(uuid, number)
+        ), messages AS (
+            INSERT INTO messenger_messages (
+                uuid, project_id, author_uuid, payload, source_name, source,
+                created_at, updated_at, content_updated_at
+            )
+            SELECT generated.uuid, original.project_id, original.author_uuid,
+                   original.payload, original.source_name, original.source,
+                   original.created_at + generated.number * interval '1 second',
+                   original.updated_at, original.content_updated_at
+            FROM messenger_messages AS original CROSS JOIN generated
+            WHERE original.uuid = %s
+            RETURNING uuid, project_id, created_at
+        ), placements AS (
+            INSERT INTO messenger_message_placements (
+                uuid, project_id, message_uuid, stream_uuid, topic_uuid, created_at
+            )
+            SELECT message.uuid, message.project_id, message.uuid,
+                   original.stream_uuid, original.topic_uuid, message.created_at
+            FROM messages AS message CROSS JOIN messenger_message_placements AS original
+            WHERE original.uuid = %s
+            RETURNING uuid, project_id
+        ), access AS (
+            INSERT INTO messenger_user_message_bindings (
+                uuid, project_id, placement_uuid, user_uuid, membership_generation,
+                relation_role, visibility, permissions
+            )
+            SELECT placement.uuid, placement.project_id, placement.uuid,
+                   original.user_uuid,
+                   CASE WHEN generated.number > 1213 THEN 99
+                        ELSE original.membership_generation END,
+                   original.relation_role,
+                   CASE WHEN generated.number BETWEEN 1204 AND 1213
+                        THEN 'hidden' ELSE 'visible' END,
+                   original.permissions
+            FROM placements AS placement
+            JOIN generated ON generated.uuid = placement.uuid
+            CROSS JOIN messenger_user_message_bindings AS original
+            WHERE original.placement_uuid = %s
+            RETURNING uuid, project_id, placement_uuid, user_uuid, membership_generation
+        )
+        INSERT INTO messenger_user_message_states (
+            uuid, project_id, placement_uuid, binding_uuid, user_uuid,
+            membership_generation, read_at, mentioned
+        )
+        SELECT access.uuid, access.project_id, access.placement_uuid, access.uuid,
+               access.user_uuid, access.membership_generation,
+               CASE WHEN generated.number BETWEEN 1103 AND 1203 THEN NOW() END,
+               CASE WHEN generated.number <= 1100 THEN %s ELSE NOT %s END
+        FROM access JOIN generated ON generated.uuid = access.placement_uuid
+        """,
+        (
+            generated,
+            original.message_uuid,
+            original.uuid,
+            original.uuid,
+            large_active,
+            large_active,
+        ),
+    )
+    _refresh_counters()
+    for model in (
+        v2_models.WorkspaceStreamBinding,
+        v2_models.WorkspaceUserTopicBinding,
+    ):
+        (binding,) = _viewer_rows(account, model)
+        assert binding.unread_count == 1102
+        assert binding.active_unread_count == (1100 if large_active else 2)
+        assert binding.passive_unread_count == (2 if large_active else 1100)
+        assert binding.last_message_uuid == generated[1202]
+    folder = v2_models.WorkspaceUserFolder.objects.get_one(
+        filters={
+            "project_id": filters.EQ(account.project_id),
+            "user_uuid": filters.EQ(account.owner_user_uuid),
+            "uuid": filters.EQ(uuid.UUID(int=0)),
+        }
+    )
+    assert folder.unread_count == (1100 if large_active else 2)
+    db.execute(
+        "UPDATE messenger_user_message_states SET read_at = NOW() "
+        "WHERE project_id = %s AND placement_uuid = ANY(%s::uuid[])",
+        (account.project_id, generated[:900]),
+    )
+    with contexts.Context().session_manager() as session:
+        for scope in ("user-stream", "user-topic"):
+            v2_projection._refresh_recipient_counters(
+                session,
+                account.project_id,
+                original.stream_uuid,
+                original.topic_uuid,
+                [account.owner_user_uuid],
+                scope,
+            )
+    for model in (
+        v2_models.WorkspaceStreamBinding,
+        v2_models.WorkspaceUserTopicBinding,
+    ):
+        (binding,) = _viewer_rows(account, model)
+        assert binding.unread_count == 202
+        assert binding.active_unread_count == (200 if large_active else 2)
+        assert binding.passive_unread_count == (2 if large_active else 200)
+
+
+@pytest.mark.parametrize("scope", ["user-stream", "user-topic"])
+def test_counter_snapshot_does_not_overwrite_a_new_membership_generation(
+    message_sources, db, scope
+):
+    account, source = message_sources()
+    source.read = False
+    source.update()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(100)
+    with contexts.Context().session_manager() as session:
+        execute = session.execute
+
+        def replace_generation(query, params):
+            if "AS snapshot(uuid, unread_count" in query:
+                db.execute(
+                    "UPDATE messenger_stream_bindings "
+                    "SET membership_generation = membership_generation + 1 "
+                    "WHERE project_id = %s AND user_uuid = %s",
+                    (account.project_id, account.owner_user_uuid),
+                )
+            return execute(query, params)
+
+        with mock.patch.object(session, "execute", side_effect=replace_generation):
+            v2_projection._refresh_recipient_counters(
+                session,
+                account.project_id,
+                source.channel.stream_uuid,
+                source.topic.uuid,
+                [account.owner_user_uuid],
+                scope,
+            )
+    for model in (
+        v2_models.WorkspaceStreamBinding,
+        v2_models.WorkspaceUserTopicBinding,
+    ):
+        (binding,) = _viewer_rows(account, model)
+        assert binding.unread_count == 0
+        assert binding.last_message_uuid is None
+
+
+def test_counter_preview_uses_canonical_dates_and_placement_uuid_ties(
+    message_sources, db, monkeypatch
+):
+    monkeypatch.setattr(v2_projection, "PREVIEW_CANDIDATE_LIMIT", 1)
+    account, source = message_sources()
+    for offset in (1, 2):
+        models.ZulipMessage(
+            project_id=account.project_id,
+            external_account_uuid=account.uuid,
+            message_uuid=uuid.uuid4(),
+            message_id=source.message_id + offset,
+            sender_id=source.sender_id,
+            timestamp=source.timestamp + 100,
+            channel=source.channel,
+            topic=source.topic,
+            content=source.content,
+            read=True,
+        ).insert()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(100)
+    original_uuid = uuid.uuid5(
+        uuid.uuid5(account.project_id, str(source.message_uuid)), "zulip-placement"
+    )
+    # Forwarded copies can have a placement date newer than their message.
+    db.execute(
+        "UPDATE messenger_message_placements SET created_at = NOW() WHERE uuid = %s",
+        (original_uuid,),
+    )
+    expected = max(
+        placement.uuid
+        for placement in _placements(account)
+        if placement.uuid != original_uuid
+    )
+    _refresh_counters()
+    for model in (
+        v2_models.WorkspaceStreamBinding,
+        v2_models.WorkspaceUserTopicBinding,
+    ):
+        (binding,) = _viewer_rows(account, model)
+        assert binding.unread_count == 0
+        assert binding.last_message_uuid == expected
+
+
+def test_counter_preview_falls_back_to_an_old_topic(message_sources, monkeypatch):
+    monkeypatch.setattr(v2_projection, "PREVIEW_CANDIDATE_LIMIT", 1)
+    account, source = message_sources()
+    recent_topic = models.ZulipTopic(
+        uuid=uuid.uuid5(source.channel.stream_uuid, "Recent"),
+        stream_id=source.channel.stream_id,
+        name="Recent",
+        max_id=source.message_id + 1,
+    )
+    recent_topic.insert()
+    models.ZulipMessage(
+        project_id=account.project_id,
+        external_account_uuid=account.uuid,
+        message_uuid=uuid.uuid4(),
+        message_id=source.message_id + 1,
+        sender_id=source.sender_id,
+        timestamp=source.timestamp + 100,
+        channel=source.channel,
+        topic=recent_topic,
+        content=source.content,
+        read=True,
+    ).insert()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(100)
+    _refresh_counters()
+    expected = uuid.uuid5(
+        uuid.uuid5(account.project_id, str(source.message_uuid)), "zulip-placement"
+    )
+    topics = _viewer_rows(account, v2_models.WorkspaceUserTopicBinding)
+    old_topic = next(topic for topic in topics if topic.topic_uuid == source.topic.uuid)
+    assert old_topic.unread_count == 0
+    assert old_topic.last_message_uuid == expected
+
+
 @pytest.mark.parametrize("inaccessible", [None, "hidden", "stale_generation"])
 def test_counter_previews_only_include_the_users_accessible_messages(
     message_sources, inaccessible

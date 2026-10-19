@@ -1159,9 +1159,10 @@ class ZulipUserMessageState(
                     (state.read_at or self.flags_updated_at) if self.read else None
                 )
                 state.starred = self.starred
-                state.mentioned = self.mentioned
                 if new_generation:
                     state.pinned = False
+            # Notification preferences can change without a new flags snapshot.
+            state.mentioned = self.mentioned
             state.properties["binding_uuid"].set_value_force(binding.uuid)
             state.properties["membership_generation"].set_value_force(
                 self.membership_generation
@@ -1983,15 +1984,6 @@ class ImportHistoryContent(AbstractZulipTaskContent):
                         "message_id": filters.EQ(data["id"]),
                     },
                 )
-                if message is not None:
-                    contexts.Context().get_session().execute(
-                        "SELECT uuid FROM bridge_zulip_v5_messages "
-                        "WHERE uuid = %s FOR UPDATE",
-                        (message.uuid,),
-                    )
-                    message = ZulipMessage.objects.get_one(
-                        filters={"uuid": filters.EQ(message.uuid)}
-                    )
                 content_hash = hashlib.sha256(
                     data["content"].encode("utf-8")
                 ).hexdigest()
@@ -2011,14 +2003,7 @@ class ImportHistoryContent(AbstractZulipTaskContent):
                     content = MessageContent(**content_values)
                     content.insert()
                 else:
-                    contexts.Context().get_session().execute(
-                        "SELECT uuid FROM bridge_zulip_v5_message_contents "
-                        "WHERE uuid = %s FOR UPDATE",
-                        (message.content.uuid,),
-                    )
-                    content = MessageContent.objects.get_one(
-                        filters={"uuid": filters.EQ(message.content.uuid)}
-                    )
+                    content = message.content
                     if content_updated_at < content.zulip_content_updated_at:
                         for field in (
                             "zulip_content",

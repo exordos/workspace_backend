@@ -209,6 +209,55 @@ class WorkspaceMessageChange(
         )
 
 
+class WorkspaceMessageCounterChange(
+    models.ModelWithID,
+    models.ModelWithProject,
+    orm.SQLStorableMixin,
+):
+    __tablename__ = "messenger_message_counter_changes"
+
+    project_id = properties.property(
+        types.UUID(), required=True, read_only=True, id_property=True
+    )
+    user_uuid = properties.property(
+        types.UUID(), required=True, read_only=True, id_property=True
+    )
+    placement_uuid = properties.property(
+        types.UUID(), required=True, read_only=True, id_property=True
+    )
+    stream_uuid = properties.property(
+        types.UUID(), required=True, read_only=True, id_property=True
+    )
+    topic_uuid = properties.property(types.UUID(), required=True, read_only=True)
+    revision = properties.property(
+        types.Integer(min_value=1), required=True, read_only=True
+    )
+
+    @classmethod
+    def get_id_property(cls) -> dict[str, typing.Any]:
+        return cls.id_properties.copy()
+
+    def get_id(
+        self,
+    ) -> tuple[sys_uuid.UUID, sys_uuid.UUID, sys_uuid.UUID, sys_uuid.UUID]:
+        return self.project_id, self.user_uuid, self.stream_uuid, self.placement_uuid
+
+    @classmethod
+    def reconcile_batch(
+        cls, project_id: object, user_uuid: object, stream_uuid: object, limit: int
+    ) -> bool:
+        result = (
+            contexts.Context()
+            .get_session()
+            .execute(
+                "SELECT * FROM messenger_apply_message_counter_changes(%s, %s, %s, %s)",
+                (project_id, user_uuid, stream_uuid, limit),
+            )
+            .fetchone()
+        )
+        return result["pending"]
+
+
 class WorkspaceMessagePlacement(
     models.ModelWithUUID,
     models.ModelWithProject,
