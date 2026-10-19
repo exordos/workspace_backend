@@ -322,62 +322,9 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         session = contexts.Context().get_session()
         session.execute(
             """
-            INSERT INTO messenger_project_users (project_id, user_uuid)
-            SELECT %s, uuid FROM m_workspace_users WHERE uuid = %s
-            ON CONFLICT (project_id, user_uuid) DO UPDATE
-            SET updated_at = NOW()
+            SELECT messenger_v2_register_project_user(%s, %s)
             """,
             (self.project_uuid, value),
-        )
-        session.execute(
-            """
-            INSERT INTO messenger_folders (
-                uuid, project_id, title, background_color_value,
-                system_type, created_at, updated_at
-            )
-            SELECT template.uuid, %s, template.title, 11184810, 'all',
-                   template.created_at, template.created_at
-            FROM (
-                VALUES
-                    ('00000000-0000-0000-0000-000000000000'::uuid,
-                     'All chats'::varchar,
-                     '2000-01-01 00:00:00'::timestamp),
-                    ('00000000-0000-0000-0000-000000000001'::uuid,
-                     'Personal'::varchar,
-                     '2000-01-01 00:00:01'::timestamp),
-                    ('00000000-0000-0000-0000-000000000002'::uuid,
-                     'Channels'::varchar,
-                     '2000-01-01 00:00:02'::timestamp)
-            ) AS template(uuid, title, created_at)
-            ON CONFLICT (project_id, uuid) DO NOTHING
-            """,
-            (self.project_uuid,),
-        )
-        session.execute(
-            """
-            INSERT INTO messenger_user_folder_bindings (
-                uuid, project_id, user_uuid, folder_uuid, rule,
-                created_at, updated_at, snapshot_updated_at
-            )
-            SELECT messenger_uuid_v5(template.folder_uuid, %s),
-                   %s, %s, template.folder_uuid, template.rule,
-                   template.created_at, template.created_at,
-                   template.created_at AT TIME ZONE current_setting('TIMEZONE')
-            FROM (
-                VALUES
-                    ('00000000-0000-0000-0000-000000000000'::uuid,
-                     'all_chats'::varchar,
-                     '2000-01-01 00:00:00'::timestamp),
-                    ('00000000-0000-0000-0000-000000000001'::uuid,
-                     'personal'::varchar,
-                     '2000-01-01 00:00:01'::timestamp),
-                    ('00000000-0000-0000-0000-000000000002'::uuid,
-                     'channels'::varchar,
-                     '2000-01-01 00:00:02'::timestamp)
-            ) AS template(folder_uuid, rule, created_at)
-            ON CONFLICT (project_id, user_uuid, folder_uuid) DO NOTHING
-            """,
-            (str(value), self.project_uuid, value),
         )
 
     def sync_iam_identity(

@@ -1801,6 +1801,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         create_compact_events.assert_called_once_with(
             bindings=[first_binding, second_binding],
             session=session,
+            defer_folder_events=False,
         )
         create_binding_events.assert_called_once_with(
             bindings=[first_binding, second_binding],

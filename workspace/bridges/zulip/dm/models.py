@@ -333,6 +333,7 @@ class ZulipStreamBindingState(
             },
             binding_uuids={str(self.user_uuid): self.binding_uuid},
             session=contexts.Context().get_session(),
+            defer_folder_events=True,
         )
         if self.notification_mode is not None:
             self.update_workspace_binding()
@@ -388,6 +389,7 @@ class ZulipStreamBindingState(
             project_id=self.project_id,
             binding_uuid=self.binding_uuid,
             session=contexts.Context().get_session(),
+            defer_folder_events=True,
         )
 
 
@@ -2109,7 +2111,7 @@ class ReconciliationContent(AbstractTaskContent):
     KIND = "reconciliation"
 
     batch_size = properties.property(
-        types.Integer(min_value=1), default=1000, read_only=True
+        types.Integer(min_value=1), default=16, read_only=True
     )
     interval = properties.property(
         types.Integer(min_value=0), default=10, read_only=True

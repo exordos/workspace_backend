@@ -6,12 +6,14 @@
 from unittest import mock
 import uuid
 
+import psycopg
 import pytest
 from restalchemy.common import contexts
 from restalchemy.dm import filters
 from restalchemy.storage.sql import migrations
 
 from workspace.bridges.zulip.dm import models
+from workspace.messenger_api.api import v2_store
 from workspace.messenger_api.dm import external_models
 from workspace.tests.integration import conftest
 
@@ -141,6 +143,104 @@ def test_project_user_state_registers_system_folders(project_user_accounts, db):
         "SELECT count(*) FROM messenger_stream_bindings WHERE project_id = %s",
         (account.project_id,),
     ).fetchone() == (0,)
+
+
+@pytest.mark.parametrize(
+    "table",
+    ["messenger_project_users", "messenger_folders", "messenger_user_folder_bindings"],
+)
+def test_repeated_registration_does_not_wait_for_import_writes(
+    project_user_accounts, db, table
+):
+    account = project_user_accounts()
+    db.execute(
+        "SELECT messenger_v2_register_project_user(%s, %s)",
+        (account.project_id, account.owner_user_uuid),
+    )
+    before = db.execute(
+        "SELECT updated_at FROM messenger_project_users "
+        "WHERE project_id = %s AND user_uuid = %s",
+        (account.project_id, account.owner_user_uuid),
+    ).fetchone()
+    store = v2_store.MessengerV2Store(account.project_id, account.owner_user_uuid)
+    with psycopg.connect(conftest.TEST_DB_URL) as importer:
+        importer.execute(
+            f"UPDATE {table} SET updated_at = NOW() WHERE project_id = %s",
+            (account.project_id,),
+        )
+        with contexts.Context().session_manager() as session:
+            session.execute("SET LOCAL lock_timeout = '100ms'")
+            store._ensure_project_user(account.owner_user_uuid)
+        importer.rollback()
+    assert (
+        db.execute(
+            "SELECT updated_at FROM messenger_project_users "
+            "WHERE project_id = %s AND user_uuid = %s",
+            (account.project_id, account.owner_user_uuid),
+        ).fetchone()
+        == before
+    )
+
+
+def test_repeated_registration_repairs_missing_system_folders(
+    project_user_accounts, db
+):
+    account = project_user_accounts()
+    store = v2_store.MessengerV2Store(account.project_id, account.owner_user_uuid)
+    with contexts.Context().session_manager():
+        store._ensure_project_user(account.owner_user_uuid)
+    db.execute(
+        "DELETE FROM messenger_folders WHERE project_id = %s "
+        "AND uuid = '00000000-0000-0000-0000-000000000001'",
+        (account.project_id,),
+    )
+    with contexts.Context().session_manager():
+        store._ensure_project_user(account.owner_user_uuid)
+    assert db.execute(
+        "SELECT count(*) FROM messenger_user_folder_bindings "
+        "WHERE project_id = %s AND user_uuid = %s",
+        (account.project_id, account.owner_user_uuid),
+    ).fetchone() == (3,)
+
+
+def test_contention_migration_bounds_existing_default_batches_and_is_reversible(
+    project_user_accounts, db
+):
+    project_user_accounts()
+    engine = migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    migration = (
+        "0230-Avoid-redundant-project-user-writes-and-bound-Zulip-"
+        "reconciliation-batches-fc01aa.py"
+    )
+    engine.rollback_migration(migration)
+    try:
+        tasks = [
+            models.Task(content=models.ReconciliationContent(batch_size=batch_size))
+            for batch_size in (1000, 17)
+        ]
+        for task in tasks:
+            task.insert()
+        assert (
+            "DO UPDATE SET updated_at = NOW()"
+            in db.execute(
+                "SELECT pg_get_functiondef('messenger_v2_register_project_user(uuid,uuid)'::regprocedure)"
+            ).fetchone()[0]
+        )
+        engine.apply_migration(migration)
+        assert [
+            models.Task.objects.get_one(
+                filters={"uuid": filters.EQ(task.uuid)}
+            ).content.batch_size
+            for task in tasks
+        ] == [16, 17]
+        assert (
+            "DO UPDATE SET updated_at = NOW()"
+            not in db.execute(
+                "SELECT pg_get_functiondef('messenger_v2_register_project_user(uuid,uuid)'::regprocedure)"
+            ).fetchone()[0]
+        )
+    finally:
+        engine.apply_migration(engine.get_latest_migration())
 
 
 def test_reconciliation_batches_project_users_before_other_stages(

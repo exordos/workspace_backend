@@ -21,6 +21,7 @@ from workspace.messenger_api.dm import event_payloads
 from workspace.messenger_api.dm import models as messenger_models
 from workspace.messenger_api.dm import v2_models
 from workspace.services import history_import
+from workspace.services.messenger_workers import v2_projection
 from workspace.tests.integration import conftest
 
 
@@ -352,6 +353,82 @@ def test_binding_state_uses_current_transaction(stream_state_account, db, action
             filters={"project_id": filters.EQ(account.project_id)}
         )
     ] == counter_changes
+
+
+def test_membership_changes_defer_and_coalesce_folder_snapshots(
+    stream_state_account, db, monkeypatch
+):
+    account = stream_state_account
+    stream_uuids = [uuid.uuid4() for _ in range(3)]
+    channels = []
+    for index, stream_uuid in enumerate(stream_uuids, start=1):
+        _stream(db, account, stream_uuid, "zulip")
+        channels.append(_channel(account, stream_uuid, stream_id=index))
+
+    def unexpected_folder_query(*args, **kwargs):
+        pytest.fail("Membership reconciliation must defer legacy folder queries")
+
+    monkeypatch.setattr(
+        messenger_models.UserFolder.objects, "get_all", unexpected_folder_query
+    )
+    monkeypatch.setattr(
+        messenger_models.UserFolder.objects, "get_one", unexpected_folder_query
+    )
+    monkeypatch.setattr(
+        messenger_models.WorkspaceUserStream.objects,
+        "get_one",
+        unexpected_folder_query,
+    )
+    with contexts.Context().session_manager():
+        for state in _binding_states(account):
+            state.do()
+    assert db.execute(
+        "SELECT count(*) FROM m_workspace_visible_events "
+        "WHERE project_id = %s AND object_type = 'folder'",
+        (account.project_id,),
+    ).fetchone() == (0,)
+
+    def drain():
+        for _ in range(100):
+            with contexts.Context().session_manager() as session:
+                if not v2_projection.process_one_projection_task(
+                    session, "integration:zulip-membership-folders"
+                ):
+                    break
+        else:
+            pytest.fail("Membership projections did not converge")
+        assert db.execute(
+            "SELECT count(*) FROM messenger_projection_tasks "
+            "WHERE project_id = %s AND status <> 'completed'",
+            (account.project_id,),
+        ).fetchone() == (0,)
+
+    drain()
+    folders = db.execute(
+        "SELECT folder_uuid, snapshot_version, folder_items_snapshot "
+        "FROM messenger_user_folder_bindings "
+        "WHERE project_id = %s AND rule IN ('all_chats', 'channels') "
+        "ORDER BY folder_uuid",
+        (account.project_id,),
+    ).fetchall()
+    assert len(folders) == 2
+    for _, version, items in folders:
+        assert version == 1
+        assert {item["stream_uuid"] for item in items} == set(map(str, stream_uuids))
+
+    channels[0].delete()
+    with contexts.Context().session_manager():
+        (state,) = _binding_states(account)
+        state.do()
+    drain()
+    for (items,) in db.execute(
+        "SELECT folder_items_snapshot FROM messenger_user_folder_bindings "
+        "WHERE project_id = %s AND rule IN ('all_chats', 'channels')",
+        (account.project_id,),
+    ).fetchall():
+        assert {item["stream_uuid"] for item in items} == set(
+            map(str, stream_uuids[1:])
+        )
 
 
 @pytest.mark.parametrize(
@@ -1239,7 +1316,7 @@ def test_worker_ensures_one_active_reconciliation(stream_state_account, status):
         assert active.content.interval == 31
     else:
         assert active.status == "new"
-        assert active.content.batch_size == 1000
+        assert active.content.batch_size == 16
         assert active.content.interval == 10
 
 

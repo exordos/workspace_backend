@@ -31,7 +31,7 @@ from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api import exceptions as messenger_exc
 from workspace.messenger_api import file_storage, reaction_users
 from workspace.messenger_api.dm import base as messenger_dm_base
-from workspace.messenger_api.dm import message_payloads, models, read_state
+from workspace.messenger_api.dm import message_payloads, models, read_state, v2_models
 
 _SUMMARY_REASONING_UNSET = object()
 _LEGACY_MESSAGE_FLAG_COUNTER_SUPPRESSION = (
@@ -1220,9 +1220,25 @@ def _add_folder_event_target(
 
 
 def _create_available_folder_updated_events(
-    project_id: object, folder_targets: typing.Any, session: typing.Any = None
+    project_id: object,
+    folder_targets: typing.Any,
+    session: typing.Any = None,
+    defer: bool = False,
 ) -> None:
     for target_user_uuid, folder_uuid in folder_targets:
+        if defer:
+            v2_models.WorkspaceDomainOutboxEvent(
+                project_id=project_id,
+                event_kind="folder_projection",
+                scope_kind="user-folder",
+                scope_key=f"{project_id}:{target_user_uuid}:{folder_uuid}",
+                payload={
+                    "source_kind": "zulip.reconciled",
+                    "user_uuid": str(target_user_uuid),
+                    "folder_uuid": str(folder_uuid),
+                },
+            ).insert(session=session)
+            continue
         try:
             folder = get_workspace_user_folder(
                 project_id=project_id,
@@ -2089,7 +2105,9 @@ def create_workspace_stream_binding_events(
 
 
 def create_compact_workspace_stream_binding_events(
-    bindings: typing.Any, session: typing.Any = None
+    bindings: typing.Any,
+    session: typing.Any = None,
+    defer_folder_events: bool = False,
 ) -> None:
     bindings = list(bindings)
     if not bindings:
@@ -2122,6 +2140,18 @@ def create_compact_workspace_stream_binding_events(
             ALL_CHATS_FOLDER_UUID,
             PERSONAL_FOLDER_UUID if private else CHANNELS_FOLDER_UUID,
         ]
+        if defer_folder_events:
+            _create_available_folder_updated_events(
+                binding.project_id,
+                [
+                    (user_uuid, folder_uuid)
+                    for user_uuid in visible_users
+                    for folder_uuid in folder_uuids
+                ],
+                session=current_session,
+                defer=True,
+            )
+            return
         user_folders = models.UserFolder.objects.get_all(
             filters={
                 "project_id": dm_filters.EQ(binding.project_id),
@@ -2167,6 +2197,7 @@ def delete_workspace_stream_binding(
     project_id: sys_uuid.UUID,
     binding_uuid: sys_uuid.UUID,
     session: typing.Any = None,
+    defer_folder_events: bool = False,
 ) -> None:
     with _workspace_session(session=session) as s:
         _lock_workspace_project_event_writes(project_id, s)
@@ -2178,12 +2209,21 @@ def delete_workspace_stream_binding(
             },
             session=s,
         )
-        user_stream = get_workspace_user_stream(
-            project_id=project_id,
-            user_uuid=binding.user_uuid,
-            stream_uuid=binding.stream_uuid,
-            session=s,
-        )
+        if defer_folder_events:
+            user_stream = models.WorkspaceStream.objects.get_one(
+                filters={
+                    "project_id": dm_filters.EQ(project_id),
+                    "uuid": dm_filters.EQ(binding.stream_uuid),
+                },
+                session=s,
+            )
+        else:
+            user_stream = get_workspace_user_stream(
+                project_id=project_id,
+                user_uuid=binding.user_uuid,
+                stream_uuid=binding.stream_uuid,
+                session=s,
+            )
         folder_targets = _get_user_stream_folder_event_targets(
             project_id=project_id,
             user_uuid=binding.user_uuid,
@@ -2231,6 +2271,7 @@ def delete_workspace_stream_binding(
             project_id=project_id,
             folder_targets=folder_targets,
             session=s,
+            defer=defer_folder_events,
         )
 
 
@@ -2370,6 +2411,7 @@ def get_or_create_workspace_stream_bindings(
     session: typing.Any = None,
     binding_uuids: typing.Any = None,
     emit_events: bool = True,
+    defer_folder_events: bool = False,
 ) -> typing.Any:
     _validate_stream_binding_roles_payload(role_user_uuids)
     result = []
@@ -2394,6 +2436,7 @@ def get_or_create_workspace_stream_bindings(
         create_compact_workspace_stream_binding_events(
             bindings=created_bindings,
             session=session,
+            defer_folder_events=defer_folder_events,
         )
         create_workspace_stream_bindings_created_events(
             bindings=created_bindings,
