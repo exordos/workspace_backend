@@ -285,15 +285,21 @@ def test_repeated_file_references_preserve_count_and_order():
 @pytest.mark.parametrize(
     "source,expected",
     [
-        ("[report.pdf]({path})", "report.pdf (file deleted)"),
-        ('![preview](<{url}> "Preview")', "preview (file deleted)"),
-        ("{url}", r"report\_old\.pdf (file deleted)"),
-        ("<{url}>", r"report\_old\.pdf (file deleted)"),
-        ("{path}", r"report\_old\.pdf (file deleted)"),
-        ("({url}).", r"(report\_old\.pdf (file deleted))."),
+        ("[report.pdf]({path})", "report.pdf ({notice})"),
+        ('![preview](<{url}> "Preview")', "preview ({notice})"),
+        ("{url}", r"report\_old\.pdf ({notice})"),
+        ("<{url}>", r"report\_old\.pdf ({notice})"),
+        ("{path}", r"report\_old\.pdf ({notice})"),
+        ("({url}).", r"(report\_old\.pdf ({notice}))."),
     ],
 )
-def test_deleted_files_become_text_without_affecting_other_elements(source, expected):
+@pytest.mark.parametrize(
+    "context_key,notice",
+    [("deleted_files", "file deleted"), ("inaccessible_files", "access denied")],
+)
+def test_unavailable_files_become_text_without_affecting_other_elements(
+    source, expected, context_key, notice
+):
     path = "/user_uploads/1/missing/report_old.pdf"
     url = "https://zulip.example.test" + path
     kept = "/user_uploads/1/kept/report.pdf"
@@ -301,7 +307,7 @@ def test_deleted_files_become_text_without_affecting_other_elements(source, expe
     user = "22222222-2222-4222-8222-222222222222"
     context = {
         "server_url": "https://zulip.example.test",
-        "deleted_files": {path, url},
+        context_key: {path, url},
         "files": {kept: urn},
         "mention_uuids": {"id:7": user},
     }
@@ -312,26 +318,34 @@ def test_deleted_files_become_text_without_affecting_other_elements(source, expe
 
     payload = message_conversion.zulip_to_workspace(message, context)
 
-    assert payload["content"] == f"{expected} [kept]({urn}) [Bob](urn:user:{user})"
+    assert payload["content"] == (
+        f"{expected.format(notice=notice)} [kept]({urn}) [Bob](urn:user:{user})"
+    )
     assert message_conversion.get_workspace_files(payload) == [urn]
 
 
 @pytest.mark.parametrize(
     "prefix", ["/poll Choose ", "/me attaches ", "Check $$x^2$$: "]
 )
-def test_deleted_files_remain_visible_in_unsupported_content(prefix):
+@pytest.mark.parametrize(
+    "context_key,notice",
+    [("deleted_files", "file deleted"), ("inaccessible_files", "access denied")],
+)
+def test_unavailable_files_remain_visible_in_unsupported_content(
+    prefix, context_key, notice
+):
     path = "/user_uploads/1/missing/report.pdf"
     context = {
         "server_url": "https://zulip.example.test",
         "original_url": "https://zulip.example.test/#narrow/near/1",
-        "deleted_files": {path},
+        context_key: {path},
     }
 
     payload = message_conversion.zulip_to_workspace(
         {"id": 1, "content": f"{prefix}[report]({path})"}, context
     )
 
-    assert r"report\.pdf (file deleted)" in payload["content"]
+    assert rf"report\.pdf ({notice})" in payload["content"]
     assert "/user_uploads/" not in payload["content"]
 
 
@@ -354,11 +368,15 @@ def test_unsupported_content_retains_files_without_a_local_copy(url):
     assert message_conversion.get_workspace_files(payload) == []
 
 
-def test_deleted_files_are_marked_inside_quoted_snapshots():
+@pytest.mark.parametrize(
+    "context_key,notice",
+    [("deleted_files", "file deleted"), ("inaccessible_files", "access denied")],
+)
+def test_unavailable_files_are_marked_inside_quoted_snapshots(context_key, notice):
     path = "/user_uploads/1/missing/report.pdf"
     context = {
         "server_url": "https://zulip.example.test",
-        "deleted_files": {path},
+        context_key: {path},
     }
 
     payload = message_conversion.zulip_to_workspace(
@@ -367,7 +385,7 @@ def test_deleted_files_are_marked_inside_quoted_snapshots():
 
     snapshot = payload["content"].partition("?snapshot=")[2].removesuffix(")")
     assert base64.urlsafe_b64decode(snapshot + "=" * (-len(snapshot) % 4)).decode() == (
-        "report (file deleted)"
+        f"report ({notice})"
     )
 
 

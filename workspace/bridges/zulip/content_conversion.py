@@ -80,6 +80,7 @@ class ConversionContext:
         self._topic_references = set()
         self._message_versions = {}
         self._outgoing = False
+        self._delivered = {}
         self._users()
         self._channels()
 
@@ -246,6 +247,28 @@ class ConversionContext:
                 f"{self.server_url}/#narrow/channel/{row['stream_id']}/topic/"
                 + message_conversion.encode_hash(name)
             )
+
+    def prefetch(self, messages):
+        """Resolve identities and deliveries once for the whole ordered batch."""
+        text = "\n".join(
+            message["content"] + f" /near/{message['id']}" for message in messages
+        )
+        self._topics(text)
+        self._messages(text)
+        ids = [message["id"] for message in messages]
+        self._delivered.update(dict.fromkeys(ids))
+        for row in self.session.execute(
+            """SELECT delivery.zulip_message_id,message.payload->>'content' AS content,
+                      message.content_updated_at
+               FROM bridge_zulip_v5_deliveries AS delivery
+               JOIN messenger_messages AS message
+                 ON message.project_id=delivery.project_id AND message.uuid=delivery.message_uuid
+               WHERE delivery.project_id=%s AND delivery.hostname=%s
+                 AND delivery.zulip_message_id=ANY(%s)
+                 AND message.deleted_at IS NULL AND message.payload->>'kind'='markdown'""",
+            (self.account.project_id, self.host, ids),
+        ).fetchall():
+            self._delivered[row["zulip_message_id"]] = row
 
     def _messages(self, text):
         remote_ids = {
@@ -426,7 +449,8 @@ class ConversionContext:
 
     def _import_files(self, message, stream_uuid, zulip):
         deleted_files = self.context["deleted_files"] = set()
-        deleted_paths = set()
+        inaccessible_files = self.context["inaccessible_files"] = set()
+        unavailable_paths = {}
         for url in message_conversion.get_zulip_files(
             message, self.context, include_quotes=True
         ):
@@ -443,8 +467,8 @@ class ConversionContext:
             ):
                 continue
             path = parsed.path
-            if path in deleted_paths:
-                deleted_files.add(url)
+            if path in unavailable_paths:
+                unavailable_paths[path].add(url)
                 continue
             row = self.session.execute(
                 """SELECT file.* FROM bridge_zulip_v5_file_links AS link
@@ -475,10 +499,15 @@ class ConversionContext:
                         data, content_type = zulip.download_file(path)
                 except requests.HTTPError as error:
                     response = error.response
-                    if response is None or response.status_code not in (404, 410):
+                    if response is None or response.status_code not in (403, 404, 410):
                         raise
-                    deleted_paths.add(path)
-                    deleted_files.add(url)
+                    unavailable = (
+                        inaccessible_files
+                        if response.status_code == 403
+                        else deleted_files
+                    )
+                    unavailable_paths[path] = unavailable
+                    unavailable.add(url)
                     continue
                 file_uuid = uuid.uuid5(
                     self.account.project_id,
@@ -547,6 +576,8 @@ class ConversionContext:
         return message_conversion.zulip_to_workspace(message, self.context)["content"]
 
     def delivered_content(self, message_id):
+        if message_id in self._delivered:
+            return self._delivered[message_id]
         return self.session.execute(
             """SELECT message.payload->>'content' AS content, message.content_updated_at
                FROM bridge_zulip_v5_deliveries AS delivery

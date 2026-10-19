@@ -8,8 +8,8 @@
 Context contains server_url and original_url, plus optional mention_uuids
 (id:<Zulip ID> or name:<name>), stream_uuids (name), topic_uuids (channel>topic),
 message_uuids (Zulip ID), stream_ids (name -> Zulip ID), files (URL -> Workspace
-file URN), deleted_files (source URLs), linkifier_urls, user_group_ids,
-and custom_emoji_names.
+file URN), deleted_files and inaccessible_files (source URLs), linkifier_urls,
+user_group_ids, and custom_emoji_names.
 The optional messages mapping contains
 original Zulip messages keyed by their string IDs, for full/partial quotes.
 Reverse conversion produces canonical Markdown, not the original spelling.
@@ -281,8 +281,12 @@ class _ZulipToWorkspace:
         text = f"Not supported in Workspace: {description}"
         return text if block else f"({text})"
 
-    def deleted_file(self, target: str, label: str | None = None) -> str | None:
-        if target not in self.context.get("deleted_files", ()):
+    def unavailable_file(self, target: str, label: str | None = None) -> str | None:
+        if target in self.context.get("inaccessible_files", ()):
+            reason = "access denied"
+        elif target in self.context.get("deleted_files", ()):
+            reason = "file deleted"
+        else:
             return None
         if not label:
             label = _escape_label(
@@ -290,14 +294,14 @@ class _ZulipToWorkspace:
                     urllib.parse.urlsplit(target).path.rsplit("/", 1)[-1]
                 )
             )
-        return f"{label} (file deleted)"
+        return f"{label} ({reason})"
 
     def block_notice(self, description: str, source: str) -> str:
         parts = [self.notice(description, block=True)]
         for url in get_zulip_files({"content": source}, self.context):
-            deleted = self.deleted_file(url)
-            if deleted is not None:
-                parts.append(deleted)
+            unavailable = self.unavailable_file(url)
+            if unavailable is not None:
+                parts.append(unavailable)
                 continue
             target = self.target(url)
             if target is None:
@@ -410,9 +414,9 @@ class _ZulipToWorkspace:
                     output.append(token)
                     continue
                 label, destination, title, image, position = link
-                deleted = self.deleted_file(destination, label)
-                if deleted is not None:
-                    output.append(deleted)
+                unavailable = self.unavailable_file(destination, label)
+                if unavailable is not None:
+                    output.append(unavailable)
                     continue
                 target = self.target(destination)
                 if target is None:
@@ -428,9 +432,9 @@ class _ZulipToWorkspace:
                 position = match.start() + len(target) + int(token.startswith("<"))
                 if token.startswith("<") and text[position : position + 1] == ">":
                     position += 1
-                deleted = self.deleted_file(target)
-                if deleted is not None:
-                    output.append(deleted)
+                unavailable = self.unavailable_file(target)
+                if unavailable is not None:
+                    output.append(unavailable)
                     continue
                 urn = self.target(target)
                 if urn is None:

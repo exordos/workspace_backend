@@ -23,6 +23,7 @@ SERVICE_NAMES=(
     workspace-api
     workspace-history-import
     workspace-zulip-realtime
+    workspace-zulip-task-worker
     workspace-messenger-worker
     workspace-messenger-events
 )

@@ -547,6 +547,21 @@ resources:
       before:
         - kind: shell
           command: /usr/local/bin/workspace-bootstrap
+    workspace_zulip_task_worker:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace-zulip-task-worker
+      path: /usr/bin/workspace-zulip-task-worker --config-file /etc/workspace/workspace.conf
+      user: root
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_backend:uuid
+      service_type:
+        kind: simple
+        count: 1
+      target_status: enabled
+      before:
+        - kind: shell
+          command: /usr/local/bin/workspace-bootstrap
     workspace_messenger_worker:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       name: workspace-messenger-worker

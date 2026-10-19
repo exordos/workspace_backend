@@ -51,6 +51,8 @@ def migration(_database, db):
     # Keep current task models usable while testing the earlier data migration.
     db.execute("""
         ALTER TABLE bridge_zulip_v5_tasks
+            ADD COLUMN IF NOT EXISTS queue VARCHAR(16) NOT NULL DEFAULT 'background',
+            ADD COLUMN IF NOT EXISTS concurrency_key TEXT NOT NULL DEFAULT '',
             ADD COLUMN IF NOT EXISTS execution_time DOUBLE PRECISION,
             ADD COLUMN IF NOT EXISTS queue_wait_time DOUBLE PRECISION,
             ADD COLUMN IF NOT EXISTS message_created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT 'epoch',

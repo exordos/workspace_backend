@@ -212,9 +212,12 @@ def test_missing_mapping_fails_before_the_send_attempt_is_marked(outgoing, kind)
     zulip.send_message.assert_not_called()
 
 
-@pytest.mark.parametrize("status", [404, 410])
-def test_deleted_attachments_do_not_block_import_or_stored_content_conversion(
-    history_account, db, monkeypatch, tmp_path, status
+@pytest.mark.parametrize(
+    "status,notice",
+    [(403, "access denied"), (404, "file deleted"), (410, "file deleted")],
+)
+def test_unavailable_attachments_do_not_block_import_or_stored_content_conversion(
+    history_account, db, monkeypatch, tmp_path, status, notice
 ):
     account = history_account
     account.settings = {
@@ -230,7 +233,7 @@ def test_deleted_attachments_do_not_block_import_or_stored_content_conversion(
     kept = "/user_uploads/2/kept/report.txt"
     response = requests.Response()
     response.status_code = status
-    error = requests.HTTPError("File is gone", response=response)
+    error = requests.HTTPError("File is unavailable", response=response)
     zulip = mock.Mock()
 
     def download(path):
@@ -254,7 +257,7 @@ def test_deleted_attachments_do_not_block_import_or_stored_content_conversion(
         (account.project_id,),
     ).fetchone()[0]
     expected = (
-        "report (file deleted) preview (file deleted) 2 (file deleted). 2 (file deleted) "
+        f"report ({notice}) preview ({notice}) 2 ({notice}). 2 ({notice}) "
         f"[kept](urn:file:{file_uuid}) [Alias](urn:user:{account.owner_user_uuid})"
     )
     assert source.content.workspace_content == expected
@@ -283,7 +286,55 @@ def test_deleted_attachments_do_not_block_import_or_stored_content_conversion(
         task.delete()
 
 
-@pytest.mark.parametrize("status", [403, 429, 500, None, "timeout"])
+def test_unavailable_attachment_states_are_distinct_and_retried_for_later_messages(
+    history_account, db, monkeypatch, tmp_path
+):
+    account = history_account
+    stream_uuid = test_zulip_messages._create_workspace_stream(account, db)
+    monkeypatch.setenv(file_storage.ENV_STORAGE_PATH, str(tmp_path))
+    denied = "/user_uploads/2/denied/report.pdf"
+    deleted = "/user_uploads/2/deleted/report.pdf"
+    raw = f"[private]({denied}) [gone]({deleted}) https://zulip.example.com{denied}?download=1"
+    zulip = mock.Mock()
+
+    def download(path):
+        response = requests.Response()
+        response.status_code = 403 if path == denied else 404
+        raise requests.HTTPError(response=response)
+
+    zulip.download_file.side_effect = download
+    with contexts.Context().session_manager():
+        converter = content_conversion.ConversionContext(account)
+        assert (
+            converter.to_workspace(
+                test_zulip_messages._message_data(content=raw), stream_uuid, zulip
+            )
+            == r"private (access denied) gone (file deleted) report\.pdf (access denied)"
+        )
+        assert zulip.download_file.call_args_list == [
+            mock.call(denied),
+            mock.call(deleted),
+        ]
+
+        zulip.download_file.side_effect = None
+        zulip.download_file.return_value = b"report", "application/pdf"
+        converted = converter.to_workspace(
+            test_zulip_messages._message_data(id=102, content=raw), stream_uuid, zulip
+        )
+        assert "(access denied)" not in converted
+        assert "(file deleted)" not in converted
+        assert converted.count("urn:file:") == 3
+        assert converter.context["deleted_files"] == set()
+        assert converter.context["inaccessible_files"] == set()
+        assert zulip.download_file.call_args_list == [
+            mock.call(denied),
+            mock.call(deleted),
+            mock.call(denied),
+            mock.call(deleted),
+        ]
+
+
+@pytest.mark.parametrize("status", [401, 429, 500, None, "timeout"])
 def test_other_attachment_download_errors_are_not_reported_as_deletions(
     history_account, db, status
 ):
@@ -309,6 +360,7 @@ def test_other_attachment_download_errors_are_not_reported_as_deletions(
             )
         assert raised.value is error
         assert converter.context["deleted_files"] == set()
+        assert converter.context["inaccessible_files"] == set()
 
 
 @pytest.mark.parametrize("deleted", [False, True])

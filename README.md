@@ -39,20 +39,55 @@ Direct local services:
 - Messenger worker: `workspace-messenger-worker`
 - History import service: `workspace-history-import`
 - Zulip realtime service: `workspace-zulip-realtime`
+- Zulip realtime task worker: `workspace-zulip-task-worker`
 - Workspace OpenAPI spec: `http://127.0.0.1:21084/specifications/3.0.3`
 
 The single `workspace-api` process serves all REST resources, including Messenger,
 with two HTTP workers by default.
 
-The history import service executes durable bridge tasks in priority order. The
-`[history_import] step_interval` option controls idle checks (default: three
+The history import service executes the `background` queue with a bounded thread
+pool (`[history_import] workers`, default: four). Run `workspace-zulip-task-worker`
+as a separate process for the `realtime` queue, in addition to the realtime event
+receiver. It has a dedicated execution thread and checks for work every 100 ms.
+The equivalent module command is `python -m workspace.cmd.zulip_task_worker`.
+
+Migration 0243 adds explicit task queues and classifies pending tasks by origin.
+Live message imports, edits, sends, reactions and flag updates use `realtime`;
+backfills, catalog polling, stored-content conversion and historical flag repair
+use `background`. Both queues preserve the existing numeric priorities. Stop old
+history workers before applying the migration and start both task workers after
+updating: older workers do not filter by queue.
+
+Dispatchers reserve only as many tasks as there are free execution slots. Claims
+commit before execution and use `FOR UPDATE SKIP LOCKED` and recoverable leases.
+Each execution has its own database session. Tasks for the same account within a
+queue are serialized; global maintenance and conversion chains each have their
+own execution key. Catalog refreshes for a project share a key across both queues.
+Transaction advisory locks fence overlapping execution even
+after a lease expires. Outbound sends retain their committed attempt marker, so
+an ambiguous HTTP result waits for the echo rather than repeating the POST.
+
+Realtime imports schedule bounded reconciliation of only their affected messages,
+streams and topics, so publishing them does not wait for the global history
+reconciliation queue. Shared database locks can still cause waits between queues.
+
+The `[history_import] step_interval` option controls idle checks (default: three
 seconds); successful work continues immediately.
-Ready tasks run by priority descending, then `created_at` ascending, with UUID
-as the final tiebreaker.
+Ready tasks run by priority descending, message creation time and provider ID
+descending, then task creation time ascending and UUID. Independent accounts may
+finish in a different order. Stored-content conversion keeps its sequential
+newest-first batch chain, while prefetching references and deliveries for the
+whole batch instead of reading them separately for every message.
 History import tasks cover at most 100 consecutive message IDs, newest ranges
 first. Migration 0237 splits unfinished larger tasks, preserving their priority,
 schedule, status, account, cutoff, and backfill/event links. The original tasks
 are cancelled and detached from backfill completion tracking.
+
+Run the opt-in comparison on the disposable integration database with
+`WORKSPACE_ZULIP_BENCHMARK_REPORT=/tmp/zulip-worker-benchmark.json .tox/develop/bin/python -m pytest -q -s workspace/tests/integration/test_zulip_worker_performance.py`.
+It compares conversion against commit `e431b88`, then compares a single task
+worker with separate realtime/background workers. The I/O comparison emulates
+Zulip latency; database operations use PostgreSQL. No live Zulip requests are made.
 
 Migration 0238 adds nullable `execution_time` and `queue_wait_time` fields in
 seconds. They accumulate execution and ready-queue waiting across attempts,
@@ -116,7 +151,8 @@ once per destination stream, with persisted file mappings for retries and echoes
 Temporary download URLs are fetched without forwarding Zulip API credentials.
 Externally hosted media retain their original URLs.
 Attachments returning HTTP 404 or 410 are replaced with their caption or filename
-followed by `(file deleted)`; other content and available attachments still import.
+followed by `(file deleted)`; HTTP 403 uses `(access denied)` instead. Other content
+and available attachments still import. Other download failures remain retryable.
 Full and partial quotes use persisted message identities; outgoing quotes require
 the sender's access to the referenced message. Missing incoming targets retain a
 provider URL or quoted snapshot instead of an invented internal identity. Features

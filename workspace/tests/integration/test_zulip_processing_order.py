@@ -333,6 +333,7 @@ def test_ordering_migration_backfills_existing_content_without_requeueing_it(
         (account.project_id,),
     ).fetchall()
     assert rows == [(data[0]["timestamp"], value, value) for value in (43, 42, 41)]
+    engine.apply_migration(engine.get_latest_migration())
 
 
 def test_ordering_migration_round_trips(_database):

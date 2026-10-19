@@ -330,6 +330,8 @@ def isolated_migration_database(migration, *, current_models=False):
                     ALTER TABLE m_external_accounts_v2 ADD COLUMN IF NOT EXISTS
                         has_completed_backfill BOOLEAN NOT NULL DEFAULT FALSE;
                     ALTER TABLE bridge_zulip_v5_tasks
+                        ADD COLUMN IF NOT EXISTS queue VARCHAR(16) NOT NULL DEFAULT 'background',
+                        ADD COLUMN IF NOT EXISTS concurrency_key TEXT NOT NULL DEFAULT '',
                         ADD COLUMN IF NOT EXISTS backfill_uuid UUID,
                         ADD COLUMN IF NOT EXISTS realtime_event_uuid UUID,
                         ADD COLUMN IF NOT EXISTS execution_time DOUBLE PRECISION,
@@ -445,6 +447,9 @@ def _test_database_url(_database, request, monkeypatch):
         # Historical rollbacks can recreate these tables. Keep the current
         # queue models usable without applying the compatibility retirement.
         with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+            connection.execute("""ALTER TABLE bridge_zulip_v5_tasks
+                ADD COLUMN IF NOT EXISTS queue VARCHAR(16) NOT NULL DEFAULT 'background',
+                ADD COLUMN IF NOT EXISTS concurrency_key TEXT NOT NULL DEFAULT ''""")
             for table in (
                 "messenger_message_changes",
                 "bridge_zulip_v5_message_changes",

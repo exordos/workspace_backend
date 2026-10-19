@@ -20,6 +20,13 @@ from workspace.services import history_import
 DOMAIN = "history_import"
 
 history_import_opts = [
+    cfg.StrOpt(
+        "queue",
+        default="background",
+        choices=["background", "realtime"],
+        help="Durable task queue consumed by this process",
+    ),
+    cfg.IntOpt("workers", default=4, min=1, help="Maximum concurrent background tasks"),
     cfg.FloatOpt(
         "step-interval",
         default=3,
@@ -34,16 +41,21 @@ ra_config_opts.register_posgresql_db_opts(CONF)
 file_storage_opts.register_opts(CONF)
 
 
-def main() -> None:
+def main(queue=None) -> None:
     config.parse(sys.argv[1:])
     infra_log.configure()
     log = logging.getLogger(__name__)
 
+    queue = queue or CONF[DOMAIN].queue
     service = history_import.HistoryImportService(
-        iter_min_period=CONF[DOMAIN].step_interval,
+        queue=queue,
+        workers=1 if queue == "realtime" else CONF[DOMAIN].workers,
+        iter_min_period=0.1 if queue == "realtime" else CONF[DOMAIN].step_interval,
     )
     service.add_setup(
-        lambda: database.configure_postgresql("workspace-history-import", conf=CONF)
+        lambda: database.configure_postgresql(
+            f"workspace-zulip-{queue}-tasks", conf=CONF
+        )
     )
     service_hub = hub.ProcessHubService()
     service_hub.add_service(service)

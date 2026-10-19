@@ -63,6 +63,21 @@
             "subProcess": true
         },
         {
+            "name": "Python Debugger: Zulip Realtime Tasks",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${workspaceFolder}/.tox/develop/bin/python",
+            "module": "workspace.cmd.zulip_task_worker",
+            "cwd": "${workspaceFolder}",
+            "args": [
+                "--config-file",
+                "${workspaceFolder}/etc/workspace/workspace.local.conf"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "subProcess": true
+        },
+        {
             "name": "Python Debugger: Zulip Realtime",
             "type": "debugpy",
             "request": "launch",

@@ -880,11 +880,20 @@ class ZulipMessageState(
         return self.project_id, self.message_uuid
 
     @classmethod
-    def reconcile_batch(cls, limit: int) -> int:
+    def reconcile_batch(cls, limit: int, *, project_id=None, message_uuids=None) -> int:
         changes = {}
+        scope = (
+            {
+                "project_id": filters.EQ(project_id),
+                "message_uuid": filters.In(message_uuids),
+            }
+            if message_uuids is not None
+            else {}
+        )
         change_models = (ZulipMessageChange, v2_models.WorkspaceMessageChange)
         for model in change_models:
             for change in model.objects.get_all(
+                filters=scope,
                 order_by={
                     "message_created_at": "desc",
                     "message_sequence": "desc",
@@ -1543,6 +1552,28 @@ class ZulipTopic(
         required=True,
     )
 
+    @classmethod
+    def observe(cls, **values):
+        topic = cls(**values)
+        contexts.Context().get_session().execute(
+            """INSERT INTO bridge_zulip_v5_topics (uuid,stream_id,name,max_id,created_at,updated_at)
+               VALUES (%s,%s,%s,%s,%s,%s)
+               ON CONFLICT (uuid) DO UPDATE SET name=EXCLUDED.name,
+                   max_id=GREATEST(bridge_zulip_v5_topics.max_id,EXCLUDED.max_id),
+                   updated_at=EXCLUDED.updated_at
+               WHERE bridge_zulip_v5_topics.name IS DISTINCT FROM EXCLUDED.name
+                  OR bridge_zulip_v5_topics.max_id<EXCLUDED.max_id""",
+            (
+                topic.uuid,
+                topic.stream_id,
+                topic.name,
+                topic.max_id,
+                messenger_helpers._database_timestamp(topic.created_at),
+                messenger_helpers._database_timestamp(topic.updated_at),
+            ),
+        )
+        return cls.objects.get_one(filters={"uuid": filters.EQ(topic.uuid)})
+
 
 class ZulipMessage(
     models.ModelWithUUID,
@@ -2165,6 +2196,8 @@ class ImportHistoryContent(AbstractZulipTaskContent):
             raise exceptions.ValidationErrorException()
 
     def execute(self, task: "Task") -> None:
+        if getattr(self, "_prepared_error", None) is not None:
+            raise self._prepared_error
         account = external_models.ExternalAccount.objects.get_one(
             filters={
                 "uuid": filters.EQ(task.external_account_uuid),
@@ -2175,13 +2208,22 @@ class ImportHistoryContent(AbstractZulipTaskContent):
             raise ExternalAccountIdPendingError(
                 "Waiting for the importing account's Zulip identity"
             )
+        prepared = getattr(self, "_prepared_import", None)
+        if prepared is not None and account.realtime_revision() != prepared[0]:
+            raise SubscriptionChangedError()
         hostname = account.get_host()
         server_namespace = sys_uuid.uuid5(sys_uuid.NAMESPACE_DNS, hostname)
         zulip = client.ZulipClient(account)
         try:
-            observed_at = datetime.datetime.now(datetime.timezone.utc)
+            observed_at = (
+                prepared[1]
+                if prepared is not None
+                else datetime.datetime.now(datetime.timezone.utc)
+            )
             messages = sorted(
-                zulip.get_messages(self.first_message_id, self.last_message_id),
+                prepared[2]
+                if prepared is not None
+                else zulip.get_messages(self.first_message_id, self.last_message_id),
                 key=lambda data: data["id"],
                 reverse=True,
             )
@@ -2209,6 +2251,7 @@ class ImportHistoryContent(AbstractZulipTaskContent):
                 MessageDelivery.pending_sender_ids(account) if messages else set()
             )
             imported_contents = []
+            topics = {}
             for data in messages:
                 if (
                     self.since is not None
@@ -2312,21 +2355,14 @@ class ImportHistoryContent(AbstractZulipTaskContent):
                     if channel.channel_type == ZulipChannelType.CHANNEL.value
                     else "Zulip"
                 )
-                topic = ZulipTopic.objects.get_one_or_none(
-                    filters={"uuid": filters.EQ(topic_uuid)},
-                )
-                if topic is None:
-                    topic = ZulipTopic(
+                if topic_uuid not in topics:
+                    topics[topic_uuid] = ZulipTopic.observe(
                         uuid=topic_uuid,
                         stream_id=channel.stream_id,
                         name=topic_name,
                         max_id=data["id"],
                     )
-                    topic.insert()
-                elif data["id"] > topic.max_id or topic.name != topic_name:
-                    topic.name = topic_name
-                    topic.max_id = max(topic.max_id, data["id"])
-                    topic.update()
+                topic = topics[topic_uuid]
                 message = ZulipMessage.objects.get_one_or_none(
                     filters={
                         "external_account_uuid": filters.EQ(account.uuid),
@@ -2434,13 +2470,34 @@ class ImportHistoryContent(AbstractZulipTaskContent):
                     ):
                         state.do()
                 converter = content_conversion.ConversionContext(account)
+                converter.prefetch(
+                    [
+                        {**data, "content": content.zulip_content}
+                        for content, data, _stream in imported_contents
+                    ]
+                )
                 for content, data, stream_uuid in imported_contents:
                     content.convert(converter, data, stream_uuid, zulip)
+                if task.queue == "realtime":
+                    Task(
+                        project_id=task.project_id,
+                        external_account_uuid=account.uuid,
+                        realtime_event_uuid=task.realtime_event_uuid,
+                        priority=TASK_PRIORITY_REALTIME_MESSAGE,
+                        content=ReconcileRealtimeContent(
+                            message_ids=[
+                                data["id"]
+                                for _content, data, _stream in imported_contents
+                            ]
+                        ),
+                    ).insert()
         finally:
             zulip.close()
 
     def on_error(self, task: "Task", error: Exception) -> None:
-        if isinstance(
+        if isinstance(error, SubscriptionChangedError):
+            task.status = TaskStatus.CANCEL.value
+        elif isinstance(
             error, (DeliveryPendingError, content_conversion.ConversionPendingError)
         ):
             task.status = TaskStatus.RETRY.value
@@ -2694,19 +2751,23 @@ class OutboundMessageContent(AbstractTaskContent):
             contexts.Context()
             .get_session()
             .execute(
-                "SELECT status, lease_expires_at FROM bridge_zulip_v5_tasks WHERE uuid=%s FOR UPDATE",
+                "SELECT status, lease_owner, lease_expires_at FROM bridge_zulip_v5_tasks WHERE uuid=%s FOR UPDATE",
                 (task.uuid,),
             )
             .fetchone()
         )
         return row["status"] in ("new", "waiting", "retry") and (
-            row["lease_expires_at"] is None
+            (
+                getattr(task, "_worker_owner", None) is not None
+                and row["lease_owner"] == task._worker_owner
+            )
+            or row["lease_expires_at"] is None
             or row["lease_expires_at"]
             <= datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
         )
 
     def claim(self, task):
-        task.lease_owner = sys_uuid.uuid4()
+        task.lease_owner = getattr(task, "_worker_owner", None) or sys_uuid.uuid4()
         task.lease_expires_at = datetime.datetime.now(
             datetime.timezone.utc
         ) + datetime.timedelta(minutes=2)
@@ -2943,23 +3004,53 @@ class ConvertMessageContent(AbstractTaskContent):
             )
             .fetchall()
         )
+        contents = (
+            {
+                content.uuid: content
+                for content in MessageContent.objects.get_all(
+                    filters={"uuid": filters.In([row["uuid"] for row in rows])}
+                )
+            }
+            if rows
+            else {}
+        )
         converters = {}
+        for account_uuid in dict.fromkeys(row["external_account_uuid"] for row in rows):
+            converters[account_uuid] = None
+            try:
+                with utils.savepoint():
+                    account = external_models.ExternalAccount.objects.get_one(
+                        filters={"uuid": filters.EQ(account_uuid)}
+                    )
+                    converter = content_conversion.ConversionContext(account)
+                    converter.prefetch(
+                        [
+                            {
+                                "id": row["message_id"],
+                                "content": contents[row["uuid"]].zulip_content,
+                            }
+                            for row in rows
+                            if row["external_account_uuid"] == account_uuid
+                        ]
+                    )
+                    converters[account_uuid] = converter
+            except Exception:
+                LOG.exception(
+                    "Failed to prefetch Zulip content; resolving messages individually"
+                )
         for row in rows:
             try:
                 with utils.savepoint():
                     account_uuid = row["external_account_uuid"]
-                    if account_uuid not in converters:
+                    content = contents[row["uuid"]]
+                    converter = converters[account_uuid]
+                    if converter is None:
                         account = external_models.ExternalAccount.objects.get_one(
                             filters={"uuid": filters.EQ(account_uuid)}
                         )
-                        converters[account_uuid] = content_conversion.ConversionContext(
-                            account
-                        )
-                    content = MessageContent.objects.get_one(
-                        filters={"uuid": filters.EQ(row["uuid"])}
-                    )
+                        converter = content_conversion.ConversionContext(account)
                     content.convert(
-                        converters[account_uuid],
+                        converter,
                         {
                             "id": row["message_id"],
                             "sender_id": row["sender_id"],
@@ -2996,6 +3087,65 @@ class ConvertMessageContent(AbstractTaskContent):
         task.next_retry_at = datetime.datetime.now(
             datetime.timezone.utc
         ) + datetime.timedelta(seconds=10)
+
+
+class ReconcileRealtimeContent(AbstractTaskContent):
+    """Publish only the messages touched by a realtime import, in bounded steps."""
+
+    KIND = "reconcile_realtime"
+    message_ids = properties.property(
+        types.TypedList(types.Integer(min_value=1)), required=True
+    )
+
+    def execute(self, task):
+        session = contexts.Context().get_session()
+        rows = session.execute(
+            """SELECT messenger_uuid_v5(observed.project_id,observed.message_uuid::text) AS message_uuid,
+                      channel.stream_uuid,observed.topic AS topic_uuid
+               FROM bridge_zulip_v5_messages AS observed
+               JOIN bridge_zulip_v5_channels AS channel ON channel.uuid=observed.channel
+               WHERE observed.project_id=%s AND observed.external_account_uuid=%s
+                 AND observed.message_id=ANY(%s)""",
+            (task.project_id, task.external_account_uuid, self.message_ids),
+        ).fetchall()
+        if not rows:
+            return
+        streams = list({row["stream_uuid"] for row in rows})
+        topics = list({row["topic_uuid"] for row in rows})
+        messages = list({row["message_uuid"] for row in rows})
+        processed = 0
+        for model, scope in (
+            (ZulipStreamState, {"stream_uuid": filters.In(streams)}),
+            (ZulipStreamBindingState, {"stream_uuid": filters.In(streams)}),
+            (ZulipTopicState, {"topic_uuid": filters.In(topics)}),
+        ):
+            if processed == 16:
+                break
+            states = model.objects.get_all(
+                filters={"project_id": filters.EQ(task.project_id), **scope},
+                limit=16 - processed,
+            )
+            for state in states:
+                state.do()
+            processed += len(states)
+        if processed < 16:
+            processed += ZulipMessageState.reconcile_batch(
+                16 - processed, project_id=task.project_id, message_uuids=messages
+            )
+        if processed:
+            Task(
+                project_id=task.project_id,
+                external_account_uuid=task.external_account_uuid,
+                realtime_event_uuid=task.realtime_event_uuid,
+                priority=task.priority,
+                content=self,
+            ).insert()
+
+    def on_error(self, task, error):
+        task.status = TaskStatus.RETRY.value
+        task.next_retry_at = datetime.datetime.now(
+            datetime.timezone.utc
+        ) + datetime.timedelta(seconds=3)
 
 
 class RefreshMessageCountersContent(AbstractTaskContent):
@@ -3080,6 +3230,7 @@ class ReconciliationContent(AbstractTaskContent):
 
 
 TASK_CONTENT_TYPE = types_dynamic.KindModelSelectorType(
+    types_dynamic.KindModelType(ReconcileRealtimeContent),
     types_dynamic.KindModelType(ConvertMessageContent),
     types_dynamic.KindModelType(UpdateReactionContent),
     types_dynamic.KindModelType(UpdateMessageFlagsContent),
@@ -3113,6 +3264,11 @@ class Task(
     orm.SQLStorableMixin,
 ):
     __tablename__ = "bridge_zulip_v5_tasks"
+
+    queue = properties.property(
+        types.Enum(["realtime", "background"]), default="background"
+    )
+    concurrency_key = properties.property(types.String(), default="", read_only=True)
 
     message_created_at = properties.property(
         types.UTCDateTimeZ(),
@@ -3162,6 +3318,24 @@ class Task(
     )
 
     def __init__(self, **kwargs: object) -> None:
+        if "queue" not in kwargs and kwargs["content"].kind in (
+            "send_message",
+            "edit_message",
+            "update_message_flags",
+            "update_reaction",
+            "initialize_connection",
+            "reconcile_realtime",
+        ):
+            kwargs["queue"] = "realtime"
+        if "concurrency_key" not in kwargs:
+            account_uuid = kwargs.get("external_account_uuid")
+            kwargs["concurrency_key"] = (
+                f"{kwargs.get('project_id')}:catalog"
+                if kwargs["content"].kind in ("import_users", "import_channels")
+                else f"{kwargs.get('project_id')}:{account_uuid}"
+                if account_uuid is not None
+                else kwargs["content"].kind
+            )
         super().__init__(**kwargs)
         if (
             self.status == TaskStatus.NEW.value
@@ -3222,9 +3396,10 @@ class Task(
             )
             if value is not None
         )
-        self.queue_wait_time = (self.queue_wait_time or 0.0) + max(
-            0.0, (now - ready_at).total_seconds()
-        )
+        if getattr(self, "_worker_owner", None) is None:
+            self.queue_wait_time = (self.queue_wait_time or 0.0) + max(
+                0.0, (now - ready_at).total_seconds()
+            )
         started = time.monotonic()
         try:
             yield
@@ -3712,6 +3887,7 @@ class RealtimeEvent(
                 priority=priority,
                 backfill_uuid=backfill_uuid,
                 realtime_event_uuid=self.uuid,
+                queue="background" if backfill_uuid is not None else "realtime",
                 content=content,
             ).insert()
 

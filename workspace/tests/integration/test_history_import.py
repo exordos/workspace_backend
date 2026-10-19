@@ -141,7 +141,7 @@ def test_timing_migration_preserves_unknown_history_and_round_trips(task_queue, 
             "SELECT status FROM bridge_zulip_v5_tasks WHERE uuid = %s", (task.uuid,)
         ).fetchone() == ("done",)
     finally:
-        engine.apply_migration(migration)
+        engine.apply_migration(engine.get_latest_migration())
     restored = _stored(task)
     assert restored.status == "done"
     assert restored.execution_time is restored.queue_wait_time is None
