@@ -26,7 +26,7 @@ from gcl_looper.services import basic
 
 from workspace.common import topic_summary_opts
 from workspace.messenger_api.dm import helpers as messenger_dm_helpers
-from workspace.messenger_api.dm import read_state
+from workspace.messenger_api.dm import schema
 from workspace.messenger_api.api import sql_canonical_store
 from workspace.messenger_api import topic_summarization
 from workspace.services.messenger_workers import projection_wakeup
@@ -34,8 +34,6 @@ from workspace.services.messenger_workers import v2_projection
 
 LOG = logging.getLogger(__name__)
 EVENT_PRUNE_INTERVAL_SECONDS = 5 * 60
-READ_STATE_FAILURE_BACKOFF_BASE_SECONDS = 5.0
-READ_STATE_FAILURE_BACKOFF_MAX_SECONDS = 5 * 60.0
 V2_METRICS_LOG_INTERVAL_SECONDS = 30
 V2_IDLE_SLEEP_SECONDS = 0.5
 
@@ -45,16 +43,8 @@ def database_session_context() -> typing.Iterator[typing.Any]:
     """Own one transaction at a worker or operator-command boundary."""
     ctx = contexts.Context()
     with ctx.session_manager() as session:
-        read_state.lock_read_state_schema_shared(session)
+        schema.lock_shared(session)
         yield session
-
-
-def _read_state_failure_backoff_seconds(failure_count: int) -> float:
-    exponent = min(max(failure_count - 1, 0), 16)
-    return min(
-        READ_STATE_FAILURE_BACKOFF_BASE_SECONDS * (2**exponent),
-        READ_STATE_FAILURE_BACKOFF_MAX_SECONDS,
-    )
 
 
 class MessengerWorkerAgent(basic.BasicService):
@@ -63,10 +53,6 @@ class MessengerWorkerAgent(basic.BasicService):
         event_retention: datetime.timedelta = (sql_canonical_store.EVENT_RETENTION),
         event_prune_interval_seconds: int = EVENT_PRUNE_INTERVAL_SECONDS,
         event_prune_batch_size: int = (sql_canonical_store.EVENT_PRUNE_BATCH_SIZE),
-        read_state_compaction_enabled: bool = False,
-        read_state_cleanup_enabled: bool = False,
-        read_state_batch_size: int = read_state.COMPACTION_BATCH_SIZE,
-        read_state_max_batches_per_iteration: int = 1,
         v2_projection_enabled: bool = False,
         v2_projection_max_tasks_per_iteration: int = 100,
         v2_fanout_batch_size: int = v2_projection.DEFAULT_FANOUT_BATCH_SIZE,
@@ -93,13 +79,6 @@ class MessengerWorkerAgent(basic.BasicService):
         self._event_retention = event_retention
         self._event_prune_interval_seconds = event_prune_interval_seconds
         self._event_prune_batch_size = event_prune_batch_size
-        self._read_state_compaction_enabled = read_state_compaction_enabled
-        self._read_state_cleanup_enabled = read_state_cleanup_enabled
-        self._read_state_batch_size = read_state_batch_size
-        self._read_state_max_batches_per_iteration = (
-            read_state_max_batches_per_iteration
-        )
-        self._read_state_failures: dict[object, tuple[int, float]] = {}
         self._v2_projection_enabled = v2_projection_enabled
         self._v2_projection_max_tasks_per_iteration = (
             v2_projection_max_tasks_per_iteration
@@ -176,64 +155,6 @@ class MessengerWorkerAgent(basic.BasicService):
                 )
         except Exception:
             LOG.exception("Failed to refresh stale Workspace presence")
-
-        if self._read_state_compaction_enabled:
-            for _batch in range(self._read_state_max_batches_per_iteration):
-                retry_now = time.monotonic()
-                excluded_projects = {
-                    project_id
-                    for project_id, (_failure_count, retry_at) in (
-                        self._read_state_failures.items()
-                    )
-                    if retry_at > retry_now
-                }
-                try:
-                    with database_session_context() as session:
-                        read_state_maintenance = read_state.maintain_next_project(
-                            session,
-                            batch_size=self._read_state_batch_size,
-                            cleanup_enabled=self._read_state_cleanup_enabled,
-                            excluded_project_ids=excluded_projects,
-                        )
-                except read_state.MaintenanceProjectError as error:
-                    failure_now = time.monotonic()
-                    failure_count = (
-                        self._read_state_failures.get(
-                            error.project_id,
-                            (0, 0.0),
-                        )[0]
-                        + 1
-                    )
-                    backoff = _read_state_failure_backoff_seconds(
-                        failure_count,
-                    )
-                    self._read_state_failures[error.project_id] = (
-                        failure_count,
-                        failure_now + backoff,
-                    )
-                    LOG.exception(
-                        "Failed to maintain compact Workspace read state",
-                        extra={
-                            "project_id": str(error.project_id),
-                            "retry_in_seconds": backoff,
-                        },
-                    )
-                    continue
-                except Exception:
-                    LOG.exception("Failed to maintain compact Workspace read state")
-                    break
-                if read_state_maintenance is None:
-                    break
-                action, project_id, processed = read_state_maintenance
-                self._read_state_failures.pop(project_id, None)
-                LOG.info(
-                    "Completed bounded Workspace read-state maintenance",
-                    extra={
-                        "action": action,
-                        "project_id": str(project_id),
-                        "processed": processed,
-                    },
-                )
 
         self._summarize_one_topic()
         if self._v2_projection_enabled and not processed_v2:

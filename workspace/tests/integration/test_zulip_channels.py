@@ -418,6 +418,7 @@ def test_channel_import_handles_provider_errors(
         assert pending[0].not_before_at is not None
 
 
+@pytest.mark.pre_retirement_schema
 def test_channel_type_migration_preserves_channels_and_enforces_direct_references(
     _database,
 ):
@@ -523,6 +524,7 @@ def test_channel_type_migration_preserves_channels_and_enforces_direct_reference
             engine.apply_migration(migration)
 
 
+@pytest.mark.pre_retirement_schema
 @pytest.mark.parametrize("action", ["delete_account", "delete_stream", "rollback"])
 def test_channel_account_and_stream_references(_database, action):
     migration = (
@@ -606,6 +608,7 @@ def test_channel_account_and_stream_references(_database, action):
                 )
 
 
+@pytest.mark.pre_retirement_schema
 def test_unmapped_channel_migration_round_trip(_database):
     migration = "0201-Allow-unmapped-Zulip-channels-and-enforce-account-stream-identity-42e7cb.py"
     with conftest.isolated_migration_database(
@@ -670,6 +673,7 @@ def test_unmapped_channel_migration_round_trip(_database):
             ).fetchall() == [(stream_uuid,), (stream_uuid,)]
 
 
+@pytest.mark.pre_retirement_schema
 def test_deterministic_channel_uuid_migration_backfills_and_restores_constraints(
     _database,
 ):

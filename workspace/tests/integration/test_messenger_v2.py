@@ -17,12 +17,8 @@ import pytest
 from restalchemy.common import contexts
 from restalchemy.storage.sql import migrations as ra_migrations
 
-from workspace.messenger_api import events as messenger_events
-from workspace.tests.integration import legacy_store
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.api import store_factory
-from workspace.messenger_api.dm import helpers as messenger_helpers
-from workspace.messenger_api.dm import message_payloads
 from workspace.messenger_api.dm import models as messenger_models
 from workspace.services.messenger_workers import v2_projection
 from workspace.tests.integration import conftest
@@ -43,45 +39,16 @@ TOMBSTONE_MIRROR_MIGRATION = "0188-Skip-tombstoned-streams-in-binding-mirrors-fd
 
 
 def _truncate_messenger_test_data():
-    """Fence this module from the integration suite's session-scoped data."""
     with contexts.Context().session_manager() as session:
-        session.execute(
-            """
+        session.execute("""
             CREATE TEMP TABLE messenger_v2_test_system_users
                 (LIKE m_workspace_users INCLUDING ALL) ON COMMIT DROP;
-            INSERT INTO messenger_v2_test_system_users
-            SELECT * FROM m_workspace_users
-            WHERE uuid = '00000000-0000-0000-0000-000000000000'::uuid;
-
-            CREATE TEMP TABLE messenger_v2_test_system_folders
-                (LIKE m_folders INCLUDING ALL) ON COMMIT DROP;
-            INSERT INTO messenger_v2_test_system_folders
-            SELECT * FROM m_folders
-            WHERE uuid IN (
-                '00000000-0000-0000-0000-000000000000'::uuid,
-                '00000000-0000-0000-0000-000000000001'::uuid,
-                '00000000-0000-0000-0000-000000000002'::uuid
-            );
-
-            TRUNCATE TABLE
-                m_workspace_users,
-                m_workspace_event_audience_snapshots_v1,
-                m_workspace_read_state_projects_v1,
-                m_workspace_read_state_compaction_v1,
-                m_workspace_user_read_chunks_v1,
-                m_workspace_message_mentions_v1,
-                m_workspace_user_topic_read_stats_v1,
-                m_workspace_topic_message_stats_v1,
-                m_external_accounts_v2
-            RESTART IDENTITY CASCADE;
-
-            INSERT INTO m_workspace_users
-            SELECT * FROM messenger_v2_test_system_users;
-            INSERT INTO m_folders
-            SELECT * FROM messenger_v2_test_system_folders;
-            """,
-            (),
-        )
+            INSERT INTO messenger_v2_test_system_users SELECT * FROM m_workspace_users
+                WHERE uuid='00000000-0000-0000-0000-000000000000';
+            TRUNCATE TABLE m_workspace_users, m_workspace_event_audience_snapshots_v1,
+                m_external_accounts_v2 RESTART IDENTITY CASCADE;
+            INSERT INTO m_workspace_users SELECT * FROM messenger_v2_test_system_users;
+        """)
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -100,7 +67,7 @@ def _production_v2_store():
     try:
         yield
     finally:
-        api_store.configure_store_factory(legacy_store.LegacyMessengerStoreFactory())
+        api_store.configure_store_factory(store_factory.build_store_factory())
 
 
 @pytest.fixture
@@ -112,30 +79,6 @@ def migration_engine(_database):
     finally:
         _truncate_messenger_test_data()
         engine.apply_migration(engine.get_latest_migration())
-
-
-def _seed_legacy_message(api, stream_uuid, topic_uuid, content):
-    """Seed a persisted legacy message and its historical message events."""
-    with contexts.Context().session_manager() as session:
-        message = messenger_helpers.create_workspace_user_message(
-            project_id=sys_uuid.UUID(api.project_id),
-            user_uuid=sys_uuid.UUID(api.user_uuid),
-            stream_uuid=sys_uuid.UUID(stream_uuid),
-            topic_uuid=sys_uuid.UUID(topic_uuid),
-            payload=message_payloads.MarkdownPayload(content=content),
-            session=session,
-            compact_events=True,
-            return_visible=False,
-            emit_events=False,
-        )
-        messenger_events.create_message_events(
-            project_id=message.project_id,
-            message=message,
-            recipients=message.get_recipients(session=session),
-            session=session,
-            compact=True,
-        )
-        return str(message.uuid)
 
 
 @pytest.fixture(autouse=True)
@@ -420,14 +363,9 @@ def test_native_v2_topic_deletion_drains_derived_projections(api, db):
 
 
 @pytest.mark.parametrize("resource", ("message", "topic"))
-@pytest.mark.parametrize("repair_pending", (False, True))
 def test_native_v2_deletion_before_stream_purge_drains_snapshots(
-    api, workspace_api, db, resource, repair_pending, migration_engine
+    api, workspace_api, db, resource
 ):
-    migration = migration_engine._load_migrations()[TOMBSTONE_MIRROR_MIGRATION]
-    if repair_pending:
-        with contexts.Context().session_manager() as session:
-            migration.downgrade(session)
     response = api.post(STREAMS, json={"name": "Delivery snapshot deletion"})
     assert response.status_code == 201, response.text
     stream = response.json()
@@ -470,31 +408,6 @@ def test_native_v2_deletion_before_stream_purge_drains_snapshots(
     assert api.get(target).status_code == 404
     assert api.get(f"{STREAMS}{stream['uuid']}").status_code == 404
 
-    if repair_pending:
-        with db.cursor() as cursor:
-            cursor.execute(
-                "SELECT uuid, status, attempts, created_at, updated_at "
-                "FROM messenger_projection_tasks WHERE project_id = %s "
-                "AND status = 'pending' ORDER BY uuid",
-                (api.project_id,),
-            )
-            pending = cursor.fetchall()
-        assert len(pending) >= 2
-        assert all(row[1] == "pending" and row[2] == 0 for row in pending)
-        with pytest.raises(psycopg.errors.InFailedSqlTransaction) as failure:
-            _drain()
-        assert isinstance(failure.value.__context__, psycopg.errors.ForeignKeyViolation)
-        with db.cursor() as cursor:
-            cursor.execute(
-                "SELECT uuid, status, attempts, created_at, updated_at "
-                "FROM messenger_projection_tasks WHERE project_id = %s "
-                "AND status = 'pending' ORDER BY uuid",
-                (api.project_id,),
-            )
-            assert cursor.fetchall() == pending
-        with contexts.Context().session_manager() as session:
-            migration.upgrade(session)
-
     assert _drain() >= 1
 
     with db.cursor() as cursor:
@@ -514,16 +427,11 @@ def test_native_v2_deletion_before_stream_purge_drains_snapshots(
             SELECT
                 (SELECT count(*) FROM messenger_streams WHERE project_id = %s),
                 (SELECT count(*) FROM messenger_topics WHERE project_id = %s),
-                (SELECT count(*) FROM messenger_messages WHERE project_id = %s),
-                (SELECT count(*) FROM m_workspace_streams WHERE project_id = %s),
-                (SELECT count(*) FROM m_workspace_stream_bindings
-                 WHERE project_id = %s),
-                (SELECT count(*) FROM m_workspace_stream_topics
-                 WHERE project_id = %s)
+                (SELECT count(*) FROM messenger_messages WHERE project_id = %s)
             """,
-            (api.project_id,) * 6,
+            (api.project_id,) * 3,
         )
-        assert cursor.fetchone() == (0, 0, 0, 0, 0, 0)
+        assert cursor.fetchone() == (0, 0, 0)
 
     response = workspace_api.get(EVENTS, user=api.user_uuid, project=api.project_id)
     assert response.status_code == 200, response.text
@@ -1648,9 +1556,9 @@ def test_native_v2_keeps_folder_file_and_draft_contracts(api, db):
     with db.cursor() as cursor:
         cursor.execute(
             """
-            SELECT count(*) FROM m_folder_items
+            SELECT count(*) FROM messenger_folder_items
             WHERE project_id = %s AND user_uuid = %s
-              AND folder_uuid = %s AND stream_uuid = %s
+              AND folder_uuid = %s AND stream_uuid = %s AND pinned_at IS NOT NULL
             """,
             (
                 api.project_id,
@@ -1809,82 +1717,6 @@ def test_native_v2_isolates_projects_and_rejects_non_members(api, workspace_api,
     current_events = workspace_api.get(EVENTS, params={"page_limit": 500})
     assert current_events.status_code == 200, current_events.text
     assert all(event["project_id"] == api.project_id for event in current_events.json())
-
-
-def test_native_v2_rolling_legacy_message_update_converges_mentions(api, db):
-    peer_uuid = sys_uuid.uuid4()
-    conftest.seed_workspace_user(db, peer_uuid, f"user-{peer_uuid}")
-    _register_project_user(db, api.project_id, peer_uuid)
-    stream = api.post(
-        STREAMS,
-        json={
-            "name": "Rolling legacy writer",
-            "description": "",
-            "source_name": "native",
-            "source": {"kind": "native"},
-        },
-    ).json()
-    _drain()
-    api.post(
-        f"{STREAMS}{stream['uuid']}/actions/add_users/invoke",
-        json={"member": [str(peer_uuid)]},
-    )
-    _drain()
-    canonical_uuid = sys_uuid.uuid4()
-    message = api.post(
-        MESSAGES,
-        json={
-            "uuid": str(canonical_uuid),
-            "stream_uuid": stream["uuid"],
-            "topic_uuid": stream["default_topic_uuid"],
-            "payload": {
-                "kind": "markdown",
-                "content": f"hello [peer](urn:user:{peer_uuid})",
-            },
-        },
-    ).json()
-    _drain()
-    assert api.get(f"{MESSAGES}{message['uuid']}", user=peer_uuid).json()["mentioned"]
-
-    with db.cursor() as cursor:
-        cursor.execute(
-            """
-            SELECT legacy.uuid
-            FROM m_workspace_messages AS legacy
-            JOIN messenger_message_placements AS placement
-              ON placement.project_id = legacy.project_id
-             AND legacy.uuid = COALESCE(
-                    placement.legacy_public_uuid, placement.uuid
-                 )
-            WHERE placement.project_id = %s AND placement.uuid = %s
-            """,
-            (api.project_id, message["uuid"]),
-        )
-        legacy_uuid = cursor.fetchone()[0]
-        cursor.execute(
-            """
-            UPDATE m_workspace_messages
-            SET payload = '{"kind":"markdown","content":"legacy edit"}'::jsonb,
-                updated_at = NOW()
-            WHERE project_id = %s AND uuid = %s
-            """,
-            (api.project_id, legacy_uuid),
-        )
-    _drain()
-    reloaded = api.get(f"{MESSAGES}{message['uuid']}", user=peer_uuid)
-    assert reloaded.status_code == 200, reloaded.text
-    assert reloaded.json()["payload"]["content"] == "legacy edit"
-    assert reloaded.json()["mentioned"] is False
-    with db.cursor() as cursor:
-        cursor.execute(
-            """
-            SELECT count(*)
-            FROM messenger_messages
-            WHERE project_id = %s AND uuid IN (%s, %s)
-            """,
-            (api.project_id, canonical_uuid, legacy_uuid),
-        )
-        assert cursor.fetchone()[0] == 1
 
 
 def test_native_v2_scheduler_preserves_fifo_within_fanout_lane(api, monkeypatch):

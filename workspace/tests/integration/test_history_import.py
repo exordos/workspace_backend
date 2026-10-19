@@ -885,6 +885,7 @@ def test_error_handler_failure_rolls_back_and_saves_terminal_error(
     assert account.settings == {"server_url": "https://zulip.example.com"}
 
 
+@pytest.mark.pre_retirement_schema
 def test_priority_migration_updates_pending_tasks_and_preserves_completed_tasks(
     _database,
 ):
@@ -980,6 +981,7 @@ def test_priority_migration_updates_pending_tasks_and_preserves_completed_tasks(
             engine.apply_migration(migration)
 
 
+@pytest.mark.pre_retirement_schema
 def test_waiting_status_migration_preserves_schedules_and_rolls_back(_database):
     migration = "0207-Add-waiting-status-for-scheduled-bridge-tasks-e1b0e4.py"
     with conftest.isolated_migration_database(
@@ -1042,6 +1044,7 @@ def test_waiting_status_migration_preserves_schedules_and_rolls_back(_database):
             engine.apply_migration(migration)
 
 
+@pytest.mark.pre_retirement_schema
 def test_task_metadata_and_cancel_migrations_round_trip(_database):
     metadata_migration = "0197-Move-external-account-reference-to-task-5af16f.py"
     cancel_migration = "0198-Add-task-cancellation-status-452cb8.py"
@@ -1126,6 +1129,7 @@ def test_task_metadata_and_cancel_migrations_round_trip(_database):
             )
 
 
+@pytest.mark.pre_retirement_schema
 @pytest.mark.parametrize("source", ["created_event", "single_project", "ambiguous"])
 def test_account_and_task_project_migration_preserves_data(_database, source):
     migration = "0199-Scope-external-accounts-and-Zulip-tasks-to-projects-4fb70b.py"

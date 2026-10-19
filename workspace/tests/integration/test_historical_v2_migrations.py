@@ -15,9 +15,11 @@ from restalchemy.storage.sql import migrations as ra_migrations
 
 from workspace.tests.integration import legacy_store
 from workspace.messenger_api.api import store as api_store
-from workspace.messenger_api.api import store_factory
+from workspace.tests.integration.legacy_messenger import store_factory
 from workspace.services.messenger_workers import v2_projection
 from workspace.tests.integration import conftest
+
+pytestmark = pytest.mark.pre_retirement_schema
 
 
 V1 = "/v1"
@@ -142,9 +144,7 @@ def _production_v2_store():
     try:
         yield
     finally:
-        api_store.configure_store_factory(
-            legacy_store.LegacyMessengerStoreFactory()
-        )
+        api_store.configure_store_factory(legacy_store.LegacyMessengerStoreFactory())
 
 
 @pytest.fixture(autouse=True)
@@ -194,6 +194,7 @@ def _register_project_user(db, project_uuid, user_uuid):
         )
 
 
+@pytest.mark.pre_retirement_schema
 def test_native_read_repair_migration_preserves_compact_reads(api, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
     engine.rollback_migration(PROVIDER_OWNER_READ_REPAIR_MIGRATION)
@@ -346,6 +347,7 @@ def test_native_read_repair_migration_preserves_compact_reads(api, db):
         engine.apply_migration(PROVIDER_PARTICIPANT_STATE_REPAIR_MIGRATION)
 
 
+@pytest.mark.pre_retirement_schema
 def test_v2_compatibility_read_repair_restores_all_canonical_reads(api, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
     peer_uuid = sys_uuid.uuid4()
@@ -597,12 +599,11 @@ def test_v2_compatibility_read_repair_restores_all_canonical_reads(api, db):
         _truncate_messenger_test_data()
 
 
+@pytest.mark.pre_retirement_schema
 def test_native_v2_migration_rewrites_and_rolls_back_legacy_message_identity(api, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
     audience_uuid = None
-    api_store.configure_store_factory(
-        legacy_store.LegacyMessengerStoreFactory()
-    )
+    api_store.configure_store_factory(legacy_store.LegacyMessengerStoreFactory())
     engine.rollback_migration(V2_MIGRATION)
     try:
         stream_uuid = conftest.seed_user_stream(
@@ -716,9 +717,7 @@ def test_native_v2_migration_rewrites_and_rolls_back_legacy_message_identity(api
                 native_v2_uuid,
             }
 
-        api_store.configure_store_factory(
-            legacy_store.LegacyMessengerStoreFactory()
-        )
+        api_store.configure_store_factory(legacy_store.LegacyMessengerStoreFactory())
         engine.rollback_migration(V2_MIGRATION)
         restored = api.get(f"{MESSAGES}{legacy_uuid}")
         assert restored.status_code == 200, restored.text
@@ -777,11 +776,10 @@ def test_native_v2_migration_rewrites_and_rolls_back_legacy_message_identity(api
         api_store.configure_store_factory(store_factory.build_store_factory())
 
 
+@pytest.mark.pre_retirement_schema
 def test_native_v2_migration_fences_revoked_historical_events(api, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
-    api_store.configure_store_factory(
-        legacy_store.LegacyMessengerStoreFactory()
-    )
+    api_store.configure_store_factory(legacy_store.LegacyMessengerStoreFactory())
     engine.rollback_migration(V2_MIGRATION)
     try:
         peer_uuid = sys_uuid.uuid4()
@@ -873,13 +871,12 @@ def test_native_v2_migration_fences_revoked_historical_events(api, db):
         api_store.configure_store_factory(store_factory.build_store_factory())
 
 
+@pytest.mark.pre_retirement_schema
 def test_native_v2_migration_requires_explicit_large_cutover_authorization(
     api, db, monkeypatch
 ):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
-    api_store.configure_store_factory(
-        legacy_store.LegacyMessengerStoreFactory()
-    )
+    api_store.configure_store_factory(legacy_store.LegacyMessengerStoreFactory())
     engine.rollback_migration(V2_MIGRATION)
     try:
         stream_uuid = conftest.seed_user_stream(
@@ -942,13 +939,12 @@ def test_native_v2_migration_requires_explicit_large_cutover_authorization(
         api_store.configure_store_factory(store_factory.build_store_factory())
 
 
+@pytest.mark.pre_retirement_schema
 def test_native_v2_migration_collapses_realm_chat_aliases_and_keeps_native_rows(
     api, db
 ):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
-    api_store.configure_store_factory(
-        legacy_store.LegacyMessengerStoreFactory()
-    )
+    api_store.configure_store_factory(legacy_store.LegacyMessengerStoreFactory())
     engine.rollback_migration(V2_MIGRATION)
     try:
         peer_uuid = sys_uuid.uuid4()
@@ -1254,14 +1250,13 @@ def test_native_v2_migration_collapses_realm_chat_aliases_and_keeps_native_rows(
         api_store.configure_store_factory(store_factory.build_store_factory())
 
 
+@pytest.mark.pre_retirement_schema
 @pytest.mark.parametrize("materialized", [True, False])
 def test_native_v2_migration_rejects_realm_chat_selected_in_multiple_projects(
     api, db, materialized
 ):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
-    api_store.configure_store_factory(
-        legacy_store.LegacyMessengerStoreFactory()
-    )
+    api_store.configure_store_factory(legacy_store.LegacyMessengerStoreFactory())
     engine.rollback_migration(V2_MIGRATION)
     account_uuids = (sys_uuid.uuid4(), sys_uuid.uuid4())
     chat_uuids = (sys_uuid.uuid4(), sys_uuid.uuid4())

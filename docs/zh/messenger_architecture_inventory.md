@@ -1,5 +1,10 @@
 # 建议架构的正规库 Messenger
 
+> Historical reference: the rolling compatibility tables and compact read-state
+> maintenance were retired by migration `0231`. See
+> [the current cutover procedure](messenger_domain_model.md#retiring-the-compatibility-schema).
+
+
 状态: **提案; 机器检查的文档词典, 不 production schema**.
 
 [← 文件的主要索引](index.md) · [域名模型](messenger_domain_model.md) · [RestAlchemy API](messenger_restalchemy_api_spec.md) · [Sequence index](diagrams/sequence/README.md) · Zulip Bridge proposal

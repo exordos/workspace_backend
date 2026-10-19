@@ -8,9 +8,9 @@ import typing
 
 import uuid as sys_uuid
 
-from workspace.messenger_api import reaction_users
+from migrations import legacy_messenger_reaction_users as reaction_users
 
-from workspace.messenger_api.dm import read_state
+from migrations import legacy_messenger_read_state as read_state
 
 _PAYLOAD_REFERENCE_TABLES = (
     "m_workspace_broadcast_message_events_v1",

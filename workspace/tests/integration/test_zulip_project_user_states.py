@@ -203,6 +203,7 @@ def test_repeated_registration_repairs_missing_system_folders(
     ).fetchone() == (3,)
 
 
+@pytest.mark.pre_retirement_schema
 def test_contention_migration_bounds_existing_default_batches_and_is_reversible(
     project_user_accounts, db
 ):
@@ -313,6 +314,7 @@ def test_reconciliation_rolls_back_project_users_with_later_stages(
     ).fetchone() == (0,)
 
 
+@pytest.mark.pre_retirement_schema
 def test_project_user_state_view_migration_is_reversible(project_user_accounts, db):
     account = project_user_accounts()
     (state,) = _states(account)

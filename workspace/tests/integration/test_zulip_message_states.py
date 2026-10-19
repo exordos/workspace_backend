@@ -25,7 +25,6 @@ from workspace.messenger_api.dm import v2_models
 from workspace.services.messenger_workers import v2_projection
 from workspace.services import history_import
 from workspace.tests.integration import conftest
-from workspace.tests.integration import legacy_store
 
 
 @pytest.fixture
@@ -231,7 +230,6 @@ def test_message_state_creates_canonical_content_without_placements(
     assert deleted_event.source.kind == "zulip"
     for table in (
         "messenger_message_placements",
-        "m_workspace_messages",
         "messenger_user_message_bindings",
         "messenger_user_message_states",
     ):
@@ -274,7 +272,7 @@ def test_message_states_deduplicate_accounts_and_delete_the_root(message_sources
     with contexts.Context().session_manager():
         deletion.do()
     assert _states(first) == _messages(first) == []
-    for table in ("messenger_message_placements", "m_workspace_messages"):
+    for table in ("messenger_message_placements",):
         assert db.execute(
             f"SELECT count(*) FROM {table} WHERE project_id = %s", (first.project_id,)
         ).fetchone() == (0,)
@@ -475,6 +473,7 @@ def test_message_failure_rolls_back_all_reconciliation_stages(message_sources):
     )
 
 
+@pytest.mark.pre_retirement_schema
 def test_message_state_view_migration_is_reversible(message_sources, db):
     account, source = message_sources()
     _prepare(account)
@@ -680,6 +679,7 @@ def test_tracking_and_acknowledgement_roll_back_together(message_sources, db):
     ).fetchone() == (True,)
 
 
+@pytest.mark.pre_retirement_schema
 def test_change_migration_backfills_both_sides_and_is_reversible(message_sources, db):
     account, source = message_sources()
     other_account, other = message_sources(
@@ -918,6 +918,7 @@ def test_content_failure_rolls_back_the_payload_and_keeps_the_marks(
     assert _changes(models.ZulipMessageChange, account)[0].revision == pending.revision
 
 
+@pytest.mark.pre_retirement_schema
 def test_content_migration_backfills_marks_and_preserves_source_creation_time(
     message_sources, db
 ):
@@ -1034,7 +1035,7 @@ def _move_source(source, stream_id=None, subject="Moved", edited_at=None):
     return channel, topic
 
 
-def test_message_batch_creates_a_stable_placement_and_checks_both_api_projections(
+def test_message_batch_creates_a_stable_placement_and_checks_canonical_api_projection(
     message_sources, db, api
 ):
     account, source = message_sources()
@@ -1050,7 +1051,7 @@ def test_message_batch_creates_a_stable_placement_and_checks_both_api_projection
     assert placement.created_at == _messages(account)[0].created_at
     assert _placement_states(account) == []
     legacy = db.execute(
-        "SELECT uuid, canonical_message_uuid, created_at FROM m_workspace_messages "
+        "SELECT uuid, message_uuid, created_at FROM messenger_message_placements "
         "WHERE project_id = %s",
         (account.project_id,),
     ).fetchone()
@@ -1078,7 +1079,7 @@ def test_message_batch_creates_a_stable_placement_and_checks_both_api_projection
         assert response.json()[0]["starred"] is True
         assert response.json()[0]["mentioned"] is True
     finally:
-        api_store.configure_store_factory(legacy_store.LegacyMessengerStoreFactory())
+        api_store.configure_store_factory(store_factory.build_store_factory())
     assert _changes(models.ZulipMessageChange, account) == []
     assert len(_changes(v2_models.WorkspaceMessageChange, account)) == 1
     with contexts.Context().session_manager():
@@ -1114,7 +1115,7 @@ def test_source_moves_keep_the_placement_identity(
     assert (moved.stream_uuid, moved.topic_uuid) == (channel.stream_uuid, topic.uuid)
     assert _messages(account)[0].created_at == message.created_at
     assert db.execute(
-        "SELECT stream_uuid, topic_uuid, created_at FROM m_workspace_messages WHERE uuid = %s",
+        "SELECT stream_uuid, topic_uuid, created_at FROM messenger_message_placements WHERE uuid = %s",
         (moved.uuid,),
     ).fetchone() == (
         channel.stream_uuid,
@@ -1167,7 +1168,7 @@ def test_workspace_placement_changes_are_marked_and_repaired(message_sources):
 
 
 @pytest.mark.parametrize("deleted_root", ("source", "canonical"))
-def test_message_deletion_cascades_to_placement_and_legacy_projection(
+def test_message_deletion_cascades_to_canonical_placement(
     message_sources, db, deleted_root
 ):
     account, source = message_sources()
@@ -1183,7 +1184,8 @@ def test_message_deletion_cascades_to_placement_and_legacy_projection(
             _messages(account)[0].delete()
     assert _placements(account) == _messages(account) == []
     assert db.execute(
-        "SELECT count(*) FROM m_workspace_messages WHERE uuid = %s", (placement.uuid,)
+        "SELECT count(*) FROM messenger_message_placements WHERE uuid = %s",
+        (placement.uuid,),
     ).fetchone() == (0,)
 
 
@@ -1233,6 +1235,7 @@ def test_placement_failure_rolls_back_content_and_keeps_the_batch(
     assert _changes(models.ZulipMessageChange, account)[0].revision == pending.revision
 
 
+@pytest.mark.pre_retirement_schema
 @pytest.mark.parametrize("existing_placement", (False, True))
 def test_placement_migration_is_reversible_and_backfills_existing_messages(
     message_sources, db, existing_placement
@@ -1447,16 +1450,16 @@ def test_native_history_rebuild_preserves_observed_zulip_access(message_sources)
         topic_uuid=destination.uuid,
     )
     forwarded.insert()
-    membership = messenger_models.WorkspaceStreamBinding.objects.get_one(
-        filters={
-            "project_id": filters.EQ(second.project_id),
-            "user_uuid": filters.EQ(second.owner_user_uuid),
-            "stream_uuid": filters.EQ(other.channel.stream_uuid),
-        }
-    )
-    membership.role = "owner"
-    membership.update()
     with contexts.Context().session_manager() as session:
+        session.execute(
+            "UPDATE messenger_stream_bindings SET active=false, "
+            "membership_generation=membership_generation+1 "
+            "WHERE project_id=%s AND stream_uuid=%s AND user_uuid=%s",
+            (first.project_id, other.channel.stream_uuid, second.owner_user_uuid),
+        )
+    _prepare(first)
+    with contexts.Context().session_manager() as session:
+        models.ZulipMessageState.reconcile_batch(10)
         assert v2_projection.drain_projection_queue(session, str(uuid.uuid4())) > 0
         assert (
             session.execute(
@@ -1583,6 +1586,7 @@ def test_user_state_failure_rolls_back_all_message_stages(message_sources, monke
     assert _changes(models.ZulipMessageChange, account)[0].revision == revision
 
 
+@pytest.mark.pre_retirement_schema
 def test_user_message_migration_is_reversible_and_requeues_existing_placements(
     message_sources, db
 ):
@@ -1855,6 +1859,7 @@ def test_topic_preferences_follow_a_rebound_external_account(message_sources, db
     assert binding.notification_mode == "follow"
 
 
+@pytest.mark.pre_retirement_schema
 def test_topic_notification_migration_renames_dm_topics_without_changing_identity(
     message_sources, db
 ):
@@ -2484,6 +2489,7 @@ def test_counter_task_is_periodic_high_priority_and_bounded(message_sources):
     assert next_task.not_before_at >= before + datetime.timedelta(seconds=30)
 
 
+@pytest.mark.pre_retirement_schema
 def test_counter_migration_backfills_existing_imports_and_is_reversible(
     message_sources, db
 ):
@@ -2697,6 +2703,7 @@ def test_topic_creation_and_acknowledgement_roll_back_together(
     assert _topic_states(account)[0].action == "create"
 
 
+@pytest.mark.pre_retirement_schema
 def test_topic_migration_round_trip_backfills_pending_topics(message_sources, db):
     account, source = message_sources()
     _prepare(account)

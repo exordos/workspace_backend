@@ -22,7 +22,6 @@ import typing
 import uuid as sys_uuid
 
 from restalchemy.common import contexts
-from restalchemy.common import exceptions as ra_exc
 from restalchemy.dm import filters as dm_filters
 from restalchemy.dm import models
 from restalchemy.dm import properties
@@ -33,6 +32,7 @@ from workspace.common import file_storage_opts
 from workspace.common import models as common_models
 from workspace.messenger_api.dm import base
 from workspace.messenger_api.dm import message_payloads
+from workspace.messenger_api.dm import v2_models
 
 
 class ChatType(str, enum.Enum):
@@ -57,48 +57,17 @@ WorkspaceTopicNotificationMode = base.WorkspaceTopicNotificationMode
 SUMMARY_REASONING_EFFORTS = ("off", "minimal", "low", "medium", "high")
 
 
-class Folder(
-    base.WorkspaceFolderBase,
-    orm.SQLStorableMixin,
-):
-    __tablename__ = "m_folders"
+Folder = v2_models.WorkspaceFolder
 
 
 class UserFolder(
     base.WorkspaceUserFolderBase,
     orm.SQLStorableMixin,
 ):
-    __tablename__ = "m_folders_view"
+    __tablename__ = "messenger_api_user_folders_v1"
 
 
-class FolderItem(
-    base.UserScopedModelWithUUID,
-    models.ModelWithProject,
-    models.ModelWithTimestamp,
-    orm.SQLStorableMixin,
-):
-    __tablename__ = "m_folder_items"
-
-    folder_uuid = properties.property(
-        types.UUID(),
-        required=True,
-    )
-    stream_uuid = properties.property(
-        types.UUID(),
-        required=True,
-    )
-    order_index = properties.property(
-        types.AllowNone(types.Integer(max_value=2**31 - 1)),
-        default=None,
-    )
-    pinned_at = properties.property(
-        types.AllowNone(types.UTCDateTimeZ()),
-        default=None,
-    )
-    chat_type = properties.property(
-        types.Enum([t.value for t in ChatType]),
-        required=True,
-    )
+FolderItem = v2_models.WorkspaceFolderItem
 
 
 class UserFolderItem(
@@ -107,7 +76,7 @@ class UserFolderItem(
     models.ModelWithTimestamp,
     orm.SQLStorableMixin,
 ):
-    __tablename__ = "m_folder_items_created_view"
+    __tablename__ = "messenger_api_user_folder_items_v1"
 
     folder_uuid = properties.property(
         types.UUID(),
@@ -141,62 +110,6 @@ class UserFolderItem(
         types.Integer(min_value=0),
         default=0,
     )
-
-
-class SystemFolderItemBase(
-    base.UserScopedModelWithUUID,
-    models.ModelWithProject,
-    models.ModelWithTimestamp,
-    orm.SQLStorableMixin,
-):
-    folder = properties.property(
-        types.UUID(),
-        required=True,
-    )
-    stream_uuid = properties.property(
-        types.UUID(),
-        required=True,
-    )
-    order_index = properties.property(
-        types.AllowNone(types.Integer(max_value=2**31 - 1)),
-        default=None,
-    )
-    pinned_at = properties.property(
-        types.AllowNone(types.UTCDateTimeZ()),
-        default=None,
-    )
-    chat_type = properties.property(
-        types.Enum([t.value for t in ChatType]),
-        required=True,
-    )
-    unread_count = properties.property(
-        types.Integer(min_value=0),
-        default=0,
-    )
-    active_unread_count = properties.property(
-        types.Integer(min_value=0),
-        default=0,
-    )
-    passive_unread_count = properties.property(
-        types.Integer(min_value=0),
-        default=0,
-    )
-
-    @property
-    def folder_uuid(self) -> sys_uuid.UUID:
-        return self.folder
-
-
-class AllFolderItem(SystemFolderItemBase):
-    __tablename__ = "m_folder_all_items_view"
-
-
-class PersonalFolderItem(SystemFolderItemBase):
-    __tablename__ = "m_folder_private_items_view"
-
-
-class ChannelFolderItem(SystemFolderItemBase):
-    __tablename__ = "m_folder_channel_items_view"
 
 
 class WorkspaceUserStatus(str, enum.Enum):
@@ -479,15 +392,7 @@ class WorkspaceVisibleFile(WorkspaceFile):
     viewer_user_uuid = properties.property(types.AllowNone(types.UUID()), default=None)
 
 
-class WorkspaceStream(base.WorkspaceStreamBase, orm.SQLStorableMixin):
-    __tablename__ = "m_workspace_streams"
-
-    def get_recipients(self, session: typing.Any = None) -> list[sys_uuid.UUID]:
-        return get_stream_recipients(
-            project_id=self.project_id,
-            stream_uuid=self.uuid,
-            session=session,
-        )
+WorkspaceStream = v2_models.WorkspaceStream
 
 
 class WorkspaceStreamBinding(
@@ -496,7 +401,7 @@ class WorkspaceStreamBinding(
     models.ModelWithTimestamp,
     orm.SQLStorableMixin,
 ):
-    __tablename__ = "m_workspace_stream_bindings"
+    __tablename__ = "messenger_stream_bindings"
 
     stream_uuid = properties.property(
         types.UUID(),
@@ -537,10 +442,11 @@ def get_stream_recipients(
     stream_uuid: sys_uuid.UUID,
     session: typing.Any = None,
 ) -> list[sys_uuid.UUID]:
-    bindings = WorkspaceStreamBinding.objects.get_all(
+    bindings = v2_models.WorkspaceStreamBinding.objects.get_all(
         filters={
             "project_id": dm_filters.EQ(project_id),
             "stream_uuid": dm_filters.EQ(stream_uuid),
+            "active": dm_filters.EQ(True),
         },
         order_by={"user_uuid": "asc"},
         session=session,
@@ -549,7 +455,7 @@ def get_stream_recipients(
 
 
 class WorkspaceUserStream(base.WorkspaceUserStreamBase, orm.SQLStorableMixin):
-    __tablename__ = "m_workspace_user_streams"
+    __tablename__ = "messenger_api_user_streams_v1"
 
     def get_default_topic(self) -> "WorkspaceStreamTopic | None":
         if self.default_topic_uuid is None:
@@ -576,7 +482,7 @@ class WorkspaceMessageReactions(
     models.ModelWithTimestamp,
     orm.SQLStorableMixin,
 ):
-    __tablename__ = "m_workspace_message_reactions"
+    __tablename__ = "messenger_api_message_reactions_v1"
 
     message_uuid = properties.property(
         types.UUID(),
@@ -593,7 +499,7 @@ class WorkspaceMessageReactions(
 
 
 class WorkspaceVisibleMessageReaction(WorkspaceMessageReactions):
-    __tablename__ = "m_workspace_visible_message_reactions_v1"
+    __tablename__ = "messenger_api_message_reactions_v1"
 
     viewer_user_uuid = properties.property(types.UUID(), required=True)
 
@@ -831,52 +737,7 @@ class WorkspaceLLMEndpointSecret(
     envelope = properties.property(types.Dict(), required=True)
 
 
-class WorkspaceStreamTopic(
-    models.ModelWithUUID,
-    models.ModelWithProject,
-    models.ModelWithTimestamp,
-    base.WorkspaceTopicSourceBase,
-    models.CustomPropertiesMixin,
-    orm.SQLStorableMixin,
-):
-    __tablename__ = "m_workspace_stream_topics"
-
-    name = properties.property(
-        types.String(max_length=128),
-        required=True,
-    )
-    stream_uuid = properties.property(
-        types.UUID(),
-        required=True,
-    )
-    color = properties.property(
-        base.Color(),
-        default=base.random_color,
-    )
-    summary = properties.property(
-        types.AllowNone(types.String(min_length=1, max_length=4096)),
-        default=None,
-    )
-    summary_last_message_uuid = properties.property(
-        types.AllowNone(types.UUID()),
-        default=None,
-    )
-    summary_enabled = properties.property(types.Boolean(), default=True)
-    summary_system_prompt = properties.property(
-        types.AllowNone(types.String(min_length=1, max_length=16384)),
-        default=None,
-    )
-    summary_reasoning_effort = properties.property(
-        types.AllowNone(types.Enum(SUMMARY_REASONING_EFFORTS)),
-        default=None,
-    )
-
-    def get_recipients(self, session: typing.Any = None) -> list[sys_uuid.UUID]:
-        return get_stream_recipients(
-            project_id=self.project_id,
-            stream_uuid=self.stream_uuid,
-            session=session,
-        )
+WorkspaceStreamTopic = v2_models.WorkspaceStreamTopic
 
 
 class WorkspaceDraft(
@@ -916,6 +777,10 @@ class WorkspaceDraft(
     )
 
 
+class WorkspaceVisibleDraft(WorkspaceDraft):
+    __tablename__ = "messenger_api_user_drafts_v1"
+
+
 class WorkspaceUserTopic(
     base.UserScopedModelWithUUID,
     models.ModelWithProject,
@@ -923,7 +788,7 @@ class WorkspaceUserTopic(
     base.WorkspaceTopicSourceBase,
     orm.SQLStorableMixin,
 ):
-    __tablename__ = "m_workspace_user_topics_view"
+    __tablename__ = "messenger_api_user_topics_v1"
 
     name = properties.property(
         types.String(max_length=128),
@@ -996,15 +861,6 @@ class WorkspaceUserTopic(
         read_only=True,
     )
 
-    def get_flags(self) -> "WorkspaceUserTopicFlags":
-        return WorkspaceUserTopicFlags.objects.get_one(
-            filters={
-                "uuid": dm_filters.EQ(self.uuid),
-                "user_uuid": dm_filters.EQ(self.user_uuid),
-                "project_id": dm_filters.EQ(self.project_id),
-            }
-        )
-
     def get_recipients(self, session: typing.Any = None) -> list[sys_uuid.UUID]:
         return get_stream_recipients(
             project_id=self.project_id,
@@ -1013,61 +869,14 @@ class WorkspaceUserTopic(
         )
 
 
-class WorkspaceMessage(
-    models.ModelWithUUID,
-    base.WorkspaceMessageBase,
-    orm.SQLStorableMixin,
-):
-    __tablename__ = "m_workspace_messages"
-
-    user_uuid = properties.property(
-        types.UUID(),
-        required=True,
-    )
-    reaction_users = properties.property(
-        types.Dict(),
-        default=dict,
-    )
-    ingest_sequence = properties.property(
-        types.AllowNone(types.Integer(min_value=1)),
-        default=None,
-        read_only=True,
-    )
-
-    def validate(self) -> None:
-        super().validate()
-        binding = WorkspaceStreamBinding.objects.get_one_or_none(
-            filters={
-                "project_id": dm_filters.EQ(self.project_id),
-                "stream_uuid": dm_filters.EQ(self.stream_uuid),
-                "user_uuid": dm_filters.EQ(self.user_uuid),
-            },
-        )
-        if binding is None:
-            raise ra_exc.ValidationErrorException()
-        topic = WorkspaceStreamTopic.objects.get_one_or_none(
-            filters={
-                "uuid": dm_filters.EQ(self.topic_uuid),
-                "project_id": dm_filters.EQ(self.project_id),
-                "stream_uuid": dm_filters.EQ(self.stream_uuid),
-            },
-        )
-        if topic is None:
-            raise ra_exc.ValidationErrorException()
-
-    def get_recipients(self, session: typing.Any = None) -> list[sys_uuid.UUID]:
-        return get_stream_recipients(
-            project_id=self.project_id,
-            stream_uuid=self.stream_uuid,
-            session=session,
-        )
+WorkspaceMessage = v2_models.WorkspaceMessage
 
 
 class WorkspaceUserMessage(
     base.WorkspaceUserMessageBase,
     orm.SQLStorableMixin,
 ):
-    __tablename__ = "m_workspace_user_messages_view"
+    __tablename__ = "messenger_api_user_messages_v1"
 
     def get_recipients(self, session: typing.Any = None) -> list[sys_uuid.UUID]:
         return get_stream_recipients(
@@ -1075,76 +884,3 @@ class WorkspaceUserMessage(
             stream_uuid=self.stream_uuid,
             session=session,
         )
-
-
-class WorkspaceUserMessageFlags(
-    base.UserScopedModelWithUUID,
-    models.ModelWithProject,
-    models.ModelWithTimestamp,
-    orm.SQLStorableMixin,
-):
-    __tablename__ = "m_workspace_user_message_flags"
-
-    read = properties.property(
-        types.Boolean(),
-        default=False,
-    )
-    pinned = properties.property(
-        types.Boolean(),
-        default=False,
-    )
-    starred = properties.property(
-        types.Boolean(),
-        default=False,
-    )
-
-
-class WorkspaceUserTopicFlags(
-    base.UserScopedModelWithUUID,
-    models.ModelWithProject,
-    models.ModelWithTimestamp,
-    orm.SQLStorableMixin,
-):
-    __tablename__ = "m_workspace_user_topic_flags"
-
-    is_done = properties.property(
-        types.Boolean(),
-        default=False,
-    )
-    notification_mode = properties.property(
-        types.Enum([mode.value for mode in WorkspaceTopicNotificationMode]),
-        default=WorkspaceTopicNotificationMode.DEFAULT.value,
-    )
-    notification_updated_at = properties.property(
-        types.UTCDateTimeZ(),
-        default=lambda: datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc),
-    )
-
-
-class UnreadUserMessages(
-    models.ModelWithUUID,
-    models.ModelWithProject,
-    orm.SQLStorableMixin,
-):
-    __tablename__ = "m_unread_user_messages"
-
-    user_uuid = properties.property(
-        types.UUID(),
-        required=True,
-    )
-    stream_uuid = properties.property(
-        types.UUID(),
-        required=True,
-    )
-    unread_count = properties.property(
-        types.Integer(min_value=0),
-        required=True,
-    )
-    active_unread_count = properties.property(
-        types.Integer(min_value=0),
-        required=True,
-    )
-    passive_unread_count = properties.property(
-        types.Integer(min_value=0),
-        required=True,
-    )

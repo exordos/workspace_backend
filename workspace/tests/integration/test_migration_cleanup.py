@@ -14,9 +14,11 @@ from restalchemy.common import contexts as ra_contexts
 from restalchemy.storage.sql import migrations as ra_migrations
 
 from workspace.messenger_api.api import context as messenger_context
-from workspace.messenger_api.dm import helpers as messenger_dm_helpers
-from workspace.messenger_api.dm import read_state
+from workspace.tests.integration.legacy_messenger import helpers as messenger_dm_helpers
+from migrations import legacy_messenger_read_state as read_state
 from workspace.tests.integration import conftest
+
+pytestmark = pytest.mark.pre_retirement_schema
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -404,13 +406,7 @@ def test_published_messenger_v2_migration_is_immutable_and_joined_at_head():
     ]
 
 
-def test_current_migrations_have_a_single_head(_database, db):
-    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
-
-    assert (
-        engine.get_latest_migration()
-        == "0193-Add-Zulip-task-retries-57691c.py"
-    )
+def test_published_cleanup_migrations_remain_applied(_database, db):
     with db.cursor() as cur:
         cur.execute(
             'SELECT uuid, applied FROM "ra_migrations" WHERE uuid = ANY(%s::text[])',
@@ -1748,6 +1744,7 @@ def test_compact_dense_compatibility_join_is_explicitly_forward_only(
             migration.downgrade(session)
 
 
+@pytest.mark.pre_retirement_schema
 def test_forward_correction_upgrades_published_read_state_without_rewrite(
     _database,
     db,
@@ -1920,6 +1917,7 @@ def test_forward_correction_upgrades_published_read_state_without_rewrite(
         )
 
 
+@pytest.mark.pre_retirement_schema
 def test_forward_graph_upgrades_compact_0137_read_state(_database, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
     _set_historical_schema_fixture_before_forward_only_join(db)
@@ -2797,6 +2795,7 @@ def test_compact_read_state_final_downgrade_gate_fences_new_project_writer(
             )
 
 
+@pytest.mark.pre_retirement_schema
 def test_compact_read_state_populated_downgrade_restores_legacy_flags(
     _database,
     db,
@@ -3160,6 +3159,7 @@ def test_compact_read_state_populated_downgrade_restores_legacy_flags(
             engine.apply_migration(migration_file)
 
 
+@pytest.mark.pre_retirement_schema
 def test_read_state_index_repair_recovers_partial_recursive_downgrade(
     _database,
     db,

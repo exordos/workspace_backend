@@ -23,7 +23,6 @@ from workspace.messenger_api.api import resource_projection
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.dm import helpers
 from workspace.messenger_api.dm import models
-from workspace.messenger_api.dm import read_state
 
 
 RESOURCE_MODELS: dict[str, typing.Any] = {
@@ -53,49 +52,6 @@ BOUNDED_VISIBLE_EVENTS_SQL = """
             event."updated_at", event."schema_version",
             event."object_type", event."action"
         FROM "m_workspace_events" AS event
-        LEFT JOIN LATERAL (
-            SELECT COALESCE(
-                NULLIF(event."payload"->>'stream_uuid', '')::uuid,
-                CASE
-                    WHEN event."object_type" = 'stream'
-                    THEN NULLIF(event."payload"->>'uuid', '')::uuid
-                END,
-                (
-                    SELECT message."stream_uuid"
-                    FROM "m_workspace_messages" AS message
-                    WHERE message."project_id" = event."project_id"
-                      AND message."uuid" = NULLIF(
-                          event."payload"->>'message_uuid', ''
-                      )::uuid
-                ),
-                (
-                    SELECT placement."stream_uuid"
-                    FROM "messenger_message_placements" AS placement
-                    WHERE placement."project_id" = event."project_id"
-                      AND placement."uuid" = NULLIF(
-                          event."payload"->>'message_uuid', ''
-                      )::uuid
-                )
-            ) AS stream_uuid,
-            COALESCE(
-                (
-                    SELECT message."stream_uuid"
-                    FROM "m_workspace_messages" AS message
-                    WHERE message."project_id" = event."project_id"
-                      AND message."uuid" = NULLIF(
-                          event."payload"->>'old_message_uuid', ''
-                      )::uuid
-                ),
-                (
-                    SELECT placement."stream_uuid"
-                    FROM "messenger_message_placements" AS placement
-                    WHERE placement."project_id" = event."project_id"
-                      AND placement."uuid" = NULLIF(
-                          event."payload"->>'old_message_uuid', ''
-                      )::uuid
-                )
-            ) AS old_stream_uuid
-        ) AS event_stream ON TRUE
         WHERE event."project_id" = %s
           AND event."user_uuid" = %s
           AND event."epoch_version" > %s
@@ -128,11 +84,12 @@ BOUNDED_VISIBLE_EVENTS_SQL = """
               OR event."payload"->>'stream_uuid' IS NULL
               OR EXISTS (
                   SELECT 1
-                  FROM "m_workspace_stream_bindings" AS binding
+                  FROM "messenger_stream_bindings" AS binding
                   WHERE binding."project_id" = event."project_id"
                     AND binding."stream_uuid" =
                         (event."payload"->>'stream_uuid')::uuid
                     AND binding."user_uuid" = event."user_uuid"
+                    AND binding."active"
               )
           )
 
@@ -167,49 +124,6 @@ BOUNDED_VISIBLE_EVENTS_SQL = """
     broadcast_events AS (
         SELECT event.*
         FROM broadcast_payloads AS event
-        LEFT JOIN LATERAL (
-            SELECT COALESCE(
-                NULLIF(event."payload"->>'stream_uuid', '')::uuid,
-                CASE
-                    WHEN event."object_type" = 'stream'
-                    THEN NULLIF(event."payload"->>'uuid', '')::uuid
-                END,
-                (
-                    SELECT message."stream_uuid"
-                    FROM "m_workspace_messages" AS message
-                    WHERE message."project_id" = event."project_id"
-                      AND message."uuid" = NULLIF(
-                          event."payload"->>'message_uuid', ''
-                      )::uuid
-                ),
-                (
-                    SELECT placement."stream_uuid"
-                    FROM "messenger_message_placements" AS placement
-                    WHERE placement."project_id" = event."project_id"
-                      AND placement."uuid" = NULLIF(
-                          event."payload"->>'message_uuid', ''
-                      )::uuid
-                )
-            ) AS stream_uuid,
-            COALESCE(
-                (
-                    SELECT message."stream_uuid"
-                    FROM "m_workspace_messages" AS message
-                    WHERE message."project_id" = event."project_id"
-                      AND message."uuid" = NULLIF(
-                          event."payload"->>'old_message_uuid', ''
-                      )::uuid
-                ),
-                (
-                    SELECT placement."stream_uuid"
-                    FROM "messenger_message_placements" AS placement
-                    WHERE placement."project_id" = event."project_id"
-                      AND placement."uuid" = NULLIF(
-                          event."payload"->>'old_message_uuid', ''
-                      )::uuid
-                )
-            ) AS old_stream_uuid
-        ) AS event_stream ON TRUE
         WHERE TRUE
           AND (
               NOT EXISTS (
@@ -238,11 +152,12 @@ BOUNDED_VISIBLE_EVENTS_SQL = """
               OR event."payload"->>'stream_uuid' IS NULL
               OR EXISTS (
                   SELECT 1
-                  FROM "m_workspace_stream_bindings" AS binding
+                  FROM "messenger_stream_bindings" AS binding
                   WHERE binding."project_id" = event."project_id"
                     AND binding."stream_uuid" =
                         (event."payload"->>'stream_uuid')::uuid
                     AND binding."user_uuid" = event."user_uuid"
+                    AND binding."active"
               )
           )
 
@@ -453,10 +368,7 @@ class SQLCanonicalReadStore:
         self.user_uuid = sys_uuid.UUID(str(user_uuid))
 
     def _read_state_mode(self) -> str:
-        return read_state.project_mode(
-            contexts.Context().get_session(),
-            self.project_uuid,
-        )
+        return "canonical"
 
     def _scope_filters(
         self,
@@ -578,7 +490,7 @@ class SQLCanonicalReadStore:
             params.extend([marker.updated_at, marker.updated_at, marker.uuid])
         direction = sort_direction.upper()
         statement = (
-            'SELECT "uuid" FROM "m_workspace_drafts" WHERE '
+            'SELECT "uuid" FROM "messenger_api_user_drafts_v1" WHERE '
             + " AND ".join(where)
             + f' ORDER BY "updated_at" {direction}, "uuid" {direction}'
         )
@@ -715,15 +627,15 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
         session = contexts.Context().get_session()
         row = session.execute(
             """
-            SELECT "user_uuid", "direct_user_uuid", "private"
-            FROM "m_workspace_streams"
+            SELECT "owner_uuid" AS "user_uuid", "direct_user_uuid", "private"
+            FROM "messenger_streams"
             WHERE "project_id" = %s AND "uuid" = %s
             """,
             (self.project_uuid, stream_uuid),
         ).fetchone()
         if row is None:
             raise ra_exceptions.ValidationErrorException()
-        models.WorkspaceStream.validate_private_identity(
+        models.base.WorkspaceStreamBase.validate_private_identity(
             row["private"], row["direct_user_uuid"]
         )
         if not row["private"]:

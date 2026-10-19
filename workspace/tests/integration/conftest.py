@@ -58,7 +58,7 @@ from workspace.common import topic_summary_opts
 from workspace.bridges.zulip.dm import models as zulip_models
 from workspace.messenger_api.api import context as auth_context
 from workspace.messenger_api.api import middlewares as app_middlewares
-from workspace.tests.integration import legacy_store
+from workspace.messenger_api.api import store_factory
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.dm import models as messenger_models
 from workspace.workspace_api.api import app as workspace_app
@@ -297,7 +297,7 @@ def _database():
 
     engine = ra_migrations.MigrationEngine(migrations_path=str(MIGRATIONS_DIR))
     engine.apply_migration(engine.get_latest_migration())
-    api_store.configure_store_factory(legacy_store.LegacyMessengerStoreFactory())
+    api_store.configure_store_factory(store_factory.build_store_factory())
 
     yield
 
@@ -384,10 +384,61 @@ def workspace_api(http_server, db):
     )
 
 
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "pre_retirement_schema: verify a published migration before compatibility retirement",
+    )
+
+
+@pytest.fixture(autouse=True)
+def _test_database_url(_database, request, monkeypatch):
+    if request.node.get_closest_marker("pre_retirement_schema") is None:
+        with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+            if connection.execute(
+                "SELECT to_regclass('messenger_domain_outbox_events')"
+            ).fetchone()[0]:
+                connection.execute("DELETE FROM messenger_domain_outbox_events")
+                connection.execute("DELETE FROM messenger_projection_scope_leases")
+        api_store.configure_store_factory(store_factory.build_store_factory())
+        try:
+            yield TEST_DB_URL
+        finally:
+            api_store.configure_store_factory(store_factory.build_store_factory())
+        return
+    baseline = "0230-Avoid-redundant-project-user-writes-and-bound-Zulip-reconciliation-batches-fc01aa.py"
+    from workspace.tests.integration import legacy_store
+
+    if hasattr(request.module, "_historical_database"):
+        api_store.configure_store_factory(legacy_store.LegacyMessengerStoreFactory())
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                ra_migrations.MigrationEngine,
+                "get_latest_migration",
+                lambda self: baseline,
+            )
+            yield TEST_DB_URL
+        api_store.configure_store_factory(store_factory.build_store_factory())
+        return
+    with isolated_migration_database(baseline) as database_url:
+        api_store.configure_store_factory(legacy_store.LegacyMessengerStoreFactory())
+        with monkeypatch.context() as patch:
+            patch.setitem(globals(), "TEST_DB_URL", database_url)
+            patch.setattr(
+                ra_migrations.MigrationEngine,
+                "get_latest_migration",
+                lambda self: baseline,
+            )
+            try:
+                yield database_url
+            finally:
+                api_store.configure_store_factory(store_factory.build_store_factory())
+
+
 @pytest.fixture
-def db():
+def db(_test_database_url):
     """Direct DB connection for seeding rows the API only needs to read."""
-    conn = psycopg.connect(TEST_DB_URL, autocommit=True)
+    conn = psycopg.connect(_test_database_url, autocommit=True)
     try:
         yield conn
     finally:
@@ -428,6 +479,16 @@ def seed_user_stream(conn, project_id, user_uuid, name, description="seeded"):
     """
     seed_workspace_user(conn, user_uuid, f"user-{user_uuid}")
     stream_uuid = sys_uuid.uuid4()
+    if not conn.execute("SELECT to_regclass('m_workspace_streams')").fetchone()[0]:
+        conn.execute(
+            "SELECT messenger_v2_register_project_user(%s,%s)", (project_id, user_uuid)
+        )
+        conn.execute(
+            "INSERT INTO messenger_streams (uuid,project_id,owner_uuid,name,description) VALUES (%s,%s,%s,%s,%s)",
+            (stream_uuid, project_id, user_uuid, name, description),
+        )
+        seed_user_stream_binding(conn, project_id, stream_uuid, user_uuid, role="owner")
+        return str(stream_uuid)
     binding_uuid = sys_uuid.uuid4()
     with conn.cursor() as cur:
         cur.execute(
@@ -544,10 +605,21 @@ def seed_workspace_user(conn, user_uuid, username, status="active", last_ping_at
 def seed_user_stream_binding(conn, project_id, stream_uuid, user_uuid, role="member"):
     seed_workspace_user(conn, user_uuid, f"user-{user_uuid}")
     binding_uuid = sys_uuid.uuid4()
+    table = (
+        "m_workspace_stream_bindings"
+        if conn.execute("SELECT to_regclass('m_workspace_stream_bindings')").fetchone()[
+            0
+        ]
+        else "messenger_stream_bindings"
+    )
+    if table == "messenger_stream_bindings":
+        conn.execute(
+            "SELECT messenger_v2_register_project_user(%s,%s)", (project_id, user_uuid)
+        )
     with conn.cursor() as cur:
         cur.execute(
-            """
-            INSERT INTO m_workspace_stream_bindings
+            f"""
+            INSERT INTO {table}
                 (uuid, project_id, stream_uuid, user_uuid, who_uuid, role,
                  created_at, updated_at)
             VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW())
@@ -568,6 +640,26 @@ def seed_stream_topic(conn, project_id, stream_uuid, user_uuid, name, is_default
     """Insert a topic and the binding needed for the user topics view."""
     topic_uuid = sys_uuid.uuid4()
     seed_user_stream_binding(conn, project_id, stream_uuid, user_uuid)
+    if not conn.execute("SELECT to_regclass('m_workspace_stream_topics')").fetchone()[
+        0
+    ]:
+        conn.execute(
+            "INSERT INTO messenger_topics (uuid,project_id,stream_uuid,name) VALUES (%s,%s,%s,%s)",
+            (topic_uuid, project_id, stream_uuid, name),
+        )
+        conn.execute(
+            "INSERT INTO messenger_user_topic_bindings (uuid,project_id,user_uuid,topic_uuid,notification_mode) "
+            "SELECT messenger_uuid_v5(%s,user_uuid::text),project_id,user_uuid,%s,'default' "
+            "FROM messenger_stream_bindings WHERE project_id=%s AND stream_uuid=%s AND active "
+            "ON CONFLICT (project_id,user_uuid,topic_uuid) DO NOTHING",
+            (topic_uuid, topic_uuid, project_id, stream_uuid),
+        )
+        if is_default:
+            conn.execute(
+                "UPDATE messenger_streams SET default_topic_uuid=%s WHERE project_id=%s AND uuid=%s",
+                (topic_uuid, project_id, stream_uuid),
+            )
+        return str(topic_uuid)
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -590,6 +682,14 @@ def seed_stream_topic(conn, project_id, stream_uuid, user_uuid, name, is_default
 
 
 def seed_stream_topic_flags(conn, topic_uuid, user_uuid, project_id, is_done=False):
+    if not conn.execute(
+        "SELECT to_regclass('m_workspace_user_topic_flags')"
+    ).fetchone()[0]:
+        conn.execute(
+            "UPDATE messenger_topics SET is_done=%s WHERE project_id=%s AND uuid=%s",
+            (is_done, project_id, topic_uuid),
+        )
+        return
     with conn.cursor() as cur:
         cur.execute(
             """

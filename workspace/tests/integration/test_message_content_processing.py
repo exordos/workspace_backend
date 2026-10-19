@@ -15,7 +15,7 @@ from workspace.messenger_api import topic_summarization
 from workspace.tests.integration import legacy_store
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.api import store_factory
-from workspace.messenger_api.dm import read_state
+from migrations import legacy_messenger_read_state as read_state
 from workspace.tests.integration import conftest
 from workspace.tests.integration import test_key_announcements
 from workspace.tests.integration import test_messenger_api
@@ -271,6 +271,7 @@ def test_summary_selection_counts_only_markdown_messages(
         )
 
 
+@pytest.mark.pre_retirement_schema
 def test_content_migration_round_trip_repairs_stored_mentions(
     content_migration_database,
 ):
@@ -347,6 +348,7 @@ def test_content_migration_round_trip_repairs_stored_mentions(
             assert cursor.fetchone() == (definition,)
 
 
+@pytest.mark.pre_retirement_schema
 def test_compaction_rebuilds_only_markdown_mentions(api, db):
     stream = test_key_announcements._create_stream(api)
     peer_uuid = test_key_announcements._add_member(api, db, stream["uuid"])

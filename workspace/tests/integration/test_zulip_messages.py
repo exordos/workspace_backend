@@ -329,6 +329,7 @@ def test_direct_conversation_identity_is_shared_between_accounts(
     assert incoming.channel.direct_user_uuid == history_account.uuid
 
 
+@pytest.mark.pre_retirement_schema
 def test_topic_identity_migration_merges_accounts_and_preserves_messages(_database):
     with conftest.isolated_migration_database(
         "0215-Name-empty-Zulip-topics-General-Topic-146c8a.py"
@@ -455,7 +456,8 @@ def _create_workspace_stream(account, db):
     state = models.ZulipStreamState.objects.get_one(
         filters={"project_id": filters.EQ(account.project_id)}
     )
-    state.do()
+    with contexts.Context().session_manager():
+        state.do()
     conftest.seed_user_stream_binding(
         db, account.project_id, state.stream_uuid, account.owner_user_uuid
     )
@@ -477,7 +479,8 @@ def test_topic_state_creates_topics_after_the_stream_and_exposes_zulip_source(
     (state,) = _topic_states(account)
     assert state.get_id() == (account.project_id, uuid.uuid5(stream_uuid, subject))
     assert state.action == "create"
-    state.do()
+    with contexts.Context().session_manager():
+        state.do()
 
     for topic_model in (
         messenger_models.WorkspaceStreamTopic,
@@ -527,7 +530,8 @@ def test_topic_states_deduplicate_accounts_and_delete_only_unreferenced_zulip_to
     )
     stream_uuid = _create_workspace_stream(account, db)
     (state,) = _topic_states(account)
-    state.do()
+    with contexts.Context().session_manager():
+        state.do()
     native = v2_models.WorkspaceStreamTopic(
         project_id=account.project_id, stream_uuid=stream_uuid, name="Native"
     )
@@ -539,7 +543,8 @@ def test_topic_states_deduplicate_accounts_and_delete_only_unreferenced_zulip_to
     (deletion,) = _topic_states(account)
     assert deletion.action == "delete"
     assert deletion.topic_uuid == state.topic_uuid
-    deletion.do()
+    with contexts.Context().session_manager():
+        deletion.do()
 
     for topic_model in (
         messenger_models.WorkspaceStreamTopic,
@@ -602,7 +607,8 @@ def test_topic_state_restores_soft_deleted_topics_in_the_current_transaction(
     assert _import_history(account).status == "done"
     _create_workspace_stream(account, db)
     (state,) = _topic_states(account)
-    state.do()
+    with contexts.Context().session_manager():
+        state.do()
     db.execute(
         "UPDATE messenger_topics SET deleted_at = NOW() WHERE uuid = %s",
         (state.topic_uuid,),
@@ -615,7 +621,8 @@ def test_topic_state_restores_soft_deleted_topics_in_the_current_transaction(
             assert _topic_states(account) == []
             raise RuntimeError("Rollback topic creation")
     (state,) = _topic_states(account)
-    state.do()
+    with contexts.Context().session_manager():
+        state.do()
     assert _topic_states(account) == []
 
 
@@ -974,6 +981,7 @@ def test_history_import_errors_roll_back_partial_changes(
         assert account.error_description is None
 
 
+@pytest.mark.pre_retirement_schema
 def test_message_uuid_and_project_migrations_backfill_and_round_trip(_database):
     migration = "0203-Add-Workspace-message-UUID-to-Zulip-messages-4118dc.py"
     project_migration = "0204-Scope-Zulip-messages-to-projects-c07814.py"

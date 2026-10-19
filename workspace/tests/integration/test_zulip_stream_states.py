@@ -161,7 +161,10 @@ def test_binding_states_show_only_required_actions(
         )
         binding_uuid = binding.uuid
         if membership == "inactive":
-            binding.delete()
+            db.execute(
+                "UPDATE messenger_stream_bindings SET active=false, membership_generation=membership_generation+1 WHERE project_id=%s AND uuid=%s",
+                (account.project_id, binding.uuid),
+            )
     if deleted:
         db.execute(
             "UPDATE messenger_streams SET deleted_at = NOW() WHERE project_id = %s",
@@ -555,6 +558,7 @@ def test_subscription_snapshot_repairs_notification_modes_from_channel_muting(
     http.close.assert_called_once()
 
 
+@pytest.mark.pre_retirement_schema
 def test_subscription_migration_preserves_bindings_and_reschedules_snapshots(
     stream_state_account, db
 ):
@@ -795,9 +799,11 @@ def test_stream_state_creates_each_stream_type(stream_state_account, db, channel
         filters={"project_id": filters.EQ(account.project_id)}
     )
 
-    state.do()
-    with pytest.raises(storage_exceptions.ConflictRecords):
+    with contexts.Context().session_manager():
         state.do()
+    with pytest.raises(storage_exceptions.ConflictRecords):
+        with contexts.Context().session_manager():
+            state.do()
 
     stream = v2_models.WorkspaceStream.objects.get_one(
         filters={"project_id": filters.EQ(account.project_id)}
@@ -840,7 +846,8 @@ def test_stream_state_resolves_channel_creator(stream_state_account, db):
         filters={"project_id": filters.EQ(account.project_id)}
     )
 
-    state.create_workspace_stream()
+    with contexts.Context().session_manager():
+        state.create_workspace_stream()
 
     stream = v2_models.WorkspaceStream.objects.get_one(
         filters={"uuid": filters.EQ(state.stream_uuid)}
@@ -878,7 +885,8 @@ def test_stream_creation_ignores_newer_channels_outside_project_provider(
             filters={"project_id": filters.EQ(account.project_id)}
         )
 
-        state.create_workspace_stream()
+        with contexts.Context().session_manager():
+            state.create_workspace_stream()
 
         stream = v2_models.WorkspaceStream.objects.get_one(
             filters={"uuid": filters.EQ(channel.stream_uuid)}
@@ -898,7 +906,8 @@ def test_stream_state_restores_soft_deleted_stream(stream_state_account, db):
         filters={"project_id": filters.EQ(account.project_id)}
     )
 
-    state.create_workspace_stream()
+    with contexts.Context().session_manager():
+        state.create_workspace_stream()
 
     assert db.execute(
         "SELECT uuid, name, deleted_at FROM messenger_streams WHERE project_id = %s",
@@ -943,9 +952,11 @@ def test_stream_state_deletion_cascades_from_root(stream_state_account, db):
         filters={"project_id": filters.EQ(account.project_id)}
     )
 
-    state.do()
-    with pytest.raises(storage_exceptions.RecordNotFound):
+    with contexts.Context().session_manager():
         state.do()
+    with pytest.raises(storage_exceptions.RecordNotFound):
+        with contexts.Context().session_manager():
+            state.do()
 
     assert (
         v2_models.WorkspaceStream.objects.get_one_or_none(
@@ -1024,11 +1035,11 @@ def test_zulip_stream_source_is_readable_in_models_and_events(stream_state_accou
     )
     assert canonical.source_name == legacy.source_name == visible.source_name == "zulip"
     assert canonical.source == {"kind": "zulip"}
-    assert isinstance(legacy.source, messenger_models.ZulipSource)
+    assert legacy.source == {"kind": "zulip"}
     assert isinstance(visible.source, messenger_models.ZulipSource)
     created = event_payloads.StreamCreatedEventPayload(**dict(visible))
     deleted = event_payloads.StreamDeletedEventPayload(
-        uuid=stream_uuid, source_name=legacy.source_name, source=legacy.source
+        uuid=stream_uuid, source_name=visible.source_name, source=visible.source
     )
     assert created.source.KIND == deleted.source.KIND == "zulip"
 
@@ -1350,6 +1361,7 @@ def test_worker_bootstraps_and_recreates_missing_reconciliation(stream_state_acc
     assert replacement.project_id is replacement.external_account_uuid is None
 
 
+@pytest.mark.pre_retirement_schema
 def test_stream_state_view_migration_is_reversible(stream_state_account, db):
     account = stream_state_account
     stream_uuid = uuid.uuid4()
@@ -1377,6 +1389,7 @@ def test_stream_state_view_migration_is_reversible(stream_state_account, db):
     )
 
 
+@pytest.mark.pre_retirement_schema
 def test_binding_state_view_migration_is_reversible(stream_state_account, db):
     account = stream_state_account
     stream_uuid = uuid.uuid4()

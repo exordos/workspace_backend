@@ -233,6 +233,7 @@ def test_counter_generation_change_does_not_include_previous_access(message_sour
     _assert_counts(account, 1, 1)
 
 
+@pytest.mark.pre_retirement_schema
 def test_counter_delta_migration_seeds_existing_counts_and_rolls_back(
     message_sources, db
 ):

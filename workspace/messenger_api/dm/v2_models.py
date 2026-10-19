@@ -16,6 +16,7 @@ import typing
 import uuid as sys_uuid
 
 from restalchemy.common import contexts
+from restalchemy.dm import filters as dm_filters
 from restalchemy.dm import models
 from restalchemy.dm import properties
 from restalchemy.dm import types
@@ -23,6 +24,7 @@ from restalchemy.storage.sql import orm
 
 from workspace.common import models as common_models
 from workspace.common import types as common_types
+from workspace.messenger_api import exceptions as messenger_exceptions
 from workspace.messenger_api.dm import base
 from workspace.messenger_api.dm import message_payloads
 
@@ -571,6 +573,22 @@ class WorkspaceUserTopic(
         types.AllowNone(types.UTCDateTimeZ()), default=None, read_only=True
     )
     visible = properties.property(types.Boolean(), default=True, read_only=True)
+
+    def validate_summary_prompt_update(self, session: typing.Any) -> None:
+        binding = WorkspaceStreamBinding.objects.get_one(
+            filters={
+                "project_id": dm_filters.EQ(self.project_id),
+                "stream_uuid": dm_filters.EQ(self.stream_uuid),
+                "user_uuid": dm_filters.EQ(self.user_uuid),
+                "active": dm_filters.EQ(True),
+            },
+            session=session,
+        )
+        if binding.role not in {
+            base.WorkspaceStreamRole.OWNER.value,
+            base.WorkspaceStreamRole.ADMINISTRATOR.value,
+        }:
+            raise messenger_exceptions.TopicSummaryPromptForbiddenError()
 
 
 class WorkspaceMessageReactionFact(

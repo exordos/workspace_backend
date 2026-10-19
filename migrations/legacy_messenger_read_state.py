@@ -3,7 +3,9 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
-"""Compact, exact per-user message read state.
+"""Frozen compact read-state support for published pre-retirement migrations.
+
+The application uses canonical Messenger viewer state after migration 0231.
 
 Unread is the implicit value.  Read messages are stored in fixed-size bitmaps
 addressed by an immutable message ingest sequence.  Existing projects move

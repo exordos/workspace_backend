@@ -16,11 +16,11 @@ from restalchemy.common import contexts
 from restalchemy.common import exceptions as ra_exceptions
 from restalchemy.dm import filters as dm_filters
 
-from workspace.messenger_api.api import sql_canonical_store
+from workspace.tests.integration.legacy_messenger import sql_canonical_store
 from workspace.messenger_api.api import store as api_store
-from workspace.messenger_api.dm import helpers
-from workspace.messenger_api.dm import models
-from workspace.messenger_api.dm import read_state
+from workspace.tests.integration.legacy_messenger import helpers
+from workspace.tests.integration.legacy_messenger import models
+from migrations import legacy_messenger_read_state as read_state
 
 
 MENTIONED_MESSAGE_UUIDS_SQL = """

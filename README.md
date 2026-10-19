@@ -93,6 +93,10 @@ authorized URNs, never binary MIME parts.
 
 The project virtual environment is expected at `.tox/develop`.
 
+Messenger migration `0231` retires duplicate compatibility storage. Its application
+revision requires a coordinated writer shutdown and a verified database backup;
+see [the cutover procedure](docs/en/messenger_domain_model.md#retiring-the-compatibility-schema).
+
 The tracked `etc/workspace/workspace.conf` intentionally contains no IAM JWKS
 decryption key. For local development, copy it to the ignored local config and
 set the key there:

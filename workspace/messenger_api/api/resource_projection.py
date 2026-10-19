@@ -11,6 +11,7 @@ import typing
 import uuid as sys_uuid
 
 
+from workspace.messenger_api.dm import base
 from workspace.messenger_api.dm import models
 
 
@@ -24,7 +25,7 @@ RESOURCE_MODELS: dict[str, typing.Any] = {
     "message_reactions": models.WorkspaceMessageReactions,
     "files": models.WorkspaceFile,
     "users": models.WorkspaceUser,
-    "drafts": models.WorkspaceDraft,
+    "drafts": models.WorkspaceVisibleDraft,
 }
 USER_SCOPED_RESOURCES = {
     "folders",
@@ -89,7 +90,7 @@ def projection_values(
         result.pop(name, None)
     source = result.get("source")
     if isinstance(source, dict):
-        source_type = models.WorkspaceMessage.properties.properties[
+        source_type = base.WorkspaceSourceBase.properties.properties[
             "source"
         ].get_property_type()
         result["source"] = source_type.from_simple_type(source)

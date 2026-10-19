@@ -291,7 +291,6 @@ def test_failure_after_updating_the_key_rolls_back_the_whole_announcement(
         for table in (
             "messenger_messages",
             "messenger_message_placements",
-            "m_workspace_messages",
         ):
             cursor.execute(
                 f"SELECT COUNT(*) FROM {table} WHERE project_id = %s", (api.project_id,)

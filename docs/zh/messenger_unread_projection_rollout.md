@@ -1,5 +1,10 @@
 # Messenger未读的投影升级和倒退
 
+> Historical reference: the rolling compatibility tables and compact read-state
+> maintenance were retired by migration `0231`. See
+> [the current cutover procedure](messenger_domain_model.md#retiring-the-compatibility-schema).
+
+
 本运行簿应用了迁移引入的查询计划更正
 `0149-split-messenger-unread-read-state-branches-c84ae9.py`. 只有迁移
 取代视图定义;它不会重写消息或读状态数据.

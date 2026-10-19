@@ -3,7 +3,7 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
-"""Persist complete bounded reaction-user lists on the reaction write path."""
+"""Frozen legacy reaction snapshots for published identity-repair migrations."""
 
 import collections.abc
 import json

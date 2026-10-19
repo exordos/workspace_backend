@@ -1,5 +1,10 @@
 # Messenger nicht gelesenes Projektions-Upgrade und Rollback
 
+> Historical reference: the rolling compatibility tables and compact read-state
+> maintenance were retired by migration `0231`. See
+> [the current cutover procedure](messenger_domain_model.md#retiring-the-compatibility-schema).
+
+
 Dieses Runbook wendet die durch die Migration eingeführte Abfrageplankorrektur an
 `0149-split-messenger-unread-read-state-branches-c84ae9.py`. Nur die Migration
 ersetzt Ansichtsdefinitionen; er schreibt keine Nachrichten- oder Lesestatusdaten neu.

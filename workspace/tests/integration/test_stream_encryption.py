@@ -67,7 +67,7 @@ def test_stored_stream_encryption_is_consistent_in_reads_and_events(
             """,
             (encryption, key_uuid, api.project_id, stream_uuid),
         )
-        for view in ("m_workspace_user_streams", "messenger_api_user_streams_v1"):
+        for view in ("messenger_api_user_streams_v1",):
             cursor.execute(
                 f"SELECT encryption, current_encryption_key_uuid FROM {view} "
                 "WHERE project_id = %s AND uuid = %s AND user_uuid = %s",
@@ -114,6 +114,7 @@ def test_stored_stream_encryption_is_consistent_in_reads_and_events(
     assert updates[-1]["current_encryption_key_uuid"] == str(key_uuid)
 
 
+@pytest.mark.pre_retirement_schema
 def test_encryption_migration_defaults_existing_streams_and_restores_views(
     api, encryption_migration_database
 ):

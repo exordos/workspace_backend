@@ -32,6 +32,7 @@ from restalchemy.dm import properties
 from restalchemy.dm import relationships
 from restalchemy.dm import types
 from restalchemy.dm import types_dynamic
+from restalchemy.storage import exceptions as storage_exceptions
 from restalchemy.storage.sql import orm
 from restalchemy.storage.sql import utils
 
@@ -237,14 +238,24 @@ class ZulipStreamState(
         owner_uuid: sys_uuid.UUID,
         direct_user_uuid: sys_uuid.UUID | None = None,
     ) -> None:
-        messenger_models.WorkspaceStream(
+        session = contexts.Context().get_session()
+        session.execute(
+            "SELECT messenger_v2_register_project_user(%s,%s)",
+            (self.project_id, owner_uuid),
+        )
+        if direct_user_uuid is not None:
+            session.execute(
+                "SELECT messenger_v2_register_project_user(%s,%s)",
+                (self.project_id, direct_user_uuid),
+            )
+        stream = v2_models.WorkspaceStream(
             uuid=self.stream_uuid,
             project_id=self.project_id,
-            user_uuid=owner_uuid,
+            owner_uuid=owner_uuid,
             name=channel.name,
             description=channel.description,
             source_name=messenger_models.StreamSourceName.ZULIP.value,
-            source=messenger_models.ZulipSource(),
+            source={"kind": "zulip"},
             invite_only=channel.invite_only,
             is_archived=channel.is_archived,
             private=channel.channel_type == ZulipChannelType.PRIVATE.value,
@@ -259,7 +270,36 @@ class ZulipStreamState(
                 if channel.date_created is not None
                 else channel.created_at
             ),
-        ).insert()
+        )
+        restored = session.execute(
+            "INSERT INTO messenger_streams (uuid,project_id,owner_uuid,name,description,source_name,source,invite_only,is_archived,private,direct_user_uuid,private_index,color,created_at,updated_at) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s,%s,%s,%s,%s) "
+            "ON CONFLICT (project_id,uuid) DO UPDATE SET owner_uuid=EXCLUDED.owner_uuid, name=EXCLUDED.name,description=EXCLUDED.description, "
+            "source_name=EXCLUDED.source_name,source=EXCLUDED.source,invite_only=EXCLUDED.invite_only,is_archived=EXCLUDED.is_archived, "
+            "private=EXCLUDED.private,direct_user_uuid=EXCLUDED.direct_user_uuid,private_index=EXCLUDED.private_index,color=EXCLUDED.color, "
+            "deleted_at=NULL,updated_at=EXCLUDED.updated_at WHERE messenger_streams.deleted_at IS NOT NULL RETURNING uuid",
+            (
+                stream.uuid,
+                stream.project_id,
+                stream.owner_uuid,
+                stream.name,
+                stream.description,
+                stream.source_name,
+                json.dumps(stream.source),
+                stream.invite_only,
+                stream.is_archived,
+                stream.private,
+                stream.direct_user_uuid,
+                stream.private_index,
+                stream.color,
+                messenger_helpers._database_timestamp(stream.created_at),
+                messenger_helpers._database_timestamp(stream.updated_at),
+            ),
+        ).fetchone()
+        if restored is None:
+            raise storage_exceptions.ConflictRecords(
+                model=stream, msg="Stream already exists"
+            )
 
     def delete_workspace_stream(self) -> None:
         stream = v2_models.WorkspaceStream.objects.get_one(
@@ -496,7 +536,7 @@ class ZulipTopicState(
         topic = ZulipTopic.objects.get_one(
             filters={"uuid": filters.EQ(self.topic_uuid)},
         )
-        messenger_models.WorkspaceStreamTopic(
+        workspace_topic = v2_models.WorkspaceStreamTopic(
             uuid=self.topic_uuid,
             project_id=self.project_id,
             stream_uuid=self.stream_uuid,
@@ -504,7 +544,44 @@ class ZulipTopicState(
             source_name=messenger_models.TopicSourceName.ZULIP.value,
             source=messenger_models.ZulipSource(),
             created_at=topic.created_at,
-        ).insert()
+        )
+        session = contexts.Context().get_session()
+        restored = session.execute(
+            "INSERT INTO messenger_topics (uuid,project_id,stream_uuid,name,color,source_name,source,created_at,updated_at) "
+            "VALUES (%s,%s,%s,%s,%s,'zulip','{\"kind\":\"zulip\"}'::jsonb,%s,%s) "
+            "ON CONFLICT (project_id,uuid) DO UPDATE SET name=EXCLUDED.name,color=EXCLUDED.color,source_name=EXCLUDED.source_name,source=EXCLUDED.source,deleted_at=NULL,updated_at=EXCLUDED.updated_at WHERE messenger_topics.deleted_at IS NOT NULL RETURNING uuid",
+            (
+                workspace_topic.uuid,
+                workspace_topic.project_id,
+                workspace_topic.stream_uuid,
+                workspace_topic.name,
+                workspace_topic.color,
+                messenger_helpers._database_timestamp(workspace_topic.created_at),
+                messenger_helpers._database_timestamp(workspace_topic.updated_at),
+            ),
+        ).fetchone()
+        if restored is None:
+            raise storage_exceptions.ConflictRecords(
+                model=workspace_topic, msg="Topic already exists"
+            )
+        session.execute(
+            "INSERT INTO messenger_user_topic_bindings (uuid,project_id,user_uuid,topic_uuid,notification_mode) "
+            "SELECT messenger_uuid_v5(%s,user_uuid::text),project_id,user_uuid,%s,'default' "
+            "FROM messenger_stream_bindings WHERE project_id=%s AND stream_uuid=%s AND active "
+            "ON CONFLICT (project_id,user_uuid,topic_uuid) DO NOTHING",
+            (self.topic_uuid, self.topic_uuid, self.project_id, self.stream_uuid),
+        )
+        v2_models.WorkspaceDomainOutboxEvent(
+            project_id=self.project_id,
+            event_kind="topic_state_projection",
+            scope_kind="topic",
+            scope_key=f"{self.project_id}:{self.topic_uuid}",
+            payload={
+                "source_kind": "topic.created",
+                "topic_uuid": str(self.topic_uuid),
+                "emit_public_event": False,
+            },
+        ).insert(session=session)
 
     def delete_workspace_topic(self) -> None:
         topic = v2_models.WorkspaceStreamTopic.objects.get_one(

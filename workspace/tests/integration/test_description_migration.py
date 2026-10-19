@@ -5,8 +5,10 @@
 
 import psycopg
 import pytest
+from restalchemy.common import contexts
 from restalchemy.storage.sql import migrations
 
+from workspace.services.messenger_workers import v2_projection
 from workspace.tests.integration import conftest
 from workspace.user_api.dm import models
 
@@ -33,6 +35,7 @@ def _views(connection):
     ).fetchall()
 
 
+@pytest.mark.pre_retirement_schema
 def test_description_migration_preserves_data_and_views_and_is_reversible(_database):
     with conftest.isolated_migration_database(PREVIOUS_MIGRATION) as database_url:
         with psycopg.connect(database_url, autocommit=True) as connection:
@@ -107,9 +110,11 @@ def test_api_description_limit_and_round_trip(api, db, resource, length):
     stored = api.get(path + response.json()["uuid"])
     assert stored.status_code == 200, stored.text
     assert stored.json()["description"] == description
+    with contexts.Context().session_manager() as session:
+        v2_projection.drain_projection_queue(session, "integration:description")
     assert (
         db.execute(
-            "SELECT count(*) FROM m_workspace_events "
+            "SELECT count(*) FROM m_workspace_visible_events "
             "WHERE project_id = %s AND payload->>'description' = %s",
             (api.project_id, description),
         ).fetchone()[0]

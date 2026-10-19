@@ -8,7 +8,7 @@ import json
 import pytest
 
 
-pytestmark = pytest.mark.usefixtures("_database")
+pytestmark = [pytest.mark.usefixtures("_database"), pytest.mark.pre_retirement_schema]
 
 
 def _walk_plan(node):

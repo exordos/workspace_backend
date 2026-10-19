@@ -8,7 +8,6 @@ import uuid as sys_uuid
 import pytest
 from restalchemy.common import exceptions as ra_exc
 
-from workspace.messenger_api.dm import models
 from workspace.messenger_api.dm import v2_models
 
 
@@ -16,23 +15,15 @@ USER_UUID = sys_uuid.UUID("11111111-1111-4111-8111-111111111111")
 PEER_UUID = sys_uuid.UUID("22222222-2222-4222-8222-222222222222")
 
 
-@pytest.fixture(params=[models.WorkspaceStream, v2_models.WorkspaceStream])
-def stream_factory(request):
+@pytest.fixture
+def stream_factory():
     def create(**identity):
-        owner_field = (
-            "user_uuid" if request.param is models.WorkspaceStream else "owner_uuid"
-        )
-        source = (
-            models.NativeSource()
-            if request.param is models.WorkspaceStream
-            else {"kind": "native"}
-        )
-        return request.param(
+        return v2_models.WorkspaceStream(
             project_id=sys_uuid.uuid4(),
+            owner_uuid=USER_UUID,
             name="Native stream",
             source_name="native",
-            source=source,
-            **{owner_field: USER_UUID},
+            source={"kind": "native"},
             **identity,
         )
 

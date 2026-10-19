@@ -170,6 +170,7 @@ def test_channel_preferences_keep_other_observers_mention_state(message_sources)
         }
 
 
+@pytest.mark.pre_retirement_schema
 def test_wildcard_migration_backfills_existing_flags_and_is_reversible(
     message_sources, db
 ):

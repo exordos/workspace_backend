@@ -20,7 +20,6 @@ from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.dm import base
 from workspace.messenger_api.dm import helpers
 from workspace.messenger_api.dm import message_payloads
-from workspace.messenger_api.dm import read_state
 from workspace.messenger_api.dm import v2_models
 
 
@@ -52,7 +51,7 @@ def _simple_source(value: object) -> dict[str, typing.Any]:
 
 
 def _public(row: typing.Any, resource: str) -> dict[str, typing.Any]:
-    result = resource_projection.simple(row)
+    result = resource_projection.as_dict(row, resource)
     for name in _INTERNAL_FIELDS:
         result.pop(name, None)
     if resource == "streams":
@@ -62,30 +61,6 @@ def _public(row: typing.Any, resource: str) -> dict[str, typing.Any]:
 
 class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
     """Use the v2 canonical schema for native Messenger resources."""
-
-    def _legacy_message_uuid(
-        self,
-        session: typing.Any,
-        placement_uuid: object,
-    ) -> sys_uuid.UUID:
-        """Resolve the rolling compatibility identity for a v2 placement."""
-        row = session.execute(
-            """
-            SELECT COALESCE(legacy_public_uuid, uuid) AS uuid
-            FROM messenger_message_placements
-            WHERE project_id = %s AND uuid = %s
-            """,
-            (self.project_uuid, placement_uuid),
-        ).fetchone()
-        if row is None:
-            raise ra_exceptions.ValidationErrorException()
-        return sys_uuid.UUID(str(row["uuid"]))
-
-    def _syncs_compact_read_state(self, session: typing.Any) -> bool:
-        """Return whether v2 read actions must update compact compatibility state."""
-        return read_state.mode_uses_compact_state(
-            read_state.project_mode(session, self.project_uuid)
-        )
 
     def _v2_scope_filters(
         self,
@@ -348,12 +323,8 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         legacy_placements = session.execute(
             """
             SELECT placement.uuid
-            FROM messenger_messages AS message
-            JOIN messenger_message_placements AS placement
-              ON placement.project_id = message.project_id
-             AND placement.message_uuid = message.uuid
-            WHERE message.project_id = %s AND message.legacy_public_uuid = %s
-              AND placement.legacy_public_uuid = message.legacy_public_uuid
+            FROM messenger_message_placements AS placement
+            WHERE placement.project_id = %s AND placement.legacy_public_uuid = %s
             ORDER BY placement.uuid
             LIMIT 2
             """,
@@ -475,7 +446,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 (stream_uuid,),
             ).fetchone()
             if existing_row is not None:
-                expected_description = values.get("description")
+                expected_description = values.get("description") or ""
                 if (
                     existing_row["project_id"] != self.project_uuid
                     or existing_row["owner_uuid"] != self.user_uuid
@@ -492,6 +463,24 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                     raise ra_exceptions.ValidationErrorException()
                 return _public(self._stream(stream_uuid), "streams")
         topic_uuid = sys_uuid.uuid4()
+        stream_model = v2_models.WorkspaceStream(
+            uuid=stream_uuid,
+            project_id=self.project_uuid,
+            owner_uuid=self.user_uuid,
+            name=values["name"],
+            description=values.get("description", ""),
+            source_name=source_name,
+            source=source,
+            invite_only=values.get("invite_only", False),
+            announce=values.get("announce", False),
+            direct_user_uuid=direct_user,
+            private=private,
+            private_index=private_index,
+            color=values.get("color", base.random_color()),
+            default_topic_uuid=topic_uuid,
+            encryption=encryption.encryption,
+            current_encryption_key_uuid=encryption.current_encryption_key_uuid,
+        )
         now = session.execute("SELECT NOW() AS value", ()).fetchone()["value"]
         session.execute(
             """
@@ -509,17 +498,17 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             (
                 stream_uuid,
                 self.project_uuid,
-                values["name"],
-                values.get("description"),
+                stream_model.name,
+                stream_model.description,
                 self.user_uuid,
                 source_name,
                 json.dumps(source),
-                values.get("invite_only", False),
-                values.get("announce", False),
+                stream_model.invite_only,
+                stream_model.announce,
                 direct_user,
                 private,
                 private_index,
-                values.get("color", base.random_color()),
+                stream_model.color,
                 topic_uuid,
                 now,
                 now,
@@ -1296,6 +1285,8 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             updates = {name: values[name] for name in allowed if name in values}
             if not updates:
                 raise ra_exceptions.ValidationErrorException()
+            stream.update_dm(values=updates)
+            updates = {name: getattr(stream, name) for name in updates}
             assignments = ", ".join(f'"{name}" = %s' for name in updates)
             session.execute(
                 f"UPDATE messenger_streams SET {assignments}, updated_at = NOW() "
@@ -1935,14 +1926,6 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 """,
                 (self.project_uuid, message.uuid, self.user_uuid),
             ).fetchone()
-            if self._syncs_compact_read_state(session):
-                read_state.set_message_read(
-                    session,
-                    self.project_uuid,
-                    self.user_uuid,
-                    self._legacy_message_uuid(session, message.uuid),
-                    True,
-                )
             self._enqueue_counter_projections(
                 source_kind="message.read",
                 placement_uuid=message.uuid,
@@ -2016,42 +1999,6 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                     message.uuid,
                 ),
             )
-            if self._syncs_compact_read_state(session):
-                # Compatibility rows can be projected in a different physical
-                # order from canonical placements. Reuse the canonical tuple
-                # boundary instead of comparing legacy timestamps and UUIDs.
-                read_state._bulk_mark_read(
-                    session,
-                    self.project_uuid,
-                    self.user_uuid,
-                    """
-                    EXISTS (
-                        SELECT 1
-                        FROM messenger_message_placements AS placement
-                        JOIN messenger_messages AS canonical
-                          ON canonical.project_id = placement.project_id
-                         AND canonical.uuid = placement.message_uuid
-                        JOIN messenger_user_message_states AS state
-                          ON state.project_id = placement.project_id
-                         AND state.placement_uuid = placement.uuid
-                         AND state.user_uuid = %s
-                        WHERE placement.project_id = message.project_id
-                          AND COALESCE(
-                              placement.legacy_public_uuid,
-                              placement.uuid
-                          ) = message.uuid
-                          AND placement.topic_uuid = %s
-                          AND (canonical.created_at, placement.uuid)
-                              <= (%s, %s)
-                    )
-                    """,
-                    (
-                        self.user_uuid,
-                        message.topic_uuid,
-                        message.created_at,
-                        message.uuid,
-                    ),
-                )
             self._enqueue_counter_projections(
                 source_kind="messages.read",
                 placement_uuid=message.uuid,
@@ -2137,14 +2084,6 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 """,
                 (self.project_uuid, self.user_uuid, stream.uuid),
             )
-            if self._syncs_compact_read_state(session):
-                read_state.read_stream(
-                    session,
-                    self.project_uuid,
-                    self.user_uuid,
-                    stream.uuid,
-                    collect_message_rows=False,
-                )
             topics = session.execute(
                 """
                 SELECT uuid FROM messenger_topics
@@ -2295,15 +2234,6 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 """,
                 (self.project_uuid, self.user_uuid, topic.uuid),
             )
-            if self._syncs_compact_read_state(session):
-                read_state.read_topic(
-                    session,
-                    self.project_uuid,
-                    self.user_uuid,
-                    topic.stream_uuid,
-                    topic.uuid,
-                    collect_message_rows=False,
-                )
             self._enqueue_counter_projections(
                 source_kind="topic.read",
                 user_uuid=self.user_uuid,
@@ -2327,7 +2257,9 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             )
             return _public(self._topic(topic.uuid), "stream_topics")
         if resource == "stream_topics" and action == "set_summary_prompt":
+            helpers._lock_workspace_topic(self.project_uuid, resource_uuid, session)
             topic = self._topic(resource_uuid)
+            topic.validate_summary_prompt_update(session)
             allowed = {
                 "summary_system_prompt",
                 "summary_reasoning_effort",

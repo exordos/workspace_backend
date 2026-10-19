@@ -1,5 +1,10 @@
 # Kanonisches Inventar der proposal-Architektur Messenger
 
+> Historical reference: the rolling compatibility tables and compact read-state
+> maintenance were retired by migration `0231`. See
+> [the current cutover procedure](messenger_domain_model.md#retiring-the-compatibility-schema).
+
+
 Status: **proposal; maschinell abgleichbares Wörterbuch für Dokumentation, nicht production schema**.
 
 [← Hauptindex der Dokumentation](index.md) · [Domänenmodell](messenger_domain_model.md) · [RestAlchemy API](messenger_restalchemy_api_spec.md) · [Sequence index](diagrams/sequence/README.md) · Zulip Bridge proposal

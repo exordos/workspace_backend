@@ -218,9 +218,10 @@ def test_project_user_reconciliation_follows_account_rebinding(
     with contexts.Context().session_manager():
         task.execute()
 
-    assert models.Task.objects.get_one(
-        filters={"uuid": filters.EQ(task.uuid)}
-    ).status == "done"
+    assert (
+        models.Task.objects.get_one(filters={"uuid": filters.EQ(task.uuid)}).status
+        == "done"
+    )
     states = {
         state.user_uuid: state
         for state in models.ZulipProjectUserState.objects.get_all(
@@ -621,6 +622,7 @@ def test_connection_does_not_claim_external_identity_from_another_scope(
         imported.delete()
 
 
+@pytest.mark.pre_retirement_schema
 def test_hidden_profile_directory_migration_can_be_applied_and_rolled_back(_database):
     migration = "0210-Hide-rebound-Zulip-profiles-from-the-user-directory-751a1a.py"
     with conftest.isolated_migration_database(
@@ -1185,6 +1187,7 @@ def test_failed_user_import_rolls_back_new_profiles_and_accounts(
     zulip.close.assert_called_once_with()
 
 
+@pytest.mark.pre_retirement_schema
 def test_external_account_identity_migration_and_lookup_index(_database):
     migration = "0206-Add-provider-account-identity-to-external-accounts-812e0e.py"
     with conftest.isolated_migration_database(
