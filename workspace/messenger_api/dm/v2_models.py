@@ -181,6 +181,14 @@ class WorkspaceMessageChange(
     revision = properties.property(
         types.Integer(min_value=1), required=True, read_only=True
     )
+    message_created_at = properties.property(
+        types.UTCDateTimeZ(),
+        default=datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc),
+        read_only=True,
+    )
+    message_sequence = properties.property(
+        types.Integer(min_value=0), default=0, read_only=True
+    )
 
     @classmethod
     def get_id_property(cls) -> dict[str, typing.Any]:

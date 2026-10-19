@@ -102,6 +102,11 @@ def test_conversion_preserves_file_count_and_identity(example, context):
     "content,expected",
     [
         ("/user_uploads/1/abc/file.pdf", ["/user_uploads/1/abc/file.pdf"]),
+        ("(/user_uploads/1/abc/file.pdf).", ["/user_uploads/1/abc/file.pdf"]),
+        (
+            "https://zulip.example.test/user_uploads/1/abc/file.pdf, next",
+            ["https://zulip.example.test/user_uploads/1/abc/file.pdf"],
+        ),
         (
             "https://zulip.example.test/user_uploads/1/abc/file.pdf",
             ["https://zulip.example.test/user_uploads/1/abc/file.pdf"],
@@ -275,6 +280,95 @@ def test_repeated_file_references_preserve_count_and_order():
 
     assert message_conversion.get_zulip_files(message, context) == [url, url]
     assert message_conversion.get_workspace_files(payload) == [urn, urn]
+
+
+@pytest.mark.parametrize(
+    "source,expected",
+    [
+        ("[report.pdf]({path})", "report.pdf (file deleted)"),
+        ('![preview](<{url}> "Preview")', "preview (file deleted)"),
+        ("{url}", r"report\_old\.pdf (file deleted)"),
+        ("<{url}>", r"report\_old\.pdf (file deleted)"),
+        ("{path}", r"report\_old\.pdf (file deleted)"),
+        ("({url}).", r"(report\_old\.pdf (file deleted))."),
+    ],
+)
+def test_deleted_files_become_text_without_affecting_other_elements(source, expected):
+    path = "/user_uploads/1/missing/report_old.pdf"
+    url = "https://zulip.example.test" + path
+    kept = "/user_uploads/1/kept/report.pdf"
+    urn = "urn:file:11111111-1111-4111-8111-111111111111"
+    user = "22222222-2222-4222-8222-222222222222"
+    context = {
+        "server_url": "https://zulip.example.test",
+        "deleted_files": {path, url},
+        "files": {kept: urn},
+        "mention_uuids": {"id:7": user},
+    }
+    message = {
+        "id": 1,
+        "content": source.format(path=path, url=url) + f" [kept]({kept}) @**Bob|7**",
+    }
+
+    payload = message_conversion.zulip_to_workspace(message, context)
+
+    assert payload["content"] == f"{expected} [kept]({urn}) [Bob](urn:user:{user})"
+    assert message_conversion.get_workspace_files(payload) == [urn]
+
+
+@pytest.mark.parametrize(
+    "prefix", ["/poll Choose ", "/me attaches ", "Check $$x^2$$: "]
+)
+def test_deleted_files_remain_visible_in_unsupported_content(prefix):
+    path = "/user_uploads/1/missing/report.pdf"
+    context = {
+        "server_url": "https://zulip.example.test",
+        "original_url": "https://zulip.example.test/#narrow/near/1",
+        "deleted_files": {path},
+    }
+
+    payload = message_conversion.zulip_to_workspace(
+        {"id": 1, "content": f"{prefix}[report]({path})"}, context
+    )
+
+    assert r"report\.pdf (file deleted)" in payload["content"]
+    assert "/user_uploads/" not in payload["content"]
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["https://external.example.test/photo.png", "/user_uploads/1/offline/photo.png"],
+)
+def test_unsupported_content_retains_files_without_a_local_copy(url):
+    context = {
+        "server_url": "https://zulip.example.test",
+        "original_url": "https://zulip.example.test/#narrow/near/1",
+    }
+
+    payload = message_conversion.zulip_to_workspace(
+        {"id": 1, "content": f"/poll Choose ![photo]({url})"}, context
+    )
+
+    absolute = url if url.startswith("https://") else context["server_url"] + url
+    assert f"[photo\\.png](urn:url:{absolute})" in payload["content"]
+    assert message_conversion.get_workspace_files(payload) == []
+
+
+def test_deleted_files_are_marked_inside_quoted_snapshots():
+    path = "/user_uploads/1/missing/report.pdf"
+    context = {
+        "server_url": "https://zulip.example.test",
+        "deleted_files": {path},
+    }
+
+    payload = message_conversion.zulip_to_workspace(
+        {"id": 1, "content": f"> [report]({path})"}, context
+    )
+
+    snapshot = payload["content"].partition("?snapshot=")[2].removesuffix(")")
+    assert base64.urlsafe_b64decode(snapshot + "=" * (-len(snapshot) % 4)).decode() == (
+        "report (file deleted)"
+    )
 
 
 @pytest.mark.parametrize(

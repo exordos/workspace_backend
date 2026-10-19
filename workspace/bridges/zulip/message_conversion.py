@@ -8,7 +8,8 @@
 Context contains server_url and original_url, plus optional mention_uuids
 (id:<Zulip ID> or name:<name>), stream_uuids (name), topic_uuids (channel>topic),
 message_uuids (Zulip ID), stream_ids (name -> Zulip ID), files (URL -> Workspace
-file URN), linkifier_urls, user_group_ids, and custom_emoji_names.
+file URN), deleted_files (source URLs), linkifier_urls, user_group_ids,
+and custom_emoji_names.
 The optional messages mapping contains
 original Zulip messages keyed by their string IDs, for full/partial quotes.
 Reverse conversion produces canonical Markdown, not the original spelling.
@@ -31,7 +32,7 @@ _INLINE = (
     r"|(?P<group>@\*[^*\n]+\*)"
     r"|(?P<channel>\#\*\*[^*\n]+\*\*)"
     r"|(?P<link>!?\[)"
-    r"|(?P<url><?https?://[^\s<>`]+>?)"
+    r"|(?P<url><?(?:https?://|/user_uploads/)[^\s<>`]+>?)"
     r"|(?P<math>\$\$.+?\$\$)"
     r"|(?P<time><time:[^>\n]+>)"
     r"|(?P<emoji>:[\w+-]+:)"
@@ -128,6 +129,13 @@ def parse_snapshot(query: str) -> str | None:
         return None
 
 
+def _url_target(token: str) -> str:
+    target = token.removeprefix("<").removesuffix(">").rstrip(".,!?;:")
+    while target.endswith(")") and target.count(")") > target.count("("):
+        target = target[:-1]
+    return target
+
+
 def _message_links(text: str) -> collections.abc.Iterator[tuple[str, bool]]:
     tokens = re.compile(r"\\[^\n]|!?\[|<?https?://[^\s<>`]+>?|/user_uploads/[^\s<>`]+")
     position = 0
@@ -142,7 +150,7 @@ def _message_links(text: str) -> collections.abc.Iterator[tuple[str, bool]]:
                 _, target, _, image, position = link
                 yield target, image
         else:
-            yield token.removeprefix("<").removesuffix(">"), False
+            yield _url_target(token), False
 
 
 def workspace_references(text: str) -> collections.abc.Iterator[tuple[str, str, str]]:
@@ -273,10 +281,28 @@ class _ZulipToWorkspace:
         text = f"Not supported in Workspace: {description}"
         return text if block else f"({text})"
 
+    def deleted_file(self, target: str, label: str | None = None) -> str | None:
+        if target not in self.context.get("deleted_files", ()):
+            return None
+        if not label:
+            label = _escape_label(
+                urllib.parse.unquote(
+                    urllib.parse.urlsplit(target).path.rsplit("/", 1)[-1]
+                )
+            )
+        return f"{label} (file deleted)"
+
     def block_notice(self, description: str, source: str) -> str:
         parts = [self.notice(description, block=True)]
         for url in get_zulip_files({"content": source}, self.context):
-            target = self.context["files"][url]
+            deleted = self.deleted_file(url)
+            if deleted is not None:
+                parts.append(deleted)
+                continue
+            target = self.target(url)
+            if target is None:
+                parts.append(url)
+                continue
             name = urllib.parse.unquote(
                 urllib.parse.urlsplit(url).path.rsplit("/", 1)[-1]
             )
@@ -384,6 +410,10 @@ class _ZulipToWorkspace:
                     output.append(token)
                     continue
                 label, destination, title, image, position = link
+                deleted = self.deleted_file(destination, label)
+                if deleted is not None:
+                    output.append(deleted)
+                    continue
                 target = self.target(destination)
                 if target is None:
                     output.append(text[match.start() : position])
@@ -394,13 +424,14 @@ class _ZulipToWorkspace:
                     )
                 )
             elif kind == "url":
-                target = token.removeprefix("<").removesuffix(">")
-                target = target.rstrip(".,!?;:")
-                while target.endswith(")") and target.count(")") > target.count("("):
-                    target = target[:-1]
+                target = _url_target(token)
                 position = match.start() + len(target) + int(token.startswith("<"))
                 if token.startswith("<") and text[position : position + 1] == ">":
                     position += 1
+                deleted = self.deleted_file(target)
+                if deleted is not None:
+                    output.append(deleted)
+                    continue
                 urn = self.target(target)
                 if urn is None:
                     output.append(text[match.start() : position])

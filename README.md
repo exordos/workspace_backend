@@ -114,11 +114,14 @@ Uploaded Zulip attachments are copied into Workspace file storage with the
 destination stream's access rules. Workspace attachments are uploaded to Zulip
 once per destination stream, with persisted file mappings for retries and echoes.
 Temporary download URLs are fetched without forwarding Zulip API credentials.
-Externally hosted media retain their original URLs. Full and partial quotes use
-persisted message identities; outgoing quotes require the sender's access to the
-referenced message. Missing incoming targets retain a provider URL or quoted
-snapshot instead of an invented internal identity. Features that Workspace
-cannot represent retain an explicit notice and a link to the original message.
+Externally hosted media retain their original URLs.
+Attachments returning HTTP 404 or 410 are replaced with their caption or filename
+followed by `(file deleted)`; other content and available attachments still import.
+Full and partial quotes use persisted message identities; outgoing quotes require
+the sender's access to the referenced message. Missing incoming targets retain a
+provider URL or quoted snapshot instead of an invented internal identity. Features
+that Workspace cannot represent retain an explicit notice and a link to the
+original message.
 Malformed URLs, reference URNs, and Base64 or UTF-8 quote snapshots remain verbatim
 as text. A parsing failure affects only that element; conversion continues for
 the rest of the message.
@@ -128,6 +131,14 @@ changing the provider's edit timestamps or overwriting newer local edits. Failed
 records retry independently. Disconnected accounts can convert stored text;
 attachments without local copies retain their provider URLs until a later import
 can download them. Only `markdown` payloads enter the conversion path.
+
+Migration 0242 indexes repair queues by original message time and Zulip message
+ID. Content conversion, file transfer, message projection, flag reconciliation,
+and reaction reconciliation process recent messages before older history.
+Refresh tasks also traverse known messages from newer IDs to older ones.
+Realtime content and attachments are converted before Workspace publication and
+before an outgoing Zulip send, including forwarded snapshots. Provider events
+retain their original ordering so newer state cannot be undone by older events.
 
 Delivery bindings retain the Workspace UUID and the Zulip message ID. After
 delivery, the canonical message and placement creation dates are updated to the

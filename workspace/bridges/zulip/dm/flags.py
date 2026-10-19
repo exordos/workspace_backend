@@ -144,11 +144,12 @@ def outgoing_batch(
         contexts.Context()
         .get_session()
         .execute(
-            """SELECT DISTINCT flag_state_uuid AS state_uuid FROM bridge_zulip_v5_tasks
+            """SELECT DISTINCT flag_state_uuid AS state_uuid,message_created_at,message_sequence
+           FROM bridge_zulip_v5_tasks
            WHERE project_id=%s AND external_account_uuid=%s
              AND content->>'kind'='update_message_flags' AND status IN ('new', 'retry')
              AND content->>'flag'=%s AND (content->>'value')::boolean=%s
-           ORDER BY flag_state_uuid LIMIT 100""",
+           ORDER BY message_created_at DESC,message_sequence DESC,flag_state_uuid LIMIT 100""",
             (project_id, account_uuid, flag, value),
         )
         .fetchall()
@@ -230,6 +231,14 @@ class FlagChange(models.ModelWithID, models.ModelWithProject, orm.SQLStorableMix
     revision = properties.property(
         types.Integer(min_value=1), required=True, read_only=True
     )
+    message_created_at = properties.property(
+        types.UTCDateTimeZ(),
+        default=datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc),
+        read_only=True,
+    )
+    message_sequence = properties.property(
+        types.Integer(min_value=0), default=0, read_only=True
+    )
 
     @classmethod
     def get_id_property(cls) -> dict[str, typing.Any]:
@@ -242,7 +251,14 @@ class FlagChange(models.ModelWithID, models.ModelWithProject, orm.SQLStorableMix
     def reconcile_batch(cls, limit: int) -> int:
         from workspace.bridges.zulip.dm import models as zulip_models
 
-        changes = cls.objects.get_all(order_by={"revision": "asc"}, limit=limit)
+        changes = cls.objects.get_all(
+            order_by={
+                "message_created_at": "desc",
+                "message_sequence": "desc",
+                "revision": "asc",
+            },
+            limit=limit,
+        )
         for change in changes:
             targets = flag_states(change.project_id, change.state_uuid)
             for target in targets:

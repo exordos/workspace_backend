@@ -610,6 +610,14 @@ class ReactionChange(models.ModelWithID, models.ModelWithProject, orm.SQLStorabl
     revision = properties.property(
         types.Integer(min_value=1), required=True, read_only=True
     )
+    message_created_at = properties.property(
+        types.UTCDateTimeZ(),
+        default=datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc),
+        read_only=True,
+    )
+    message_sequence = properties.property(
+        types.Integer(min_value=0), default=0, read_only=True
+    )
     next_retry_at = properties.property(
         types.AllowNone(types.UTCDateTimeZ()), default=None
     )
@@ -628,7 +636,7 @@ class ReactionChange(models.ModelWithID, models.ModelWithProject, orm.SQLStorabl
             .execute(
                 """SELECT * FROM bridge_zulip_v5_reaction_messages
                WHERE canonical_message_uuid IS NULL AND (next_retry_at IS NULL OR next_retry_at<=NOW() AT TIME ZONE 'UTC')
-               ORDER BY next_retry_at NULLS FIRST,uuid LIMIT %s FOR UPDATE SKIP LOCKED""",
+               ORDER BY message_id DESC,uuid LIMIT %s FOR UPDATE SKIP LOCKED""",
                 (limit,),
             )
             .fetchall()
@@ -639,7 +647,11 @@ class ReactionChange(models.ModelWithID, models.ModelWithProject, orm.SQLStorabl
             filters=filters.OR(
                 {"next_retry_at": filters.Is(None)}, {"next_retry_at": filters.LE(now)}
             ),
-            order_by={"revision": "asc"},
+            order_by={
+                "message_created_at": "desc",
+                "message_sequence": "desc",
+                "revision": "asc",
+            },
             limit=limit,
         )
         for change in changes:

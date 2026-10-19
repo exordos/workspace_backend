@@ -40,6 +40,7 @@ from restalchemy.storage.sql import utils
 
 from workspace.bridges.zulip import client
 from workspace.bridges.zulip import content_conversion
+from workspace.bridges.zulip import message_conversion
 from workspace.bridges.zulip.dm import flags as message_flags
 from workspace.bridges.zulip.dm import reactions as message_reactions
 from workspace.common import models as common_models
@@ -91,6 +92,9 @@ class MessageContent(
     orm.SQLStorableMixin,
 ):
     __tablename__ = "bridge_zulip_v5_message_contents"
+
+    source_timestamp = properties.property(types.Integer(min_value=0), default=0)
+    source_message_id = properties.property(types.Integer(min_value=0), default=0)
 
     conversion_version = properties.property(types.Integer(min_value=0), default=0)
 
@@ -880,9 +884,25 @@ class ZulipMessageState(
         changes = {}
         change_models = (ZulipMessageChange, v2_models.WorkspaceMessageChange)
         for model in change_models:
-            for change in model.objects.get_all(limit=limit):
+            for change in model.objects.get_all(
+                order_by={
+                    "message_created_at": "desc",
+                    "message_sequence": "desc",
+                    "revision": "asc",
+                },
+                limit=limit,
+            ):
                 changes.setdefault(change.get_id(), []).append(change)
-        batch = dict(list(changes.items())[:limit])
+        batch = dict(
+            sorted(
+                changes.items(),
+                key=lambda item: max(
+                    (change.message_created_at, change.message_sequence)
+                    for change in item[1]
+                ),
+                reverse=True,
+            )[:limit]
+        )
         if not batch:
             return 0
         projects = {}
@@ -913,6 +933,10 @@ class ZulipMessageState(
                     )
                     if not states:
                         continue
+                    rank = {
+                        message: index for index, message in enumerate(message_uuids)
+                    }
+                    states.sort(key=lambda state: rank[state.message_uuid])
                     changed_uuids = list({state.message_uuid for state in states})
                     counter_scopes.update(
                         ZulipMessageCounterChange.message_scopes(
@@ -2156,7 +2180,11 @@ class ImportHistoryContent(AbstractZulipTaskContent):
         zulip = client.ZulipClient(account)
         try:
             observed_at = datetime.datetime.now(datetime.timezone.utc)
-            messages = zulip.get_messages(self.first_message_id, self.last_message_id)
+            messages = sorted(
+                zulip.get_messages(self.first_message_id, self.last_message_id),
+                key=lambda data: data["id"],
+                reverse=True,
+            )
             observed_flags = message_flags.observe_snapshot(
                 account, messages, observed_at
             )
@@ -2314,6 +2342,8 @@ class ImportHistoryContent(AbstractZulipTaskContent):
                     tz=datetime.timezone.utc,
                 )
                 content_values = {
+                    "source_timestamp": data["timestamp"],
+                    "source_message_id": data["id"],
                     "zulip_content": data["content"],
                     "workspace_content": data["content"],
                     "zulip_content_hash": content_hash,
@@ -2385,6 +2415,24 @@ class ImportHistoryContent(AbstractZulipTaskContent):
                     message.update_dm(values=values)
                     message.update()
             if imported_contents:
+                file_streams = {
+                    stream_uuid
+                    for content, data, stream_uuid in imported_contents
+                    if message_conversion.get_zulip_files(
+                        {**data, "content": content.zulip_content},
+                        {},
+                        include_quotes=True,
+                    )
+                }
+                if file_streams:
+                    for state in ZulipStreamState.objects.get_all(
+                        filters={
+                            "project_id": filters.EQ(task.project_id),
+                            "stream_uuid": filters.In(list(file_streams)),
+                            "action": filters.EQ("create"),
+                        }
+                    ):
+                        state.do()
                 converter = content_conversion.ConversionContext(account)
                 for content, data, stream_uuid in imported_contents:
                     content.convert(converter, data, stream_uuid, zulip)
@@ -2463,7 +2511,7 @@ class UpdateMessageFlagsContent(AbstractZulipTaskContent):
         )
         if not batch:
             return
-        message_ids = sorted({row["message_id"] for row in batch})
+        message_ids = sorted({row["message_id"] for row in batch}, reverse=True)
         zulip = client.ZulipClient(account)
         try:
             result = zulip.update_message_flags(message_ids, self.flag, self.value)
@@ -2545,7 +2593,7 @@ class RefreshMessageFlagsContent(AbstractZulipTaskContent):
                    (SELECT DISTINCT message_id FROM bridge_zulip_v5_message_flags
                     WHERE project_id=%s AND external_account_uuid=%s
                       AND message_id > %s AND message_id <= %s
-                    ORDER BY message_id LIMIT 100)
+                    ORDER BY message_id DESC LIMIT 100)
                    UNION
                    (SELECT delivery.zulip_message_id AS message_id
                     FROM bridge_zulip_v5_deliveries AS delivery
@@ -2553,8 +2601,8 @@ class RefreshMessageFlagsContent(AbstractZulipTaskContent):
                       ON channel.external_account_uuid=%s AND channel.stream_uuid=delivery.stream_uuid
                     WHERE delivery.project_id=%s AND delivery.hostname=%s
                       AND delivery.zulip_message_id > %s AND delivery.zulip_message_id <= %s
-                    ORDER BY delivery.zulip_message_id LIMIT 100)
-               ) AS known ORDER BY message_id LIMIT 100""",
+                    ORDER BY delivery.zulip_message_id DESC LIMIT 100)
+               ) AS known ORDER BY message_id DESC LIMIT 100""",
                 (
                     task.project_id,
                     account.uuid,
@@ -2571,13 +2619,15 @@ class RefreshMessageFlagsContent(AbstractZulipTaskContent):
         )
         if not rows:
             return
-        first = rows[0]["message_id"]
-        last = min(rows[-1]["message_id"], first + HISTORY_BATCH_SIZE - 1)
-        wanted = {row["message_id"] for row in rows if row["message_id"] <= last}
+        last = rows[0]["message_id"]
+        first = max(rows[-1]["message_id"], last - HISTORY_BATCH_SIZE + 1)
+        wanted = {row["message_id"] for row in rows if row["message_id"] >= first}
         zulip = client.ZulipClient(account)
         try:
             observed_at = datetime.datetime.now(datetime.timezone.utc)
-            data = zulip.get_messages(first, last)
+            data = sorted(
+                zulip.get_messages(first, last), key=lambda row: row["id"], reverse=True
+            )
             message_flags.observe_snapshot(
                 account, [row for row in data if row["id"] in wanted], observed_at
             )
@@ -2587,13 +2637,13 @@ class RefreshMessageFlagsContent(AbstractZulipTaskContent):
         finally:
             zulip.close()
         Task(
-            uuid=sys_uuid.uuid5(task.uuid, str(last)),
+            uuid=sys_uuid.uuid5(task.uuid, str(first)),
             project_id=task.project_id,
             external_account_uuid=account.uuid,
             priority=task.priority,
             realtime_event_uuid=task.realtime_event_uuid,
             content=RefreshMessageFlagsContent(
-                after_message_id=last, last_message_id=self.last_message_id
+                after_message_id=self.after_message_id, last_message_id=first - 1
             ),
         ).insert()
 
@@ -2844,7 +2894,15 @@ class ConvertMessageContent(AbstractTaskContent):
     batch_size = properties.property(
         types.Integer(min_value=1, max_value=100), default=100
     )
+    # Retain the old cursor field when loading tasks serialized before 0242.
     after_uuid = properties.property(types.AllowNone(types.UUID()), default=None)
+    before_timestamp = properties.property(
+        types.AllowNone(types.Integer(min_value=0)), default=None
+    )
+    before_uuid = properties.property(types.AllowNone(types.UUID()), default=None)
+    before_message_id = properties.property(
+        types.AllowNone(types.Integer(min_value=0)), default=None
+    )
     content_uuid = properties.property(types.AllowNone(types.UUID()), default=None)
 
     def execute(self, task):
@@ -2852,20 +2910,32 @@ class ConvertMessageContent(AbstractTaskContent):
             contexts.Context()
             .get_session()
             .execute(
-                """SELECT DISTINCT ON (content.uuid) content.uuid, observed.external_account_uuid,
-                      observed.message_id, observed.sender_id, observed.timestamp,
-                      channel.stream_uuid
-               FROM bridge_zulip_v5_message_contents AS content
-               JOIN bridge_zulip_v5_messages AS observed ON observed.content=content.uuid
-               JOIN bridge_zulip_v5_channels AS channel ON channel.uuid=observed.channel
-               WHERE content.conversion_version < %s
-                 AND (%s::uuid IS NULL OR content.uuid > %s)
-                 AND (%s::uuid IS NULL OR content.uuid = %s)
-               ORDER BY content.uuid LIMIT %s""",
+                """SELECT content.uuid, content.source_timestamp, content.source_message_id, observed.*
+               FROM (
+                   SELECT content.uuid, content.source_timestamp, content.source_message_id
+                   FROM bridge_zulip_v5_message_contents AS content
+                   WHERE content.conversion_version < %s
+                     AND (%s::bigint IS NULL OR (content.source_timestamp, content.source_message_id, content.uuid) < (%s, %s, %s))
+                     AND (%s::uuid IS NULL OR content.uuid = %s)
+                     AND EXISTS (SELECT 1 FROM bridge_zulip_v5_messages AS candidate WHERE candidate.content=content.uuid)
+                   ORDER BY content.source_timestamp DESC, content.source_message_id DESC, content.uuid DESC LIMIT %s
+               ) AS content
+               JOIN LATERAL (
+                   SELECT observed.external_account_uuid, observed.message_id,
+                          observed.sender_id, observed.timestamp, channel.stream_uuid
+                   FROM bridge_zulip_v5_messages AS observed
+                   JOIN bridge_zulip_v5_channels AS channel ON channel.uuid=observed.channel
+                   WHERE observed.content=content.uuid
+                   ORDER BY observed.timestamp DESC, observed.message_id DESC, observed.uuid
+                   LIMIT 1
+               ) AS observed ON true
+               ORDER BY content.source_timestamp DESC, content.source_message_id DESC, content.uuid DESC""",
                 (
                     content_conversion.VERSION,
-                    self.after_uuid,
-                    self.after_uuid,
+                    self.before_timestamp,
+                    self.before_timestamp,
+                    self.before_message_id,
+                    self.before_uuid,
                     self.content_uuid,
                     self.content_uuid,
                     self.batch_size,
@@ -2914,7 +2984,10 @@ class ConvertMessageContent(AbstractTaskContent):
             Task(
                 priority=150000,
                 content=ConvertMessageContent(
-                    batch_size=self.batch_size, after_uuid=rows[-1]["uuid"]
+                    batch_size=self.batch_size,
+                    before_timestamp=rows[-1]["source_timestamp"],
+                    before_message_id=rows[-1]["source_message_id"],
+                    before_uuid=rows[-1]["uuid"],
                 ),
             ).insert()
 
@@ -3040,6 +3113,15 @@ class Task(
     orm.SQLStorableMixin,
 ):
     __tablename__ = "bridge_zulip_v5_tasks"
+
+    message_created_at = properties.property(
+        types.UTCDateTimeZ(),
+        default=datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc),
+        read_only=True,
+    )
+    message_sequence = properties.property(
+        types.Integer(min_value=0), default=0, read_only=True
+    )
 
     project_id = properties.property(
         types.AllowNone(types.UUID()), default=None, read_only=True
@@ -3511,7 +3593,7 @@ class RealtimeEvent(
                 ImportHistoryContent(
                     first_message_id=message_id, last_message_id=message_id
                 )
-                for message_id in sorted(set(message_ids))
+                for message_id in sorted(set(message_ids), reverse=True)
             ]
         elif kind == "delete_message":
             account = external_models.ExternalAccount.objects.get_one(
@@ -3580,7 +3662,9 @@ class RealtimeEvent(
                     ImportHistoryContent(
                         first_message_id=message_id, last_message_id=message_id
                     )
-                    for message_id in sorted(set(message_ids) - known - {0})
+                    for message_id in sorted(
+                        set(message_ids) - known - {0}, reverse=True
+                    )
                 ]
         elif kind == "reaction":
             account = external_models.ExternalAccount.objects.get_one(

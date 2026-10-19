@@ -10,6 +10,7 @@ import uuid
 
 import pytest
 import psycopg
+import requests
 from restalchemy.common import contexts
 from restalchemy.dm import filters
 from restalchemy.storage.sql import migrations
@@ -209,6 +210,281 @@ def test_missing_mapping_fails_before_the_send_attempt_is_marked(outgoing, kind)
     assert not delivery.sending
     assert test_zulip_outgoing.tasks(account)[0].status == "error"
     zulip.send_message.assert_not_called()
+
+
+@pytest.mark.parametrize("status", [404, 410])
+def test_deleted_attachments_do_not_block_import_or_stored_content_conversion(
+    history_account, db, monkeypatch, tmp_path, status
+):
+    account = history_account
+    account.settings = {
+        **account.settings,
+        "email": "user@example.com",
+        "api_key": "key",
+    }
+    account.status = "active"
+    account.update()
+    monkeypatch.setenv(file_storage.ENV_STORAGE_PATH, str(tmp_path))
+    test_zulip_messages._create_workspace_stream(account, db)
+    missing = "/user_uploads/2"
+    kept = "/user_uploads/2/kept/report.txt"
+    response = requests.Response()
+    response.status_code = status
+    error = requests.HTTPError("File is gone", response=response)
+    zulip = mock.Mock()
+
+    def download(path):
+        if path == missing:
+            raise error
+        assert path == kept
+        return b"report", "text/plain"
+
+    zulip.download_file.side_effect = download
+    raw = (
+        f"[report]({missing}) ![preview]({missing}) "
+        f"https://zulip.example.com{missing}. {missing} [kept]({kept}) @**Alias|7**"
+    )
+    zulip.get_messages.return_value = [test_zulip_messages._message_data(content=raw)]
+    monkeypatch.setattr(client, "ZulipClient", lambda account: zulip)
+
+    assert test_zulip_messages._import_history(account).status == "done"
+    (source,) = test_zulip_messages._messages(account)
+    file_uuid = db.execute(
+        "SELECT file_uuid FROM bridge_zulip_v5_file_links WHERE project_id=%s",
+        (account.project_id,),
+    ).fetchone()[0]
+    expected = (
+        "report (file deleted) preview (file deleted) 2 (file deleted). 2 (file deleted) "
+        f"[kept](urn:file:{file_uuid}) [Alias](urn:user:{account.owner_user_uuid})"
+    )
+    assert source.content.workspace_content == expected
+    assert zulip.download_file.call_args_list == [mock.call(missing), mock.call(kept)]
+    db.execute(
+        "UPDATE bridge_zulip_v5_message_contents SET workspace_content=zulip_content,conversion_version=0 WHERE uuid=%s",
+        (source.content.uuid,),
+    )
+    task = models.Task(
+        content=models.ConvertMessageContent(content_uuid=source.content.uuid)
+    )
+    task.insert()
+    try:
+        with contexts.Context().session_manager():
+            task.execute()
+            assert task.status == "done"
+        (source,) = test_zulip_messages._messages(account)
+        assert source.content.workspace_content == expected
+        assert source.content.conversion_version == content_conversion.VERSION
+        assert zulip.download_file.call_args_list == [
+            mock.call(missing),
+            mock.call(kept),
+            mock.call(missing),
+        ]
+    finally:
+        task.delete()
+
+
+@pytest.mark.parametrize("status", [403, 429, 500, None, "timeout"])
+def test_other_attachment_download_errors_are_not_reported_as_deletions(
+    history_account, db, status
+):
+    account = history_account
+    stream_uuid = test_zulip_messages._create_workspace_stream(account, db)
+    if status == "timeout":
+        error = requests.Timeout("Download timed out")
+    else:
+        response = requests.Response()
+        response.status_code = status
+        error = requests.HTTPError(response=response if status is not None else None)
+    zulip = mock.Mock()
+    zulip.download_file.side_effect = error
+    with contexts.Context().session_manager():
+        converter = content_conversion.ConversionContext(account)
+        with pytest.raises(type(error)) as raised:
+            converter.to_workspace(
+                test_zulip_messages._message_data(
+                    content="[report](/user_uploads/2/kept/report.pdf)"
+                ),
+                stream_uuid,
+                zulip,
+            )
+        assert raised.value is error
+        assert converter.context["deleted_files"] == set()
+
+
+@pytest.mark.parametrize("deleted", [False, True])
+def test_first_direct_message_with_an_attachment_does_not_wait_for_its_own_chat(
+    history_account, api, db, monkeypatch, tmp_path, deleted
+):
+    account = history_account
+    owner = uuid.uuid4()
+    conftest.seed_workspace_user(db, owner, f"attachment-peer-{owner}")
+    peer = external_models.ExternalAccount(
+        project_id=account.project_id,
+        owner_user_uuid=owner,
+        provider="zulip",
+        external_account_id="zulip.example.com:8",
+        settings=account.settings,
+    )
+    peer.insert()
+    monkeypatch.setenv(file_storage.ENV_STORAGE_PATH, str(tmp_path))
+    path = "/user_uploads/2/new/photo.png"
+    zulip = mock.Mock()
+    zulip.download_file.return_value = b"photo", "image/png"
+    if deleted:
+        response = requests.Response()
+        response.status_code = 404
+        zulip.download_file.side_effect = requests.HTTPError(response=response)
+    zulip.get_messages.return_value = [
+        test_zulip_messages._message_data(
+            type="private",
+            subject="Zulip",
+            content=f"![photo]({path})",
+            display_recipient=[
+                {"id": 7, "full_name": "Me"},
+                {"id": 8, "full_name": "Peer"},
+            ],
+        )
+    ]
+    monkeypatch.setattr(client, "ZulipClient", lambda account: zulip)
+    try:
+        assert test_zulip_messages._import_history(account).status == "done"
+        (source,) = test_zulip_messages._messages(account)
+        assert (
+            db.execute(
+                "SELECT uuid FROM messenger_streams WHERE project_id=%s AND uuid=%s",
+                (account.project_id, source.channel.stream_uuid),
+            ).fetchone()
+            is not None
+        )
+        if deleted:
+            assert source.content.workspace_content == "photo (file deleted)"
+        else:
+            assert source.content.workspace_content.startswith("![photo](urn:image:")
+        with contexts.Context().session_manager():
+            for state in models.ZulipStreamBindingState.objects.get_all(
+                filters={"project_id": filters.EQ(account.project_id)}
+            ):
+                state.do()
+        _publish(account, db)
+        api.project_id, api.user_uuid = account.project_id, account.owner_user_uuid
+        public = uuid.uuid5(
+            uuid.uuid5(account.project_id, str(source.message_uuid)), "zulip-placement"
+        )
+        assert api.get(f"/v1/messenger/messages/{public}").status_code == 200
+    finally:
+        peer.delete()
+
+
+def test_realtime_message_is_converted_with_attachments_before_workspace_creation(
+    outgoing, db, monkeypatch, tmp_path
+):
+    api, account, _channel, remote, zulip, _constructor = outgoing
+    monkeypatch.setenv(file_storage.ENV_STORAGE_PATH, str(tmp_path))
+    path = "/user_uploads/2/new/photo.png"
+    remote.update(
+        test_zulip_messages._message_data(
+            remote["id"], content=f"@**Alias|7** ![photo]({path})"
+        )
+    )
+    zulip.download_file.return_value = b"photo", "image/png"
+    subscription = models.RealtimeSubscription.for_account(account)
+    with contexts.Context().session_manager():
+        models.RealtimeSubscription.append_events(
+            account,
+            subscription.generation,
+            [{"id": 0, "type": "message", "message": dict(remote), "flags": []}],
+        )
+        assert models.RealtimeEvent.dispatch_one()
+    created = []
+    original = v2_models.WorkspaceMessage.insert
+
+    def insert(message, *args, **kwargs):
+        created.append(message.payload.content)
+        return original(message, *args, **kwargs)
+
+    monkeypatch.setattr(v2_models.WorkspaceMessage, "insert", insert)
+    history_import.HistoryImportService()._iteration()
+    _publish(account, db)
+    (source,) = test_zulip_messages._messages(account)
+    converted = source.content.workspace_content
+    assert created == [converted]
+    assert f"[Alias](urn:user:{account.owner_user_uuid})" in converted
+    assert "![photo](urn:image:" in converted and "/user_uploads/" not in converted
+    public = uuid.uuid5(
+        uuid.uuid5(account.project_id, str(source.message_uuid)), "zulip-placement"
+    )
+    assert (
+        api.get(f"/v1/messenger/messages/{public}").json()["payload"]["content"]
+        == converted
+    )
+    file_uuid = re.search(r"urn:image:([\da-f-]{36})", converted)[1]
+    assert (
+        api.get(f"/v1/messenger/files/{file_uuid}/actions/download").content == b"photo"
+    )
+    zulip.download_file.assert_called_once_with(path)
+
+
+def test_outgoing_messages_and_forwards_upload_before_sending_and_reuse_files(
+    outgoing, monkeypatch, tmp_path
+):
+    api, account, channel, remote, zulip, _constructor = outgoing
+    monkeypatch.setenv(file_storage.ENV_STORAGE_PATH, str(tmp_path))
+    uploaded = api.post(
+        "/v1/messenger/files/",
+        data={"stream_uuid": str(channel.stream_uuid)},
+        files={"file": ("report.txt", b"report", "text/plain")},
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    body = f"[Me](urn:user:{account.owner_user_uuid}) [report](urn:file:{uploaded.json()['uuid']})"
+    order, sent = [], []
+    path = "/user_uploads/2/new/report.txt"
+
+    def upload(*args):
+        order.append("upload")
+        return path
+
+    def send(recipient, content, topic, queue_id, local_id):
+        order.append("send")
+        sent.append(content)
+        remote["content"] = content
+        return remote["id"]
+
+    zulip.upload_file.side_effect = upload
+    zulip.send_message.side_effect = send
+    remote["content"] = body
+    first = test_zulip_outgoing.create(outgoing)
+    test_zulip_outgoing.dispatch()
+    history_import.HistoryImportService()._iteration()
+    test_zulip_outgoing.ready(test_zulip_outgoing.tasks(account)[0])
+    history_import.HistoryImportService()._iteration()
+    assert order == ["upload", "send"]
+    assert (
+        api.get(f"/v1/messenger/messages/{first['uuid']}").json()["payload"]["content"]
+        == body
+    )
+    snapshot = base64.urlsafe_b64encode(body.encode()).decode().rstrip("=")
+    forward = f"[Forward](urn:forward:{first['uuid']}?snapshot={snapshot})"
+    remote["id"] += 1
+    remote["content"] = forward
+    second = test_zulip_outgoing.create(outgoing)
+    test_zulip_outgoing.dispatch()
+    history_import.HistoryImportService()._iteration()
+    test_zulip_outgoing.ready(test_zulip_outgoing.tasks(account)[-1])
+    history_import.HistoryImportService()._iteration()
+    assert order == ["upload", "send", "send"]
+    assert all(
+        "urn:" not in content and "|7**" in content and f"[report]({path})" in content
+        for content in sent
+    )
+    assert sent[1] == f"```quote\n{sent[0]}\n```"
+    assert (
+        api.get(f"/v1/messenger/messages/{second['uuid']}").json()["payload"]["content"]
+        == forward
+    )
+    zulip.upload_file.assert_called_once_with("report.txt", b"report", "text/plain")
+    assert all(task.status == "done" for task in test_zulip_outgoing.tasks(account)), [
+        (task.content.kind, task.status) for task in test_zulip_outgoing.tasks(account)
+    ]
 
 
 def test_attachments_are_downloadable_and_uploaded_once(

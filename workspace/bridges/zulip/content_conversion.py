@@ -11,6 +11,7 @@ import re
 import urllib.parse
 import uuid
 
+import requests
 from restalchemy.common import contexts
 from restalchemy.storage.sql import utils
 
@@ -424,6 +425,8 @@ class ConversionContext:
         )
 
     def _import_files(self, message, stream_uuid, zulip):
+        deleted_files = self.context["deleted_files"] = set()
+        deleted_paths = set()
         for url in message_conversion.get_zulip_files(
             message, self.context, include_quotes=True
         ):
@@ -440,6 +443,9 @@ class ConversionContext:
             ):
                 continue
             path = parsed.path
+            if path in deleted_paths:
+                deleted_files.add(url)
+                continue
             row = self.session.execute(
                 """SELECT file.* FROM bridge_zulip_v5_file_links AS link
                    JOIN m_workspace_files AS file ON file.uuid = link.file_uuid
@@ -456,16 +462,24 @@ class ConversionContext:
                     raise ConversionPendingError(
                         "Waiting for the attachment's Workspace stream"
                     )
-                if zulip is None:
-                    if not self.account.can_stream():
-                        continue
-                    downloader = client.ZulipClient(self.account)
-                    try:
-                        data, content_type = downloader.download_file(path)
-                    finally:
-                        downloader.close()
-                else:
-                    data, content_type = zulip.download_file(path)
+                try:
+                    if zulip is None:
+                        if not self.account.can_stream():
+                            continue
+                        downloader = client.ZulipClient(self.account)
+                        try:
+                            data, content_type = downloader.download_file(path)
+                        finally:
+                            downloader.close()
+                    else:
+                        data, content_type = zulip.download_file(path)
+                except requests.HTTPError as error:
+                    response = error.response
+                    if response is None or response.status_code not in (404, 410):
+                        raise
+                    deleted_paths.add(path)
+                    deleted_files.add(url)
+                    continue
                 file_uuid = uuid.uuid5(
                     self.account.project_id,
                     f"zulip-file:{self.host}:{stream_uuid}:{path}",

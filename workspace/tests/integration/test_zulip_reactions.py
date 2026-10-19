@@ -615,6 +615,18 @@ def test_migration_normalizes_existing_aliases_and_preserves_local_intentions(
     finally:
         with db.transaction():
             migration.migration_step.upgrade(db)
+            # Restore independent queue metadata after the historical migration
+            # recreates the reaction queue.
+            db.execute("""
+                ALTER TABLE bridge_zulip_v5_reaction_changes
+                    ADD COLUMN message_created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT 'epoch',
+                    ADD COLUMN message_sequence BIGINT NOT NULL DEFAULT 0;
+                CREATE TRIGGER newest_message_first BEFORE INSERT OR UPDATE ON bridge_zulip_v5_reaction_changes
+                    FOR EACH ROW EXECUTE FUNCTION bridge_zulip_v5_order_message_change();
+                UPDATE bridge_zulip_v5_reaction_changes SET message_sequence=message_sequence;
+                CREATE INDEX bridge_zulip_v5_reaction_changes_newest_idx
+                    ON bridge_zulip_v5_reaction_changes(message_created_at DESC,message_sequence DESC,revision);
+            """)
     (fact,) = facts(account)
     assert fact.emoji_name == "thumbs_up"
     reconcile()

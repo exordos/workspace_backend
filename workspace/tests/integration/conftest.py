@@ -333,9 +333,19 @@ def isolated_migration_database(migration, *, current_models=False):
                         ADD COLUMN IF NOT EXISTS backfill_uuid UUID,
                         ADD COLUMN IF NOT EXISTS realtime_event_uuid UUID,
                         ADD COLUMN IF NOT EXISTS execution_time DOUBLE PRECISION,
-                        ADD COLUMN IF NOT EXISTS queue_wait_time DOUBLE PRECISION;
+                        ADD COLUMN IF NOT EXISTS queue_wait_time DOUBLE PRECISION,
+                        ADD COLUMN IF NOT EXISTS message_created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT 'epoch',
+                        ADD COLUMN IF NOT EXISTS message_sequence BIGINT NOT NULL DEFAULT 0;
                     ALTER TABLE bridge_zulip_v5_message_contents
-                        ADD COLUMN IF NOT EXISTS conversion_version INTEGER NOT NULL DEFAULT 0;
+                        ADD COLUMN IF NOT EXISTS conversion_version INTEGER NOT NULL DEFAULT 0,
+                        ADD COLUMN IF NOT EXISTS source_timestamp BIGINT NOT NULL DEFAULT 0,
+                        ADD COLUMN IF NOT EXISTS source_message_id BIGINT NOT NULL DEFAULT 0;
+                    ALTER TABLE IF EXISTS messenger_message_changes ADD COLUMN IF NOT EXISTS
+                        message_created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT 'epoch',
+                        ADD COLUMN IF NOT EXISTS message_sequence BIGINT NOT NULL DEFAULT 0;
+                    ALTER TABLE IF EXISTS bridge_zulip_v5_message_changes ADD COLUMN IF NOT EXISTS
+                        message_created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT 'epoch',
+                        ADD COLUMN IF NOT EXISTS message_sequence BIGINT NOT NULL DEFAULT 0;
                     ALTER TABLE messenger_user_message_states
                         ADD COLUMN IF NOT EXISTS read_updated_at TIMESTAMP WITHOUT TIME ZONE,
                         ADD COLUMN IF NOT EXISTS starred_updated_at TIMESTAMP WITHOUT TIME ZONE;
@@ -428,9 +438,30 @@ def _test_database_url(_database, request, monkeypatch):
     baseline = "0230-Avoid-redundant-project-user-writes-and-bound-Zulip-reconciliation-batches-fc01aa.py"
     from workspace.tests.integration import legacy_store
 
+    apply = ra_migrations.MigrationEngine.apply_migration
+
+    def apply_with_current_queue_metadata(engine, *args, **kwargs):
+        result = apply(engine, *args, **kwargs)
+        # Historical rollbacks can recreate these tables. Keep the current
+        # queue models usable without applying the compatibility retirement.
+        with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+            for table in (
+                "messenger_message_changes",
+                "bridge_zulip_v5_message_changes",
+            ):
+                connection.execute(
+                    f"ALTER TABLE IF EXISTS {table} ADD COLUMN IF NOT EXISTS message_created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT 'epoch', ADD COLUMN IF NOT EXISTS message_sequence BIGINT NOT NULL DEFAULT 0"
+                )
+        return result
+
     if hasattr(request.module, "_historical_database"):
         api_store.configure_store_factory(legacy_store.LegacyMessengerStoreFactory())
         with monkeypatch.context() as patch:
+            patch.setattr(
+                ra_migrations.MigrationEngine,
+                "apply_migration",
+                apply_with_current_queue_metadata,
+            )
             patch.setattr(
                 ra_migrations.MigrationEngine,
                 "get_latest_migration",
@@ -442,6 +473,11 @@ def _test_database_url(_database, request, monkeypatch):
     with isolated_migration_database(baseline, current_models=True) as database_url:
         api_store.configure_store_factory(legacy_store.LegacyMessengerStoreFactory())
         with monkeypatch.context() as patch:
+            patch.setattr(
+                ra_migrations.MigrationEngine,
+                "apply_migration",
+                apply_with_current_queue_metadata,
+            )
             patch.setitem(globals(), "TEST_DB_URL", database_url)
             patch.setattr(
                 ra_migrations.MigrationEngine,

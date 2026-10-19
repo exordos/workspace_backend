@@ -444,7 +444,7 @@ def test_bulk_read_sends_one_batch_and_does_not_include_later_messages(imported,
     for task in pending(account):
         with contexts.Context().session_manager():
             task.execute()
-    zulip.update_message_flags.assert_called_once_with([42, 43], "read", True)
+    zulip.update_message_flags.assert_called_once_with([43, 42], "read", True)
     reconcile()
     unread = api.get(MESSAGES).json()
     assert sum(not message["read"] for message in unread) == 1
@@ -618,6 +618,18 @@ def test_flag_migration_preserves_existing_local_changes(imported, db):
         )
     finally:
         migration.migration_step.upgrade(db)
+        # Restore independent queue metadata from migration 0242 after the
+        # historical migration recreates this table.
+        db.execute("""
+            ALTER TABLE bridge_zulip_v5_flag_changes
+                ADD COLUMN message_created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT 'epoch',
+                ADD COLUMN message_sequence BIGINT NOT NULL DEFAULT 0;
+            CREATE TRIGGER newest_message_first BEFORE INSERT OR UPDATE ON bridge_zulip_v5_flag_changes
+                FOR EACH ROW EXECUTE FUNCTION bridge_zulip_v5_order_message_change();
+            UPDATE bridge_zulip_v5_flag_changes SET message_sequence=message_sequence;
+            CREATE INDEX bridge_zulip_v5_flag_changes_newest_idx
+                ON bridge_zulip_v5_flag_changes(message_created_at DESC,message_sequence DESC,revision);
+        """)
     reconcile()
     current = reload(state)
     assert current.read_at is None and not current.starred

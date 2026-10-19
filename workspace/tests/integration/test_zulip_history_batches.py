@@ -52,7 +52,9 @@ def migration(_database, db):
     db.execute("""
         ALTER TABLE bridge_zulip_v5_tasks
             ADD COLUMN IF NOT EXISTS execution_time DOUBLE PRECISION,
-            ADD COLUMN IF NOT EXISTS queue_wait_time DOUBLE PRECISION;
+            ADD COLUMN IF NOT EXISTS queue_wait_time DOUBLE PRECISION,
+            ADD COLUMN IF NOT EXISTS message_created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT 'epoch',
+            ADD COLUMN IF NOT EXISTS message_sequence BIGINT NOT NULL DEFAULT 0;
     """)
     try:
         yield engine

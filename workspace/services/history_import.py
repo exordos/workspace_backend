@@ -76,7 +76,13 @@ class HistoryImportService(basic.BasicService):
                     {"lease_expires_at": filters.LE(now)},
                 ),
             ),
-            order_by={"priority": "desc", "created_at": "asc", "uuid": "asc"},
+            order_by={
+                "priority": "desc",
+                "message_created_at": "desc",
+                "message_sequence": "desc",
+                "created_at": "asc",
+                "uuid": "asc",
+            },
             limit=1,
         )
 
