@@ -13,6 +13,7 @@ import pytest
 import requests
 from restalchemy.common import contexts
 from restalchemy.dm import filters
+from restalchemy.storage import exceptions as storage_exceptions
 from restalchemy.storage.sql import engines
 from restalchemy.storage.sql import migrations
 
@@ -710,6 +711,8 @@ def test_not_before_at_defers_tasks_until_the_scheduled_time(
     [
         requests.Timeout("Timed out"),
         requests.ConnectionError("Disconnected"),
+        storage_exceptions.DeadLock(msg="deadlock detected"),
+        psycopg.errors.DeadlockDetected("deadlock detected"),
         _http_error(408),
         _http_error(429, "RATE_LIMIT_HIT"),
         _http_error(500),

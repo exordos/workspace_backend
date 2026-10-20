@@ -190,8 +190,8 @@ known, metadata fetches can be retried independently of sending.
 Priorities are numeric: users 500000, channels 450000, realtime message creation
 300000, realtime edits 250000, reconciliation (including topics) 200000, and
 history batches 10000 or lower. Missing prerequisites retry after three seconds;
-there are no task dependency chains. Superseded edit tasks do not overwrite a
-newer local edit.
+database deadlocks retry the same task after one minute. There are no task
+dependency chains. Superseded edit tasks do not overwrite a newer local edit.
 Future read and reaction tasks must also run below message creation priority
 and retry when the target message has not been created yet.
 

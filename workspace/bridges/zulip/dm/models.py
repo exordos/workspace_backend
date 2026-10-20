@@ -25,6 +25,7 @@ import time
 import typing
 import uuid as sys_uuid
 
+import psycopg.errors
 import requests
 from restalchemy.common import contexts
 from restalchemy.common import exceptions
@@ -1748,7 +1749,15 @@ class AbstractZulipTaskContent(AbstractTaskContent):
 
     def on_error(self, task: "Task", error: Exception) -> None:
         response = error.response if isinstance(error, requests.HTTPError) else None
-        if isinstance(error, (requests.ConnectionError, requests.Timeout)) or (
+        if isinstance(
+            error,
+            (
+                requests.ConnectionError,
+                requests.Timeout,
+                storage_exceptions.DeadLock,
+                psycopg.errors.DeadlockDetected,
+            ),
+        ) or (
             response is not None
             and (response.status_code in (408, 429) or response.status_code >= 500)
         ):

@@ -447,6 +447,66 @@ def test_prepared_import_keeps_retry_semantics(
         service.stop()
 
 
+@pytest.mark.parametrize("queue,workers", [("background", 4), ("realtime", 1)])
+def test_history_import_retries_database_deadlock_after_rolling_back_partial_writes(
+    history_account, db, monkeypatch, scheduled_reconciliation, queue, workers
+):
+    account = history_account
+    zulip = mock.Mock()
+    zulip.get_messages.return_value = [message_tests._message_data()]
+    monkeypatch.setattr(client, "ZulipClient", lambda account: zulip)
+    insert_message = models.ZulipMessage.insert
+    attempts = []
+
+    def insert(message):
+        result = insert_message(message)
+        attempts.append(message.message_id)
+        if len(attempts) == 1:
+            contexts.Context().get_session().execute(
+                "DO $$ BEGIN RAISE EXCEPTION 'deadlock detected' USING ERRCODE='40P01'; END $$"
+            )
+        return result
+
+    monkeypatch.setattr(models.ZulipMessage, "insert", insert)
+    task = models.Task(
+        project_id=account.project_id,
+        external_account_uuid=account.uuid,
+        queue=queue,
+        content=models.ImportHistoryContent(first_message_id=42, last_message_id=42),
+    )
+    task.insert()
+    service = history_import.HistoryImportService(queue=queue, workers=workers)
+    before = datetime.datetime.now(datetime.timezone.utc)
+    try:
+        _until(service, lambda: _stored(task).status == "retry")
+        retried = _stored(task)
+        after = datetime.datetime.now(datetime.timezone.utc)
+        assert before + models.TASK_RETRY_DELAY <= retried.next_retry_at
+        assert retried.next_retry_at <= after + models.TASK_RETRY_DELAY
+        assert "deadlock detected" in retried.error_description
+        assert retried.lease_owner is None
+        assert retried.lease_expires_at is None
+        assert not message_tests._messages(account)
+        service._iteration()
+        service.stop()
+        assert attempts == [42]
+
+        db.execute(
+            "UPDATE bridge_zulip_v5_tasks SET next_retry_at=%s WHERE uuid=%s",
+            (before.replace(tzinfo=None), task.uuid),
+        )
+        _until(service, lambda: _stored(task).status == "done")
+        finished = _stored(task)
+        assert finished.error_description is None
+        assert finished.next_retry_at is None
+        assert attempts == [42, 42]
+        assert [message.message_id for message in message_tests._messages(account)] == [
+            42
+        ]
+    finally:
+        service.stop()
+
+
 def test_execution_lock_fences_other_tasks_even_after_the_lease_expires(
     _database, monkeypatch
 ):
