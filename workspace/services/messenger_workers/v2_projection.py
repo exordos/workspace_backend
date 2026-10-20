@@ -1327,18 +1327,26 @@ def _refresh_recipient_counters(
             LIMIT 1
         ) AS recent_preview ON true
         LEFT JOIN LATERAL (
-            -- Old scopes may have no messages in the recent project window.
-            -- Sort only that scope instead of scanning the whole project.
-            SELECT placement.uuid
-            FROM messenger_message_placements AS placement
-            JOIN messenger_messages AS message
-              ON message.project_id = placement.project_id AND message.uuid = placement.message_uuid
-             AND message.deleted_at IS NULL
-            {visible_joins}
-            WHERE recent_preview.uuid IS NULL
-              AND placement.project_id = target.project_id
-              AND placement.{scope_column} = target.scope_uuid
-            ORDER BY message.created_at DESC, placement.uuid DESC
+            -- Materialize the visible scope and look up each canonical row.
+            -- Otherwise the date-order LIMIT can drive a project-wide scan.
+            WITH scoped AS MATERIALIZED (
+                SELECT placement.uuid, placement.message_uuid
+                FROM messenger_message_placements AS placement
+                {visible_joins}
+                WHERE recent_preview.uuid IS NULL
+                  AND placement.project_id = target.project_id
+                  AND placement.{scope_column} = target.scope_uuid
+            )
+            SELECT scoped.uuid
+            FROM scoped
+            CROSS JOIN LATERAL (
+                SELECT message.created_at
+                FROM messenger_messages AS message
+                WHERE message.project_id = target.project_id AND message.uuid = scoped.message_uuid
+                  AND message.deleted_at IS NULL
+                LIMIT 1
+            ) AS message
+            ORDER BY message.created_at DESC, scoped.uuid DESC
             LIMIT 1
         ) AS older_preview ON true
         """,
