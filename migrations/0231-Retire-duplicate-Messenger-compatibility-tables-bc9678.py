@@ -215,8 +215,8 @@ ALTER TABLE m_workspace_drafts
 ALTER TABLE m_workspace_files DROP CONSTRAINT m_workspace_files_stream_uuid_fkey;
 ALTER TABLE m_workspace_files ADD CONSTRAINT m_workspace_files_stream_uuid_fkey
     FOREIGN KEY (project_id, stream_uuid) REFERENCES messenger_streams(project_id, uuid) ON DELETE CASCADE;
-ALTER TABLE m_workspace_topic_summary_jobs DROP CONSTRAINT m_workspace_topic_summary_job_boundary_fkey,
-    DROP CONSTRAINT m_workspace_topic_summary_job_topic_fkey;
+ALTER TABLE m_workspace_topic_summary_jobs DROP CONSTRAINT IF EXISTS m_workspace_topic_summary_job_boundary_fkey,
+    DROP CONSTRAINT IF EXISTS m_workspace_topic_summary_job_topic_fkey;
 UPDATE m_workspace_topic_summary_jobs AS job SET boundary_message_uuid=placement.uuid
 FROM messenger_message_placements AS placement
 WHERE placement.project_id=job.project_id AND placement.legacy_public_uuid=job.boundary_message_uuid;
@@ -228,7 +228,7 @@ ALTER TABLE m_workspace_topic_summary_jobs
         REFERENCES messenger_message_placements(project_id, uuid) ON DELETE SET NULL (boundary_message_uuid),
     ADD CONSTRAINT m_workspace_topic_summary_job_topic_fkey FOREIGN KEY (project_id, topic_uuid)
         REFERENCES messenger_topics(project_id, uuid) ON DELETE CASCADE;
-ALTER TABLE m_workspace_topic_summary_journal DROP CONSTRAINT m_workspace_topic_summary_journal_topic_fkey;
+ALTER TABLE m_workspace_topic_summary_journal DROP CONSTRAINT IF EXISTS m_workspace_topic_summary_journal_topic_fkey;
 ALTER TABLE m_workspace_topic_summary_journal ADD CONSTRAINT m_workspace_topic_summary_journal_topic_fkey
     FOREIGN KEY (project_id, topic_uuid) REFERENCES messenger_topics(project_id, uuid) ON DELETE CASCADE;
 

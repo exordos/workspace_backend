@@ -32,9 +32,27 @@ class MigrationStep(migrations.AbstractMigrationStep):
     def upgrade(self, session):
         session.execute(
             """
+            CREATE TABLE IF NOT EXISTS workspace_zulip_v5_legacy_state (
+                kind text NOT NULL,
+                identity_key text NOT NULL,
+                data jsonb NOT NULL,
+                PRIMARY KEY (kind, identity_key)
+            );
             ALTER TABLE m_external_accounts_v2 ADD COLUMN project_id UUID;
             UPDATE m_external_accounts_v2 AS account
             SET project_id = COALESCE(
+                (
+                    SELECT NULLIF(data #>> '{settings,default_project_id}', '')::uuid
+                    FROM workspace_zulip_v5_legacy_state
+                    WHERE kind='account' AND identity_key=account.uuid::text
+                ),
+                (
+                    SELECT (array_agg(DISTINCT (data->>'project_id')::uuid))[1]
+                    FROM workspace_zulip_v5_legacy_state
+                    WHERE kind='chat' AND data->>'external_account_uuid'=account.uuid::text
+                        AND data->>'project_id' IS NOT NULL
+                    HAVING count(DISTINCT data->>'project_id')=1
+                ),
                 (
                     SELECT event.project_id FROM m_workspace_events AS event
                     WHERE event.user_uuid = account.owner_user_uuid

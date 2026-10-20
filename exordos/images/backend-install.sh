@@ -26,6 +26,8 @@ VENV_PATH="$GC_PATH/.venv"
 
 WORKSPACE_BINARIES=(
     workspace-api
+    workspace-prepare-upgrade
+    workspace-migrate-legacy-data
     workspace-history-import
     workspace-zulip-realtime
     workspace-zulip-task-worker
@@ -49,6 +51,7 @@ disable_packaged_nginx_service() {
 }
 
 source "$GC_PATH/exordos/images/install-universal-agent-umask.sh"
+source "$GC_PATH/exordos/images/configure-bootstrap-timeout.sh"
 
 sudo env DEBIAN_FRONTEND=noninteractive apt-get \
     -o DPkg::Lock::Timeout=600 \

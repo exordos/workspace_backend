@@ -29,6 +29,7 @@ below the auth layer, including the composite-primary-key controllers.
 
 import contextlib
 import datetime
+import gc
 import json
 import os
 import pathlib
@@ -355,6 +356,9 @@ def isolated_migration_database(migration, *, current_models=False):
         yield database_url
     finally:
         engines.engine_factory.destroy_all_engines()
+        # Historical-schema tests create many short-lived pools. Restalchemy
+        # closes session/engine reference cycles when they are collected.
+        gc.collect()
         engines.engine_factory.configure_factory(db_url=TEST_DB_URL)
         with psycopg.connect(TEST_DB_URL, autocommit=True) as admin:
             admin.execute(

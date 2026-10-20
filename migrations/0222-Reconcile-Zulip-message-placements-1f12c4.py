@@ -151,10 +151,14 @@ WHERE (placement.uuid IS NOT NULL
                IS DISTINCT FROM (changes.message_uuid, source.stream_uuid, source.topic_uuid)));
 
 ALTER TABLE m_workspace_messages ADD COLUMN canonical_message_uuid uuid;
+-- Linking the compatibility row is metadata-only. Re-importing it can bind
+-- a public address to a different message whose internal UUID is identical.
+ALTER TABLE m_workspace_messages DISABLE TRIGGER messenger_v2_import_legacy_message;
 UPDATE m_workspace_messages AS legacy SET canonical_message_uuid = placement.message_uuid
 FROM messenger_message_placements AS placement
 WHERE placement.project_id = legacy.project_id
   AND COALESCE(placement.legacy_public_uuid, placement.uuid) = legacy.uuid;
+ALTER TABLE m_workspace_messages ENABLE TRIGGER messenger_v2_import_legacy_message;
 ALTER TABLE m_workspace_messages ADD CONSTRAINT m_workspace_messages_canonical_message_fkey
     FOREIGN KEY (project_id, canonical_message_uuid)
     REFERENCES messenger_messages(project_id, uuid) ON DELETE CASCADE;

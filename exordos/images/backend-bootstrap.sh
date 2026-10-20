@@ -19,10 +19,10 @@
 set -eu
 set -o pipefail
 
-GC_PATH="/opt/workspace"
-GC_CFG_DIR="/etc/workspace"
+GC_PATH="${WORKSPACE_PATH:-/opt/workspace}"
+GC_CFG_DIR="${WORKSPACE_CONFIG_DIR:-/etc/workspace}"
 WORKSPACE_CONFIG="$GC_CFG_DIR/workspace.conf"
-RUN_DIR="/run/workspace"
+RUN_DIR="${WORKSPACE_RUN_DIR:-/run/workspace}"
 READY_FILE="$RUN_DIR/bootstrap.ready"
 LOCK_FILE="$RUN_DIR/bootstrap.lock"
 
@@ -37,7 +37,49 @@ if [ ! -s "$WORKSPACE_CONFIG" ]; then
     exit 0
 fi
 
-mkdir -p /var/lib/workspace/messenger/files
+REVISION="$(cat "$WORKSPACE_CONFIG" "$GC_PATH"/migrations/*.py | sha256sum | cut -d ' ' -f 1)"
+if [ -f "$READY_FILE" ] && [ "$(cat "$READY_FILE")" = "$REVISION" ]; then
+    exit 0
+fi
+rm -f "$READY_FILE"
+
+# Running units restart through this same bootstrap lock. They cannot reopen
+# database writers until the migrations and the credential handoff have finished.
+SERVICE_NAMES=(
+    workspace-api
+    workspace-messenger-api
+    workspace-history-import-worker
+    workspace-history-import
+    workspace-zulip-realtime
+    workspace-zulip-task-worker
+    workspace-external-bridge-control
+    workspace-external-bridge-api
+    workspace-messenger-worker
+    workspace-messenger-events
+)
+old_pids=()
+for service_name in "${SERVICE_NAMES[@]}"; do
+    pattern="(^|[ /])${service_name}([[:space:]]|$)"
+    mapfile -t service_pids < <(pgrep -f "$pattern" || true)
+    if [ "${#service_pids[@]}" -gt 0 ]; then
+        old_pids+=("${service_pids[@]}")
+        kill -TERM "${service_pids[@]}" 2>/dev/null || true
+    fi
+done
+shutdown_deadline=$((SECONDS + 90))
+for pid in "${old_pids[@]}"; do
+    while kill -0 "$pid" 2>/dev/null; do
+        state="$(ps -o stat= -p "$pid" 2>/dev/null || true)"
+        [[ "$state" = Z* ]] && break
+        if [ "$SECONDS" -ge "$shutdown_deadline" ]; then
+            echo "Workspace writers did not stop; refusing schema migration." >&2
+            exit 1
+        fi
+        sleep 0.2
+    done
+done
+
+mkdir -p "${WORKSPACE_FILES_PATH:-/var/lib/workspace/messenger/files}"
 
 TRACE_ENABLED=0
 case "$-" in
@@ -82,7 +124,9 @@ until PGPASSWORD="$WORKSPACE_PG_PASS" psql \
 done
 
 source "$GC_PATH/.venv/bin/activate"
+workspace-prepare-upgrade --config-file "$WORKSPACE_CONFIG"
 ra-apply-migration --config-dir "$GC_CFG_DIR" --path "$GC_PATH/migrations"
+workspace-migrate-legacy-data --config-file "$WORKSPACE_CONFIG"
 deactivate
 unset WORKSPACE_PG_PASS
 
@@ -91,6 +135,7 @@ if [[ "$TRACE_ENABLED" -eq 1 ]]; then
 fi
 unset TRACE_ENABLED
 
-touch "$READY_FILE"
+printf '%s\n' "$REVISION" > "$READY_FILE"
+chmod 0600 "$READY_FILE"
 
 echo "Workspace backend bootstrap completed successfully."

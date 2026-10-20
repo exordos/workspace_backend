@@ -16,9 +16,13 @@
 
 from restalchemy.storage.sql import migrations
 
+from migrations import legacy_zulip_upgrade
+
 
 # Preserve canonical content; remove only integration metadata and processing state.
 CLEANUP_SQL = """
+-- Run deferred FK checks before subsequent ALTER TABLE operations.
+SET CONSTRAINTS ALL IMMEDIATE;
 SELECT pg_advisory_xact_lock(hashtextextended('workspace-read-state-schema-v1', 0));
 
 DROP VIEW IF EXISTS "m_confirmed_external_account_access" CASCADE;
@@ -2157,6 +2161,7 @@ class MigrationStep(migrations.AbstractMigrationStep):
         return False
 
     def upgrade(self, session):
+        legacy_zulip_upgrade.capture(session)
         session.execute(CLEANUP_SQL)
 
     def downgrade(self, session):
