@@ -5718,6 +5718,205 @@ paths:
       operationId: Delete_v1_messenger_message_reactions_WorkspaceMessageReactionsUuid
       security:
       - bearerAuth: []
+  /v1/messenger/me/:
+    get:
+      deprecated: true
+      operationId: Filter_v1_messenger_me
+      parameters: []
+      responses:
+        200:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceUser_Get'
+          description: WorkspaceUser_Get
+        default: &id001
+          $ref: '#/components/responses/Error'
+      security:
+      - bearerAuth: []
+      summary: Get current Workspace user
+      tags:
+      - WorkspaceUser
+  /v1/messenger/users/:
+    get:
+      deprecated: true
+      operationId: Filter_v1_messenger_users
+      parameters:
+      - description: "Filter expression (a subset of AIP-160). Combines with the field\n\
+          parameters, which stay the typed way to ask for equality.\n\n    name =\
+          \ \"vm1\" AND size > 10\n    tags:\"env:prod\" OR tags:\"env:staging\"\n\
+          \    NOT (state = error) AND created_at >= \"2026-07-01T00:00:00Z\"\n\n\
+          Operators: `=` `!=` `<` `<=` `>` `>=`, `:` (an array holds the element,\n\
+          or with `*` that the field is set), `AND` `OR` `NOT`, parentheses.\nThe\
+          \ keywords are uppercase, and `OR` binds tighter than `AND`. Values\ncarrying\
+          \ `:`, `.` or spaces must be quoted."
+        example: name = "vm1"
+        in: query
+        name: q
+        required: false
+        schema:
+          type: string
+        x-ra-filter-fields:
+        - avatar
+        - created_at
+        - disabled
+        - email
+        - first_name
+        - last_name
+        - last_ping_at
+        - source
+        - status
+        - status_emoji
+        - status_text
+        - updated_at
+        - username
+        - uuid
+      - $ref: '#/components/parameters/WorkspaceUser_uuid'
+      - $ref: '#/components/parameters/WorkspaceUser_created_at'
+      - $ref: '#/components/parameters/WorkspaceUser_updated_at'
+      - $ref: '#/components/parameters/WorkspaceUser_username'
+      - $ref: '#/components/parameters/WorkspaceUser_source'
+      - $ref: '#/components/parameters/WorkspaceUser_disabled'
+      - $ref: '#/components/parameters/WorkspaceUser_status'
+      - $ref: '#/components/parameters/WorkspaceUser_status_emoji'
+      - $ref: '#/components/parameters/WorkspaceUser_status_text'
+      - $ref: '#/components/parameters/WorkspaceUser_first_name'
+      - $ref: '#/components/parameters/WorkspaceUser_last_name'
+      - $ref: '#/components/parameters/WorkspaceUser_email'
+      - $ref: '#/components/parameters/WorkspaceUser_avatar'
+      - $ref: '#/components/parameters/WorkspaceUser_last_ping_at'
+      - description: Maximum resources returned in this page.
+        in: query
+        name: page_limit
+        schema:
+          minimum: 0
+          type: integer
+      - description: Last resource identifier from the previous page.
+        in: query
+        name: page_marker
+        schema:
+          format: uuid
+          type: string
+      responses:
+        200:
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: '#/components/schemas/WorkspaceUser_Filter'
+                type: array
+          description: WorkspaceUser_Filter
+          headers:
+            X-Pagination-Limit:
+              description: Requested page limit.
+              schema:
+                type: integer
+            X-Pagination-Marker:
+              description: Continuation marker. Present only when another resource
+                exists.
+              schema:
+                format: uuid
+                type: string
+        default: *id001
+      security:
+      - bearerAuth: []
+      summary: Get WorkspaceUsers
+      tags:
+      - WorkspaceUser
+  /v1/messenger/users/{WorkspaceUserUuid}:
+    get:
+      deprecated: true
+      operationId: Get_v1_messenger_users_WorkspaceUserUuid
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceUserUuid'
+      responses:
+        200:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceUser_Get'
+          description: WorkspaceUser_Get
+        default: *id001
+      security:
+      - bearerAuth: []
+      summary: Get WorkspaceUser
+      tags:
+      - WorkspaceUser
+  /v1/messenger/users/{WorkspaceUserUuid}/actions/avatar_reset/invoke:
+    post:
+      deprecated: true
+      operationId: Avatar_reset_v1_messenger_users_WorkspaceUserUuid_actions_avatar_reset_invoke
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceUserUuid'
+      responses: &id002
+        200:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceUserTopic_Get'
+          description: WorkspaceUserTopic_Get
+        default: *id001
+        403:
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                properties:
+                  message:
+                    type: string
+                required:
+                - message
+                type: object
+          description: The stream role cannot update summary configuration.
+      security:
+      - bearerAuth: []
+      summary: Avatar_reset WorkspaceUser
+      tags:
+      - WorkspaceUser
+  /v1/messenger/users/{WorkspaceUserUuid}/actions/avatar_upload/invoke:
+    post:
+      deprecated: true
+      operationId: Avatar_upload_v1_messenger_users_WorkspaceUserUuid_actions_avatar_upload_invoke
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceUserUuid'
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              properties:
+                file:
+                  format: binary
+                  type: string
+              required:
+              - file
+              type: object
+        description: Upload own Workspace avatar
+        required: true
+      responses:
+        201:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceUser_AvatarUpload'
+          description: WorkspaceUser_AvatarUpload
+        default: *id001
+      security:
+      - bearerAuth: []
+      summary: Upload own avatar
+      tags:
+      - WorkspaceUser
+  /v1/messenger/users/{WorkspaceUserUuid}/actions/presence/invoke:
+    post:
+      deprecated: true
+      operationId: Presence_v1_messenger_users_WorkspaceUserUuid_actions_presence_invoke
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceUserUuid'
+      responses: *id002
+      security:
+      - bearerAuth: []
+      summary: Presence WorkspaceUser
+      tags:
+      - WorkspaceUser
   /v1/messenger/messages/:
     get:
       summary: Get WorkspaceUserMessages

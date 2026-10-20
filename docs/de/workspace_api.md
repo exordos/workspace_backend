@@ -2011,6 +2011,12 @@ Daten werden nicht gelöscht.
 Workspace Benutzer werden in `m_workspace_users` gespeichert.
 Die Kommission hat die Kommission aufgefordert,
 
+The compatibility routes `/api/workspace/v1/messenger/me/` and
+`/api/workspace/v1/messenger/users/` (including user lookups and actions)
+return the same responses through the shared controllers. They are deprecated
+and will be removed after clients migrate to `/api/workspace/v1/me/` and
+`/api/workspace/v1/users/`. New clients must use the shared Workspace routes.
+
 `GET /api/workspace/v1/me/` gibt das gleiche `WorkspaceUser_Get` Objekt zurück wie
 `GET /api/workspace/v1/users/{user_uuid}`, mit dem Benutzer UUID aus dem IAM
 Der Client sendet oder leitet keinen Benutzer UUID für diese Anfrage ab.

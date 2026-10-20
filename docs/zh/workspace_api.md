@@ -2008,6 +2008,12 @@ GET /api/workspace/v1/events/?epoch_version%3E=<last_epoch_version>&epoch_genera
 Workspace用户存储在`m_workspace_users`.路线是全球性的
 项目范围.
 
+The compatibility routes `/api/workspace/v1/messenger/me/` and
+`/api/workspace/v1/messenger/users/` (including user lookups and actions)
+return the same responses through the shared controllers. They are deprecated
+and will be removed after clients migrate to `/api/workspace/v1/me/` and
+`/api/workspace/v1/users/`. New clients must use the shared Workspace routes.
+
 `GET /api/workspace/v1/me/`返回相同的`WorkspaceUser_Get`作为对象
 `GET /api/workspace/v1/users/{user_uuid}`,使用用户UUID从IAM
 客户端没有发送或导出一个用户UUID这个请求.

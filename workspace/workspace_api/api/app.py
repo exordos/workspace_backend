@@ -47,10 +47,14 @@ class WorkspaceOpenApiPaths(openapi_structures.OpenApiPaths):
         self, request: typing.Any, components: typing.Any
     ) -> dict[str, typing.Any]:
         specification = super().build(request, components)
-        for path in specification["paths"].values():
-            for operation in path.values():
+        for path, operations in specification["paths"].items():
+            for operation in operations.values():
                 if isinstance(operation, dict) and "responses" in operation:
                     operation["security"] = [{"bearerAuth": []}]
+                    if path == "/v1/messenger/me/" or path.startswith(
+                        "/v1/messenger/users/"
+                    ):
+                        operation["deprecated"] = True
         specification = openapi_contract.add_collection_pagination_contract(
             specification,
             components,
@@ -86,9 +90,13 @@ class WorkspaceOpenApiPaths(openapi_structures.OpenApiPaths):
             "/v1/epoch/",
             components,
         )
-        return openapi_contract.add_current_user_contract(
+        specification = openapi_contract.add_current_user_contract(
             specification,
             "/v1/me/",
+        )
+        return openapi_contract.add_current_user_contract(
+            specification,
+            "/v1/messenger/me/",
         )
 
 

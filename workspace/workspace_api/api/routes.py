@@ -14,6 +14,9 @@ class MessengerRoute(routes.Route):
     __controller__ = controllers.MessengerApiEndpointController
     __allow_methods__ = [routes.FILTER]
 
+    # Deprecated: remove these aliases once clients use the shared Workspace routes.
+    users = routes.route(messenger_routes.WorkspaceUserRoute)
+    me = routes.route(messenger_routes.MeRoute)
     folders = routes.route(messenger_routes.FolderRoute)
     folder_items = routes.route(messenger_routes.FolderItemRoute)
     streams = routes.route(messenger_routes.WorkspaceStreamRoute)

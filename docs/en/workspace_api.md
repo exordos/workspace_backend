@@ -2012,6 +2012,12 @@ data are not deleted.
 Workspace users are stored in `m_workspace_users`. The route is global rather
 than project-scoped.
 
+The compatibility routes `/api/workspace/v1/messenger/me/` and
+`/api/workspace/v1/messenger/users/` (including user lookups and actions)
+return the same responses through the shared controllers. They are deprecated
+and will be removed after clients migrate to `/api/workspace/v1/me/` and
+`/api/workspace/v1/users/`. New clients must use the shared Workspace routes.
+
 `GET /api/workspace/v1/me/` returns the same `WorkspaceUser_Get` object as
 `GET /api/workspace/v1/users/{user_uuid}`, using the user UUID from the IAM
 token. The client does not send or derive a user UUID for this request. The

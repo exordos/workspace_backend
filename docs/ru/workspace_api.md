@@ -2011,6 +2011,12 @@ GET /api/workspace/v1/events/?epoch_version%3E=<last_epoch_version>&epoch_genera
 Workspace пользователи хранятся в `m_workspace_users`. маршрут является глобальным, а
 чем в рамках проекта.
 
+The compatibility routes `/api/workspace/v1/messenger/me/` and
+`/api/workspace/v1/messenger/users/` (including user lookups and actions)
+return the same responses through the shared controllers. They are deprecated
+and will be removed after clients migrate to `/api/workspace/v1/me/` and
+`/api/workspace/v1/users/`. New clients must use the shared Workspace routes.
+
 `GET /api/workspace/v1/me/` возвращает тот же объект `WorkspaceUser_Get`, что и
 `GET /api/workspace/v1/users/{user_uuid}`, используя пользователя UUID из IAM
 Клиент не отправляет или получает пользователя UUID для этого запроса.

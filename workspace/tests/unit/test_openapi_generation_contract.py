@@ -490,6 +490,36 @@ def test_workspace_openapi_exposes_messenger_actions():
     _assert_topic_summary_management_contract(specification, "/v1/messenger/")
 
 
+@pytest.mark.parametrize(
+    "suffix",
+    (
+        "me/",
+        "users/",
+        "users/{WorkspaceUserUuid}",
+        "users/{WorkspaceUserUuid}/actions/presence/invoke",
+        "users/{WorkspaceUserUuid}/actions/avatar_upload/invoke",
+        "users/{WorkspaceUserUuid}/actions/avatar_reset/invoke",
+    ),
+)
+def test_deprecated_messenger_user_aliases_keep_the_shared_openapi_contract(suffix):
+    specification = _build_openapi(workspace_app)
+    paths = specification["paths"]
+    canonical = paths[f"/v1/{suffix}"]
+    alias = paths[f"/v1/messenger/{suffix}"]
+
+    assert set(alias) == set(canonical)
+    for method, operation in canonical.items():
+        alias_operation = alias[method]
+        assert alias_operation["deprecated"] is True
+        assert not operation.get("deprecated", False)
+        assert alias_operation["operationId"] != operation["operationId"]
+        assert {
+            key: value
+            for key, value in alias_operation.items()
+            if key not in {"operationId", "deprecated"}
+        } == {key: value for key, value in operation.items() if key != "operationId"}
+
+
 def test_workspace_openapi_exposes_messenger_and_rest_events():
     specification = _build_openapi(workspace_app)
     paths = specification["paths"]

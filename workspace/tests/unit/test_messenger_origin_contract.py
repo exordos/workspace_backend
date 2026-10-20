@@ -243,15 +243,14 @@ def test_messenger_v1_route_and_method_manifest_is_preserved():
         for name, value in workspace_routes.MessengerRoute.__dict__.items()
         if inspect.isclass(value) and issubclass(value, ra_routes.Route)
     }
-    assert root_routes == set(ROUTE_MANIFEST) - {"users", "me"}
+    assert root_routes == set(ROUTE_MANIFEST)
 
     for name, (route_class, controller_class, methods) in ROUTE_MANIFEST.items():
-        parent = (
-            workspace_routes.WorkspaceApiEndpointRoute
-            if name in {"users", "me"}
-            else workspace_routes.MessengerRoute
-        )
-        assert getattr(parent, name) is route_class
+        assert getattr(workspace_routes.MessengerRoute, name) is route_class
+        if name in {"users", "me"}:
+            assert (
+                getattr(workspace_routes.WorkspaceApiEndpointRoute, name) is route_class
+            )
         assert route_class.__controller__ is controller_class
         assert set(route_class.__allow_methods__) == methods
 
