@@ -147,6 +147,8 @@ The existing primary Messenger worker forwards it to the local Notification
 v1 API and polls that event UUID. Per-device HPKE uses RFC 9180
 X25519/HKDF-SHA256/AES-256-GCM. The action, server/project/chat/message route,
 recipient, device and key UUID are authenticated as associated data.
+Device registration rejects low-order X25519 public keys. A bad legacy key is
+skipped per device so it cannot interrupt native message fanout.
 
 The two kinds are `workspace_message_create` and
 `workspace_message_cancelled`. Reading a message, topic or stream enqueues a

@@ -156,3 +156,51 @@ def test_transient_delivery_error_keeps_outbox_retrying(api, workspace_api, db):
     assert not db.execute(
         "SELECT terminal FROM messenger_push_outbox WHERE user_uuid=%s", (peer,)
     ).fetchone()[0]
+
+
+def test_low_order_registration_key_is_rejected_and_legacy_bad_key_cannot_block_chat(
+    api, workspace_api, db
+):
+    stream, peer, good_device, _ = prepared_message(api, workspace_api, db)
+    bad_device = sys_uuid.uuid4()
+    invalid_key = base64.urlsafe_b64encode(bytes(32)).rstrip(b"=").decode()
+    payload = {
+        "transport": "fcm",
+        "platform": "android",
+        "registration_token": "invalid-key-token",
+        "encryption": {
+            "kind": "HPKE",
+            "algorithm": "HPKE-v1-BASE-X25519-HKDF-SHA256-AES-256-GCM",
+            "key_uuid": str(sys_uuid.uuid4()),
+            "public_key": invalid_key,
+        },
+    }
+    rejected = workspace_api.put(
+        f"/v1/push_devices/{bad_device}", user=peer, json=payload
+    )
+    assert rejected.status_code == 400, rejected.text
+    # Previous servers accepted length-correct low-order keys. Exercise that real stored case.
+    db.execute(
+        """INSERT INTO m_workspace_push_devices (uuid, project_id, user_uuid, transport, platform, registration_token, encryption)
+        VALUES (%s, %s, %s, 'fcm', 'android', 'invalid-key-token', %s::jsonb)""",
+        (bad_device, api.project_id, peer, json.dumps(payload["encryption"])),
+    )
+    created = api.post(
+        "/v1/messages/",
+        json={
+            "stream_uuid": stream["uuid"],
+            "payload": {"kind": "markdown", "content": "Still reaches the chat"},
+        },
+    )
+    assert created.status_code == 201, created.text
+    test_messenger_v2._drain()
+    message_uuid = created.json()["uuid"]
+    result = api.get(f"/v1/messages/{message_uuid}", user=peer)
+    assert result.status_code == 200, result.text
+    event = db.execute(
+        "SELECT event FROM messenger_push_outbox WHERE message_uuid=%s AND user_uuid=%s",
+        (message_uuid, peer),
+    ).fetchone()[0]
+    assert [d["device_uuid"] for d in event["event_params"]["devices"]] == [
+        str(good_device)
+    ]

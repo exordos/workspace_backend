@@ -4,12 +4,15 @@
 
 import base64
 import json
+import logging
 import typing
 import uuid as sys_uuid
 
 from workspace.external_bridge_control import hpke
 from workspace.messenger_api.dm import push_devices
 
+
+LOG = logging.getLogger(__name__)
 
 MESSAGE_CREATE = "workspace_message_create"
 MESSAGE_CANCELLED = "workspace_message_cancelled"
@@ -81,12 +84,17 @@ def build_event(
     for device in devices:
         encryption = device.encryption
         public_key = base64.urlsafe_b64decode(encryption.public_key + "=")
-        enc, ciphertext = hpke.seal(
-            public_key,
-            plaintext,
-            associated_data(event, device.uuid, encryption.key_uuid),
-            HPKE_INFO,
-        )
+        try:
+            enc, ciphertext = hpke.seal(
+                public_key,
+                plaintext,
+                associated_data(event, device.uuid, encryption.key_uuid),
+                HPKE_INFO,
+            )
+        except ValueError:
+            # A legacy bad key must not abort native chat fanout for every recipient.
+            LOG.warning("Invalid push encryption key for device %s", device.uuid)
+            continue
         event["event_params"]["devices"].append(
             {
                 "device_uuid": str(device.uuid),

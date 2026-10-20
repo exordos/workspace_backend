@@ -133,7 +133,8 @@ def enqueue_message(session, source_event_uuid, project_id, message, recipients)
             devices=devices,
             content=content,
         )
-        _insert(session, event, user_uuid, message.uuid)
+        if event["event_params"]["devices"]:
+            _insert(session, event, user_uuid, message.uuid)
 
 
 def enqueue_read(session, project_id, user_uuid, kind, payload):
@@ -181,7 +182,8 @@ def enqueue_read(session, project_id, user_uuid, kind, payload):
             devices=devices,
             content={},
         )
-        _insert(session, event, user_uuid, row["message_uuid"])
+        if event["event_params"]["devices"]:
+            _insert(session, event, user_uuid, row["message_uuid"])
 
 
 @functools.lru_cache(maxsize=4)
