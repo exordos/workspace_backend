@@ -148,12 +148,21 @@ def test_raw_events_and_cursor_commit_together_and_replay_is_idempotent(
     )
 
 
+@pytest.mark.parametrize("age_days", (0, 30))
 @pytest.mark.parametrize("bulk", (False, True))
 def test_message_deletion_events_remove_only_the_observers_copy(
-    message_sources, api, bulk
+    message_sources, api, bulk, age_days
 ):
-    account, source = message_sources()
-    other, copy = message_sources(project_id=account.project_id, sender_id=8)
+    timestamp = int(
+        (
+            datetime.datetime.now(datetime.timezone.utc)
+            - datetime.timedelta(days=age_days)
+        ).timestamp()
+    )
+    account, source = message_sources(timestamp=timestamp)
+    other, copy = message_sources(
+        project_id=account.project_id, sender_id=8, timestamp=timestamp
+    )
     account.settings = {
         **account.settings,
         "email": "owner@example.com",
@@ -194,13 +203,14 @@ def test_message_deletion_events_remove_only_the_observers_copy(
     )
     assert models.ZulipMessage.objects.get_one(filters={"uuid": filters.EQ(copy.uuid)})
     assert len(message_tests._messages(other)) == 1
+    created = ["message.created"] if age_days == 0 else []
     assert [event["kind"] for event in message_tests._message_events(api, account)] == [
-        "message.created",
+        *created,
         "message.deleted",
     ]
-    assert [event["kind"] for event in message_tests._message_events(api, other)] == [
-        "message.created"
-    ]
+    assert [
+        event["kind"] for event in message_tests._message_events(api, other)
+    ] == created
 
 
 def test_stale_subscription_cannot_delete_an_imported_message(message_sources):

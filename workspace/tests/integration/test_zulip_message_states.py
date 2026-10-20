@@ -32,7 +32,14 @@ from workspace.tests.integration import test_messenger_v2 as messenger_tests
 def message_sources(_database, db):
     accounts = []
 
-    def create(project_id=None, host=None, message_id=42, sender_id=7, stream_id=42):
+    def create(
+        project_id=None,
+        host=None,
+        message_id=42,
+        sender_id=7,
+        stream_id=42,
+        timestamp=1691057093,
+    ):
         owner_uuid = uuid.uuid4()
         conftest.seed_workspace_user(db, owner_uuid, f"message-owner-{owner_uuid}")
         account = external_models.ExternalAccount(
@@ -83,7 +90,7 @@ def message_sources(_database, db):
             message_uuid=uuid.uuid5(namespace, str(message_id)),
             message_id=message_id,
             sender_id=7,
-            timestamp=1691057093,
+            timestamp=timestamp,
             channel=channel,
             topic=topic,
             content=content,
@@ -3021,7 +3028,9 @@ def _message_events(api, account):
 
 
 def test_message_reconciliation_publishes_complete_lifecycle_once(message_sources, api):
-    account, source = message_sources()
+    account, source = message_sources(
+        timestamp=int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+    )
     _prepare(account)
     with contexts.Context().session_manager():
         assert models.ZulipMessageState.reconcile_batch(100) == 1
@@ -3064,7 +3073,9 @@ def test_message_reconciliation_publishes_complete_lifecycle_once(message_source
 def test_message_reconciliation_does_not_publish_unchanged_observations(
     message_sources, api
 ):
-    account, source = message_sources()
+    account, source = message_sources(
+        timestamp=int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+    )
     _prepare(account)
     with contexts.Context().session_manager():
         models.ZulipMessageState.reconcile_batch(100)
@@ -3076,8 +3087,12 @@ def test_message_reconciliation_does_not_publish_unchanged_observations(
 
 
 def test_message_events_follow_each_observers_access(message_sources, api):
-    first, source = message_sources()
-    second, copy = message_sources(project_id=first.project_id, sender_id=8)
+    first, source = message_sources(
+        timestamp=int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+    )
+    second, copy = message_sources(
+        project_id=first.project_id, sender_id=8, timestamp=source.timestamp
+    )
     _prepare(first)
     with contexts.Context().session_manager():
         models.ZulipMessageState.reconcile_batch(100)
@@ -3109,7 +3124,9 @@ def test_message_events_follow_each_observers_access(message_sources, api):
 
 
 def test_message_event_failure_rolls_back_reconciliation(message_sources, api):
-    account, source = message_sources()
+    account, source = message_sources(
+        timestamp=int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+    )
     _prepare(account)
     with mock.patch.object(
         models.messenger_events,
@@ -3132,7 +3149,9 @@ def test_message_event_failure_rolls_back_reconciliation(message_sources, api):
 def test_imported_message_events_are_fenced_to_the_membership_generation(
     message_sources, db, api
 ):
-    account, source = message_sources()
+    account, source = message_sources(
+        timestamp=int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+    )
     _prepare(account)
     with contexts.Context().session_manager():
         models.ZulipMessageState.reconcile_batch(100)
@@ -3143,3 +3162,98 @@ def test_imported_message_events_are_fenced_to_the_membership_generation(
         (account.project_id, account.owner_user_uuid),
     )
     assert _message_events(api, account) == []
+
+
+@pytest.mark.parametrize("age_hours", [0, 23, 25, 30 * 24, 180 * 24])
+def test_historical_creation_is_rest_only_but_later_changes_still_publish(
+    message_sources, api, age_hours
+):
+    timestamp = int(
+        (
+            datetime.datetime.now(datetime.timezone.utc)
+            - datetime.timedelta(hours=age_hours)
+        ).timestamp()
+    )
+    account, source = message_sources(timestamp=timestamp)
+    _prepare(account)
+    with contexts.Context().session_manager():
+        assert models.ZulipMessageState.reconcile_batch(100) == 1
+    created = _message_events(api, account)
+    assert [event["kind"] for event in created] == (
+        ["message.created"] if age_hours < 24 else []
+    )
+    response = api.get(
+        "/v1/messenger/messages/",
+        user=account.owner_user_uuid,
+        project=account.project_id,
+        params={
+            "project_id": str(account.project_id),
+            "stream_uuid": str(source.channel.stream_uuid),
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert len(response.json()) == 1
+    assert response.json()[0]["payload"]["content"] == source.content.workspace_content
+    assert _changes(models.ZulipMessageChange, account) == []
+
+    source.content.workspace_content = "Edited old message"
+    source.content.workspace_content_updated_at += datetime.timedelta(days=1)
+    source.content.update()
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(100)
+    assert _message_events(api, account)[-1]["kind"] == "message.updated"
+    assert (
+        _message_events(api, account)[-1]["payload"]["content"] == "Edited old message"
+    )
+    source.delete()
+    with contexts.Context().session_manager():
+        models.ZulipMessageState.reconcile_batch(100)
+    assert _message_events(api, account)[-1]["kind"] == "message.deleted"
+
+
+@pytest.mark.parametrize("age_days", [0, 30])
+def test_history_batch_keeps_rest_messages_without_flooding_events(
+    message_sources, api, age_days
+):
+    timestamp = int(
+        (
+            datetime.datetime.now(datetime.timezone.utc)
+            - datetime.timedelta(days=age_days)
+        ).timestamp()
+    )
+    account, source = message_sources(timestamp=timestamp)
+    namespace = uuid.uuid5(uuid.NAMESPACE_DNS, account.get_host())
+    for message_id in range(43, 142):
+        models.ZulipMessage(
+            project_id=account.project_id,
+            external_account_uuid=account.uuid,
+            message_uuid=uuid.uuid5(namespace, str(message_id)),
+            message_id=message_id,
+            sender_id=7,
+            timestamp=timestamp,
+            channel=source.channel,
+            topic=source.topic,
+            content=source.content,
+            read=True,
+        ).insert()
+    _prepare(account)
+    with contexts.Context().session_manager():
+        assert models.ZulipMessageState.reconcile_batch(100) == 100
+        assert models.ZulipMessageState.reconcile_batch(100) == 0
+    events = _message_events(api, account)
+    response = api.get(
+        "/v1/messenger/messages/",
+        user=account.owner_user_uuid,
+        project=account.project_id,
+        params={"project_id": str(account.project_id), "page_limit": 100},
+    )
+    assert response.status_code == 200, response.text
+    print(
+        {
+            "age_days": age_days,
+            "rest_messages": len(response.json()),
+            "message_events": len(events),
+        }
+    )
+    assert len(response.json()) == 100
+    assert len(events) == (100 if age_days == 0 else 0)

@@ -185,14 +185,15 @@ class HistoryImportService(basic.BasicService):
         return claimed
 
     @staticmethod
-    def _locked_task(task_uuid, owner):
+    def _locked_task(task_uuid, owner, *, skip_locked=True):
         session = contexts.Context().get_session()
+        lock_clause = "FOR UPDATE SKIP LOCKED" if skip_locked else "FOR UPDATE"
         task = models.Task.objects.get_one(filters={"uuid": filters.EQ(task_uuid)})
         # Keep account-before-task locking consistent with rebind and send paths.
         if task.external_account_uuid is not None:
             account = session.execute(
                 "SELECT uuid,status,settings ? 'api_key' AS has_credentials "
-                "FROM m_external_accounts_v2 WHERE project_id=%s AND uuid=%s FOR UPDATE SKIP LOCKED",
+                f"FROM m_external_accounts_v2 WHERE project_id=%s AND uuid=%s {lock_clause}",
                 (task.project_id, task.external_account_uuid),
             ).fetchone()
             if account is None:
@@ -214,8 +215,8 @@ class HistoryImportService(basic.BasicService):
                 )
                 return None
         row = session.execute(
-            """SELECT uuid FROM bridge_zulip_v5_tasks WHERE uuid=%s AND lease_owner=%s
-               AND status IN ('new','waiting','retry') FOR UPDATE SKIP LOCKED""",
+            f"""SELECT uuid FROM bridge_zulip_v5_tasks WHERE uuid=%s AND lease_owner=%s
+               AND status IN ('new','waiting','retry') {lock_clause}""",
             (task_uuid, owner),
         ).fetchone()
         if row is None:
@@ -226,10 +227,16 @@ class HistoryImportService(basic.BasicService):
             if task.concurrency_key.endswith(":catalog")
             else f"zulip-task:{task.queue}:{task.concurrency_key}"
         )
-        locked = session.execute(
-            "SELECT pg_try_advisory_xact_lock(hashtextextended(%s,0)) AS locked",
-            (key,),
-        ).fetchone()["locked"]
+        if skip_locked:
+            locked = session.execute(
+                "SELECT pg_try_advisory_xact_lock(hashtextextended(%s,0)) AS locked",
+                (key,),
+            ).fetchone()["locked"]
+        else:
+            session.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))", (key,)
+            )
+            locked = True
         if not locked:
             if task.concurrency_key.endswith(":catalog"):
                 session.execute(
@@ -263,10 +270,12 @@ class HistoryImportService(basic.BasicService):
                             task.on_error(error)
                 else:
                     self._execute_task(task)
-            # Preserve the committed attempt marker across a lost HTTP response.
+            # Once the attempt marker commits, skipping a busy lock would lose
+            # the in-memory permission to POST and wait forever for an echo.
+            # Wait for this fence while still checking the durable claim.
             if prepared is not None:
                 with contexts.Context().session_manager():
-                    task = self._locked_task(task_uuid, owner)
+                    task = self._locked_task(task_uuid, owner, skip_locked=False)
                     if task is not None:
                         task.content._submit = getattr(
                             prepared.content, "_submit", False

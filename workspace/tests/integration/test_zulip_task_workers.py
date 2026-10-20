@@ -586,8 +586,13 @@ def test_history_import_retries_database_deadlock_after_rolling_back_partial_wri
         _until(service, lambda: _stored(task).status == "retry")
         retried = _stored(task)
         after = datetime.datetime.now(datetime.timezone.utc)
-        assert before + models.TASK_RETRY_DELAY <= retried.next_retry_at
-        assert retried.next_retry_at <= after + models.TASK_RETRY_DELAY
+        retry_delay = (
+            datetime.timedelta(seconds=1)
+            if queue == "realtime"
+            else models.TASK_RETRY_DELAY
+        )
+        assert before + retry_delay <= retried.next_retry_at
+        assert retried.next_retry_at <= after + retry_delay
         status_update.assert_not_called()
         assert retried.error_description == deadlock["message"]
         assert retried.lease_owner is None
@@ -859,3 +864,61 @@ def test_catalog_updates_share_an_execution_key_across_queues(
         release.set()
         bg.stop()
         rt.stop()
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_send_waits_for_account_contention_after_prepare(outgoing, monkeypatch, cancel):
+    _api, account, _channel, _remote, zulip, _constructor = outgoing
+    outgoing_tests.create(outgoing)
+    outgoing_tests.dispatch()
+    service = history_import.HistoryImportService(queue="realtime")
+    with contexts.Context().session_manager():
+        [(task_uuid, owner)] = service._claim_tasks(1)
+    after_prepare, continue_execution = threading.Event(), threading.Event()
+    locked_task = service._locked_task
+    calls = []
+
+    def fence(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 2:
+            after_prepare.set()
+            assert continue_execution.wait(5)
+        return locked_task(*args, **kwargs)
+
+    monkeypatch.setattr(service, "_locked_task", fence)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(service._run_task, task_uuid, owner)
+        try:
+            assert after_prepare.wait(5)
+            with psycopg.connect(conftest.TEST_DB_URL) as blocker:
+                blocker.execute(
+                    "SELECT uuid FROM m_external_accounts_v2 WHERE uuid=%s FOR UPDATE",
+                    (account.uuid,),
+                )
+                if cancel:
+                    blocker.execute(
+                        "UPDATE bridge_zulip_v5_tasks SET status='cancel' WHERE uuid=%s",
+                        (task_uuid,),
+                    )
+                continue_execution.set()
+                # The committed send marker must not turn a skipped lock into
+                # an indefinite wait for an echo from a POST that never ran.
+                with pytest.raises(concurrent.futures.TimeoutError):
+                    future.result(timeout=0.1)
+                zulip.send_message.assert_not_called()
+            future.result(timeout=5)
+        finally:
+            continue_execution.set()
+    task = models.Task.objects.get_one(filters={"uuid": filters.EQ(task_uuid)})
+    if cancel:
+        assert task.status == "cancel"
+        zulip.send_message.assert_not_called()
+    else:
+        zulip.send_message.assert_called_once()
+        assert task.status == "retry"
+        assert task.error_description is None
+        delivery = models.MessageDelivery.objects.get_one(
+            filters={"uuid": filters.EQ(task.content.delivery_uuid)}
+        )
+        assert delivery.zulip_message_id == zulip.send_message.return_value
+    assert task.lease_owner is None
