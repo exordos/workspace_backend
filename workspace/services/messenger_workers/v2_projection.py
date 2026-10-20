@@ -26,6 +26,7 @@ from restalchemy.common import contexts
 from restalchemy.dm import filters as dm_filters
 
 from workspace.messenger_api import events as messenger_events
+from workspace.messenger_api import push_outbox
 from workspace.messenger_api import file_storage
 from workspace.messenger_api.api import resource_projection
 from workspace.messenger_api.dm import message_payloads
@@ -1704,6 +1705,10 @@ def _process_fanout(
                 for recipient in recipients
                 if _uuid(recipient["user_uuid"]) in set(recipient_uuids)
             },
+        )
+    if task["payload"].get("emit_public_event", True):
+        push_outbox.enqueue_message(
+            session, task["outbox_event_uuid"], project_id, message, recipient_uuids
         )
     for user_uuid in recipient_uuids:
         _enqueue_counter_outbox_events(

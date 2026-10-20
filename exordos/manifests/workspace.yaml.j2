@@ -503,6 +503,11 @@ resources:
           v2_metrics_log_interval_seconds = 30
 
 
+          [mobile_push]
+          # The managed backend node UUID is this installation's stable server identity.
+          organization_uuid = {$core.compute.nodes.$workspace_backend:uuid}
+
+
           [topic_summary]
           secret_encryption_key = {$core.secret.passwords.$workspace_topic_summary_secret_key:value}
           connect_timeout_seconds = 30
@@ -559,6 +564,7 @@ resources:
 
           server {
               listen 80;
+              include /etc/nginx/workspace.d/locations/*.conf;
               server_name _;
               client_max_body_size 50m;
 

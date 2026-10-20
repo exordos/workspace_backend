@@ -1,0 +1,100 @@
+{
+  "description": "Synthetic Workspace interoperability example using public RFC 9180 test keys. Never use these keys in deployment.",
+  "recipient_private_key_hex": "497b4502664cfea5d5af0b39934dac72242a74f8480451e1aee7d6a53320333d",
+  "event": {
+    "uuid": "00000000-0000-0000-0000-000000000001",
+    "project_id": "00000000-0000-0000-0000-000000000003",
+    "event_type": "/v1/event_types/864b5689-2675-5cbf-b545-5307fa158449",
+    "exchange": {
+      "kind": "User",
+      "user_uuid": "00000000-0000-0000-0000-000000000008"
+    },
+    "event_params": {
+      "kind": "workspace_message_create",
+      "organization_uuid": "00000000-0000-0000-0000-000000000002",
+      "project_uuid": "00000000-0000-0000-0000-000000000003",
+      "stream_uuid": "00000000-0000-0000-0000-000000000004",
+      "topic_uuid": "00000000-0000-0000-0000-000000000005",
+      "message_uuid": "00000000-0000-0000-0000-000000000006",
+      "devices": [
+        {
+          "device_uuid": "00000000-0000-0000-0000-000000000009",
+          "registration_token": "test-token",
+          "content": {
+            "kind": "encrypted",
+            "algorithm": "HPKE-v1-BASE-X25519-HKDF-SHA256-AES-256-GCM",
+            "key_uuid": "00000000-0000-0000-0000-00000000000a",
+            "enc": "bJPgmGnfNALXvyMb9UD63TXNVr4U-XF48JVNuUt_wlY",
+            "ciphertext": "XlYlFEQUdIMwjq34lmi1KFa82xT4LDmv1dB2t3VVWBBJy7SH0nLEMO0dUKu33_tkKe6ZZOuhEknuWUinTSs-Mm4UuK2tA8-zp1uaXXcAGPvSOAmb9diPsJelDE5F"
+          }
+        }
+      ]
+    }
+  },
+  "payload": {
+    "uuid": "00000000-0000-0000-0000-000000000001",
+    "kind": "workspace_message_create",
+    "organization_uuid": "00000000-0000-0000-0000-000000000002",
+    "project_uuid": "00000000-0000-0000-0000-000000000003",
+    "stream_uuid": "00000000-0000-0000-0000-000000000004",
+    "topic_uuid": "00000000-0000-0000-0000-000000000005",
+    "message_uuid": "00000000-0000-0000-0000-000000000006",
+    "user_uuid": "00000000-0000-0000-0000-000000000008",
+    "device_uuid": "00000000-0000-0000-0000-000000000009",
+    "content": {
+      "kind": "encrypted",
+      "algorithm": "HPKE-v1-BASE-X25519-HKDF-SHA256-AES-256-GCM",
+      "key_uuid": "00000000-0000-0000-0000-00000000000a",
+      "enc": "bJPgmGnfNALXvyMb9UD63TXNVr4U-XF48JVNuUt_wlY",
+      "ciphertext": "XlYlFEQUdIMwjq34lmi1KFa82xT4LDmv1dB2t3VVWBBJy7SH0nLEMO0dUKu33_tkKe6ZZOuhEknuWUinTSs-Mm4UuK2tA8-zp1uaXXcAGPvSOAmb9diPsJelDE5F"
+    }
+  },
+  "cancel_event": {
+    "uuid": "26f963b3-34db-58de-86d6-d330f7139d21",
+    "project_id": "00000000-0000-0000-0000-000000000003",
+    "event_type": "/v1/event_types/90492b40-2a35-56aa-8821-82d383fe8730",
+    "exchange": {
+      "kind": "User",
+      "user_uuid": "00000000-0000-0000-0000-000000000008"
+    },
+    "event_params": {
+      "kind": "workspace_message_cancelled",
+      "organization_uuid": "00000000-0000-0000-0000-000000000002",
+      "project_uuid": "00000000-0000-0000-0000-000000000003",
+      "stream_uuid": "00000000-0000-0000-0000-000000000004",
+      "topic_uuid": "00000000-0000-0000-0000-000000000005",
+      "message_uuid": "00000000-0000-0000-0000-000000000006",
+      "devices": [
+        {
+          "device_uuid": "00000000-0000-0000-0000-000000000009",
+          "registration_token": "test-token",
+          "content": {
+            "kind": "encrypted",
+            "algorithm": "HPKE-v1-BASE-X25519-HKDF-SHA256-AES-256-GCM",
+            "key_uuid": "00000000-0000-0000-0000-00000000000a",
+            "enc": "bJPgmGnfNALXvyMb9UD63TXNVr4U-XF48JVNuUt_wlY",
+            "ciphertext": "XglVPQZmd04X6yLlI5FWZtdg"
+          }
+        }
+      ]
+    }
+  },
+  "cancel_payload": {
+    "uuid": "26f963b3-34db-58de-86d6-d330f7139d21",
+    "kind": "workspace_message_cancelled",
+    "organization_uuid": "00000000-0000-0000-0000-000000000002",
+    "project_uuid": "00000000-0000-0000-0000-000000000003",
+    "stream_uuid": "00000000-0000-0000-0000-000000000004",
+    "topic_uuid": "00000000-0000-0000-0000-000000000005",
+    "message_uuid": "00000000-0000-0000-0000-000000000006",
+    "user_uuid": "00000000-0000-0000-0000-000000000008",
+    "device_uuid": "00000000-0000-0000-0000-000000000009",
+    "content": {
+      "kind": "encrypted",
+      "algorithm": "HPKE-v1-BASE-X25519-HKDF-SHA256-AES-256-GCM",
+      "key_uuid": "00000000-0000-0000-0000-00000000000a",
+      "enc": "bJPgmGnfNALXvyMb9UD63TXNVr4U-XF48JVNuUt_wlY",
+      "ciphertext": "XglVPQZmd04X6yLlI5FWZtdg"
+    }
+  }
+}

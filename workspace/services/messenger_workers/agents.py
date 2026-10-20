@@ -26,12 +26,14 @@ from restalchemy.common import contexts
 from restalchemy.dm import filters as dm_filters
 from gcl_looper.services import basic
 
+from workspace.common import mobile_push_opts
 from workspace.common import topic_summary_opts
 from workspace.messenger_api.dm import helpers as messenger_dm_helpers
 from workspace.messenger_api.dm import read_state
 from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.api import controllers as messenger_controllers
 from workspace.messenger_api.api import sql_canonical_store
+from workspace.messenger_api import push_outbox
 from workspace.messenger_api import topic_summarization
 from workspace.messenger_api import events as messenger_events
 from workspace.external_bridge_control import sql_state
@@ -178,6 +180,12 @@ class MessengerWorkerAgent(basic.BasicService):
         processed_v2 = False
         if self._v2_projection_enabled:
             processed_v2 = self._run_v2_projection_tasks()
+        if not self._projection_only and mobile_push_opts.enabled():
+            try:
+                with database_session_context() as session:
+                    push_outbox.process_one(session)
+            except Exception:
+                LOG.exception("Failed to process mobile push outbox")
         if self._projection_only:
             if not processed_v2:
                 self._wait_for_v2_projection_work()

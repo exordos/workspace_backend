@@ -87,6 +87,37 @@ def _canonical_json(value: object) -> bytes:
     ).encode("utf-8")
 
 
+def seal(
+    recipient_public_key: bytes,
+    plaintext: bytes,
+    associated_data: bytes,
+    info: bytes,
+) -> tuple[bytes, bytes]:
+    """Seal one RFC 9180 base-mode message with the existing AES-256-GCM suite."""
+    recipient_key = x25519.X25519PublicKey.from_public_bytes(recipient_public_key)
+    ephemeral_key = x25519.X25519PrivateKey.generate()
+    encapsulated_key = ephemeral_key.public_key().public_bytes_raw()
+    dh = ephemeral_key.exchange(recipient_key)
+    eae_prk = _labeled_extract(_KEM_SUITE_ID, b"", b"eae_prk", dh)
+    shared_secret = _labeled_expand(
+        _KEM_SUITE_ID,
+        eae_prk,
+        b"shared_secret",
+        encapsulated_key + recipient_public_key,
+        32,
+    )
+    psk_id_hash = _labeled_extract(_HPKE_SUITE_ID, b"", b"psk_id_hash", b"")
+    info_hash = _labeled_extract(_HPKE_SUITE_ID, b"", b"info_hash", info)
+    key_schedule_context = b"\0" + psk_id_hash + info_hash
+    secret = _labeled_extract(_HPKE_SUITE_ID, shared_secret, b"secret", b"")
+    key = _labeled_expand(_HPKE_SUITE_ID, secret, b"key", key_schedule_context, 32)
+    nonce = _labeled_expand(
+        _HPKE_SUITE_ID, secret, b"base_nonce", key_schedule_context, 12
+    )
+    ciphertext = aead.AESGCM(key).encrypt(nonce, plaintext, associated_data)
+    return encapsulated_key, ciphertext
+
+
 def encrypt_zulip_credential(
     recipient: dict[str, Any],
     credential: dict[str, str],
@@ -124,28 +155,12 @@ def encrypt_zulip_credential(
     recipient_bytes = _decode_b64url(recipient["public_key"])
     if recipient["algorithm"] != "X25519" or len(recipient_bytes) != 32:
         raise ValueError("Bridge recipient public key is invalid")
-    recipient_key = x25519.X25519PublicKey.from_public_bytes(recipient_bytes)
-    ephemeral_key = x25519.X25519PrivateKey.generate()
-    encapsulated_key = ephemeral_key.public_key().public_bytes_raw()
-    dh = ephemeral_key.exchange(recipient_key)
-    eae_prk = _labeled_extract(_KEM_SUITE_ID, b"", b"eae_prk", dh)
-    shared_secret = _labeled_expand(
-        _KEM_SUITE_ID,
-        eae_prk,
-        b"shared_secret",
-        encapsulated_key + recipient_bytes,
-        32,
+    encapsulated_key, ciphertext = seal(
+        recipient_bytes,
+        _canonical_json(credential),
+        _canonical_json(associated_data),
+        INFO,
     )
-    psk_id_hash = _labeled_extract(_HPKE_SUITE_ID, b"", b"psk_id_hash", b"")
-    info_hash = _labeled_extract(_HPKE_SUITE_ID, b"", b"info_hash", INFO)
-    key_schedule_context = b"\0" + psk_id_hash + info_hash
-    secret = _labeled_extract(_HPKE_SUITE_ID, shared_secret, b"secret", b"")
-    key = _labeled_expand(_HPKE_SUITE_ID, secret, b"key", key_schedule_context, 32)
-    nonce = _labeled_expand(
-        _HPKE_SUITE_ID, secret, b"base_nonce", key_schedule_context, 12
-    )
-    aad = _canonical_json(associated_data)
-    ciphertext = aead.AESGCM(key).encrypt(nonce, _canonical_json(credential), aad)
     return {
         "schema": SCHEMA,
         "algorithm": ALGORITHM,

@@ -30,6 +30,7 @@ from restalchemy.api import resources as ra_resources
 from restalchemy.common import exceptions as ra_exc
 from restalchemy.common import contexts
 from restalchemy.dm import filters as dm_filters
+from workspace.messenger_api import push_outbox
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.dm import event_payloads
 from workspace.messenger_api.dm import message_payloads
@@ -553,7 +554,15 @@ def _create_workspace_event(
         action=action,
         payload=_payload_with_kind(kind, payload),
     )
-    return event.insert(session=session)
+    inserted = event.insert(session=session)
+    push_outbox.enqueue_read(
+        session,
+        project_id,
+        user_uuid,
+        kind,
+        payload,
+    )
+    return inserted
 
 
 def create_message_events(

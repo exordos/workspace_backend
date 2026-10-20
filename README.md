@@ -133,3 +133,61 @@ do not use `ra-rollback-migration` for this upgrade path.
 
 Use the `admin/admin` account for local manual checks when the environment
 provides the test IAM user.
+
+## Native encrypted Android push
+
+The existing `PUT/DELETE /api/workspace/v1/push_devices/{device_uuid}` API
+registers a device's FCM token and raw X25519 public key under the authenticated
+user/project. Private keys stay on the phone. The registration UUID stays stable
+when a token changes; there are no registration revisions.
+
+When `[mobile_push]` is configured, native message fanout writes an encrypted
+per-user event snapshot into `messenger_push_outbox` in the same transaction.
+The existing primary Messenger worker forwards it to the local Notification
+v1 API and polls that event UUID. Per-device HPKE uses RFC 9180
+X25519/HKDF-SHA256/AES-256-GCM. The action, server/project/chat/message route,
+recipient, device and key UUID are authenticated as associated data.
+
+The two kinds are `workspace_message_create` and
+`workspace_message_cancelled`. Reading a message, topic or stream enqueues a
+separate cancellation with the same public message placement UUID. Existing
+mute, mention, topic-override, membership and unread rules determine recipients.
+The author, protocol-only key messages and history import do not produce alerts.
+Ordinary preview text is bounded before encryption. End-to-end encrypted chat
+payloads remain opaque and produce a generic encrypted-message preview.
+
+The worker retries the same event UUID/ciphertext after timeouts or restart,
+retains the initial one-hour deadline, and propagates inactive-token errors.
+It deletes a device registration only if its current token still equals the
+rejected snapshot. Temporary errors keep the outbox retryable. Notification
+transport choice remains in its owner-scoped binding API; Workspace preference
+proxy endpoints and Android preference screens are deferred.
+
+Configuration keys are `mobile_push.organization_uuid`,
+`mobile_push.notification_endpoint` and `mobile_push.notification_auth_file`.
+The managed backend node UUID supplies the stable installation identity.
+The feature is disabled until the endpoint and private credential file are set.
+The [optional site manifest](exordos/manifests/mobile_push.yaml.j2) connects the
+existing worker to the local Notification and provisions a protected Event
+proxy through the existing Workspace gateway. Services read drop-ins from
+`/etc/workspace/workspace.conf.d`. Firebase sender credentials belong only on
+the upstream Notification, never in Workspace or customer installations.
+
+The complete event, encryption, relay and deployment contract is documented in
+`exordos_notification/docs/mobile-push.md`. Android integration is documented in
+`workspace_android/docs/mobile-push.md`.
+
+Tests include public HPKE vectors and a shared Python/Android event fixture,
+plus real PostgreSQL/HTTP integration of create, message/topic/stream read
+cancellation, retry and stale-token cleanup. Run the latter against a dedicated
+empty test database only:
+
+```bash
+WORKSPACE_TEST_DB_URL='<DEDICATED_TEST_POSTGRES_URL>' \
+  .tox/develop/bin/python -m pytest workspace/tests/integration/test_mobile_push.py
+```
+
+Its fixture recreates the test database's public schema. Use immutable
+`exordos build`/`exordos deploy` artifacts for runtime updates and preserve a
+Workspace database backup before applying migrations. A queued event or an
+`ACTIVE` transport status does not prove display on a real phone.

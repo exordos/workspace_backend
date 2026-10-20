@@ -1,0 +1,98 @@
+# Install after workspace, the local Notification, and its push_source manifest.
+# organization_uuid must equal the managed Workspace backend node UUID.
+name: workspace_mobile_push
+description: Native Workspace mobile push producer
+schema_version: 1
+version: "{{ version | default('1.0.0') }}"
+api_version: v1
+requirements:
+  workspace:
+    from_version: "1.3.2.dev0"
+  exordos_notification:
+    from_version: "1.2.8.dev0"
+  notification_push_source_{{ organization_uuid }}:
+    from_version: "1.0.0"
+imports:
+  backend_node:
+    element: "$workspace"
+    kind: resource
+    link: "$core.compute.nodes.$workspace_backend"
+  notification_node:
+    element: "$exordos_notification"
+    kind: resource
+    link: "$core.compute.nodes.$notification_cp"
+  source_user:
+    element: "$notification_push_source_{{ organization_uuid }}"
+    kind: resource
+    link: "$core.iam.users.$source"
+  source_password:
+    element: "$notification_push_source_{{ organization_uuid }}"
+    kind: resource
+    link: "$core.secret.passwords.$source_password"
+  core_local_domain:
+    element: "$core"
+    kind: resource
+    link: "$core.dns.domains.$local_domain"
+resources:
+  $core.config.configs:
+    authentication:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      path: /etc/workspace/mobile-push-auth.json
+      mode: "0600"
+      target:
+        kind: node
+        node: $workspace_mobile_push.imports.$backend_node:uuid
+      on_change:
+        kind: shell
+        command: /usr/local/bin/workspace-restart-services
+      body:
+        kind: text
+        content: |
+          f"{
+            "base_url": "http://core.{$workspace_mobile_push.imports.$core_local_domain:name}/api/core",
+            "username": "{$workspace_mobile_push.imports.$source_user:username}",
+            "password": "{$workspace_mobile_push.imports.$source_password:value}",
+            "scope": "project:12345678-c625-4fee-81d5-f691897b8142"
+          }"
+    notification_endpoint:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      path: /etc/workspace/workspace.conf.d/90-mobile-push.conf
+      mode: "0600"
+      target:
+        kind: node
+        node: $workspace_mobile_push.imports.$backend_node:uuid
+      on_change:
+        kind: shell
+        command: /usr/local/bin/workspace-restart-services
+      body:
+        kind: text
+        content: |
+          f"
+          [mobile_push]
+          notification_endpoint = http://{$workspace_mobile_push.imports.$notification_node:default_network:ipv4}:8080
+          notification_auth_file = /etc/workspace/mobile-push-auth.json
+          "
+
+    public_notification_gateway:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      path: /etc/nginx/workspace.d/locations/90-notification.conf
+      mode: "0644"
+      target:
+        kind: node
+        node: $workspace_mobile_push.imports.$backend_node:uuid
+      on_change:
+        kind: shell
+        command: /usr/local/bin/workspace-nginx-reload
+      body:
+        kind: text
+        content: |
+          f"
+          location ^~ /api/workspace/notification/ {
+              proxy_pass http://{$workspace_mobile_push.imports.$notification_node:default_network:ipv4}:8080/;
+              proxy_set_header Host $host;
+              proxy_set_header X-Notification-Relay 1;
+              proxy_set_header Authorization $http_authorization;
+              proxy_connect_timeout 5s;
+              proxy_read_timeout 15s;
+          }
+          "
