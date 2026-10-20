@@ -67,7 +67,26 @@ class ExternalAccount(
                     str(self.owner_user_uuid),
                     self.provider,
                     self.external_account_id,
-                    self.settings,
+                    self.connection_settings(),
+                ],
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+
+    def connection_settings(self) -> dict:
+        return {
+            name: self.settings.get(name) for name in ("server_url", "email", "api_key")
+        }
+
+    def subscription_revision(self) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                [
+                    str(self.project_id),
+                    str(self.owner_user_uuid),
+                    self.provider,
+                    self.external_account_id,
+                    self.settings["server_url"].rstrip("/"),
                 ],
                 sort_keys=True,
             ).encode()

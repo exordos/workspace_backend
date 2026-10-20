@@ -217,7 +217,7 @@ class ZulipRealtimeService:
             )
             if (
                 subscription is not None
-                and subscription.account_revision != account.realtime_revision()
+                and subscription.account_revision != account.subscription_revision()
             ):
                 subscription = None
             while True:

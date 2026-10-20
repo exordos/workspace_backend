@@ -435,7 +435,7 @@ def test_unknown_message_reactions_wait_for_import(message_sources, db):
     assert len(facts(account)) == 1
 
 
-def test_credential_rotation_cancels_old_tasks_and_requeues_the_intent(imported, api):
+def test_unverified_credential_changes_do_not_rescan_reaction_intents(imported, api):
     account, _source, _state, _subscription, zulip, _constructor = imported
     add(api, imported)
     reconcile()
@@ -444,7 +444,7 @@ def test_credential_rotation_cancels_old_tasks_and_requeues_the_intent(imported,
     account.update()
     reconcile()
     tasks = pending(account)
-    assert len(tasks) == 2
+    assert len(tasks) == 1
     with contexts.Context().session_manager():
         old_task.execute()
     assert old_task.status == "cancel"
@@ -592,6 +592,10 @@ def test_migration_normalizes_existing_aliases_and_preserves_local_intentions(
     imported, db
 ):
     account, _source, state, *_rest = imported
+    account_trigger = db.execute(
+        "SELECT pg_get_triggerdef(oid) FROM pg_trigger "
+        "WHERE tgname='bridge_zulip_v5_requeue_reactions'"
+    ).fetchone()[0]
     path = next(conftest.MIGRATIONS_DIR.glob("0235-*.py"))
     spec = importlib.util.spec_from_file_location("reaction_upgrade_data", path)
     migration = importlib.util.module_from_spec(spec)
@@ -615,6 +619,10 @@ def test_migration_normalizes_existing_aliases_and_preserves_local_intentions(
     finally:
         with db.transaction():
             migration.migration_step.upgrade(db)
+            db.execute(
+                "DROP TRIGGER bridge_zulip_v5_requeue_reactions ON m_external_accounts_v2"
+            )
+            db.execute(account_trigger)
             # Restore independent queue metadata after the historical migration
             # recreates the reaction queue.
             db.execute("""

@@ -71,8 +71,6 @@ TASK_PRIORITY_REALTIME_FLAGS = 550_000
 TASK_PRIORITY_RECONCILIATION = 200_000
 TASK_PRIORITY_REFRESH_MESSAGE_COUNTERS = 700_000
 TASK_RETRY_DELAY = datetime.timedelta(minutes=1)
-TASK_CHANNEL_SYNC_INTERVAL = datetime.timedelta(minutes=15)
-TASK_USER_SYNC_INTERVAL = datetime.timedelta(minutes=15)
 
 
 class ExternalAccountIdPendingError(Exception):
@@ -1721,6 +1719,10 @@ class AbstractZulipTaskContent(AbstractTaskContent):
         )
         if account.status != external_models.ExternalAccountStatus.ERROR.value:
             return
+        self._restore_account_status(account)
+
+    @staticmethod
+    def _restore_account_status(account: external_models.ExternalAccount) -> None:
         status = (
             external_models.ExternalAccountStatus.ACTIVE.value
             if account.has_completed_backfill
@@ -1748,14 +1750,20 @@ class AbstractZulipTaskContent(AbstractTaskContent):
         account.update_status(status)
 
     def on_error(self, task: "Task", error: Exception) -> None:
+        if isinstance(
+            error, (storage_exceptions.DeadLock, psycopg.errors.DeadlockDetected)
+        ):
+            task.status = TaskStatus.RETRY.value
+            task.next_retry_at = (
+                datetime.datetime.now(datetime.timezone.utc) + TASK_RETRY_DELAY
+            )
+            return
         response = error.response if isinstance(error, requests.HTTPError) else None
         if isinstance(
             error,
             (
                 requests.ConnectionError,
                 requests.Timeout,
-                storage_exceptions.DeadLock,
-                psycopg.errors.DeadlockDetected,
             ),
         ) or (
             response is not None
@@ -1790,12 +1798,17 @@ class AbstractZulipTaskContent(AbstractTaskContent):
 class InitializeConnectionContent(AbstractZulipTaskContent):
     KIND = "initialize_connection"
 
+    previous_revision = properties.property(
+        types.AllowNone(types.String()), default=None, read_only=True
+    )
+
     def execute(self, task: "Task") -> None:
         account = external_models.ExternalAccount.objects.get_one(
             filters={
                 "uuid": filters.EQ(task.external_account_uuid),
                 "project_id": filters.EQ(task.project_id),
             },
+            locked=True,
         )
         zulip = client.ZulipClient(account)
         try:
@@ -1905,7 +1918,27 @@ class InitializeConnectionContent(AbstractZulipTaskContent):
                 "project_id": filters.EQ(task.project_id),
             },
         )
-        account.update_status(external_models.ExternalAccountStatus.BACKFILL.value)
+        subscription = RealtimeSubscription.for_account(account)
+        if (
+            subscription is not None
+            and subscription.account_revision == account.subscription_revision()
+        ):
+            if self.previous_revision is not None:
+                contexts.Context().get_session().execute(
+                    "UPDATE bridge_zulip_v5_tasks "
+                    "SET content=jsonb_set(content,'{account_revision}',to_jsonb(%s::text)) "
+                    "WHERE external_account_uuid=%s AND project_id=%s "
+                    "AND status IN ('new','waiting','retry') AND content->>'account_revision'=%s",
+                    (
+                        account.realtime_revision(),
+                        account.uuid,
+                        account.project_id,
+                        self.previous_revision,
+                    ),
+                )
+            self._restore_account_status(account)
+        else:
+            account.update_status(external_models.ExternalAccountStatus.BACKFILL.value)
 
 
 class FullBackfillContent(AbstractZulipTaskContent):
@@ -1994,7 +2027,8 @@ class ActualizeBackfillContent(FullBackfillContent):
 class ImportUsersContent(AbstractZulipTaskContent):
     KIND = "import_users"
 
-    periodic = properties.property(types.Boolean(), default=True)
+    periodic = properties.property(types.Boolean(), default=False)
+    event = properties.property(types.AllowNone(types.Dict()), default=None)
 
     def execute(self, task: "Task") -> None:
         account = external_models.ExternalAccount.objects.get_one(
@@ -2006,10 +2040,20 @@ class ImportUsersContent(AbstractZulipTaskContent):
         hostname = account.get_host()
         server_namespace = sys_uuid.uuid5(sys_uuid.NAMESPACE_DNS, hostname)
         accounts_by_id = {}
+        person = self.event["person"] if self.event is not None else None
         for existing in external_models.ExternalAccount.objects.get_all(
             filters={
                 "project_id": filters.EQ(task.project_id),
                 "provider": filters.EQ("zulip"),
+                **(
+                    {
+                        "external_account_id": filters.EQ(
+                            f"{hostname}:{person['user_id']}"
+                        )
+                    }
+                    if person is not None
+                    else {}
+                ),
             },
         ):
             if existing.external_account_id is None:
@@ -2020,7 +2064,42 @@ class ImportUsersContent(AbstractZulipTaskContent):
             accounts_by_id[existing.external_account_id] = existing
         zulip = client.ZulipClient(account)
         try:
-            for data in zulip.get_users():
+            if person is None or self.event["op"] == "remove":
+                users = zulip.get_users()
+                if person is not None:
+                    users = [
+                        data for data in users if data["user_id"] == person["user_id"]
+                    ]
+            else:
+                stored = messenger_models.WorkspaceUser.objects.get_one_or_none(
+                    filters={
+                        "uuid": filters.EQ(
+                            sys_uuid.uuid5(
+                                server_namespace, f"user:{person['user_id']}"
+                            )
+                        )
+                    }
+                )
+                if stored is not None:
+                    data = {
+                        "user_id": person["user_id"],
+                        "full_name": stored.first_name,
+                        "email": stored.email,
+                        "is_active": not stored.disabled,
+                        **person,
+                    }
+                elif (
+                    "full_name" in person
+                    and "email" in person
+                    and "is_active" in person
+                ):
+                    data = person
+                else:
+                    data = {**zulip.get_user(person["user_id"]), **person}
+                if "new_email" in person:
+                    data = {**data, "email": person["new_email"]}
+                users = [data]
+            for data in users:
                 user_id = data["user_id"]
                 disabled = not data["is_active"]
                 external_account_id = f"{hostname}:{user_id}"
@@ -2083,25 +2162,89 @@ class ImportUsersContent(AbstractZulipTaskContent):
         else:
             super().on_error(task, error)
 
-    def on_done(self, task: "Task") -> None:
-        super().on_done(task)
-        if not self.periodic:
-            return
-        Task(
-            project_id=task.project_id,
-            external_account_uuid=task.external_account_uuid,
-            priority=TASK_PRIORITY_IMPORT_USERS,
-            not_before_at=(
-                datetime.datetime.now(datetime.timezone.utc) + TASK_USER_SYNC_INTERVAL
-            ),
-            content=ImportUsersContent(),
-        ).insert()
-
 
 class ImportChannelsContent(AbstractZulipTaskContent):
     KIND = "import_channels"
 
-    periodic = properties.property(types.Boolean(), default=True)
+    periodic = properties.property(types.Boolean(), default=False)
+    event = properties.property(types.AllowNone(types.Dict()), default=None)
+
+    def apply_event(self, account: external_models.ExternalAccount) -> bool:
+        if self.event is None:
+            return False
+        if self.event["type"] == "user_topic":
+            channel = ZulipChannel.objects.get_one_or_none(
+                filters={
+                    "external_account_uuid": filters.EQ(account.uuid),
+                    "stream_id": filters.EQ(self.event["stream_id"]),
+                }
+            )
+            if channel is None:
+                return False
+            name = self.event["topic_name"].lower()
+            row = ZulipTopicNotification.objects.get_one_or_none(
+                filters={
+                    "channel_uuid": filters.EQ(channel.uuid),
+                    "topic_name": filters.EQ(name),
+                }
+            )
+            if row is not None and row.last_updated >= self.event["last_updated"]:
+                return True
+            if self.event["visibility_policy"] == 0:
+                if row is not None:
+                    row.delete()
+            else:
+                values = {
+                    key: self.event[key]
+                    for key in ("visibility_policy", "last_updated")
+                }
+                if row is None:
+                    ZulipTopicNotification(
+                        channel_uuid=channel.uuid, topic_name=name, **values
+                    ).insert()
+                else:
+                    row.update_dm(values=values)
+                    row.update()
+            return True
+        if self.event["op"] != "update":
+            return False
+        changes = self.event.get("subscription_data", [self.event])
+        for change in changes:
+            channel = ZulipChannel.objects.get_one_or_none(
+                filters={
+                    "external_account_uuid": filters.EQ(account.uuid),
+                    "stream_id": filters.EQ(change["stream_id"]),
+                }
+            )
+            if channel is None:
+                return False
+            name = change["property"]
+            if name == "is_muted":
+                values = {
+                    "notification_mode": "mentions_only"
+                    if change["value"]
+                    else "all_messages"
+                }
+            elif name in (
+                "name",
+                "description",
+                "rendered_description",
+                "invite_only",
+                "is_web_public",
+                "history_public_to_subscribers",
+                "is_archived",
+                "message_retention_days",
+            ):
+                values = {name: change["value"]}
+                if name == "description":
+                    if "rendered_description" not in self.event:
+                        return False
+                    values["rendered_description"] = self.event["rendered_description"]
+            else:
+                continue
+            channel.update_dm(values=values)
+            channel.update()
+        return True
 
     def execute(self, task: "Task") -> None:
         account = external_models.ExternalAccount.objects.get_one(
@@ -2110,6 +2253,8 @@ class ImportChannelsContent(AbstractZulipTaskContent):
                 "project_id": filters.EQ(task.project_id),
             },
         )
+        if self.apply_event(account):
+            return
         hostname = account.get_host()
         server_namespace = sys_uuid.uuid5(sys_uuid.NAMESPACE_DNS, hostname)
         zulip = client.ZulipClient(account)
@@ -2170,21 +2315,6 @@ class ImportChannelsContent(AbstractZulipTaskContent):
                     channel.delete()
         finally:
             zulip.close()
-
-    def on_done(self, task: "Task") -> None:
-        super().on_done(task)
-        if not self.periodic:
-            return
-        Task(
-            project_id=task.project_id,
-            external_account_uuid=task.external_account_uuid,
-            priority=TASK_PRIORITY_IMPORT_CHANNELS,
-            not_before_at=(
-                datetime.datetime.now(datetime.timezone.utc)
-                + TASK_CHANNEL_SYNC_INTERVAL
-            ),
-            content=ImportChannelsContent(),
-        ).insert()
 
 
 class ImportHistoryContent(AbstractZulipTaskContent):
@@ -3218,8 +3348,8 @@ class ReconciliationContent(AbstractTaskContent):
             processed += ZulipTopicState.reconcile_batch(self.batch_size - processed)
         if processed < self.batch_size:
             processed += ZulipMessageState.reconcile_batch(self.batch_size - processed)
-        message_flags.FlagChange.reconcile_batch(self.batch_size)
-        message_reactions.ReactionChange.reconcile_batch(self.batch_size)
+        # Realtime owns flag/reaction queues. Taking their account locks here,
+        # after projection/event locks, can deadlock with imports and realtime.
         not_before_at = None
         if processed < self.batch_size:
             not_before_at = datetime.datetime.now(
@@ -3440,10 +3570,24 @@ class Task(
         if source_event_uuid is not None:
             # Match API and subscription registration lock order: account first,
             # then task. This also fences writes against a concurrent rebind.
-            contexts.Context().get_session().execute(
-                "SELECT uuid FROM m_external_accounts_v2 WHERE uuid=%s AND project_id=%s FOR UPDATE",
-                (self.external_account_uuid, self.project_id),
+            account = (
+                contexts.Context()
+                .get_session()
+                .execute(
+                    "SELECT uuid,status FROM m_external_accounts_v2 WHERE uuid=%s AND project_id=%s FOR UPDATE",
+                    (self.external_account_uuid, self.project_id),
+                )
+                .fetchone()
             )
+            if account["status"] == external_models.ExternalAccountStatus.NEW.value:
+                self.status = TaskStatus.RETRY.value
+                self.next_retry_at = datetime.datetime.now(
+                    datetime.timezone.utc
+                ) + datetime.timedelta(seconds=3)
+                self.lease_owner = None
+                self.lease_expires_at = None
+                self.update()
+                return
             event = RealtimeEvent.objects.get_one(
                 filters={"uuid": filters.EQ(source_event_uuid)}
             )
@@ -3471,9 +3615,14 @@ class Task(
                 self.content.on_error(self, error)
         except Exception as handler_error:
             LOG.exception("Task %s error handler failed", self.uuid)
-            self.status = TaskStatus.ERROR.value
             self.error_description = f"{error}\nError handler failed: {handler_error}"
-            self.next_retry_at = None
+            # A failed account-status update must not discard a scheduled retry.
+            if self.status != TaskStatus.RETRY.value or not isinstance(
+                handler_error,
+                (storage_exceptions.DeadLock, psycopg.errors.DeadlockDetected),
+            ):
+                self.status = TaskStatus.ERROR.value
+                self.next_retry_at = None
         self.lease_owner = None
         self.lease_expires_at = None
         self.update()
@@ -3568,7 +3717,7 @@ class RealtimeSubscription(
             "generation": generation,
             "queue_id": data["queue_id"],
             "last_event_id": data["last_event_id"],
-            "account_revision": account.realtime_revision(),
+            "account_revision": account.subscription_revision(),
             "longpoll_timeout": data.get("event_queue_longpoll_timeout_seconds", 90),
         }
         subscription = cls.for_account(account)
@@ -3687,7 +3836,7 @@ class RealtimeEvent(
         if (
             account is None
             or not account.can_stream()
-            or account.realtime_revision() != subscription.account_revision
+            or account.subscription_revision() != subscription.account_revision
         ):
             return None
         return subscription
@@ -3873,7 +4022,14 @@ class RealtimeEvent(
                 }
             )
             if actor is None:
-                contents.append(ImportUsersContent(periodic=False))
+                contents.append(
+                    ImportUsersContent(
+                        event={
+                            "op": "update",
+                            "person": {"user_id": self.payload["user_id"]},
+                        }
+                    )
+                )
             remote = message_reactions.message_for(account, self.payload["message_id"])
             if remote["canonical_message_uuid"] is None:
                 contents.append(
@@ -3883,10 +4039,10 @@ class RealtimeEvent(
                     )
                 )
         elif kind == "realm_user":
-            contents = [ImportUsersContent(periodic=False)]
+            contents = [ImportUsersContent(event=self.payload)]
             priority = TASK_PRIORITY_IMPORT_USERS
         elif kind in ("subscription", "stream", "user_topic"):
-            contents = [ImportChannelsContent(periodic=False)]
+            contents = [ImportChannelsContent(event=self.payload)]
             priority = TASK_PRIORITY_IMPORT_CHANNELS
         for index, content in enumerate(contents):
             Task(
@@ -3907,9 +4063,12 @@ class RealtimeEvent(
             .get_session()
             .execute(
                 """
-            SELECT uuid FROM bridge_zulip_v5_events
-            WHERE processed_at IS NULL AND (next_retry_at IS NULL OR next_retry_at <= NOW() AT TIME ZONE 'UTC')
-            ORDER BY created_at, event_id NULLS FIRST, uuid LIMIT 1 FOR UPDATE SKIP LOCKED
+            SELECT event.uuid FROM bridge_zulip_v5_events AS event
+            JOIN m_external_accounts_v2 AS account ON account.uuid=event.external_account_uuid
+            WHERE event.processed_at IS NULL AND account.status<>'new'
+              AND (event.next_retry_at IS NULL OR event.next_retry_at <= NOW() AT TIME ZONE 'UTC')
+            ORDER BY event.created_at,event.event_id NULLS FIRST,event.uuid
+            LIMIT 1 FOR UPDATE OF event SKIP LOCKED
         """,
                 (),
             )

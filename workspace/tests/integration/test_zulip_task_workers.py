@@ -4,6 +4,7 @@
 
 import concurrent.futures
 import datetime
+import json
 import os
 import signal
 import subprocess
@@ -13,10 +14,12 @@ import time
 from unittest import mock
 import uuid
 
+import psycopg.errors
 import pytest
 import requests
 from restalchemy.common import contexts
 from restalchemy.dm import filters
+from restalchemy.storage import exceptions as storage_exceptions
 from restalchemy.storage.sql import migrations
 
 from workspace.bridges.zulip import client
@@ -33,6 +36,11 @@ from workspace.tests.integration import test_zulip_realtime as realtime_tests
 history_account = message_tests.history_account
 outgoing = outgoing_tests.outgoing
 account = realtime_tests.account
+DEADLOCK_CASES = json.loads(
+    (
+        conftest.REPO_ROOT / "workspace/tests/fixtures/zulip_history_deadlocks.json"
+    ).read_text()
+)
 
 
 def _stored(task):
@@ -459,6 +467,8 @@ def test_changed_account_discards_prepared_history(
     history_account, db, monkeypatch, scheduled_reconciliation
 ):
     account = history_account
+    with contexts.Context().session_manager():
+        account.update_status("backfill")
     entered, release = threading.Event(), threading.Event()
     zulip = mock.Mock()
 
@@ -520,8 +530,15 @@ def test_prepared_import_keeps_retry_semantics(
 
 
 @pytest.mark.parametrize("queue,workers", [("background", 4), ("realtime", 1)])
+@pytest.mark.parametrize("deadlock", DEADLOCK_CASES, ids=lambda case: case["name"])
 def test_history_import_retries_database_deadlock_after_rolling_back_partial_writes(
-    history_account, db, monkeypatch, scheduled_reconciliation, queue, workers
+    history_account,
+    db,
+    monkeypatch,
+    scheduled_reconciliation,
+    queue,
+    workers,
+    deadlock,
 ):
     account = history_account
     zulip = mock.Mock()
@@ -530,16 +547,32 @@ def test_history_import_retries_database_deadlock_after_rolling_back_partial_wri
     insert_message = models.ZulipMessage.insert
     attempts = []
 
+    def fail(message, wrapped):
+        try:
+            contexts.Context().get_session().execute(
+                "DO $$ BEGIN RAISE EXCEPTION 'deadlock detected' USING ERRCODE='40P01'; END $$"
+            )
+        except psycopg.errors.DeadlockDetected:
+            if wrapped:
+                raise storage_exceptions.DeadLock(
+                    msg=message.removeprefix(
+                        "Deadlock found when trying to get lock. Original message: "
+                    )
+                )
+            raise psycopg.errors.DeadlockDetected(message)
+
     def insert(message):
         result = insert_message(message)
         attempts.append(message.message_id)
         if len(attempts) == 1:
-            contexts.Context().get_session().execute(
-                "DO $$ BEGIN RAISE EXCEPTION 'deadlock detected' USING ERRCODE='40P01'; END $$"
-            )
+            fail(deadlock["message"], deadlock["wrapped"])
         return result
 
     monkeypatch.setattr(models.ZulipMessage, "insert", insert)
+    status_update = mock.Mock(
+        side_effect=AssertionError("A database deadlock must not change account status")
+    )
+    monkeypatch.setattr(external_models.ExternalAccount, "update_status", status_update)
     task = models.Task(
         project_id=account.project_id,
         external_account_uuid=account.uuid,
@@ -555,7 +588,8 @@ def test_history_import_retries_database_deadlock_after_rolling_back_partial_wri
         after = datetime.datetime.now(datetime.timezone.utc)
         assert before + models.TASK_RETRY_DELAY <= retried.next_retry_at
         assert retried.next_retry_at <= after + models.TASK_RETRY_DELAY
-        assert "deadlock detected" in retried.error_description
+        status_update.assert_not_called()
+        assert retried.error_description == deadlock["message"]
         assert retried.lease_owner is None
         assert retried.lease_expires_at is None
         assert not message_tests._messages(account)

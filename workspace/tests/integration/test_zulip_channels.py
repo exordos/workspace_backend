@@ -413,9 +413,7 @@ def test_channel_import_handles_provider_errors(
                 "status": filters.EQ("waiting"),
             }
         )
-        assert len(pending) == 1
-        assert pending[0].priority == models.TASK_PRIORITY_IMPORT_CHANNELS
-        assert pending[0].not_before_at is not None
+        assert pending == []
 
 
 @pytest.mark.pre_retirement_schema

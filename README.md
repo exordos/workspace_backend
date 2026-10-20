@@ -114,23 +114,35 @@ The Zulip realtime service runs one asyncio poller per verified, enabled account
 with an API key. It reconciles accounts at startup, on PostgreSQL notifications,
 and every `[zulip_realtime] step_interval` seconds (default: one second). Changing
 credentials or account ownership replaces the poller; disabling or disconnecting
-an account stops it. Synchronous database work uses a bounded executor and short
+an account stops it. The subscription revision excludes credentials, so a verified
+key rotation for the same source resumes its saved queue and cursor. Unrelated
+settings and displayed status do not replace the poller or cancel pending work.
+Synchronous database work uses a bounded executor and short
 transactions, independent of the long-polling requests.
 
 Pollers subscribe to every Zulip event type. Raw events, including heartbeat and
 currently unsupported types, are stored in `bridge_zulip_v5_events` atomically
 with the subscription cursor. A subscriber in the same service schedules history
 tasks for messages, message edits, user changes, subscription/channel changes,
-and topic notification changes. Other event types remain stored without creating
-history tasks. Event consumption and task creation also commit together.
+and topic notification changes. Known user/channel/topic changes apply the event
+payload directly. Missing user details trigger a single-user fetch; catalog
+snapshots are a fallback for events that cannot be applied locally. Other event
+types remain stored without creating tasks. Event consumption and task creation
+also commit together.
+
+The realtime service consumes flag and reaction changes in separate transactions.
+Background reconciliation only projects users, streams, bindings, topics and
+messages; it does not consume those same flag/reaction queues while holding
+projection and project-event locks.
 
 Registering a new Zulip queue enqueues an internal `full_backfill` event for an
 account that has never completed import, or `actualize_backfill` for an imported
 account. The latter covers the preceding 30 days. Both use the message boundary
 returned by queue registration; neither fetches a later upper boundary. The API
-only schedules connection verification, which no longer starts backfill.
+only schedules connection verification when connection settings change; it no
+longer starts backfill or cancels existing imports for a metadata update.
 An account becomes `active` after every task in its backfill group succeeds.
-Periodic catalog refreshes do not reset that status. Migration 0232 sets
+User and channel imports do not schedule periodic catalog refreshes. Migration 0232 sets
 `has_completed_backfill` only for existing Zulip accounts in `backfill` state.
 
 PostgreSQL channel `workspace_zulip_realtime` carries wakeups (`accounts` or
@@ -199,8 +211,16 @@ known, metadata fetches can be retried independently of sending.
 Priorities are numeric: users 500000, channels 450000, realtime message creation
 300000, realtime edits 250000, reconciliation (including topics) 200000, and
 history batches 10000 or lower. Missing prerequisites retry after three seconds;
-database deadlocks retry the same task after one minute. There are no task
+database deadlocks retry the same task after one minute without changing the
+account status. A retry also survives a database deadlock in an error callback. There are no task
 dependency chains. Superseded edit tasks do not overwrite a newer local edit.
+Migration 0245 requeues history imports left in `error` by older workers when the
+stored error starts with either PostgreSQL's deadlock message or its RestAlchemy
+wrapper. It retains task identities, payloads, priorities and source-event links;
+other errors and completed or cancelled tasks are left alone.
+Migration 0246 cancels old periodic catalog tasks, guards account triggers against
+unchanged routing fields, and updates saved subscription/task revisions without
+replacing queue IDs or cursors. It also requeues user imports stopped by a deadlock.
 Future read and reaction tasks must also run below message creation priority
 and retry when the target message has not been created yet.
 

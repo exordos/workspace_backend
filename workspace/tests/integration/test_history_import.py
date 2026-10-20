@@ -242,14 +242,14 @@ def test_backfill_starts_only_after_realtime_queue_registration(
     assert user_sync.priority == models.TASK_PRIORITY_IMPORT_USERS
     service._iteration()
     assert _stored(user_sync).status == "done"
-    (next_user_sync,) = models.Task.objects.get_all(
+    next_user_sync = models.Task.objects.get_all(
         filters={
             "external_account_uuid": filters.EQ(account.uuid),
             "priority": filters.EQ(models.TASK_PRIORITY_IMPORT_USERS),
             "status": filters.EQ("waiting"),
         }
     )
-    assert next_user_sync.not_before_at is not None
+    assert next_user_sync == []
     (first_sync,) = [
         child
         for child in pending
@@ -277,10 +277,7 @@ def test_backfill_starts_only_after_realtime_queue_registration(
     assert first_sync.not_before_at is None
     assert isinstance(first_sync.content, models.ImportChannelsContent)
 
-    before = datetime.datetime.now(datetime.timezone.utc)
     service._iteration()
-    after = datetime.datetime.now(datetime.timezone.utc)
-
     assert _stored(first_sync).status == "done"
     pending = models.Task.objects.get_all(
         filters={
@@ -288,29 +285,15 @@ def test_backfill_starts_only_after_realtime_queue_registration(
             "status": filters.In(["new", "waiting"]),
         }
     )
-    assert len(pending) == 103
-    (next_sync,) = [
-        child
-        for child in pending
-        if isinstance(child.content, models.ImportChannelsContent)
-    ]
-    assert next_sync.uuid != first_sync.uuid
-    assert next_sync.project_id == account.project_id
-    assert next_sync.priority == models.TASK_PRIORITY_IMPORT_CHANNELS
-    assert isinstance(next_sync.content, models.ImportChannelsContent)
-    assert next_sync.status == "waiting"
-    interval = datetime.timedelta(minutes=15)
-    assert before + interval <= next_sync.not_before_at <= after + interval
+    assert {child.uuid for child in pending} == {child.uuid for child in history}
 
     service._iteration()
 
     assert _stored(history[0]).status == "done"
     zulip.get_messages.assert_called_once_with(10001, 10005)
-    assert _stored(next_sync).status == "waiting"
     for child in history[1:]:
         service._iteration()
 
-    assert _stored(next_sync).status == "waiting"
     assert all(_stored(child).status == "done" for child in history)
     zulip.check_connection.assert_called_once_with()
     zulip.get_last_message_id.assert_not_called()
@@ -740,10 +723,16 @@ def test_execution_errors_and_delayed_retry(task_queue, monkeypatch, error):
     account = external_models.ExternalAccount.objects.get_one(
         filters={"uuid": filters.EQ(task.external_account_uuid)}
     )
-    assert account.status == "error"
-    assert account.error_description == (
-        f"{error}\nNext retry at: {stored.next_retry_at.isoformat()}"
-    )
+    if isinstance(
+        error, (storage_exceptions.DeadLock, psycopg.errors.DeadlockDetected)
+    ):
+        assert account.status == "new"
+        assert account.error_description is None
+    else:
+        assert account.status == "error"
+        assert account.error_description == (
+            f"{error}\nNext retry at: {stored.next_retry_at.isoformat()}"
+        )
     service._iteration()
     assert attempts == [task.uuid]
     after = datetime.datetime.now(datetime.timezone.utc)

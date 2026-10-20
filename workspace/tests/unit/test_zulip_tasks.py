@@ -10,10 +10,12 @@ import json
 from unittest import mock
 import uuid
 
+import psycopg.errors
 import pytest
 import requests
 from restalchemy.common import exceptions
 from restalchemy.dm import types_dynamic
+from restalchemy.storage import exceptions as storage_exceptions
 
 from workspace.bridges.zulip import client
 from workspace.bridges.zulip.dm import models
@@ -647,6 +649,9 @@ def test_task_executes_connection_content():
         mock.patch.object(models.Task, "insert", autospec=True) as insert,
         mock.patch.object(messenger_models.WorkspaceUser, "objects") as users,
         mock.patch.object(
+            models.RealtimeSubscription, "for_account", return_value=None
+        ),
+        mock.patch.object(
             messenger_models.WorkspaceUser, "insert", autospec=True
         ) as insert_user,
     ):
@@ -826,14 +831,28 @@ def test_error_hook_overrides_prepared_terminal_error(overrides, _task_storage):
     _task_storage.assert_called_once_with()
 
 
-def test_error_handler_failure_is_added_to_the_saved_error(_task_storage):
+@pytest.mark.parametrize("scheduled_retry", [False, True])
+@pytest.mark.parametrize(
+    "handler_error",
+    [
+        ValueError("Error handler failed"),
+        storage_exceptions.DeadLock(msg="deadlock detected"),
+        psycopg.errors.DeadlockDetected("deadlock detected"),
+    ],
+)
+def test_error_handler_failure_is_added_to_the_saved_error(
+    _task_storage, scheduled_retry, handler_error
+):
     task = _task()
     error = RuntimeError("Execution failed")
-    handler_error = ValueError("Error handler failed")
+    next_retry_at = (
+        datetime.datetime.now(datetime.timezone.utc) + models.TASK_RETRY_DELAY
+    )
 
     def on_error(current_task, current_error):
-        current_task.status = "retry"
-        current_task.next_retry_at = datetime.datetime.now(datetime.timezone.utc)
+        if scheduled_retry:
+            current_task.status = "retry"
+            current_task.next_retry_at = next_retry_at
         current_task.error_description = "Partial handler result"
         raise handler_error
 
@@ -847,9 +866,12 @@ def test_error_handler_failure_is_added_to_the_saved_error(_task_storage):
     ):
         task.execute()
 
-    assert task.status == "error"
+    retry = scheduled_retry and isinstance(
+        handler_error, (storage_exceptions.DeadLock, psycopg.errors.DeadlockDetected)
+    )
+    assert task.status == ("retry" if retry else "error")
     assert task.error_description == f"{error}\nError handler failed: {handler_error}"
-    assert task.next_retry_at is None
+    assert task.next_retry_at == (next_retry_at if retry else None)
     _task_storage.assert_called_once_with()
 
 

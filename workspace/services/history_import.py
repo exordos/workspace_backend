@@ -189,15 +189,30 @@ class HistoryImportService(basic.BasicService):
         session = contexts.Context().get_session()
         task = models.Task.objects.get_one(filters={"uuid": filters.EQ(task_uuid)})
         # Keep account-before-task locking consistent with rebind and send paths.
-        if (
-            task.backfill_uuid is not None
-            or task.realtime_event_uuid is not None
-            or isinstance(task.content, models.OutboundMessageContent)
-        ):
-            session.execute(
-                "SELECT uuid FROM m_external_accounts_v2 WHERE project_id=%s AND uuid=%s FOR UPDATE",
+        if task.external_account_uuid is not None:
+            account = session.execute(
+                "SELECT uuid,status,settings ? 'api_key' AS has_credentials "
+                "FROM m_external_accounts_v2 WHERE project_id=%s AND uuid=%s FOR UPDATE SKIP LOCKED",
                 (task.project_id, task.external_account_uuid),
-            )
+            ).fetchone()
+            if account is None:
+                session.execute(
+                    "UPDATE bridge_zulip_v5_tasks SET next_retry_at=(now() AT TIME ZONE 'UTC')+interval '0.1 seconds' "
+                    "WHERE uuid=%s AND lease_owner=%s AND status IN ('new','waiting','retry')",
+                    (task_uuid, owner),
+                )
+                return None
+            if (
+                account["status"] == external_models.ExternalAccountStatus.NEW.value
+                and account["has_credentials"]
+                and not isinstance(task.content, models.InitializeConnectionContent)
+            ):
+                session.execute(
+                    "UPDATE bridge_zulip_v5_tasks SET next_retry_at=(now() AT TIME ZONE 'UTC')+interval '3 seconds' "
+                    "WHERE uuid=%s AND lease_owner=%s AND status IN ('new','waiting','retry')",
+                    (task_uuid, owner),
+                )
+                return None
         row = session.execute(
             """SELECT uuid FROM bridge_zulip_v5_tasks WHERE uuid=%s AND lease_owner=%s
                AND status IN ('new','waiting','retry') FOR UPDATE SKIP LOCKED""",
@@ -284,7 +299,10 @@ class HistoryImportService(basic.BasicService):
                         "uuid": filters.EQ(task.external_account_uuid),
                     }
                 )
-                if account.external_account_id is None:
+                if account.external_account_id is None or (
+                    account.status == external_models.ExternalAccountStatus.NEW.value
+                    and account.settings.get("api_key")
+                ):
                     return None, None, 0.0
                 revision = account.realtime_revision()
             observed_at = datetime.datetime.now(datetime.timezone.utc)

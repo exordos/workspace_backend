@@ -259,7 +259,9 @@ class FlagChange(models.ModelWithID, models.ModelWithProject, orm.SQLStorableMix
             },
             limit=limit,
         )
+        processed = 0
         for change in changes:
+            verifying_account = False
             targets = flag_states(change.project_id, change.state_uuid)
             for target in targets:
                 state = lock_state(
@@ -313,6 +315,11 @@ class FlagChange(models.ModelWithID, models.ModelWithProject, orm.SQLStorableMix
                         }
                     )
                     if not account.can_stream():
+                        verifying_account |= (
+                            account.status
+                            == external_models.ExternalAccountStatus.NEW.value
+                            and bool(account.settings.get("api_key"))
+                        )
                         continue
                     account_revision = account.realtime_revision()
                     changed_at = local_time.replace(tzinfo=datetime.timezone.utc)
@@ -339,8 +346,11 @@ class FlagChange(models.ModelWithID, models.ModelWithProject, orm.SQLStorableMix
                                 account_revision=account_revision,
                             ),
                         ).insert()
+            if verifying_account:
+                continue
             contexts.Context().get_session().execute(
                 "DELETE FROM bridge_zulip_v5_flag_changes WHERE project_id=%s AND state_uuid=%s AND revision=%s",
                 (change.project_id, change.state_uuid, change.revision),
             )
-        return len(changes)
+            processed += 1
+        return processed

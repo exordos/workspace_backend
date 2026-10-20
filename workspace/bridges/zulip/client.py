@@ -141,6 +141,9 @@ class ZulipClient:
         finally:
             self._request("DELETE", "/events", data={"queue_id": data["queue_id"]})
 
+    def get_user(self, user_id: int) -> dict:
+        return self._get(f"/users/{user_id}")["user"]
+
     def get_channels(self) -> list[dict]:
         data = self._request(
             "POST",

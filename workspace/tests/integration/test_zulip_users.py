@@ -706,9 +706,7 @@ def test_user_import_creates_linked_profiles_without_credentials_and_updates_the
     ]
     monkeypatch.setattr(client, "ZulipClient", lambda current: zulip)
 
-    before = datetime.datetime.now(datetime.timezone.utc)
     task = _run_user_import(account)
-    after = datetime.datetime.now(datetime.timezone.utc)
     assert task.status == "done"
     accounts = _accounts(account)
     assert len(accounts) == 3
@@ -741,15 +739,7 @@ def test_user_import_creates_linked_profiles_without_credentials_and_updates_the
             "status": filters.EQ("waiting"),
         }
     )
-    assert len(pending) == 1
-    assert isinstance(pending[0].content, models.ImportUsersContent)
-    assert pending[0].external_account_uuid == account.uuid
-    assert pending[0].priority == models.TASK_PRIORITY_IMPORT_USERS
-    assert (
-        before + datetime.timedelta(minutes=15)
-        <= pending[0].not_before_at
-        <= after + datetime.timedelta(minutes=15)
-    )
+    assert pending == []
     account_timestamps = {row.uuid: row.updated_at for row in _accounts(account)}
     user_filter = {"uuid": filters.In([row.owner_user_uuid for row in accounts])}
     user_timestamps = {

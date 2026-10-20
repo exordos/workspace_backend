@@ -312,15 +312,14 @@ def test_active_only_after_all_backfill_children_finish(
             mock.call(10001, 10005),
             *[mock.call(first, first + 99) for first in range(9901, 0, -100)],
         ]
-    # Catalog refreshes are not members of the completed group.
+    # A live subscription owns catalog updates; imports do not schedule polling.
     periodic = models.Task.objects.get_all(
         filters={
             "external_account_uuid": filters.EQ(account.uuid),
             "status": filters.EQ("waiting"),
         }
     )
-    assert len(periodic) == 2
-    assert all(task.backfill_uuid is None for task in periodic)
+    assert periodic == []
     assert not [
         record.getMessage()
         for record in caplog.records

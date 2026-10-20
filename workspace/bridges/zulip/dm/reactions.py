@@ -279,6 +279,7 @@ def _schedule(intent, observations):
     targets = _targets(
         intent.project_id, intent.canonical_message_uuid, intent.user_uuid
     )
+    verifying_account = False
     for target in targets:
         account = external_models.ExternalAccount.objects.get_one(
             filters={"uuid": filters.EQ(target["external_account_uuid"])}
@@ -287,6 +288,10 @@ def _schedule(intent, observations):
             not account.can_stream()
             or account.external_account_id.rsplit(":", 1)[0] != account.get_host()
         ):
+            verifying_account |= (
+                account.status == external_models.ExternalAccountStatus.NEW.value
+                and bool(account.settings.get("api_key"))
+            )
             continue
         message = message_for(account, target["message_id"])
         user_id = int(account.external_account_id.rsplit(":", 1)[1])
@@ -319,14 +324,18 @@ def _schedule(intent, observations):
                     account_revision=revision,
                 ),
             ).insert()
-    return not targets and any(
-        account.can_stream()
-        for account in external_models.ExternalAccount.objects.get_all(
-            filters={
-                "project_id": filters.EQ(intent.project_id),
-                "owner_user_uuid": filters.EQ(intent.user_uuid),
-                "provider": filters.EQ("zulip"),
-            },
+    return (
+        verifying_account
+        or not targets
+        and any(
+            account.can_stream()
+            for account in external_models.ExternalAccount.objects.get_all(
+                filters={
+                    "project_id": filters.EQ(intent.project_id),
+                    "owner_user_uuid": filters.EQ(intent.user_uuid),
+                    "provider": filters.EQ("zulip"),
+                },
+            )
         )
     )
 

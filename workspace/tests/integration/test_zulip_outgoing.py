@@ -78,7 +78,7 @@ def outgoing(api, db, scheduled_reconciliation, monkeypatch):
         generation=uuid.uuid4(),
         queue_id="sender-queue",
         last_event_id=-1,
-        account_revision=account.realtime_revision(),
+        account_revision=account.subscription_revision(),
         longpoll_timeout=90,
     )
     subscription.insert()

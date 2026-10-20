@@ -117,10 +117,16 @@ class ExternalAccountApplicationService:
         account: external_models.ExternalAccount,
         spec: dict[str, typing.Any],
     ) -> external_models.ExternalAccount:
+        connection = account.provider, account.connection_settings()
+        previous_revision = account.realtime_revision()
         account.update_dm(values=spec)
+        verify_connection = account.provider == "zulip" and connection != (
+            account.provider,
+            account.connection_settings(),
+        )
         status = account.status
         error_description = account.error_description
-        if account.provider == "zulip":
+        if verify_connection:
             status = external_models.ExternalAccountStatus.NEW.value
             error_description = None
         # Keep account and task writes in the same order as the importer.
@@ -128,13 +134,14 @@ class ExternalAccountApplicationService:
             status,
             error_description=error_description,
         )
-        if account.provider == "zulip":
+        if verify_connection:
             task = zulip_models.Task(
                 project_id=account.project_id,
                 external_account_uuid=account.uuid,
                 priority=zulip_models.TASK_PRIORITY_INITIALIZE_CONNECTION,
-                content=zulip_models.InitializeConnectionContent(),
+                content=zulip_models.InitializeConnectionContent(
+                    previous_revision=previous_revision
+                ),
             )
-            task.cancel_pending_tasks(exclude_current=True)
             task.insert(session=session)
         return account

@@ -77,7 +77,7 @@ def imported(message_sources, monkeypatch):
         generation=uuid.uuid4(),
         queue_id="flags-queue",
         last_event_id=-1,
-        account_revision=account.realtime_revision(),
+        account_revision=account.subscription_revision(),
         longpoll_timeout=90,
     )
     subscription.insert()
@@ -502,12 +502,9 @@ def test_account_changes_cancel_old_flag_tasks(imported, api):
         old.execute()
     assert old.status == "cancel"
     zulip.update_message_flags.assert_not_called()
+    # Direct unverified credential changes do not scan old message states.
     reconcile()
-    (new,) = pending(account)
-    assert new.uuid != old.uuid
-    with contexts.Context().session_manager():
-        new.execute()
-    zulip.update_message_flags.assert_called_once()
+    assert pending(account) == []
 
 
 def test_a_slow_history_snapshot_cannot_undo_a_newer_flag_event(imported):
@@ -606,6 +603,10 @@ def test_flag_migration_round_trip(_database):
 
 def test_flag_migration_preserves_existing_local_changes(imported, db):
     account, _source, state, _subscription, _zulip, _constructor = imported
+    account_trigger = db.execute(
+        "SELECT pg_get_triggerdef(oid) FROM pg_trigger "
+        "WHERE tgname='bridge_zulip_v5_track_account_flags'"
+    ).fetchone()[0]
     path = next(conftest.MIGRATIONS_DIR.glob("0234-*.py"))
     spec = importlib.util.spec_from_file_location("flag_upgrade_data", path)
     migration = importlib.util.module_from_spec(spec)
@@ -618,6 +619,10 @@ def test_flag_migration_preserves_existing_local_changes(imported, db):
         )
     finally:
         migration.migration_step.upgrade(db)
+        db.execute(
+            "DROP TRIGGER bridge_zulip_v5_track_account_flags ON m_external_accounts_v2"
+        )
+        db.execute(account_trigger)
         # Restore independent queue metadata from migration 0242 after the
         # historical migration recreates this table.
         db.execute("""
