@@ -41,22 +41,24 @@ ra_config_opts.register_posgresql_db_opts(CONF)
 file_storage_opts.register_opts(CONF)
 
 
+def _configure_database(queue, workers):
+    CONF.set_override("connection_pool_max_size", workers + 1, group="db")
+    database.configure_postgresql(f"workspace-zulip-{queue}-tasks", conf=CONF)
+
+
 def main(queue=None) -> None:
     config.parse(sys.argv[1:])
     infra_log.configure()
     log = logging.getLogger(__name__)
 
     queue = queue or CONF[DOMAIN].queue
+    workers = 1 if queue == "realtime" else CONF[DOMAIN].workers
     service = history_import.HistoryImportService(
         queue=queue,
-        workers=1 if queue == "realtime" else CONF[DOMAIN].workers,
+        workers=workers,
         iter_min_period=0.1 if queue == "realtime" else CONF[DOMAIN].step_interval,
     )
-    service.add_setup(
-        lambda: database.configure_postgresql(
-            f"workspace-zulip-{queue}-tasks", conf=CONF
-        )
-    )
+    service.add_setup(lambda: _configure_database(queue, workers))
     service_hub = hub.ProcessHubService()
     service_hub.add_service(service)
     log.info("Start history import service")

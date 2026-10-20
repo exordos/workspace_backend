@@ -36,6 +36,15 @@ class HistoryImportService(basic.BasicService):
             self._executor = None
 
     def _ensure_reconciliation_task(self) -> None:
+        session = contexts.Context().get_session()
+        existing = {
+            row["kind"]
+            for row in session.execute(
+                """SELECT DISTINCT content->>'kind' AS kind FROM bridge_zulip_v5_tasks
+                   WHERE status IN ('new','waiting','retry')
+                     AND content->>'kind' IN ('reconciliation','refresh_message_counters')"""
+            ).fetchall()
+        }
         for content, priority in (
             (models.ReconciliationContent(), models.TASK_PRIORITY_RECONCILIATION),
             (
@@ -43,20 +52,7 @@ class HistoryImportService(basic.BasicService):
                 models.TASK_PRIORITY_REFRESH_MESSAGE_COUNTERS,
             ),
         ):
-            tasks = models.Task.objects.get_all(
-                filters={
-                    "content": filters.JSONFields({"kind": content.kind}),
-                    "status": filters.In(
-                        [
-                            models.TaskStatus.NEW.value,
-                            models.TaskStatus.WAITING.value,
-                            models.TaskStatus.RETRY.value,
-                        ]
-                    ),
-                },
-                limit=1,
-            )
-            if not tasks:
+            if content.kind not in existing:
                 models.Task(
                     priority=priority,
                     not_before_at=(
@@ -140,18 +136,27 @@ class HistoryImportService(basic.BasicService):
 
     def _claim_tasks(self, limit):
         session = contexts.Context().get_session()
-        if not session.execute(
-            "SELECT pg_try_advisory_xact_lock(hashtextextended('zulip-task-dispatch',0)) AS locked"
-        ).fetchone()["locked"]:
-            return []
+        queues = ("background", "realtime") if self.queue == "all" else (self.queue,)
+        for queue in queues:
+            if not session.execute(
+                "SELECT pg_try_advisory_xact_lock(hashtextextended(%s,0)) AS locked",
+                (f"zulip-task-dispatch:{queue}",),
+            ).fetchone()["locked"]:
+                return []
+        # Separate statements keep queue statistics visible in generic plans.
+        queue_filter = {
+            "all": "",
+            "background": "AND task.queue='background'",
+            "realtime": "AND task.queue='realtime'",
+        }[self.queue]
         claimed = []
         for _index in range(limit):
             owner = uuid.uuid4()
             row = session.execute(
-                """WITH candidate AS (
+                f"""WITH candidate AS (
                     SELECT task.uuid FROM bridge_zulip_v5_tasks AS task
                     WHERE task.status IN ('new','waiting','retry')
-                      AND (%s='all' OR task.queue=%s)
+                      {queue_filter}
                       AND (task.not_before_at IS NULL OR task.not_before_at<=now() AT TIME ZONE 'UTC')
                       AND (task.next_retry_at IS NULL OR task.next_retry_at<=now() AT TIME ZONE 'UTC')
                       AND (task.lease_expires_at IS NULL OR task.lease_expires_at<=now() AT TIME ZONE 'UTC')
@@ -172,7 +177,7 @@ class HistoryImportService(basic.BasicService):
                             not_before_at,next_retry_at,lease_expires_at)))),
                     lease_owner=%s,lease_expires_at=(now() AT TIME ZONE 'UTC')+interval '2 minutes'
                 FROM candidate WHERE task.uuid=candidate.uuid RETURNING task.uuid""",
-                (self.queue, self.queue, owner),
+                (owner,),
             ).fetchone()
             if row is None:
                 break
@@ -322,5 +327,9 @@ class HistoryImportService(basic.BasicService):
             for task_uuid, owner in claimed:
                 future = self._executor.submit(self._run_task, task_uuid, owner)
                 self._futures.add(future)
-                future.add_done_callback(lambda _future: self._wake_event.set())
+                # Pacing survives a completion during _iteration(), even when
+                # BasicService clears the wake event before its next wait.
+                future.add_done_callback(
+                    lambda _future: self.boost(iterations=2, force=True)
+                )
             self.boost(iterations=2)

@@ -137,6 +137,78 @@ def test_claims_are_exclusive_and_do_not_queue_same_account_twice(history_accoun
             task.delete()
 
 
+@pytest.mark.parametrize("held_queue", ["background", "realtime"])
+def test_dispatch_transactions_do_not_block_the_other_queue(
+    history_account, held_queue
+):
+    account = history_account
+    tasks = {
+        queue: models.Task(
+            project_id=account.project_id,
+            external_account_uuid=account.uuid,
+            queue=queue,
+            content=models.ImportHistoryContent(
+                first_message_id=42, last_message_id=42
+            ),
+        )
+        for queue in ("background", "realtime")
+    }
+    for task in tasks.values():
+        task.insert()
+    other_queue = "realtime" if held_queue == "background" else "background"
+
+    def claim_other():
+        with contexts.Context().session_manager():
+            return history_import.HistoryImportService(queue=other_queue)._claim_tasks(
+                1
+            )
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            with contexts.Context().session_manager():
+                claimed = history_import.HistoryImportService(
+                    queue=held_queue
+                )._claim_tasks(1)
+                assert claimed[0][0] == tasks[held_queue].uuid
+                other = pool.submit(claim_other).result(timeout=3)
+                assert other[0][0] == tasks[other_queue].uuid
+    finally:
+        for task in tasks.values():
+            task.delete()
+
+
+@pytest.mark.parametrize("held_queue", ["background", "realtime"])
+def test_combined_dispatcher_respects_each_queue_lock(history_account, held_queue):
+    task = models.Task(
+        project_id=history_account.project_id,
+        external_account_uuid=history_account.uuid,
+        content=models.ImportHistoryContent(first_message_id=42, last_message_id=42),
+    )
+    task.insert()
+
+    def claim_combined():
+        with contexts.Context().session_manager():
+            return history_import.HistoryImportService(
+                queue="all", workers=4
+            )._claim_tasks(1)
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            with contexts.Context().session_manager() as session:
+                session.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
+                    (f"zulip-task-dispatch:{held_queue}",),
+                )
+                assert pool.submit(claim_combined).result(timeout=3) == []
+        with contexts.Context().session_manager():
+            claimed = history_import.HistoryImportService(
+                queue="all", workers=4
+            )._claim_tasks(1)
+            assert claimed[0][0] == task.uuid
+    finally:
+        task.delete()
+
+
 def test_realtime_publishes_converted_message_while_background_is_blocked(
     history_account,
     db,

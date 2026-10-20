@@ -3,12 +3,38 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
+import concurrent.futures
 import contextlib
 from unittest import mock
+import uuid
 
 import pytest
 
 from workspace.services import history_import
+
+
+def test_completion_keeps_immediate_pacing_when_iteration_clears_the_wakeup():
+    service = history_import.HistoryImportService(queue="background", iter_min_period=3)
+    future = concurrent.futures.Future()
+    executor = mock.Mock()
+    executor.submit.return_value = future
+    service._executor = executor
+    with (
+        mock.patch.object(service, "_ensure_reconciliation_task"),
+        mock.patch.object(history_import.contexts.Context, "session_manager"),
+        mock.patch.object(
+            service, "_claim_tasks", return_value=[(uuid.uuid4(), uuid.uuid4())]
+        ),
+    ):
+        service._pool_iteration()
+    service.reset_boost()
+    future.set_result(None)
+    # BasicService clears this event after an iteration. Completion must also
+    # update pacing, so this clear cannot postpone work for three seconds.
+    service._wake_event.clear()
+    assert service._current_pacing().iter_min_period == 0
+    assert service._current_pacing().iter_pause == 0
+    service.stop()
 
 
 def test_busy_loop_runs_without_waiting_and_restores_idle_pacing():

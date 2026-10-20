@@ -50,6 +50,9 @@ pool (`[history_import] workers`, default: four). Run `workspace-zulip-task-work
 as a separate process for the `realtime` queue, in addition to the realtime event
 receiver. It has a dedicated execution thread and checks for work every 100 ms.
 The equivalent module command is `python -m workspace.cmd.zulip_task_worker`.
+Each task-worker process sizes its PostgreSQL pool to its worker count plus one
+dispatcher connection: five for the default background pool, two for realtime.
+This overrides `[db] connection_pool_max_size` only in these task-worker processes.
 
 Migration 0243 adds explicit task queues and classifies pending tasks by origin.
 Live message imports, edits, sends, reactions and flag updates use `realtime`;
@@ -60,6 +63,10 @@ updating: older workers do not filter by queue.
 
 Dispatchers reserve only as many tasks as there are free execution slots. Claims
 commit before execution and use `FOR UPDATE SKIP LOCKED` and recoverable leases.
+Each queue has its own dispatcher lock and an explicit indexed queue filter,
+including when PostgreSQL reuses a generic prepared plan. Migration 0244 adds a
+small partial index for pending reconciliation and counter-refresh tasks; looking
+for these recurring tasks does not scan the history backlog or completed tasks.
 Each execution has its own database session. Tasks for the same account within a
 queue are serialized; global maintenance and conversion chains each have their
 own execution key. Catalog refreshes for a project share a key across both queues.
@@ -73,6 +80,8 @@ reconciliation queue. Shared database locks can still cause waits between queues
 
 The `[history_import] step_interval` option controls idle checks (default: three
 seconds); successful work continues immediately.
+Worker completion also renews the immediate pacing, so a completion during a
+dispatcher iteration cannot lose its wakeup and wait for the next idle check.
 Ready tasks run by priority descending, message creation time and provider ID
 descending, then task creation time ascending and UUID. Independent accounts may
 finish in a different order. Stored-content conversion keeps its sequential
