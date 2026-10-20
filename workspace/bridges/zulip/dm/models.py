@@ -71,6 +71,8 @@ TASK_PRIORITY_REALTIME_FLAGS = 550_000
 TASK_PRIORITY_RECONCILIATION = 200_000
 TASK_PRIORITY_REFRESH_MESSAGE_COUNTERS = 700_000
 TASK_RETRY_DELAY = datetime.timedelta(minutes=1)
+REALTIME_DEADLOCK_RETRY_DELAY = datetime.timedelta(seconds=1)
+MESSAGE_CREATED_EVENT_MAX_AGE = datetime.timedelta(days=1)
 
 
 class ExternalAccountIdPendingError(Exception):
@@ -1014,10 +1016,16 @@ class ZulipMessageState(
         # only after content, placement and viewer state agree, and retain the
         # previous projection for rows removed by cascading deletes.
         created, updated, deleted = {}, {}, {}
+        recent_since = (
+            datetime.datetime.now(datetime.timezone.utc) - MESSAGE_CREATED_EVENT_MAX_AGE
+        )
         for key, message in after.items():
             previous = before.get(key)
             if previous is None:
-                created.setdefault(message.uuid, []).append(message)
+                # Historical messages remain available through REST. Emitting
+                # one creation per imported row can starve live event delivery.
+                if message.created_at >= recent_since:
+                    created.setdefault(message.uuid, []).append(message)
             elif dict(previous) != dict(message):
                 updated.setdefault(message.uuid, []).append(message)
         for key, message in before.items():
@@ -1754,8 +1762,10 @@ class AbstractZulipTaskContent(AbstractTaskContent):
             error, (storage_exceptions.DeadLock, psycopg.errors.DeadlockDetected)
         ):
             task.status = TaskStatus.RETRY.value
-            task.next_retry_at = (
-                datetime.datetime.now(datetime.timezone.utc) + TASK_RETRY_DELAY
+            task.next_retry_at = datetime.datetime.now(datetime.timezone.utc) + (
+                REALTIME_DEADLOCK_RETRY_DELAY
+                if task.queue == "realtime"
+                else TASK_RETRY_DELAY
             )
             return
         response = error.response if isinstance(error, requests.HTTPError) else None
