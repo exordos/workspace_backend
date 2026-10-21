@@ -130,6 +130,41 @@ resources:
       name: "workspace.topic_summary_settings.manage"
       description: "Manage global and project Workspace topic summary settings"
 
+    # Preserve installed legacy grants until their consumers are retired.
+    workspace_external_account_reconnect:
+      name: workspace.external_account.reconnect
+      description: Reconnect the current user's Workspace external accounts
+    workspace_external_account_disconnect:
+      name: workspace.external_account.disconnect
+      description: Disconnect the current user's Workspace external accounts
+    workspace_external_provider_policy_read:
+      name: workspace.external_provider_policy.read
+      description: Read Workspace external provider policy
+    workspace_external_provider_policy_update:
+      name: workspace.external_provider_policy.update
+      description: Update Workspace external provider policy
+    workspace_external_provider_policy_suspend:
+      name: workspace.external_provider_policy.suspend
+      description: Suspend a Workspace external provider
+    workspace_external_provider_policy_resume:
+      name: workspace.external_provider_policy.resume
+      description: Resume a Workspace external provider
+    workspace_external_provider_health_read:
+      name: workspace.external_provider_health.read
+      description: Read Workspace external provider health
+    workspace_external_bridge_instance_read:
+      name: workspace.external_bridge_instance.read
+      description: Read Workspace external bridge instances
+    workspace_external_bridge_instance_suspend:
+      name: workspace.external_bridge_instance.suspend
+      description: Suspend a Workspace external bridge instance
+    workspace_external_bridge_instance_resume:
+      name: workspace.external_bridge_instance.resume
+      description: Resume a Workspace external bridge instance
+    workspace_external_bridge_instance_revoke:
+      name: workspace.external_bridge_instance.revoke
+      description: Revoke a Workspace external bridge instance
+
   # Roles are provisioned with their permission sets but are intentionally not
   # assigned to users. Operators create project-scoped role bindings explicitly.
   $core.iam.roles:
@@ -140,6 +175,12 @@ resources:
     workspace_topic_summary_admin:
       name: "workspace-topic-summary-admin"
       description: "Administer Workspace topic summarization"
+      project_id: null
+
+    # Preserve installed legacy grants until their consumers are retired.
+    workspace_external_integration_admin:
+      name: workspace-external-integration-admin
+      description: Administer Workspace external provider integrations
       project_id: null
 
   $core.iam.permissionbinding:
@@ -168,6 +209,52 @@ resources:
       permission: $core.iam.permissions.$workspace_topic_summary_settings_manage:uuid
       project_id: null
 
+    # Preserve installed legacy grants until their consumers are retired.
+    workspace_external_integration_account_reconnect:
+      role: $core.iam.roles.$workspace_external_integration:uuid
+      permission: $core.iam.permissions.$workspace_external_account_reconnect:uuid
+      project_id: null
+    workspace_external_integration_account_disconnect:
+      role: $core.iam.roles.$workspace_external_integration:uuid
+      permission: $core.iam.permissions.$workspace_external_account_disconnect:uuid
+      project_id: null
+    workspace_external_integration_admin_policy_read:
+      role: $core.iam.roles.$workspace_external_integration_admin:uuid
+      permission: $core.iam.permissions.$workspace_external_provider_policy_read:uuid
+      project_id: null
+    workspace_external_integration_admin_policy_update:
+      role: $core.iam.roles.$workspace_external_integration_admin:uuid
+      permission: $core.iam.permissions.$workspace_external_provider_policy_update:uuid
+      project_id: null
+    workspace_external_integration_admin_policy_suspend:
+      role: $core.iam.roles.$workspace_external_integration_admin:uuid
+      permission: $core.iam.permissions.$workspace_external_provider_policy_suspend:uuid
+      project_id: null
+    workspace_external_integration_admin_policy_resume:
+      role: $core.iam.roles.$workspace_external_integration_admin:uuid
+      permission: $core.iam.permissions.$workspace_external_provider_policy_resume:uuid
+      project_id: null
+    workspace_external_integration_admin_health_read:
+      role: $core.iam.roles.$workspace_external_integration_admin:uuid
+      permission: $core.iam.permissions.$workspace_external_provider_health_read:uuid
+      project_id: null
+    workspace_external_integration_admin_bridge_read:
+      role: $core.iam.roles.$workspace_external_integration_admin:uuid
+      permission: $core.iam.permissions.$workspace_external_bridge_instance_read:uuid
+      project_id: null
+    workspace_external_integration_admin_bridge_suspend:
+      role: $core.iam.roles.$workspace_external_integration_admin:uuid
+      permission: $core.iam.permissions.$workspace_external_bridge_instance_suspend:uuid
+      project_id: null
+    workspace_external_integration_admin_bridge_resume:
+      role: $core.iam.roles.$workspace_external_integration_admin:uuid
+      permission: $core.iam.permissions.$workspace_external_bridge_instance_resume:uuid
+      project_id: null
+    workspace_external_integration_admin_bridge_revoke:
+      role: $core.iam.roles.$workspace_external_integration_admin:uuid
+      permission: $core.iam.permissions.$workspace_external_bridge_instance_revoke:uuid
+      project_id: null
+
   $core.compute.nodes:
     workspace_backend:
       name: workspace-backend
@@ -182,6 +269,15 @@ resources:
             label: root
 
   $core.secret.passwords:
+    # Keep the installed bridge import valid throughout credential handoff.
+    workspace_zulip_bridge_enrollment_secret:
+      project_id: 12345678-c625-4fee-81d5-f691897b8142
+      name: workspace_zulip_bridge_enrollment_secret
+      description: One-time Zulip bridge Provider API enrollment secret
+      default_length: 40
+      constructor:
+        kind: plain
+      method: AUTO_HEX
     workspace_projection_db_password:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       name: workspace_projection_db_password
@@ -637,6 +733,9 @@ resources:
           command: /usr/local/bin/workspace-bootstrap
 
 exports:
+  zulip_bridge_enrollment_secret:
+    link: $core.secret.passwords.$workspace_zulip_bridge_enrollment_secret
+    kind: resource
   backend_node:
     link: "$core.compute.nodes.$workspace_backend"
     kind: "resource"
