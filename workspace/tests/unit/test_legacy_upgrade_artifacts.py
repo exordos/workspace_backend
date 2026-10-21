@@ -163,6 +163,8 @@ def test_native_upgrade_keeps_legacy_iam_catalog_with_existing_user_bindings():
     for namespace, resources in _legacy_resource_contract()["iam"].items():
         current = manifest["resources"][namespace]
         assert resources.keys() <= current.keys(), namespace
-        if namespace == "$core.iam.permissionbinding":
-            for name, binding in resources.items():
-                assert current[name] == binding
+        for name, resource in resources.items():
+            if namespace == "$core.iam.permissionbinding":
+                assert current[name] == resource
+            else:
+                assert current[name]["name"] == resource["name"]
