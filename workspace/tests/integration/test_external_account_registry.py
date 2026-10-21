@@ -12,6 +12,7 @@ import pytest
 
 from workspace.bridges.zulip.dm import models as zulip_models
 from workspace.messenger_api import application_services
+from workspace.messenger_api.dm import external_models
 from workspace.tests.integration import conftest
 
 
@@ -60,17 +61,24 @@ def test_account_update_does_not_deadlock_with_an_import_transaction(
                     json={"settings": {"api_key": "new-key"}},
                     permissions=permissions,
                 )
-                deadline = time.monotonic() + 5
-                while time.monotonic() < deadline:
-                    waiting = db.execute(
-                        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
-                        "WHERE %s = ANY(pg_blocking_pids(pid)))",
-                        (worker.info.backend_pid,),
-                    ).fetchone()[0]
-                    if waiting:
-                        break
-                    time.sleep(0.01)
-                assert waiting, "Account update did not reach the competing transaction"
+                if worker_write == "account":
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline:
+                        waiting = db.execute(
+                            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
+                            "WHERE %s = ANY(pg_blocking_pids(pid)))",
+                            (worker.info.backend_pid,),
+                        ).fetchone()[0]
+                        if waiting:
+                            break
+                        time.sleep(0.01)
+                    assert waiting, (
+                        "Account update did not reach the competing transaction"
+                    )
+                else:
+                    # Rebind now queues an initializer with the previous
+                    # revision; it must not synchronously lock an old task.
+                    assert update.result(timeout=3).status_code == 200
                 worker.execute(
                     "INSERT INTO bridge_zulip_v5_channels "
                     "(uuid, external_account_uuid, stream_uuid, stream_id, name, description, "
@@ -124,6 +132,7 @@ def test_zulip_account_creation_queues_connection_initialization(api, db):
             "new",
             {
                 "kind": "initialize_connection",
+                "previous_revision": None,
             },
         )
     ]
@@ -164,6 +173,9 @@ def test_zulip_account_update_resets_connection_and_queues_a_new_task(api, db):
         "WHERE external_account_uuid=%s RETURNING uuid",
         (account_uuid,),
     ).fetchone()[0]
+    previous_revision = external_models.ExternalAccount.objects.get_one(
+        filters={"uuid": sys_uuid.UUID(account_uuid)}
+    ).realtime_revision()
     update = {
         "settings": {"api_key": "new-key"},
         "status": "error",
@@ -211,6 +223,7 @@ def test_zulip_account_update_resets_connection_and_queues_a_new_task(api, db):
             "new",
             {
                 "kind": "initialize_connection",
+                "previous_revision": previous_revision,
             },
             sys_uuid.UUID(api.project_id),
         )

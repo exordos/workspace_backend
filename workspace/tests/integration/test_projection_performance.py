@@ -693,7 +693,7 @@ def test_concurrent_reaction_workers_keep_one_exact_snapshot(api, db, monkeypatc
     assert actually_claimed <= 2
     snapshot = api.get(f"{MESSAGES}{message['uuid']}").json()
     assert snapshot["reactions"] == {
-        "check": 1,
+        "check_mark_button": 1,
         "eyes": 1,
         "heart": 1,
         "rocket": 1,
