@@ -6,6 +6,8 @@ import asyncio
 import contextlib
 import datetime
 import importlib.util
+import threading
+import time
 from unittest import mock
 import uuid
 
@@ -16,7 +18,9 @@ from restalchemy.common import contexts
 from restalchemy.dm import filters
 
 from workspace.bridges.zulip import client
+from workspace.bridges.zulip.dm import flags
 from workspace.bridges.zulip.dm import models
+from workspace.bridges.zulip.dm import reactions
 from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.dm import v2_models
 from workspace.services import history_import
@@ -703,3 +707,43 @@ def test_delete_retries_after_a_lost_response_without_needing_the_native_root(ou
     history_import.HistoryImportService()._iteration()
     assert tasks(account)[0].status == "done"
     assert zulip.delete_message.call_args_list == [mock.call(remote["id"])] * 2
+
+
+@pytest.mark.parametrize("change_model", [flags.FlagChange, reactions.ReactionChange])
+def test_live_message_outbox_is_not_held_behind_a_reconciliation_batch(
+    outgoing, monkeypatch, change_model
+):
+    _api, account, _channel, _remote, _zulip, _constructor = outgoing
+
+    started = threading.Event()
+
+    def busy_changes(limit):
+        started.set()
+        # Bulk initial observation leaves many independent changes. Model
+        # their per-row work while the real HTTP and outbox dispatcher run.
+        time.sleep(0.06 * limit)
+        return limit
+
+    monkeypatch.setattr(flags.FlagChange, "reconcile_batch", lambda limit: 0)
+    monkeypatch.setattr(reactions.ReactionChange, "reconcile_batch", lambda limit: 0)
+    monkeypatch.setattr(change_model, "reconcile_batch", busy_changes)
+
+    async def scenario():
+        service = zulip_realtime.ZulipRealtimeService("unused-in-this-consumer")
+        consumer = asyncio.create_task(service._consume_workspace_events())
+        try:
+            assert await asyncio.to_thread(started.wait, 2)
+            public = await asyncio.to_thread(create, outgoing)
+            deadline = time.monotonic() + 0.5
+            while time.monotonic() < deadline:
+                if await asyncio.to_thread(tasks, account):
+                    break
+                await asyncio.sleep(0.01)
+            assert await asyncio.to_thread(tasks, account), public["uuid"]
+        finally:
+            consumer.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await consumer
+            service._executor.shutdown(wait=True)
+
+    asyncio.run(scenario())

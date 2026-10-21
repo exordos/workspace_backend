@@ -79,7 +79,9 @@ Realtime message tasks recheck local dependencies and delivery confirmation
 after 250 ms. A worker that skips its second execution lock releases only its
 own unsent attempt; an unknown HTTP result still waits for local echo rather
 than repeating the POST. Network errors and provider rate limits retain their
-longer retry interval.
+longer retry interval. The realtime dispatcher checks new Workspace messages
+before processing one flag change and one reaction change per pass, so bulk
+state reconciliation does not hold a message behind a large batch.
 
 Deleting an acknowledged native outgoing message records the Zulip route in
 the existing domain outbox transaction, before local tombstone cleanup. The

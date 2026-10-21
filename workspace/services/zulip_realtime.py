@@ -162,14 +162,14 @@ class ZulipRealtimeService:
             self._workspace_events_ready.clear()
             try:
                 for _index in range(100):
-                    flags_changed = await self._database(
-                        message_flags.FlagChange.reconcile_batch, 16
-                    )
-                    reactions_changed = await self._database(
-                        message_reactions.ReactionChange.reconcile_batch, 16
-                    )
                     event_processed = await self._database(
                         models.WorkspaceEvent.dispatch_one
+                    )
+                    flags_changed = await self._database(
+                        message_flags.FlagChange.reconcile_batch, 1
+                    )
+                    reactions_changed = await self._database(
+                        message_reactions.ReactionChange.reconcile_batch, 1
                     )
                     if (
                         not flags_changed
