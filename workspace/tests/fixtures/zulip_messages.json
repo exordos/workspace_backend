@@ -2341,5 +2341,137 @@
     },
     "unsupported_features": ["inline_latex", "global_time"],
     "expected_zulip_content": "@**Bob Example|12**, here is the **release summary** for #**general>Roadmap**.\n\n1. Read [the report](/user_uploads/1/abc123/report.pdf).\n2. Check the formula (Not supported in Workspace: inline LaTeX).\n\n```python\n# This is literal: @**Zoë Example|13** :smile:\nprint(\"ready\")\n```\n\n```spoiler Internal notes\n> Preserve the original link: [https://docs.example.test/runbook](https://docs.example.test/runbook)\n\nRestart the worker at (Not supported in Workspace: global time 2026-10-18T18:00:00+03:00).\n```\n\n![Deployment diagram](/user_uploads/1/img123/architecture.png)\n\nThanks! :+1:\n\n[Original message](https://zulip.example.test/#narrow/near/1055)"
+  },
+  {
+    "name": "multiple_commented_quotes",
+    "description": "Three sibling quotes, one nested reply, and a comment immediately after a closing fence. The source was later edited.",
+    "message": {
+      "id": 1059,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 13,
+      "sender_full_name": "Zoë Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000058,
+      "content_type": "text/x-markdown",
+      "content": "@_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1001):\n```quote\nThe deployment finished successfully.\n```\n\nFirst comment.\n\n@_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1002):\n```quote\nFirst line.\nSecond line.  \nThird line.\n\nA separate paragraph.\n\nFinal paragraph.\n```\nImmediate second comment.\nAnother comment line.\n\n@_**Bob Example|12** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1056):\n````quote\n@_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1001):\n```quote\ndeployment finished successfully.\n```\n\nThe quoted fragment is enough.\n````\n\nThird comment.\n\nLater source update.",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1059",
+      "message_uuids": {
+        "1001": "38c6b1e8-3017-53c6-b963-1694633751bb",
+        "1002": "8179d102-2fa8-508f-9320-a754952b7e81",
+        "1056": "e5ccdf1d-ed8f-5d68-b096-ee17baca17f2",
+        "1059": "0b9cda12-36c0-54d1-87a8-68c226806db0"
+      },
+      "strict_identities": true
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "[Alice Example](urn:quote:38c6b1e8-3017-53c6-b963-1694633751bb)\n\nFirst comment.\n\n[Alice Example](urn:quote:8179d102-2fa8-508f-9320-a754952b7e81)\n\nImmediate second comment.\nAnother comment line.\n\n[Bob Example](urn:quote:e5ccdf1d-ed8f-5d68-b096-ee17baca17f2)\n\nThird comment.\n\nLater source update."
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "@_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1001):\n```quote\nThe deployment finished successfully.\n```\n\nFirst comment.\n\n@_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1002):\n```quote\nFirst line.\nSecond line.  \nThird line.\n\nA separate paragraph.\n\nFinal paragraph.\n```\n\nImmediate second comment.\nAnother comment line.\n\n@_**Bob Example|12** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1056):\n````quote\n@_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1001):\n```quote\ndeployment finished successfully.\n```\n\nThe quoted fragment is enough.\n````\n\nThird comment.\n\nLater source update.",
+    "expected_quote_count": 4
+  },
+  {
+    "name": "partial_multiple_commented_quotes",
+    "description": "A Zulip UI reply preserves the original nested excerpt after the quoted message changes.",
+    "message": {
+      "id": 1060,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000059,
+      "content_type": "text/x-markdown",
+      "content": "@_**Zoë Example|13** [wrote](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1059):\n`````quote\n@_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1001):\n```quote\nThe deployment finished successfully.\n```\n\nFirst comment.\n\n@_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1002):\n```quote\nFirst line.\nSecond line.  \nThird line.\n\nA separate paragraph.\n\nFinal paragraph.\n```\nImmediate second comment.\nAnother comment line.\n\n@_**Bob Example|12** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1056):\n````quote\n@_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1001):\n```quote\ndeployment finished successfully.\n```\n\nThe quoted fragment is enough.\n````\n\nThird comment.\n`````\n\nReply outside the excerpt.",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1060",
+      "message_uuids": {
+        "1001": "38c6b1e8-3017-53c6-b963-1694633751bb",
+        "1002": "8179d102-2fa8-508f-9320-a754952b7e81",
+        "1056": "e5ccdf1d-ed8f-5d68-b096-ee17baca17f2",
+        "1059": "0b9cda12-36c0-54d1-87a8-68c226806db0"
+      },
+      "strict_identities": true
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "[Zoë Example](urn:forward:0b9cda12-36c0-54d1-87a8-68c226806db0?snapshot=W0FsaWNlIEV4YW1wbGVdKHVybjpxdW90ZTozOGM2YjFlOC0zMDE3LTUzYzYtYjk2My0xNjk0NjMzNzUxYmIpCgpGaXJzdCBjb21tZW50LgoKW0FsaWNlIEV4YW1wbGVdKHVybjpxdW90ZTo4MTc5ZDEwMi0yZmE4LTUwOGYtOTMyMC1hNzU0OTUyYjdlODEpCgpJbW1lZGlhdGUgc2Vjb25kIGNvbW1lbnQuCkFub3RoZXIgY29tbWVudCBsaW5lLgoKW0JvYiBFeGFtcGxlXSh1cm46cXVvdGU6ZTVjY2RmMWQtZWQ4Zi01ZDY4LWIwOTYtZWUxN2JhY2ExN2YyKQoKVGhpcmQgY29tbWVudC4)\n\nReply outside the excerpt."
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "@_**Zoë Example|13** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1059):\n`````quote\n@_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1001):\n```quote\nThe deployment finished successfully.\n```\n\nFirst comment.\n\n@_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1002):\n```quote\nFirst line.\nSecond line.  \nThird line.\n\nA separate paragraph.\n\nFinal paragraph.\n```\n\nImmediate second comment.\nAnother comment line.\n\n@_**Bob Example|12** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1056):\n````quote\n@_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1001):\n```quote\ndeployment finished successfully.\n```\n\nThe quoted fragment is enough.\n````\n\nThird comment.\n`````\n\nReply outside the excerpt.",
+    "expected_quote_count": 5
+  },
+  {
+    "name": "reply_to_multiple_commented_quotes",
+    "description": "A full reply to the same multi-quote message retains its source reference and all nested comments.",
+    "message": {
+      "id": 1061,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000060,
+      "content_type": "text/x-markdown",
+      "content": "@_**Zoë Example|13** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1059):\n`````quote\n@_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1001):\n```quote\nThe deployment finished successfully.\n```\n\nFirst comment.\n\n@_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1002):\n```quote\nFirst line.\nSecond line.  \nThird line.\n\nA separate paragraph.\n\nFinal paragraph.\n```\nImmediate second comment.\nAnother comment line.\n\n@_**Bob Example|12** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1056):\n````quote\n@_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1001):\n```quote\ndeployment finished successfully.\n```\n\nThe quoted fragment is enough.\n````\n\nThird comment.\n\nLater source update.\n`````\n\nReply outside all quotes.",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1061",
+      "message_uuids": {
+        "1001": "38c6b1e8-3017-53c6-b963-1694633751bb",
+        "1002": "8179d102-2fa8-508f-9320-a754952b7e81",
+        "1056": "e5ccdf1d-ed8f-5d68-b096-ee17baca17f2",
+        "1059": "0b9cda12-36c0-54d1-87a8-68c226806db0"
+      },
+      "strict_identities": true
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "[Zoë Example](urn:quote:0b9cda12-36c0-54d1-87a8-68c226806db0)\n\nReply outside all quotes."
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "@_**Zoë Example|13** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1059):\n`````quote\n@_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1001):\n```quote\nThe deployment finished successfully.\n```\n\nFirst comment.\n\n@_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1002):\n```quote\nFirst line.\nSecond line.  \nThird line.\n\nA separate paragraph.\n\nFinal paragraph.\n```\nImmediate second comment.\nAnother comment line.\n\n@_**Bob Example|12** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1056):\n````quote\n@_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1001):\n```quote\ndeployment finished successfully.\n```\n\nThe quoted fragment is enough.\n````\n\nThird comment.\n\nLater source update.\n`````\n\nReply outside all quotes.",
+    "expected_quote_count": 5
   }
 ]

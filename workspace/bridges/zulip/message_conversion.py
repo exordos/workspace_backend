@@ -329,15 +329,18 @@ class _ZulipToWorkspace:
         namespace = uuid.uuid5(uuid.NAMESPACE_DNS, host)
         return str(uuid.uuid5(namespace, message_id))
 
-    def snapshot(self, content: str) -> str:
-        encoded = (
-            base64.urlsafe_b64encode(self.inline(content).encode()).decode().rstrip("=")
-        )
-        identifier = self.context.get("current_message_uuid") or self.message_uuid(
-            str(self.message["id"])
+    def snapshot(
+        self, content: str, author: str = "unknown", message_id: str | None = None
+    ) -> str:
+        encoded = base64.urlsafe_b64encode(content.encode()).decode().rstrip("=")
+        identifier = (
+            self.message_uuid(message_id)
+            if message_id is not None
+            else self.context.get("current_message_uuid")
+            or self.message_uuid(str(self.message["id"]))
         )
         target = f"urn:forward:{identifier}?snapshot={encoded}"
-        return _markdown_link("unknown", target)
+        return _markdown_link(_escape_label(author), target)
 
     def target(self, target: str) -> str | None:
         files = self.context.get("files", {})
@@ -541,7 +544,7 @@ class _ZulipToWorkspace:
             and re.search(r"(?<!\\)\$\$.+?\$\$", text)
         ):
             return self.block_notice("inline LaTeX", text)
-        output = []
+        output: list[str] = []
         position = 0
         while position < len(text):
             header = _QUOTE_HEADER.match(text, position)
@@ -550,6 +553,8 @@ class _ZulipToWorkspace:
             if block is not None:
                 info, content, end = block
                 if info == "quote":
+                    if output and not "".join(output[-2:]).endswith("\n\n"):
+                        output.append("\n")
                     message_id = _near_id(header["url"]) if header else None
                     if (
                         header is not None
@@ -565,18 +570,29 @@ class _ZulipToWorkspace:
                     ):
                         target = f"urn:quote:{self.message_uuid(message_id)}"
                         original = self.context.get("messages", {}).get(message_id)
-                        if original is None or content != original["content"]:
-                            selected = (
-                                self.inline(content)
-                                if self.context.get("strict_identities")
-                                else content
+                        partial = original is None or content != original["content"]
+                        if partial and _without_quotes(content) != content:
+                            # Fragment URNs hold plain text; nested blocks need a snapshot.
+                            output.append(
+                                self.snapshot(
+                                    self.body(content), header["name"], message_id
+                                )
                             )
-                            target += "?text=" + urllib.parse.quote(selected, safe="")
-                        output.append(
-                            _markdown_link(_escape_label(header["name"]), target)
-                        )
+                        else:
+                            if partial:
+                                selected = (
+                                    self.inline(content)
+                                    if self.context.get("strict_identities")
+                                    else content
+                                )
+                                target += "?text=" + urllib.parse.quote(
+                                    selected, safe=""
+                                )
+                            output.append(
+                                _markdown_link(_escape_label(header["name"]), target)
+                            )
                     else:
-                        output.append(self.snapshot(content))
+                        output.append(self.snapshot(self.inline(content)))
                         if header is not None and self.context.get("strict_identities"):
                             source = self.target(header["url"])
                             output.append(
@@ -597,6 +613,8 @@ class _ZulipToWorkspace:
                     continue
                 if text[end - 1] == "\n":
                     output.append("\n")
+                    if info == "quote" and end < len(text) and text[end] != "\n":
+                        output.append("\n")
                 position = end
                 continue
             line_end = text.find("\n", position) + 1 or len(text)
@@ -607,7 +625,7 @@ class _ZulipToWorkspace:
                     position = line_end
                     line_end = text.find("\n", position) + 1 or len(text)
                 content = "".join(lines)
-                output.append(self.snapshot(content.removesuffix("\n")))
+                output.append(self.snapshot(self.inline(content.removesuffix("\n"))))
                 if content.endswith("\n"):
                     output.append("\n")
             else:
@@ -635,6 +653,21 @@ def _reverse_lookup(context: dict, mapping: str, value: str) -> str:
         if mapped == value:
             return key
     raise ValueError(f"No Zulip mapping for {mapping}: {value}")
+
+
+def _message_quote(source: dict, message_id: str, content: str, server_url: str) -> str:
+    base_url = server_url.rstrip("/")
+    url = f"{base_url}/#narrow/near/{message_id}"
+    if source["type"] == "stream":
+        channel = encode_hash(
+            f"{source['stream_id']}-{source['display_recipient'].replace(' ', '-')}"
+        )
+        topic = encode_hash(source["subject"])
+        url = f"{base_url}/#narrow/channel/{channel}/topic/{topic}/near/{message_id}"
+    author = source["sender_full_name"]
+    return (
+        f"@_**{author}|{source['sender_id']}** [said]({url}):\n{_quote_fence(content)}"
+    )
 
 
 def workspace_to_zulip(payload: dict, context: dict) -> str:
@@ -705,6 +738,28 @@ def workspace_to_zulip(payload: dict, context: dict) -> str:
             content = workspace_to_zulip(
                 {"kind": "markdown", "content": snapshot}, context
             )
+            message_id = context.get("message_ids", {}).get(identifier)
+            if message_id is None:
+                message_id = next(
+                    (
+                        key
+                        for key, value in context.get("message_uuids", {}).items()
+                        if value == identifier
+                    ),
+                    None,
+                )
+            source = context.get("messages", {}).get(message_id)
+            if (
+                source is not None
+                and label != "unknown"
+                and any(
+                    kind in ("quote", "forward")
+                    for kind, _identifier, _query in workspace_references(snapshot)
+                )
+            ):
+                return _message_quote(
+                    source, message_id, content, context["server_url"]
+                )
             return _quote_fence(content)
         if kind in ("message", "quote"):
             message_id = context.get("message_ids", {}).get(identifier)
@@ -725,15 +780,7 @@ def workspace_to_zulip(payload: dict, context: dict) -> str:
                 content = workspace_to_zulip(
                     {"kind": "markdown", "content": content}, context
                 )
-            url = f"{base_url}/#narrow/near/{message_id}"
-            if source["type"] == "stream":
-                channel = encode_hash(
-                    f"{source['stream_id']}-{source['display_recipient'].replace(' ', '-')}"
-                )
-                topic = encode_hash(source["subject"])
-                url = f"{base_url}/#narrow/channel/{channel}/topic/{topic}/near/{message_id}"
-            author = source["sender_full_name"]
-            return f"@_**{author}|{source['sender_id']}** [said]({url}):\n{_quote_fence(content)}"
+            return _message_quote(source, message_id, content, base_url)
 
         return None
 

@@ -549,6 +549,72 @@ def test_partial_quote_without_original_message_keeps_quoted_text():
     )
 
 
+@pytest.mark.parametrize("separator", ["\n", "\n\n"])
+def test_quote_references_stay_separate_from_adjacent_comments(separator):
+    identifier = "11111111-1111-4111-8111-111111111111"
+    context = {
+        "server_url": "https://zulip.example.test",
+        "message_uuids": {"1": identifier},
+        "messages": {"1": {"content": "Original leaf."}},
+    }
+    message = {
+        "id": 2,
+        "content": (
+            f"Before.{separator}"
+            "@_**Alice|9** [said](https://zulip.example.test/#narrow/near/1):\n"
+            f"```quote\nOriginal leaf.\n```{separator}After."
+        ),
+    }
+
+    assert message_conversion.zulip_to_workspace(message, context) == {
+        "kind": "markdown",
+        "content": f"Before.\n\n[Alice](urn:quote:{identifier})\n\nAfter.",
+    }
+
+
+@pytest.mark.parametrize("original_available", [True, False])
+def test_partial_nested_quote_preserves_blocks_in_a_snapshot(original_available):
+    inner_uuid = "11111111-1111-4111-8111-111111111111"
+    outer_uuid = "22222222-2222-4222-8222-222222222222"
+    current_uuid = "33333333-3333-4333-8333-333333333333"
+    inner = (
+        "@_**Alice|9** [said](https://zulip.example.test/#narrow/near/1):\n"
+        "```quote\nOriginal leaf.\n```\nImmediate comment."
+    )
+    context = {
+        "server_url": "https://zulip.example.test",
+        "original_url": "https://zulip.example.test/#narrow/near/3",
+        "current_message_uuid": current_uuid,
+        "strict_identities": True,
+        "message_uuids": {"1": inner_uuid, "2": outer_uuid},
+        "mention_uuids": {"id:9": "44444444-4444-4444-8444-444444444444"},
+        "messages": {"1": {"content": "Original leaf."}},
+    }
+    if original_available:
+        context["messages"]["2"] = {"content": inner + "\n\nLater edit."}
+    message = {
+        "id": 3,
+        "content": (
+            "@_**Bob|12** [wrote](https://zulip.example.test/#narrow/near/2):\n"
+            f"````quote\n{inner}\n````\n\nOutside reply."
+        ),
+    }
+    snapshot = (
+        base64.urlsafe_b64encode(
+            f"[Alice](urn:quote:{inner_uuid})\n\nImmediate comment.".encode()
+        )
+        .decode()
+        .rstrip("=")
+    )
+
+    assert message_conversion.zulip_to_workspace(message, context) == {
+        "kind": "markdown",
+        "content": (
+            f"[Bob](urn:forward:{outer_uuid}?snapshot={snapshot})\n\nOutside reply."
+        ),
+    }
+
+
 @pytest.mark.parametrize(
     "kind", ["user", "stream", "topic", "message", "file", "image", "video"]
 )
