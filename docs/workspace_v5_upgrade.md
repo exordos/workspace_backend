@@ -74,3 +74,16 @@ After a successful upgrade, the obsolete bridge element may be removed through
 the platform. Verify fresh messages and attachments in both directions,
 WebSocket delivery during backlog processing, and representative application
 flows before considering the installation accepted.
+
+Realtime message tasks recheck local dependencies and delivery confirmation
+after 250 ms. A worker that skips its second execution lock releases only its
+own unsent attempt; an unknown HTTP result still waits for local echo rather
+than repeating the POST. Network errors and provider rate limits retain their
+longer retry interval.
+
+Deleting an acknowledged native outgoing message records the Zulip route in
+the existing domain outbox transaction, before local tombstone cleanup. The
+realtime task retains that snapshot across restarts, uses the original sender's
+account, and cancels if that account has been rebound. Repeating a DELETE after
+a lost response accepts an already absent provider message; permission failures
+remain errors. Existing deletion events without a captured route are ignored.

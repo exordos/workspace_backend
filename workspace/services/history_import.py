@@ -241,6 +241,7 @@ class HistoryImportService(basic.BasicService):
         return task
 
     def _run_task(self, task_uuid, owner):
+        unsubmitted_delivery = None
         try:
             imported, prepare_error, prepare_seconds = self._fetch_import(
                 task_uuid, owner
@@ -272,13 +273,26 @@ class HistoryImportService(basic.BasicService):
                             prepared.content, "_submit", False
                         )
                         self._execute_task(task)
+                    elif isinstance(
+                        prepared.content, models.SendMessageContent
+                    ) and getattr(prepared.content, "_submit", False):
+                        # The second lock was skipped before execute/HTTP began.
+                        unsubmitted_delivery = prepared.content.delivery_uuid
         finally:
             with contexts.Context().session_manager() as session:
-                session.execute(
+                released = session.execute(
                     "UPDATE bridge_zulip_v5_tasks SET lease_owner=NULL,lease_expires_at=NULL "
-                    "WHERE uuid=%s AND lease_owner=%s",
+                    "WHERE uuid=%s AND lease_owner=%s RETURNING project_id",
                     (task_uuid, owner),
-                )
+                ).fetchone()
+                if released is not None and unsubmitted_delivery is not None:
+                    # Hold the owned task row until reset commits: a reclaimed
+                    # lease must never clear another worker's send attempt.
+                    session.execute(
+                        "UPDATE bridge_zulip_v5_deliveries SET sending=FALSE "
+                        "WHERE project_id=%s AND uuid=%s AND zulip_message_id IS NULL",
+                        (released["project_id"], unsubmitted_delivery),
+                    )
 
     @staticmethod
     def _fetch_import(task_uuid, owner):

@@ -6,8 +6,49 @@ import json
 from unittest import mock
 
 import pytest
+import requests
 
 from workspace.bridges.zulip import client
+
+
+@pytest.mark.parametrize("error", [None, "absent", "forbidden", "server"])
+def test_delete_is_idempotent_only_for_an_absent_message(error):
+    account = mock.Mock(
+        settings={
+            "server_url": "https://zulip.example.com",
+            "email": "sender@example.com",
+            "api_key": "sender-key",
+        }
+    )
+    response = requests.Response()
+    response.status_code = 200 if error is None else 500 if error == "server" else 400
+    response._content = json.dumps(
+        {"result": "success"}
+        if error is None
+        else {
+            "result": "error",
+            "code": "BAD_REQUEST",
+            "msg": "Invalid message(s)"
+            if error == "absent"
+            else "You don't have permission to delete this message",
+        }
+    ).encode()
+    session = mock.Mock()
+    session.request.return_value = response
+    with mock.patch.object(client.requests, "Session", return_value=session):
+        zulip = client.ZulipClient(account)
+        try:
+            if error in ("forbidden", "server"):
+                with pytest.raises(requests.HTTPError):
+                    zulip.delete_message(123)
+            else:
+                zulip.delete_message(123)
+        finally:
+            zulip.close()
+    session.request.assert_called_once_with(
+        "DELETE", "https://zulip.example.com/api/v1/messages/123", timeout=(5, 30)
+    )
+    session.close.assert_called_once()
 
 
 @pytest.mark.parametrize("recipient,topic", [(42, "General"), (42, ""), ([7, 8], None)])

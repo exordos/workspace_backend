@@ -67,6 +67,7 @@ TASK_PRIORITY_FULL_BACKFILL = 100_000
 TASK_PRIORITY_INITIALIZE_CONNECTION = 600_000
 TASK_PRIORITY_REALTIME_MESSAGE = 300_000
 TASK_PRIORITY_REALTIME_EDIT = 250_000
+REALTIME_MESSAGE_RETRY_DELAY = datetime.timedelta(milliseconds=250)
 TASK_PRIORITY_REALTIME_FLAGS = 550_000
 TASK_PRIORITY_RECONCILIATION = 200_000
 TASK_PRIORITY_REFRESH_MESSAGE_COUNTERS = 700_000
@@ -2963,9 +2964,14 @@ class OutboundMessageContent(AbstractTaskContent):
             )
         ):
             task.status = TaskStatus.RETRY.value
-            task.next_retry_at = datetime.datetime.now(
-                datetime.timezone.utc
-            ) + datetime.timedelta(seconds=3)
+            task.next_retry_at = datetime.datetime.now(datetime.timezone.utc) + (
+                REALTIME_MESSAGE_RETRY_DELAY
+                if isinstance(
+                    error,
+                    (DeliveryPendingError, content_conversion.ConversionPendingError),
+                )
+                else datetime.timedelta(seconds=3)
+            )
 
 
 class SendMessageContent(OutboundMessageContent):
@@ -3039,9 +3045,10 @@ class SendMessageContent(OutboundMessageContent):
         )
         if delivery.delivered_at is None:
             task.status = TaskStatus.RETRY.value
-            task.next_retry_at = datetime.datetime.now(
-                datetime.timezone.utc
-            ) + datetime.timedelta(seconds=3)
+            task.next_retry_at = (
+                datetime.datetime.now(datetime.timezone.utc)
+                + REALTIME_MESSAGE_RETRY_DELAY
+            )
 
 
 class EditMessageContent(OutboundMessageContent):
@@ -3086,6 +3093,51 @@ class EditMessageContent(OutboundMessageContent):
             delivery.observe(data)
         finally:
             zulip.close()
+
+
+class DeleteMessageContent(AbstractTaskContent):
+    KIND = "delete_message"
+
+    message_id = properties.property(types.Integer(min_value=1), required=True)
+    hostname = properties.property(types.String(), required=True)
+    external_account_id = properties.property(types.String(), required=True)
+    author_uuid = properties.property(types.UUID(), required=True)
+
+    def execute(self, task: "Task") -> None:
+        account = external_models.ExternalAccount.objects.get_one(
+            filters={
+                "project_id": filters.EQ(task.project_id),
+                "uuid": filters.EQ(task.external_account_uuid),
+            }
+        )
+        if (
+            account.provider != "zulip"
+            or account.get_host() != self.hostname
+            or account.external_account_id != self.external_account_id
+            or account.owner_user_uuid != self.author_uuid
+            or not account.can_stream()
+        ):
+            raise SubscriptionChangedError()
+        zulip = client.ZulipClient(account)
+        try:
+            zulip.delete_message(self.message_id)
+        finally:
+            zulip.close()
+
+    def on_error(self, task: "Task", error: Exception) -> None:
+        if isinstance(error, SubscriptionChangedError):
+            task.status = TaskStatus.CANCEL.value
+        elif isinstance(error, (requests.Timeout, requests.ConnectionError)) or (
+            isinstance(error, requests.HTTPError)
+            and (
+                error.response.status_code in (408, 429)
+                or error.response.status_code >= 500
+            )
+        ):
+            task.status = TaskStatus.RETRY.value
+            task.next_retry_at = datetime.datetime.now(
+                datetime.timezone.utc
+            ) + datetime.timedelta(seconds=3)
 
 
 class ConvertMessageContent(AbstractTaskContent):
@@ -3376,6 +3428,7 @@ TASK_CONTENT_TYPE = types_dynamic.KindModelSelectorType(
     types_dynamic.KindModelType(RefreshMessageFlagsContent),
     types_dynamic.KindModelType(SendMessageContent),
     types_dynamic.KindModelType(EditMessageContent),
+    types_dynamic.KindModelType(DeleteMessageContent),
     types_dynamic.KindModelType(InitializeConnectionContent),
     types_dynamic.KindModelType(FullBackfillContent),
     types_dynamic.KindModelType(ActualizeBackfillContent),
@@ -3460,6 +3513,7 @@ class Task(
         if "queue" not in kwargs and kwargs["content"].kind in (
             "send_message",
             "edit_message",
+            "delete_message",
             "update_message_flags",
             "update_reaction",
             "initialize_connection",
@@ -4485,6 +4539,25 @@ class WorkspaceEvent(
                 "project_id": filters.EQ(self.project_id),
             }
         )
+        if outbox.payload["source_kind"] == "message.deleted":
+            for snapshot in outbox.payload.get("zulip_deletions", []):
+                task_uuid = sys_uuid.uuid5(self.uuid, snapshot["delivery_uuid"])
+                if (
+                    Task.objects.get_one_or_none(
+                        filters={"uuid": filters.EQ(task_uuid)}
+                    )
+                    is None
+                ):
+                    Task(
+                        uuid=task_uuid,
+                        project_id=self.project_id,
+                        external_account_uuid=sys_uuid.UUID(
+                            snapshot["external_account_uuid"]
+                        ),
+                        priority=TASK_PRIORITY_REALTIME_EDIT,
+                        content=TASK_CONTENT_TYPE.from_simple_type(snapshot["content"]),
+                    ).insert()
+            return
         placement = v2_models.WorkspaceMessagePlacement.objects.get_one_or_none(
             filters={
                 "uuid": filters.EQ(sys_uuid.UUID(outbox.payload["placement_uuid"])),

@@ -438,8 +438,23 @@ def test_data_conversion_reimports_without_duplicate_legacy_resources(
 V5_HEADS = sorted(
     path.name
     for path in conftest.MIGRATIONS_DIR.glob("0*.py")
-    if "0190-" <= path.name < "0247-"
+    if "0190-" <= path.name < "0248-"
 )
+
+
+@pytest.mark.parametrize(
+    "captured_table",
+    ["workspace_zulip_v5_legacy_state", "workspace_zulip_v5_legacy_archive"],
+)
+def test_legacy_conversion_still_requires_coordinated_rollback(captured_table):
+    engine = migrations.MigrationEngine(str(conftest.MIGRATIONS_DIR))
+    with conftest.isolated_migration_database(engine.get_latest_migration()) as url:
+        with psycopg.connect(url, autocommit=True) as database:
+            database.execute(f"CREATE TABLE {captured_table} (kind TEXT)")
+        with pytest.raises(RuntimeError, match="coordinated pre-upgrade checkpoint"):
+            engine.rollback_migration(
+                next(conftest.MIGRATIONS_DIR.glob("0247-*.py")).name
+            )
 
 
 @pytest.mark.parametrize("starting_head", V5_HEADS)

@@ -859,3 +859,93 @@ def test_catalog_updates_share_an_execution_key_across_queues(
         release.set()
         bg.stop()
         rt.stop()
+
+
+@pytest.mark.parametrize("claim_state", ["new", "unknown_http", "reclaimed"])
+def test_file_send_retries_when_account_is_locked_after_preparation(
+    outgoing, db, tmp_path, monkeypatch, claim_state
+):
+    api, account, channel, remote, zulip, _constructor = outgoing
+    monkeypatch.setenv(file_storage.ENV_STORAGE_PATH, str(tmp_path))
+    uploaded = api.post(
+        "/v1/messenger/files/",
+        data={"stream_uuid": str(channel.stream_uuid)},
+        files={"file": ("claim-race.txt", b"claim-race", "text/plain")},
+    )
+    assert uploaded.status_code == 201
+    remote["content"] = f"[claim-race](urn:file:{uploaded.json()['uuid']})"
+    zulip.upload_file.return_value = "/user_uploads/2/claim-race.txt"
+    outgoing_tests.create(outgoing)
+    outgoing_tests.dispatch()
+    (task,) = outgoing_tests.tasks(account)
+    if claim_state == "unknown_http":
+        db.execute(
+            "UPDATE bridge_zulip_v5_deliveries SET sending=TRUE WHERE uuid=%s",
+            (task.content.delivery_uuid,),
+        )
+    service = history_import.HistoryImportService(queue="realtime", workers=1)
+    with contexts.Context().session_manager():
+        [(task_uuid, owner)] = service._claim_tasks(1)
+    original = service._locked_task
+    calls = 0
+    blocker = psycopg.connect(db.info.dsn)
+
+    def lock_after_prepare(claimed_uuid, claimed_owner):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            if claim_state == "reclaimed":
+                db.execute(
+                    "UPDATE bridge_zulip_v5_tasks SET lease_owner=%s WHERE uuid=%s",
+                    (uuid.uuid4(), task_uuid),
+                )
+            blocker.execute(
+                "SELECT uuid FROM m_external_accounts_v2 WHERE uuid=%s FOR UPDATE",
+                (account.uuid,),
+            )
+        return original(claimed_uuid, claimed_owner)
+
+    try:
+        with mock.patch.object(service, "_locked_task", side_effect=lock_after_prepare):
+            service._run_task(task_uuid, owner)
+    finally:
+        blocker.close()
+    assert zulip.upload_file.call_count == (0 if claim_state == "unknown_http" else 1)
+    zulip.send_message.assert_not_called()
+    (delivery,) = models.MessageDelivery.objects.get_all(
+        filters={"project_id": filters.EQ(account.project_id)}
+    )
+    # No POST started: this known local skip must not become an unknown send.
+    assert delivery.sending is (claim_state != "new")
+    if claim_state != "new":
+        return
+    outgoing_tests.ready(_stored(task))
+    with contexts.Context().session_manager():
+        [(task_uuid, owner)] = service._claim_tasks(1)
+    service._run_task(task_uuid, owner)
+    zulip.upload_file.assert_called_once()
+    zulip.send_message.assert_called_once()
+
+
+def test_realtime_send_rechecks_local_confirmation_within_250_milliseconds(outgoing):
+    _api, account, _channel, _remote, zulip, _constructor = outgoing
+    outgoing_tests.create(outgoing)
+    outgoing_tests.dispatch()
+    service = history_import.HistoryImportService(queue="realtime", workers=1)
+    with contexts.Context().session_manager():
+        [(task_uuid, owner)] = service._claim_tasks(1)
+    service._run_task(task_uuid, owner)
+    (task,) = outgoing_tests.tasks(account)
+    assert task.status == "retry"
+    assert (
+        datetime.timedelta(0)
+        < task.next_retry_at - task.updated_at
+        <= datetime.timedelta(milliseconds=250)
+    )
+    # An unacknowledged HTTP attempt may be checked quickly, never reposted.
+    outgoing_tests.ready(task)
+    with contexts.Context().session_manager():
+        [(task_uuid, owner)] = service._claim_tasks(1)
+    service._run_task(task_uuid, owner)
+    zulip.send_message.assert_called_once()
+    zulip.get_messages.assert_called_once()

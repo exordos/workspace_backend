@@ -73,6 +73,20 @@ class ZulipClient:
     def edit_message(self, message_id: int, content: str) -> None:
         self._request("PATCH", f"/messages/{message_id}", data={"content": content})
 
+    def delete_message(self, message_id: int) -> None:
+        try:
+            self._request("DELETE", f"/messages/{message_id}")
+        except requests.HTTPError as error:
+            # Retrying a DELETE after a lost response is safe. Zulip reports an
+            # already absent message as BAD_REQUEST, distinct from permission errors.
+            if error.response.status_code == 400 and error.response.json() == {
+                "result": "error",
+                "code": "BAD_REQUEST",
+                "msg": "Invalid message(s)",
+            }:
+                return
+            raise
+
     def upload_file(self, name: str, data: bytes, content_type: str) -> str:
         return self._request(
             "POST", "/user_uploads", files={"filename": (name, data, content_type)}

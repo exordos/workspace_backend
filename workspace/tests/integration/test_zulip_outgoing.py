@@ -619,3 +619,87 @@ def test_outgoing_migration_starts_with_new_events_and_round_trips(_database):
                 "SELECT to_regclass('bridge_zulip_v5_workspace_events')"
             ).fetchone() == (None,)
             migration.migration_step.upgrade(connection)
+
+
+@pytest.mark.parametrize("purge_before_dispatch", [False, True])
+def test_deleting_delivered_workspace_message_deletes_its_zulip_copy(
+    outgoing, purge_before_dispatch
+):
+    api, account, _channel, remote, zulip, _constructor = outgoing
+    public = create(outgoing)
+    dispatch()
+    service = history_import.HistoryImportService()
+    service._iteration()
+    ready(tasks(account)[0])
+    service._iteration()
+    assert tasks(account)[0].status == "done"
+    response = api.delete("/v1/messenger/messages/" + public["uuid"])
+    assert response.status_code == 204
+    if purge_before_dispatch:
+        (message,) = v2_models.WorkspaceMessage.objects.get_all(
+            filters={"project_id": filters.EQ(account.project_id)}
+        )
+        message.delete()
+    dispatch()
+    service._iteration()
+    zulip.delete_message.assert_called_once_with(remote["id"])
+    (delete,) = [
+        task for task in tasks(account) if task.content.kind == "delete_message"
+    ]
+    assert delete.status == "done" and delete.queue == "realtime"
+
+
+@pytest.mark.parametrize("changed", ["account", "imported", "unacknowledged"])
+def test_deletion_does_not_use_a_rebound_account_or_invent_a_remote_id(
+    outgoing, db, changed
+):
+    api, account, _channel, _remote, zulip, _constructor = outgoing
+    public = create(outgoing)
+    dispatch()
+    service = history_import.HistoryImportService()
+    if changed != "unacknowledged":
+        service._iteration()
+        ready(tasks(account)[0])
+        service._iteration()
+    if changed == "imported":
+        db.execute(
+            "UPDATE messenger_messages SET source_name='zulip' WHERE project_id=%s",
+            (account.project_id,),
+        )
+    assert api.delete("/v1/messenger/messages/" + public["uuid"]).status_code == 204
+    if changed == "account":
+        db.execute(
+            "UPDATE m_external_accounts_v2 SET external_account_id='zulip.example.com:99' WHERE uuid=%s",
+            (account.uuid,),
+        )
+    dispatch()
+    service._iteration()
+    zulip.delete_message.assert_not_called()
+    deletes = [task for task in tasks(account) if task.content.kind == "delete_message"]
+    assert [task.status for task in deletes] == (
+        ["cancel"] if changed == "account" else []
+    )
+
+
+def test_delete_retries_after_a_lost_response_without_needing_the_native_root(outgoing):
+    api, account, _channel, remote, zulip, _constructor = outgoing
+    public = create(outgoing)
+    dispatch()
+    service = history_import.HistoryImportService()
+    service._iteration()
+    ready(tasks(account)[0])
+    service._iteration()
+    assert api.delete("/v1/messenger/messages/" + public["uuid"]).status_code == 204
+    (message,) = v2_models.WorkspaceMessage.objects.get_all(
+        filters={"project_id": filters.EQ(account.project_id)}
+    )
+    message.delete()
+    dispatch()
+    zulip.delete_message.side_effect = [requests.Timeout("lost response"), None]
+    service._iteration()
+    (delete,) = tasks(account)
+    assert delete.status == "retry"
+    ready(delete)
+    history_import.HistoryImportService()._iteration()
+    assert tasks(account)[0].status == "done"
+    assert zulip.delete_message.call_args_list == [mock.call(remote["id"])] * 2

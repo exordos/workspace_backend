@@ -37,9 +37,13 @@ class MigrationStep(migrations.AbstractMigrationStep):
         zulip_upgrade_data.prepare(session)
 
     def downgrade(self, session):
-        raise RuntimeError(
-            "Restore the coordinated pre-upgrade checkpoint to undo the legacy handoff"
-        )
+        if session.execute(
+            "SELECT to_regclass('public.workspace_zulip_v5_legacy_state') IS NOT NULL "
+            "OR to_regclass('public.workspace_zulip_v5_legacy_archive') IS NOT NULL AS captured"
+        ).fetchone()["captured"]:
+            raise RuntimeError(
+                "Restore the coordinated pre-upgrade checkpoint to undo the legacy handoff"
+            )
 
 
 migration_step = MigrationStep()
