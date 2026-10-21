@@ -60,6 +60,7 @@ sudo env DEBIAN_FRONTEND=noninteractive apt-get \
     ca-certificates \
     curl \
     libev-dev \
+    logrotate \
     nginx \
     openssh-server \
     postgresql-client \
@@ -104,3 +105,10 @@ done
 
 sudo rm -f /etc/nginx/sites-enabled/default
 disable_packaged_nginx_service
+
+# Keep duplicate syslog archives from exhausting the managed guest root disk.
+sudo install -m 0644 "$GC_PATH/exordos/images/workspace-rsyslog.logrotate" /etc/logrotate.d/rsyslog
+sudo install -d -m 0755 /etc/systemd/system/logrotate.timer.d
+sudo install -m 0644 "$GC_PATH/exordos/images/workspace-logrotate-timer.conf" /etc/systemd/system/logrotate.timer.d/workspace.conf
+sudo systemctl daemon-reload
+sudo systemctl enable logrotate.timer
