@@ -87,10 +87,46 @@ descending, then task creation time ascending and UUID. Independent accounts may
 finish in a different order. Stored-content conversion keeps its sequential
 newest-first batch chain, while prefetching references and deliveries for the
 whole batch instead of reading them separately for every message.
-History import tasks cover at most 100 consecutive message IDs, newest ranges
-first. Migration 0237 splits unfinished larger tasks, preserving their priority,
+Legacy backfill import tasks cover at most 100 consecutive message IDs, newest
+ranges first. Migration 0237 splits unfinished larger tasks, preserving their priority,
 schedule, status, account, cutoff, and backfill/event links. The original tasks
 are cancelled and detached from backfill completion tracking.
+
+Migration 0251 adds lazy, versioned history fingerprints. New backfills scan fixed
+provider-ID windows of 1000 (`1..1000`, `1001..2000`, and so on), including sparse
+and partial windows. HTTP fetching and hashing happen before account/task locks.
+An unchanged ready batch needs one batch lookup, without loading its individual
+fingerprints or creating `import_history` processing tasks. Cursor, catalog and
+task bookkeeping still run. A changed batch uses one bounded fingerprint lookup
+and creates children containing at most 100 changed observations each; sparse
+children can span the wider source-ID window.
+
+Each account/message fingerprint separates raw UTF-8 text, known user flags,
+source metadata and normalized reactions. Flags belong to the observing account.
+Metadata includes the author, source/edit timestamps, message type, placement,
+`is_me_message` and direct-message participants. Missing reaction data is unknown,
+not an observed empty set. Component hashes use SHA-256 and canonical ordering;
+batch hashes also cover the ID range and ordered message IDs. The cache context
+includes the subscription, hash format and conversion versions, excluding queue
+IDs and credentials. Changing identity, ownership or relevant source settings
+therefore requires a new comparison.
+
+`bridge_zulip_v5_history_batches` stores range hashes, a revision, an observation
+barrier and pending child UUIDs. `bridge_zulip_v5_message_fingerprints` stores the
+component hashes. A batch becomes ready only after its children succeed and its
+revision still matches. Retries and cancelled children cannot confirm it. Equal
+snapshots advance the batch observation barrier without rewriting message, flag
+or reaction state. Newer observations, including same-value events, fence slow
+snapshots; the barrier is separate from user flag/reaction change timestamps.
+Relevant realtime, delivery and local mutations invalidate the affected ranges.
+An absent source ID withdraws that imported observer, not the shared canonical
+message. Pending native deliveries retain their existing duplicate-send guards.
+
+Flags-only and reactions-only deltas skip body conversion and file access.
+Metadata-only deltas also avoid body conversion. Completed processing tasks shed
+their embedded snapshot after the final task-status write; the durable cache
+does not depend on retaining completed tasks. Existing native projection and
+counter queues still have to converge after source processing finishes.
 
 Run the opt-in comparison on the disposable integration database with
 `WORKSPACE_ZULIP_BENCHMARK_REPORT=/tmp/zulip-worker-benchmark.json .tox/develop/bin/python -m pytest -q -s workspace/tests/integration/test_zulip_worker_performance.py`.
@@ -137,8 +173,10 @@ projection and project-event locks.
 
 Registering a new Zulip queue enqueues an internal `full_backfill` event for an
 account that has never completed import, or `actualize_backfill` for an imported
-account. The latter covers the preceding 30 days. Both use the message boundary
-returned by queue registration; neither fetches a later upper boundary. The API
+account. Both use fingerprint scans over visible history up to the message
+boundary returned by registration, including old edits and reactions; neither
+fetches a later upper boundary. The 30-day cutoff remains in legacy task payloads
+for compatibility, rather than limiting the new snapshot comparison. The API
 only schedules connection verification when connection settings change; it no
 longer starts backfill or cancels existing imports for a metadata update.
 An account becomes `active` after every task in its backfill group succeeds.
