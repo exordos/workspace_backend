@@ -7,7 +7,7 @@
 from workspace.cmd import history_import
 
 
-def main():
+def main() -> None:
     history_import.main(queue="realtime")
 
 

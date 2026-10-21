@@ -735,11 +735,13 @@ def workspace_to_zulip(payload: dict, context: dict) -> str:
             author = source["sender_full_name"]
             return f"@_**{author}|{source['sender_id']}** [said]({url}):\n{_quote_fence(content)}"
 
-    def workspace_text(text):
+        return None
+
+    def workspace_text(text: str) -> str:
         if not context.get("normalize_emoji"):
             return text
 
-        def replace_emoji(match):
+        def replace_emoji(match: re.Match[str]) -> str:
             code = emoji.code_for_name(match[1])
             if code is None:
                 return match[0]

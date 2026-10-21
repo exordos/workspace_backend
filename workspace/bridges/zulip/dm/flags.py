@@ -92,7 +92,7 @@ def observe_snapshot(
         )
         .fetchall()
     )
-    result = {}
+    result: dict[int, dict[str, bool]] = {}
     for row in rows:
         result.setdefault(row["message_id"], {})[row["flag"]] = row["value"]
     return result

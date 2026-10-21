@@ -6,6 +6,7 @@
 
 import datetime
 import json
+import typing
 import uuid
 
 import requests
@@ -15,6 +16,7 @@ from restalchemy.dm import models
 from restalchemy.dm import properties
 from restalchemy.dm import types
 from restalchemy.storage.sql import orm
+from restalchemy.storage.sql import sessions
 
 from workspace.bridges.zulip import client
 from workspace.common import emoji
@@ -22,15 +24,19 @@ from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.dm import v2_models
 
 
-def _session():
+if typing.TYPE_CHECKING:
+    from workspace.bridges.zulip.dm import models as zulip_models
+
+
+def _session() -> sessions.PgSQLSession:
     return contexts.Context().get_session()
 
 
-def _naive(value):
+def _naive(value: datetime.datetime) -> datetime.datetime:
     return value.astimezone(datetime.timezone.utc).replace(tzinfo=None)
 
 
-def _enqueue(project_id, message_uuid):
+def _enqueue(project_id: uuid.UUID, message_uuid: uuid.UUID) -> None:
     _session().execute(
         """INSERT INTO bridge_zulip_v5_reaction_changes(project_id, canonical_message_uuid)
            SELECT %s,%s WHERE EXISTS (
@@ -45,7 +51,9 @@ def _enqueue(project_id, message_uuid):
     )
 
 
-def message_for(account, message_id):
+def message_for(
+    account: external_models.ExternalAccount, message_id: int
+) -> dict[str, typing.Any]:
     _session().execute(
         "SELECT uuid FROM m_external_accounts_v2 WHERE project_id=%s AND uuid=%s FOR KEY SHARE",
         (account.project_id, account.uuid),
@@ -71,7 +79,7 @@ def message_for(account, message_id):
     return row
 
 
-def bind(message):
+def bind(message: dict[str, typing.Any]) -> None:
     imported_uuid = uuid.uuid5(
         message["project_id"],
         str(
@@ -115,7 +123,14 @@ def bind(message):
     _enqueue(message["project_id"], row["uuid"])
 
 
-def _record(message, data, present, observed_at, event_id=-1, queue_id=None):
+def _record(
+    message: dict[str, typing.Any],
+    data: dict[str, typing.Any],
+    present: bool,
+    observed_at: datetime.datetime,
+    event_id: int = -1,
+    queue_id: str | None = None,
+) -> uuid.UUID:
     reaction_uuid = uuid.uuid5(
         message["uuid"],
         f"{data['user_id']}:{data['reaction_type']}:{data['emoji_code']}",
@@ -147,7 +162,13 @@ def _record(message, data, present, observed_at, event_id=-1, queue_id=None):
     return reaction_uuid
 
 
-def record_event(account, data, observed_at, event_id, queue_id):
+def record_event(
+    account: external_models.ExternalAccount,
+    data: dict[str, typing.Any],
+    observed_at: datetime.datetime,
+    event_id: int,
+    queue_id: str,
+) -> None:
     message = message_for(account, data["message_id"])
     if (
         message["snapshot_at"] is not None
@@ -157,7 +178,11 @@ def record_event(account, data, observed_at, event_id, queue_id):
     _record(message, data, data["op"] == "add", observed_at, event_id, queue_id)
 
 
-def observe_snapshot(account, messages, observed_at):
+def observe_snapshot(
+    account: external_models.ExternalAccount,
+    messages: list[dict[str, typing.Any]],
+    observed_at: datetime.datetime,
+) -> None:
     for data in messages:
         if "reactions" not in data:
             continue
@@ -182,7 +207,7 @@ def observe_snapshot(account, messages, observed_at):
             _enqueue(account.project_id, message["canonical_message_uuid"])
 
 
-def _publish(fact, kind):
+def _publish(fact: v2_models.WorkspaceMessageReactionFact, kind: str) -> None:
     reaction = {
         name: str(getattr(fact, name)) for name in ("uuid", "project_id", "user_uuid")
     }
@@ -212,7 +237,9 @@ def _publish(fact, kind):
     )
 
 
-def _targets(project_id, canonical_uuid, user_uuid):
+def _targets(
+    project_id: uuid.UUID, canonical_uuid: uuid.UUID, user_uuid: uuid.UUID
+) -> list[dict[str, typing.Any]]:
     return (
         _session()
         .execute(
@@ -225,7 +252,9 @@ def _targets(project_id, canonical_uuid, user_uuid):
     )
 
 
-def remote_state(message, user_id, code):
+def remote_state(
+    message: dict[str, typing.Any], user_id: int, code: str
+) -> tuple[bool | None, datetime.datetime | None, str | None]:
     row = (
         _session()
         .execute(
@@ -244,7 +273,9 @@ def remote_state(message, user_id, code):
     )
 
 
-def _unicode_identity(name, observations):
+def _unicode_identity(
+    name: str, observations: list[dict[str, typing.Any]]
+) -> tuple[str, str] | None:
     code = emoji.code_for_name(name)
     for row in observations:
         if row["reaction_type"] == "unicode_emoji" and (
@@ -254,12 +285,14 @@ def _unicode_identity(name, observations):
             # Existing reactions retain the exact code and alias the server
             # supplied, including emoji introduced after our pinned catalog.
             return row["emoji_code"], row["emoji_name"]
-    if code in emoji.ZULIP_NAME_BY_CODE:
+    if code is not None and code in emoji.ZULIP_NAME_BY_CODE:
         return code, emoji.ZULIP_NAME_BY_CODE[code]
     return None
 
 
-def _schedule(intent, observations):
+def _schedule(
+    intent: "ReactionIntent", observations: list[dict[str, typing.Any]]
+) -> bool:
     from workspace.bridges.zulip.dm import models as zulip_models
 
     identity = _unicode_identity(intent.emoji_name, observations)
@@ -295,7 +328,7 @@ def _schedule(intent, observations):
             continue
         message = message_for(account, target["message_id"])
         user_id = int(account.external_account_id.rsplit(":", 1)[1])
-        value, at, _name = remote_state(message, user_id, code)
+        value, at, _remote_name = remote_state(message, user_id, code)
         if value == intent.present or (
             at is not None and at >= _naive(intent.changed_at)
         ):
@@ -340,7 +373,7 @@ def _schedule(intent, observations):
     )
 
 
-def reconcile(project_id, canonical_uuid):
+def reconcile(project_id: uuid.UUID, canonical_uuid: uuid.UUID) -> bool:
     # Keep the same account-before-message lock order as outgoing HTTP tasks.
     _session().execute(
         """SELECT uuid FROM m_external_accounts_v2 WHERE project_id=%s AND provider='zulip'
@@ -378,7 +411,7 @@ def reconcile(project_id, canonical_uuid):
         for row in observations
         if row["reaction_type"] == "unicode_emoji"
     )
-    groups = {}
+    groups: dict[tuple[uuid.UUID, str], list[dict[str, typing.Any]]] = {}
     for row in observations:
         if (
             row["reaction_type"] == "unicode_emoji"
@@ -480,7 +513,9 @@ def reconcile(project_id, canonical_uuid):
     return deferred
 
 
-def send(content, task):
+def send(
+    content: "zulip_models.UpdateReactionContent", task: "zulip_models.Task"
+) -> None:
     from workspace.bridges.zulip.dm import models as zulip_models
 
     _session().execute(
@@ -632,14 +667,14 @@ class ReactionChange(models.ModelWithID, models.ModelWithProject, orm.SQLStorabl
     )
 
     @classmethod
-    def get_id_property(cls):
+    def get_id_property(cls) -> dict[str, typing.Any]:
         return cls.id_properties.copy()
 
-    def get_id(self):
+    def get_id(self) -> tuple[uuid.UUID, uuid.UUID]:
         return self.project_id, self.canonical_message_uuid
 
     @classmethod
-    def reconcile_batch(cls, limit):
+    def reconcile_batch(cls, limit: int) -> int:
         for message in (
             _session()
             .execute(

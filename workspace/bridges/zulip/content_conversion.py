@@ -4,20 +4,24 @@
 
 """Resolve message references against the current project's persisted bridge data."""
 
+import collections.abc
 import datetime
 import contextlib
 import hashlib
 import re
+import typing
 import urllib.parse
 import uuid
 
 import requests
 from restalchemy.common import contexts
+from restalchemy.storage.sql import sessions
 from restalchemy.storage.sql import utils
 
 from workspace.bridges.zulip import message_conversion
 from workspace.bridges.zulip import client
 from workspace.messenger_api import file_storage
+from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.dm import helpers
 
 
@@ -25,7 +29,9 @@ VERSION = 1
 
 
 @contextlib.contextmanager
-def preserve_source_edit_time(session, project_id, message_uuid):
+def preserve_source_edit_time(
+    session: sessions.PgSQLSession, project_id: uuid.UUID, message_uuid: uuid.UUID
+) -> collections.abc.Iterator[None]:
     """A derived representation change is not a new user edit."""
     with utils.savepoint():
         previous = session.execute(
@@ -49,13 +55,17 @@ class ConversionPendingError(Exception):
 class ConversionContext:
     """Reuse identity catalogs across a batch; fetch only referenced messages."""
 
-    def __init__(self, account, session=None):
+    def __init__(
+        self,
+        account: external_models.ExternalAccount,
+        session: sessions.PgSQLSession | None = None,
+    ) -> None:
         self.account = account
         self.session = session or contexts.Context().get_session()
-        self.host = account.get_host()
+        self.host = typing.cast(str, account.get_host())
         self.server_url = account.settings["server_url"].rstrip("/")
         self.namespace = uuid.uuid5(uuid.NAMESPACE_DNS, self.host)
-        self.context = {
+        self.context: dict[str, typing.Any] = {
             "server_url": self.server_url,
             "strict_identities": True,
             "normalize_emoji": True,
@@ -75,16 +85,16 @@ class ConversionContext:
             "messages": {},
             "files": {},
         }
-        self._remote_messages = set()
-        self._workspace_messages = set()
-        self._topic_references = set()
-        self._message_versions = {}
+        self._remote_messages: set[int] = set()
+        self._workspace_messages: set[uuid.UUID] = set()
+        self._topic_references: set[tuple[str, str]] = set()
+        self._message_versions: dict[str, datetime.datetime | None] = {}
         self._outgoing = False
-        self._delivered = {}
+        self._delivered: dict[int, dict[str, typing.Any]] = {}
         self._users()
         self._channels()
 
-    def _users(self):
+    def _users(self) -> None:
         rows = self.session.execute(
             """SELECT account.uuid, account.external_account_id, account.owner_user_uuid,
                       COALESCE(imported.first_name, owner.first_name, owner.username) AS name
@@ -103,8 +113,8 @@ class ConversionContext:
         ).fetchall()
         self.account_ids = [row["uuid"] for row in rows]
         self.names = {}
-        names = {}
-        owners = {}
+        names: dict[str, set[str]] = {}
+        owners: dict[str, list[tuple[str, str]]] = {}
         for row in rows:
             remote_id = row["external_account_id"].rsplit(":", 1)[1]
             owner = str(row["owner_user_uuid"])
@@ -115,11 +125,11 @@ class ConversionContext:
         for name, matches in names.items():
             if len(matches) == 1:
                 self.context["mention_uuids"][f"name:{name}"] = matches.pop()
-        for owner, matches in owners.items():
-            if len(matches) == 1:
-                self.context["user_ids"][owner] = matches[0]
+        for owner, identities in owners.items():
+            if len(identities) == 1:
+                self.context["user_ids"][owner] = identities[0]
 
-    def _channels(self):
+    def _channels(self) -> None:
         rows = self.session.execute(
             """SELECT DISTINCT channel.stream_uuid, channel.stream_id, channel.name,
                       channel.channel_type, peer.external_account_id AS peer_id,
@@ -173,7 +183,7 @@ class ConversionContext:
                     f"{self.server_url}/#narrow/dm/{','.join(peers)}-group"
                 )
 
-    def _topics(self, text):
+    def _topics(self, text: str) -> None:
         references = set()
         for value in re.findall(r"#\*\*([^*\n]+)\*\*", text):
             channel, separator, topic = value.partition(">")
@@ -248,7 +258,7 @@ class ConversionContext:
                 + message_conversion.encode_hash(name)
             )
 
-    def prefetch(self, messages):
+    def prefetch(self, messages: list[dict[str, typing.Any]]) -> None:
         """Resolve identities and deliveries once for the whole ordered batch."""
         text = "\n".join(
             message["content"] + f" /near/{message['id']}" for message in messages
@@ -270,7 +280,7 @@ class ConversionContext:
         ).fetchall():
             self._delivered[row["zulip_message_id"]] = row
 
-    def _messages(self, text):
+    def _messages(self, text: str) -> None:
         remote_ids = {
             int(value)
             for match in re.findall(r"(?:near|with)/(\d+)|@(\d+)\*\*", text)
@@ -402,7 +412,7 @@ class ConversionContext:
                         str(placement["legacy_public_uuid"])
                     ] = remote_id
 
-    def _add_message(self, row):
+    def _add_message(self, row: dict[str, typing.Any]) -> None:
         remote_id = str(row["message_id"])
         if str(row["sender_id"]) not in self.names:
             raise ConversionPendingError(
@@ -432,7 +442,9 @@ class ConversionContext:
             "sender_full_name": self.names[str(row["sender_id"])],
         }
 
-    def _file_link(self, stream_uuid, file_uuid, url):
+    def _file_link(
+        self, stream_uuid: uuid.UUID, file_uuid: uuid.UUID, url: str
+    ) -> None:
         self.session.execute(
             """INSERT INTO bridge_zulip_v5_file_links
                    (uuid, project_id, hostname, stream_uuid, file_uuid, zulip_url)
@@ -447,10 +459,15 @@ class ConversionContext:
             ),
         )
 
-    def _import_files(self, message, stream_uuid, zulip):
+    def _import_files(
+        self,
+        message: dict[str, typing.Any],
+        stream_uuid: uuid.UUID,
+        zulip: client.ZulipClient | None,
+    ) -> None:
         deleted_files = self.context["deleted_files"] = set()
         inaccessible_files = self.context["inaccessible_files"] = set()
-        unavailable_paths = {}
+        unavailable_paths: dict[str, set[str]] = {}
         for url in message_conversion.get_zulip_files(
             message, self.context, include_quotes=True
         ):
@@ -562,7 +579,12 @@ class ConversionContext:
             )
             self.context["files"][url] = f"urn:{kind}:{row['uuid']}"
 
-    def to_workspace(self, message, stream_uuid, zulip):
+    def to_workspace(
+        self,
+        message: dict[str, typing.Any],
+        stream_uuid: uuid.UUID,
+        zulip: client.ZulipClient | None,
+    ) -> str:
         self._topics(message["content"])
         self._messages(message["content"] + f" /near/{message['id']}")
         self._import_files(message, stream_uuid, zulip)
@@ -575,7 +597,7 @@ class ConversionContext:
         )
         return message_conversion.zulip_to_workspace(message, self.context)["content"]
 
-    def delivered_content(self, message_id):
+    def delivered_content(self, message_id: int) -> dict[str, typing.Any] | None:
         if message_id in self._delivered:
             return self._delivered[message_id]
         return self.session.execute(
@@ -588,7 +610,12 @@ class ConversionContext:
             (self.account.project_id, self.host, message_id),
         ).fetchone()
 
-    def to_zulip(self, payload, stream_uuid, zulip):
+    def to_zulip(
+        self,
+        payload: dict[str, typing.Any],
+        stream_uuid: uuid.UUID,
+        zulip: client.ZulipClient,
+    ) -> str:
         self._outgoing = True
         text = message_conversion.workspace_reference_text(payload["content"])
         self._topics(text)
