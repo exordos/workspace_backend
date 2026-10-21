@@ -15,6 +15,7 @@ from restalchemy.common import exceptions as ra_exceptions
 from restalchemy.dm import filters as dm_filters
 from restalchemy.storage import exceptions as storage_exceptions
 
+from workspace.messenger_api import push_outbox
 from workspace.messenger_api.api import resource_projection
 from workspace.messenger_api.api import sql_canonical_store
 from workspace.messenger_api.api import store as api_store
@@ -2450,6 +2451,10 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                     stream.uuid,
                     collect_message_rows=False,
                 )
+            push_outbox.enqueue_read(
+                session, self.project_uuid, self.user_uuid, "stream.read",
+                {"uuid": str(stream.uuid)},
+            )
             topics = session.execute(
                 """
                 SELECT uuid FROM messenger_topics
@@ -2638,6 +2643,10 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                     topic.uuid,
                     collect_message_rows=False,
                 )
+            push_outbox.enqueue_read(
+                session, self.project_uuid, self.user_uuid, "topic.read",
+                {"uuid": str(topic.uuid)},
+            )
             self._enqueue_counter_projections(
                 source_kind="topic.read",
                 user_uuid=self.user_uuid,

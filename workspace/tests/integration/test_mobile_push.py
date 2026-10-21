@@ -106,7 +106,14 @@ def test_native_message_snapshot_and_read_cancellation_are_durable(
             "expires_at=NOW()-INTERVAL '10 minutes' WHERE user_uuid=%s",
             (peer,),
         )
-    read = api.post(f"/v1/messages/{message['uuid']}/actions/read/invoke", user=peer)
+    scope_uuid = {
+        "messages": message["uuid"],
+        "stream_topics": message["topic_uuid"],
+        "streams": stream["uuid"],
+    }[read_scope]
+    read = api.post(
+        f"/v1/{read_scope}/{scope_uuid}/actions/read/invoke", user=peer
+    )
     assert read.status_code == 200, read.text
     test_messenger_v2._drain()
     rows = db.execute(
