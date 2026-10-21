@@ -17,9 +17,7 @@ from restalchemy.dm import filters as dm_filters
 
 from workspace.common import mobile_push_opts
 from workspace.messenger_api import push_notifications
-from workspace.messenger_api.dm import models
-from workspace.messenger_api.dm import push_devices
-from workspace.messenger_api.dm import message_payloads
+from workspace.messenger_api.dm import message_payloads, models, push_devices
 
 LOG = logging.getLogger(__name__)
 RETENTION_SECONDS = 3600
@@ -140,7 +138,8 @@ def enqueue_message(session, source_event_uuid, project_id, message, recipients)
 def enqueue_read(session, project_id, user_uuid, kind, payload):
     if not mobile_push_opts.enabled():
         return
-    # Only messages which had a push snapshot need a cancellation. No history scan.
+    # Retained snapshots can still have a displayed alert after the FCM delivery
+    # deadline. Reading them must cancel that alert too. No history scan.
     scope = {
         "message.read": ("message_uuid", [payload.get("uuid")]),
         "messages.read": ("message_uuid", payload.get("message_uuids", [])),
@@ -154,7 +153,7 @@ def enqueue_read(session, project_id, user_uuid, kind, payload):
     rows = session.execute(
         f"""
         SELECT uuid, message_uuid, event FROM messenger_push_outbox
-        WHERE project_id = %s AND user_uuid = %s AND expires_at > NOW()
+        WHERE project_id = %s AND user_uuid = %s
           AND event->'event_params'->>'kind' = %s
           AND event->'event_params'->>'{field}' = ANY(%s::text[])
     """,
@@ -235,7 +234,7 @@ def process_one(session):
                 result = client.create("/v1/events/", data=event)
             except http_exceptions.ConflictError:
                 result = client.get("/v1/events/", str(row["uuid"]))
-    except Exception:
+    except Exception:  # noqa: BLE001 - untrusted provider exceptions can echo credentials
         # Provider errors can contain echoed tokens; never log exception bodies.
         LOG.warning("Notification request failed for event %s", row["uuid"])
         result = {"status": "IN_PROGRESS"}

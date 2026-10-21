@@ -14,8 +14,7 @@ from workspace.common import mobile_push_opts
 from workspace.messenger_api import push_outbox
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.api import store_factory
-from workspace.tests.integration import test_key_announcements
-from workspace.tests.integration import test_messenger_v2
+from workspace.tests.integration import test_key_announcements, test_messenger_v2
 
 
 @pytest.fixture(autouse=True)
@@ -77,8 +76,9 @@ def prepared_message(api, workspace_api, db):
 
 
 @pytest.mark.parametrize("read_scope", ["messages", "stream_topics", "streams"])
+@pytest.mark.parametrize("delivery_expired", [False, True])
 def test_native_message_snapshot_and_read_cancellation_are_durable(
-    api, workspace_api, db, read_scope
+    api, workspace_api, db, read_scope, delivery_expired
 ):
     stream, peer, _, message = prepared_message(api, workspace_api, db)
     event = db.execute(
@@ -98,6 +98,14 @@ def test_native_message_snapshot_and_read_cancellation_are_durable(
         ).fetchone()[0]
         == first_ciphertext
     )
+    if delivery_expired:
+        # A delivered alert can still be visible after its FCM delivery deadline.
+        # Its retained snapshot must remain usable for a later read cancellation.
+        db.execute(
+            "UPDATE messenger_push_outbox SET created_at=NOW()-INTERVAL '70 minutes', "
+            "expires_at=NOW()-INTERVAL '10 minutes' WHERE user_uuid=%s",
+            (peer,),
+        )
     read = api.post(f"/v1/messages/{message['uuid']}/actions/read/invoke", user=peer)
     assert read.status_code == 200, read.text
     test_messenger_v2._drain()
@@ -128,9 +136,11 @@ def test_retry_uses_same_event_and_inactive_response_cannot_remove_new_token(
             {"code": "registration_token_inactive", "device_uuid": str(device_uuid)}
         ],
     }
-    with mock.patch.object(push_outbox, "notification_client", return_value=client):
-        with contexts.Context().session_manager() as session:
-            assert push_outbox.process_one(session)
+    with (
+        mock.patch.object(push_outbox, "notification_client", return_value=client),
+        contexts.Context().session_manager() as session,
+    ):
+        assert push_outbox.process_one(session)
     assert (
         db.execute(
             "SELECT registration_token FROM m_workspace_push_devices WHERE uuid=%s",
@@ -150,9 +160,11 @@ def test_transient_delivery_error_keeps_outbox_retrying(api, workspace_api, db):
         "status": "ERROR",
         "errors": [{"code": "fcm_http_503", "permanent": False}],
     }
-    with mock.patch.object(push_outbox, "notification_client", return_value=client):
-        with contexts.Context().session_manager() as session:
-            assert push_outbox.process_one(session)
+    with (
+        mock.patch.object(push_outbox, "notification_client", return_value=client),
+        contexts.Context().session_manager() as session,
+    ):
+        assert push_outbox.process_one(session)
     assert not db.execute(
         "SELECT terminal FROM messenger_push_outbox WHERE user_uuid=%s", (peer,)
     ).fetchone()[0]

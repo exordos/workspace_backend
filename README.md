@@ -143,6 +143,9 @@ when a token changes; there are no registration revisions.
 
 When `[mobile_push]` is configured, native message fanout writes an encrypted
 per-user event snapshot into `messenger_push_outbox` in the same transaction.
+The delivery deadline is one hour; snapshots remain for one further hour so a
+later read can still cancel an alert delivered near that deadline. Android
+dismisses alerts one hour after receipt, within this retained-snapshot window.
 The existing primary Messenger worker forwards it to the local Notification
 v1 API and polls that event UUID. Per-device HPKE uses RFC 9180
 X25519/HKDF-SHA256/AES-256-GCM. The action, server/project/chat/message route,
