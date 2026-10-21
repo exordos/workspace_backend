@@ -363,6 +363,14 @@ def merge_resources(session, mapping):
             keeper = uuid.UUID(new) if uuid.UUID(new) in ids else ids[0]
             losers = [value for value in ids if value != keeper]
             if kind == "stream":
+                # Old archived projections must not hide an active conversation.
+                session.execute(
+                    "UPDATE messenger_streams SET is_archived=("
+                    "SELECT bool_and(is_archived) FROM messenger_streams "
+                    "WHERE project_id=%s AND uuid=ANY(%s)) "
+                    "WHERE project_id=%s AND uuid=%s",
+                    (project, ids, project, keeper),
+                )
                 # Derived caches are rebuilt from per-message facts after import.
                 for cache in (
                     "messenger_message_counter_totals",
