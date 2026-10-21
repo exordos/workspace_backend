@@ -2,6 +2,7 @@
 # Licensed under the Apache License, Version 2.0 (the "License").
 
 import hashlib
+import json
 import pathlib
 
 import jinja2
@@ -124,3 +125,44 @@ def test_missing_compatible_ui_stops_before_legacy_handoff(monkeypatch, tmp_path
         helper.main()
     current.upgrade.assert_not_called()
     helper.prepare.assert_not_called()
+
+
+def _render_manifest_for_legacy_consumer():
+    return yaml.safe_load(
+        jinja2.Template(
+            (ROOT / "exordos/manifests/workspace.yaml.j2").read_text()
+        ).render(
+            version="2.0.1",
+            images={
+                "workspace_backend": "urn:images:00000000-0000-4000-8000-000000000001"
+            },
+        )
+    )
+
+
+def _legacy_resource_contract():
+    return json.loads(
+        (
+            ROOT
+            / "workspace/tests/fixtures/legacy_workspace_1_3_1_resource_contract.json"
+        ).read_text()
+    )
+
+
+def test_native_upgrade_keeps_imports_used_by_installed_legacy_bridge():
+    manifest = _render_manifest_for_legacy_consumer()
+    exported = {entry["link"] for entry in manifest["exports"].values()}
+    for link in _legacy_resource_contract()["bridge_imports"].values():
+        namespace, name = link.rsplit(".$", 1)
+        assert name in manifest["resources"][namespace], link
+        assert link in exported
+
+
+def test_native_upgrade_keeps_legacy_iam_catalog_with_existing_user_bindings():
+    manifest = _render_manifest_for_legacy_consumer()
+    for namespace, resources in _legacy_resource_contract()["iam"].items():
+        current = manifest["resources"][namespace]
+        assert resources.keys() <= current.keys(), namespace
+        if namespace == "$core.iam.permissionbinding":
+            for name, binding in resources.items():
+                assert current[name] == binding

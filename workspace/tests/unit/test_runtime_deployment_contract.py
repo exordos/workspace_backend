@@ -5,7 +5,6 @@
 
 import pathlib
 
-
 PROJECT_ROOT = pathlib.Path(__file__).parents[3]
 
 
@@ -166,12 +165,10 @@ def test_messenger_v2_projection_worker_is_explicitly_enabled():
         assert "v2_metrics_log_interval_seconds = 30" in config
 
 
-def test_manifest_provisions_only_generic_account_permissions():
+def test_manifest_provisions_generic_permissions_without_assigning_user_roles():
     manifest = _read("exordos/manifests/workspace.yaml.j2")
     for action in ("read", "create", "update", "delete"):
         assert f'name: "workspace.external_account.{action}"' in manifest
-    assert "external_provider_policy" not in manifest
-    assert "external_bridge_instance" not in manifest
     assert "  $core.iam.rolebinding:" not in manifest
 
 
