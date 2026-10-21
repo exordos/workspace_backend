@@ -43,7 +43,7 @@ Direct local services:
 - Workspace OpenAPI spec: `http://127.0.0.1:21084/specifications/3.0.3`
 
 The single `workspace-api` process serves all REST resources, including Messenger,
-with two HTTP workers by default.
+with sixteen HTTP workers by default.
 
 The history import service executes the `background` queue with a bounded thread
 pool (`[history_import] workers`, default: four). Run `workspace-zulip-task-worker`

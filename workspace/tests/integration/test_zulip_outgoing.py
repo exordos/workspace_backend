@@ -89,6 +89,8 @@ def outgoing(api, db, scheduled_reconciliation, monkeypatch):
     remote = {
         "id": 12345,
         "sender_id": 7,
+        "flags": [],
+        "is_me_message": False,
         "timestamp": int(datetime.datetime.now(datetime.timezone.utc).timestamp()) + 10,
         "content": "Raw **message**",
         "type": "stream",
@@ -347,6 +349,129 @@ def test_lost_send_response_recovers_from_echo_without_reposting(outgoing):
     service._iteration()
     assert tasks(account)[0].status == "done"
     zulip.send_message.assert_called_once()
+
+
+@pytest.mark.parametrize("candidate", [False, True])
+def test_unknown_send_blocks_only_matching_unedited_history(outgoing, candidate):
+    _api, account, _channel, remote, zulip, _constructor = outgoing
+    create(outgoing)
+    dispatch()
+    zulip.send_message.side_effect = requests.Timeout("response lost")
+    service = history_import.HistoryImportService()
+    service._iteration()
+    if not candidate:
+        remote["content"] = "Unrelated history from the same sender"
+    task = models.Task(
+        project_id=account.project_id,
+        external_account_uuid=account.uuid,
+        content=models.ImportHistoryContent(
+            first_message_id=remote["id"], last_message_id=remote["id"]
+        ),
+    )
+    task.insert()
+    with contexts.Context().session_manager():
+        task.execute()
+    assert task.status == ("retry" if candidate else "done")
+    imported = models.ZulipMessage.objects.get_all(
+        filters={"project_id": filters.EQ(account.project_id)}
+    )
+    assert len(imported) == (0 if candidate else 1)
+    zulip.send_message.assert_called_once()
+
+
+@pytest.mark.parametrize("with_backfill", [False, True])
+def test_pending_identity_does_not_roll_back_or_starve_the_rest_of_a_history_page(
+    outgoing, with_backfill
+):
+    _api, account, _channel, remote, zulip, _constructor = outgoing
+    create(outgoing)
+    dispatch()
+    zulip.send_message.side_effect = requests.Timeout("response lost")
+    history_import.HistoryImportService()._iteration()
+    unrelated = {**remote, "id": remote["id"] - 1, "content": "Unrelated history"}
+    zulip.get_messages.side_effect = lambda first, last: [
+        dict(data) for data in (remote, unrelated) if first <= data["id"] <= last
+    ]
+    event_uuid = None
+    subscription = models.RealtimeSubscription.for_account(account)
+    if with_backfill:
+        event = models.RealtimeEvent(
+            uuid=uuid.uuid5(subscription.generation, "backfill"),
+            project_id=account.project_id,
+            external_account_uuid=account.uuid,
+            generation=subscription.generation,
+            queue_id=subscription.queue_id,
+            source="internal",
+            payload={"type": "full_backfill", "last_message_id": remote["id"]},
+            processed_at=datetime.datetime.now(datetime.timezone.utc),
+        )
+        event.insert()
+        event_uuid = event.uuid
+        with contexts.Context().session_manager():
+            account.update_status("backfill")
+    task = models.Task(
+        project_id=account.project_id,
+        external_account_uuid=account.uuid,
+        priority=models.TASK_PRIORITY_IMPORT_HISTORY + 100,
+        backfill_uuid=event_uuid,
+        realtime_event_uuid=event_uuid,
+        content=models.ImportHistoryContent(
+            first_message_id=unrelated["id"], last_message_id=remote["id"]
+        ),
+    )
+    task.insert()
+    with contexts.Context().session_manager():
+        task.execute()
+    assert task.status == "done"
+    imported = models.ZulipMessage.objects.get_all(
+        filters={"project_id": filters.EQ(account.project_id)}
+    )
+    assert [message.message_id for message in imported] == [unrelated["id"]]
+    children = [
+        item
+        for item in tasks(account)
+        if item.uuid != task.uuid and item.content.kind == "import_history"
+    ]
+    assert len(children) == 1
+    assert children[0].priority < models.TASK_PRIORITY_IMPORT_HISTORY
+    assert children[0].not_before_at > task.updated_at
+    assert children[0].backfill_uuid == children[0].realtime_event_uuid == event_uuid
+    assert (
+        children[0].content.first_message_id
+        == children[0].content.last_message_id
+        == remote["id"]
+    )
+    zulip.send_message.assert_called_once()
+    if with_backfill:
+        account = external_models.ExternalAccount.objects.get_one(
+            filters={"uuid": filters.EQ(account.uuid)}
+        )
+        assert account.status == "backfill"
+        (delivery,) = models.MessageDelivery.objects.get_all(
+            filters={"project_id": filters.EQ(account.project_id)}
+        )
+        with contexts.Context().session_manager():
+            models.RealtimeSubscription.append_events(
+                account,
+                subscription.generation,
+                [
+                    {
+                        "id": 0,
+                        "type": "message",
+                        "local_message_id": str(delivery.uuid),
+                        "message": dict(remote),
+                    }
+                ],
+            )
+            assert models.RealtimeEvent.dispatch_one()
+        with contexts.Context().session_manager():
+            children[0].execute()
+        assert children[0].status == "done"
+        account = external_models.ExternalAccount.objects.get_one(
+            filters={"uuid": filters.EQ(account.uuid)}
+        )
+        assert account.status == "active"
+        zulip.send_message.assert_called_once()
 
 
 def test_direct_message_routes_to_the_peer_without_a_channel_topic(outgoing, db):

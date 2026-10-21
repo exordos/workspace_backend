@@ -266,18 +266,23 @@ class HistoryImportService(basic.BasicService):
                     self._execute_task(task)
             # Preserve the committed attempt marker across a lost HTTP response.
             if prepared is not None:
+                if isinstance(prepared.content, models.SendMessageContent) and getattr(
+                    prepared.content, "_submit", False
+                ):
+                    unsubmitted_delivery = prepared.content.delivery_uuid
                 with contexts.Context().session_manager():
                     task = self._locked_task(task_uuid, owner)
                     if task is not None:
                         task.content._submit = getattr(
                             prepared.content, "_submit", False
                         )
-                        self._execute_task(task)
-                    elif isinstance(
-                        prepared.content, models.SendMessageContent
-                    ) and getattr(prepared.content, "_submit", False):
-                        # The second lock was skipped before execute/HTTP began.
-                        unsubmitted_delivery = prepared.content.delivery_uuid
+                        try:
+                            self._execute_task(task)
+                        finally:
+                            if isinstance(
+                                task.content, models.SendMessageContent
+                            ) and not getattr(task.content, "_submit", False):
+                                unsubmitted_delivery = None
         finally:
             with contexts.Context().session_manager() as session:
                 released = session.execute(

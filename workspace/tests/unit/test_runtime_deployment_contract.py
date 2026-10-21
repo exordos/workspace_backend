@@ -109,14 +109,14 @@ def test_postgresql_runtime_has_bounded_connection_lifetimes():
             assert f"{name} = {value}" in config
 
 
-def test_workspace_runtime_has_two_workers_with_bounded_pool_budget():
+def test_workspace_runtime_has_sixteen_workers_with_bounded_pool_budget():
     for config_path in (
         "etc/workspace/workspace.conf",
         "exordos/manifests/workspace.yaml.j2",
     ):
         config = _read(config_path)
         workspace = config.split("[workspace_api]", 1)[1].split("[", 1)[0]
-        assert "workers = 2" in workspace
+        assert "workers = 16" in workspace
         assert "connection_pool_max_size = 2" in config
 
     workspace_source = _read("workspace/cmd/workspace_api.py")
