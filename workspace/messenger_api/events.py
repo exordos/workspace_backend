@@ -29,6 +29,8 @@ from restalchemy.common import contexts
 from restalchemy.dm import filters as dm_filters
 from workspace.common import mutation_journal_opts
 from workspace.messenger_api import publication
+
+from workspace.messenger_api import push_outbox
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.dm import event_payloads
 from workspace.messenger_api.dm import message_payloads
@@ -412,6 +414,13 @@ def _create_workspace_event(
     payload: typing.Any,
     session: typing.Any = None,
 ) -> typing.Any:
+    push_outbox.enqueue_read(
+        session,
+        project_id,
+        user_uuid,
+        kind,
+        payload,
+    )
     if mutation_journal_opts.enabled():
         pending = publication.enqueue(
             session or contexts.Context().get_session(),
@@ -959,6 +968,14 @@ def create_message_deleted_events(
         "source": _event_payload_value("source", source),
     }
     if compact:
+        for recipient in recipients:
+            push_outbox.enqueue_read(
+                session,
+                project_id,
+                recipient,
+                "message.deleted",
+                {"uuid": message_uuid},
+            )
         return create_broadcast_event(
             project_id,
             message_uuid,

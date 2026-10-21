@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=workspace
-ExecStart=workspace-api --config-file /etc/workspace/workspace.conf
+ExecStart=workspace-api --config-file /etc/workspace/workspace.conf --config-dir /etc/workspace/workspace.conf.d
 Restart=on-failure
 
 [Install]

@@ -228,6 +228,16 @@ def test_manifest_proxies_core_api_over_https():
     )
 
 
+def test_mobile_push_dependencies_use_core_versions_instead_of_pep440():
+    import re
+
+    manifest = _read("exordos/manifests/mobile_push.yaml.j2")
+    versions = re.findall(r'from_version:\s*"([^"]+)"', manifest)
+    assert versions
+    for version in versions:
+        assert re.fullmatch(r"\d+\.\d+\.\d+(?:-.+)?", version)
+
+
 def test_backend_bootstrap_has_no_secondary_storage_gate():
     bootstrap = _read("exordos/images/backend-bootstrap.sh")
     install = _read("exordos/images/backend-install.sh")

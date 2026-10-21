@@ -118,6 +118,14 @@ def get_openapi_engine() -> openapi_engines.OpenApiEngine:
     )
 
 
+class MetadataOnlyLoggingMiddleware(logging_mw.LoggingMiddleware):
+    def _truncate_body(
+        self, body: typing.Any, max_size: int | None = None
+    ) -> str | None:
+        # API payloads can contain registration tokens and private messages.
+        return "[REDACTED]" if body is not None else None
+
+
 def build_wsgi_application(iam_engine_driver: typing.Any) -> typing.Any:
     return middlewares.attach_middlewares(
         applications.OpenApiApplication(
@@ -134,6 +142,6 @@ def build_wsgi_application(iam_engine_driver: typing.Any) -> typing.Any:
             app_middlewares.MutationResponseMiddleware,
             app_middlewares.DatabaseDeadlockRetryMiddleware,
             app_middlewares.ErrorsHandlerMiddleware,
-            logging_mw.LoggingMiddleware,
+            MetadataOnlyLoggingMiddleware,
         ],
     )
