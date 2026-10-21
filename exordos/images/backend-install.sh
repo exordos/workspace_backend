@@ -26,8 +26,6 @@ VENV_PATH="$GC_PATH/.venv"
 
 WORKSPACE_BINARIES=(
     workspace-api
-    workspace-prepare-upgrade
-    workspace-migrate-legacy-data
     workspace-history-import
     workspace-zulip-realtime
     workspace-zulip-task-worker

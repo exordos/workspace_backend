@@ -1,8 +1,4 @@
 {
-  "bridge_imports": {
-    "workspace_backend_node": "$core.compute.nodes.$workspace_backend",
-    "workspace_zulip_bridge_enrollment_secret": "$core.secret.passwords.$workspace_zulip_bridge_enrollment_secret"
-  },
   "iam": {
     "$core.iam.permissions": {
       "workspace_external_account_read": {

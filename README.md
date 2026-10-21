@@ -292,8 +292,8 @@ Messenger migration `0231` retires duplicate compatibility storage. Its applicat
 revision requires a coordinated writer shutdown and a verified database backup;
 see [the cutover procedure](docs/en/messenger_domain_model.md#retiring-the-compatibility-schema).
 
-For the legacy bridge to native Zulip v5 transition, use the
-[automatic element upgrade](docs/workspace_v5_upgrade.md).
+For native Workspace installations and upgrades from the legacy bridge, see the
+[element upgrade requirements](docs/workspace_v5_upgrade.md).
 
 The tracked `etc/workspace/workspace.conf` intentionally contains no IAM JWKS
 decryption key. For local development, copy it to the ignored local config and
