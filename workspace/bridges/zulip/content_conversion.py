@@ -280,7 +280,7 @@ class ConversionContext:
         workspace_ids = {
             uuid.UUID(value)
             for kind, value, _query in message_conversion.workspace_references(text)
-            if kind in ("message", "quote")
+            if kind in ("message", "quote", "forward")
         }
         remote_ids -= self._remote_messages
         workspace_ids -= self._workspace_messages

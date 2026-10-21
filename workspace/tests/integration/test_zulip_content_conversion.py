@@ -17,6 +17,7 @@ from restalchemy.storage.sql import migrations
 
 from workspace.bridges.zulip import client
 from workspace.bridges.zulip import content_conversion
+from workspace.bridges.zulip import message_conversion
 from workspace.bridges.zulip.dm import models
 from workspace.messenger_api import file_storage
 from workspace.messenger_api.dm import external_models
@@ -117,6 +118,97 @@ def test_imported_references_open_real_api_objects_and_convert_back(
             {"kind": "markdown", "content": selected}, stream_uuid, zulip
         )
         assert "|7**\n```" in selected and "urn:user:" not in selected
+
+
+def test_nested_edited_quote_keeps_snapshot_structure_through_the_api(
+    history_account, api, db, monkeypatch
+):
+    account = history_account
+
+    def quote(message_id, body, fence="```", url="near"):
+        return (
+            f"@_**Alias|7** [wrote](https://zulip.example.com/#narrow/{url}/{message_id}):\n"
+            f"{fence}quote\n{body}\n{fence}"
+        )
+
+    inner = quote(42, "First leaf.") + "\n\nInner comment."
+    group = (
+        quote(42, "First leaf.")
+        + "\n\nFirst comment.\n\n"
+        + quote(43, "Second leaf.")
+        + "\nImmediate second comment.\nAnother line.\n\n"
+        + quote(44, inner, "````")
+        + "\n\nThird comment."
+    )
+    sources = [
+        test_zulip_messages._message_data(42, content="First leaf."),
+        test_zulip_messages._message_data(43, content="Second leaf."),
+        test_zulip_messages._message_data(44, content=inner),
+        test_zulip_messages._message_data(
+            45, content=group + "\n\nA later source edit."
+        ),
+        test_zulip_messages._message_data(
+            46,
+            content=quote(45, group, "`````", "dm/7,8-dm/near") + "\n\nOutside reply.",
+        ),
+    ]
+    zulip = mock.Mock()
+    zulip.get_messages.return_value = sources
+    monkeypatch.setattr(client, "ZulipClient", lambda account: zulip)
+    assert test_zulip_messages._import_history(account, last=46).status == "done"
+    _publish(account, db)
+    api.project_id, api.user_uuid = account.project_id, account.owner_user_uuid
+    imported = test_zulip_messages._messages(account)
+    public = {
+        source.message_id: str(
+            uuid.uuid5(
+                uuid.uuid5(account.project_id, str(source.message_uuid)),
+                "zulip-placement",
+            )
+        )
+        for source in imported
+    }
+    group_response = api.get(f"/v1/messenger/messages/{public[45]}")
+    assert group_response.status_code == 200
+    assert (
+        f"[Alias](urn:quote:{public[43]})\n\nImmediate second comment."
+        in group_response.json()["payload"]["content"]
+    )
+    response = api.get(f"/v1/messenger/messages/{public[46]}")
+    assert response.status_code == 200
+    payload = response.json()["payload"]
+    kind, identifier, query = next(
+        message_conversion.workspace_references(payload["content"])
+    )
+    assert (kind, identifier) == ("forward", public[45])
+    snapshot = message_conversion.parse_snapshot(query)
+    assert snapshot.count("urn:quote:") == 3
+    assert f"urn:quote:{public[44]}" in snapshot
+    assert "\n\nImmediate second comment.\nAnother line." in snapshot
+    assert "Not supported" not in payload["content"]
+    assert payload["content"].endswith("\n\nOutside reply.")
+    stream_uuid = imported[0].channel.stream_uuid
+    with contexts.Context().session_manager():
+        text = content_conversion.ConversionContext(account).to_zulip(
+            payload, stream_uuid, zulip
+        )
+        returned = content_conversion.ConversionContext(account).to_workspace(
+            {**sources[-1], "content": text}, stream_uuid, zulip
+        )
+    assert "urn:" not in text
+    assert "`````quote" in text
+    _kind, returned_id, returned_query = next(
+        message_conversion.workspace_references(returned)
+    )
+    assert returned_id == identifier
+    returned_snapshot = message_conversion.parse_snapshot(returned_query)
+    assert list(message_conversion.workspace_references(returned_snapshot)) == list(
+        message_conversion.workspace_references(snapshot)
+    )
+    # Directory names can replace old aliases; quoted messages and comments must not change.
+    assert [
+        line for line in returned_snapshot.splitlines() if "urn:quote:" not in line
+    ] == [line for line in snapshot.splitlines() if "urn:quote:" not in line]
 
 
 def test_native_delivery_keeps_workspace_text_and_uses_public_message_ids(outgoing, db):

@@ -330,9 +330,9 @@ try {
       import * as reference from ${JSON.stringify(path.join(workspace, "packages/web/src/shared/lib/workspace-reference-urn.lib.ts"))};
       import * as fileReference from ${JSON.stringify(path.join(renderDirectory, "workspace-message-file-reference.lib.ts"))};
       import * as quote from ${JSON.stringify(path.join(workspace, "packages/web/src/shared/lib/workspace-message-quote.lib.ts"))};
-      import * as quoteFrame from ${JSON.stringify(path.join(workspace, "packages/web/src/shared/ui/workspace-message-quote-frame.ui.tsx"))};
+      import * as quoteFrame from ${JSON.stringify(path.join(workspace, "packages/web/src/shared/ui/workspace-message-quote-frame"))};
       import * as body from ${JSON.stringify(path.join(workspace, "packages/web/src/entities/messenger/messenger-workspace-message-body.ui.tsx"))};
-      import * as attachments from ${JSON.stringify(path.join(workspace, "packages/web/src/shared/ui/attachment-card.ui.tsx"))};
+      import * as attachments from ${JSON.stringify(path.join(workspace, "packages/web/src/shared/ui/attachment-card"))};
       import * as theme from ${JSON.stringify(path.join(workspace, "packages/web/src/shared/lib/themes/blue-cold.ts"))};
       import * as react from "react";
       import * as reactServer from "react-dom/server";
@@ -617,6 +617,27 @@ try {
           helper_config: helpers(),
         }).content;
       const destination = renderWorkspaceBody(example);
+      if (example.expected_quote_count != null) {
+        const sourceRoot = dom.window.document.createElement("div");
+        sourceRoot.innerHTML = source;
+        const destinationRoot = dom.window.document.createElement("div");
+        destinationRoot.innerHTML = destination;
+        assert.equal(
+          sourceRoot.querySelectorAll("blockquote").length,
+          example.expected_quote_count,
+          `${example.name}: missing Zulip quote blocks`,
+        );
+        assert.equal(
+          destinationRoot.querySelectorAll("[data-workspace-quote]").length,
+          example.expected_quote_count,
+          `${example.name}: missing Workspace quote frames`,
+        );
+        assert.ok(
+          !destinationRoot.textContent.includes("Not supported in Workspace:") &&
+            !destinationRoot.textContent.includes("```quote"),
+          `${example.name}: nested quotes leaked as literal text`,
+        );
+      }
       const kind =
         example.message.type === "stream"
           ? "Channel"
