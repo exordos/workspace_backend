@@ -132,8 +132,6 @@ where = ["."]
 
 [project.scripts]
 workspace-api = "workspace.cmd.workspace_api:main"
-workspace-prepare-upgrade = "workspace.cmd.prepare_upgrade:main"
-workspace-migrate-legacy-data = "workspace.cmd.migrate_legacy_data:main"
 workspace-history-import = "workspace.cmd.history_import:main"
 workspace-zulip-realtime = "workspace.cmd.zulip_realtime:main"
 workspace-zulip-task-worker = "workspace.cmd.zulip_task_worker:main"

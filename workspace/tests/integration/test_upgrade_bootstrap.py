@@ -18,60 +18,6 @@ from workspace.tests.integration import conftest
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 
 
-@pytest.mark.parametrize(
-    "timeout_name",
-    [
-        "connection_statement_timeout",
-        "connection_transaction_timeout",
-        "connection_idle_in_transaction_session_timeout",
-    ],
-)
-def test_data_migration_command_outlives_runtime_database_timeouts(
-    tmp_path, timeout_name
-):
-    """A resumed conversion can exceed the normal service's DB time limits."""
-    config = tmp_path / "workspace.conf"
-    config.write_text(
-        "[db]\nconnection_url=" + conftest.TEST_DB_URL + "\n" + timeout_name + "=1\n"
-    )
-    probe = textwrap.dedent("""
-        import sys,time
-        from unittest import mock
-        from restalchemy.common import contexts
-        from workspace.cmd import migrate_legacy_data
-        idle = sys.argv.pop() == 'idle'
-        def convert():
-            with contexts.Context().session_manager() as session:
-                session.execute('CREATE TEMP TABLE migration_timeout_probe(value integer)')
-                session.execute('INSERT INTO migration_timeout_probe VALUES (1)')
-                if idle:
-                    time.sleep(1.3)
-                else:
-                    session.execute('SELECT pg_sleep(1.3)')
-                session.execute('INSERT INTO migration_timeout_probe VALUES (2)')
-                assert session.execute('SELECT sum(value) AS total FROM migration_timeout_probe').fetchone()['total'] == 3
-            return 0
-        with mock.patch.object(migrate_legacy_data.legacy_data,'migrate',convert):
-            migrate_legacy_data.main()
-    """)
-    result = subprocess.run(
-        [
-            os.sys.executable,
-            "-c",
-            probe,
-            "--config-file",
-            str(config),
-            "idle" if "idle" in timeout_name else "statement",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=15,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "converted for 0 accounts" in result.stdout
-    assert timeout_name + "=1" in config.read_text()
-
-
 def test_bootstrap_quiesces_old_writers_before_migration_and_serializes_callers(
     tmp_path,
 ):
@@ -96,10 +42,6 @@ def test_bootstrap_quiesces_old_writers_before_migration_and_serializes_callers(
     (bin_dir / "activate").write_text(
         "export PATH=" + str(bin_dir) + ":$PATH\ndeactivate() { :; }\n"
     )
-    prepare = bin_dir / "workspace-prepare-upgrade"
-    prepare.write_text("#!/bin/sh\nexit 0\n")
-    prepare.chmod(0o755)
-    shutil.copy2(prepare, bin_dir / "workspace-migrate-legacy-data")
     table = "cassi_upgrade_probe_" + uuid.uuid4().hex
     migration = bin_dir / "ra-apply-migration"
     migration.write_text(

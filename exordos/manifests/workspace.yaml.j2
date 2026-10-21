@@ -269,15 +269,6 @@ resources:
             label: root
 
   $core.secret.passwords:
-    # Keep the installed bridge import valid throughout credential handoff.
-    workspace_zulip_bridge_enrollment_secret:
-      project_id: 12345678-c625-4fee-81d5-f691897b8142
-      name: workspace_zulip_bridge_enrollment_secret
-      description: One-time Zulip bridge Provider API enrollment secret
-      default_length: 40
-      constructor:
-        kind: plain
-      method: AUTO_HEX
     workspace_projection_db_password:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       name: workspace_projection_db_password
@@ -298,14 +289,6 @@ resources:
       name: workspace_s3_secret_key
       description: "Workspace messenger files S3 secret key"
       default_length: 40
-      constructor:
-        kind: plain
-      method: AUTO_HEX
-    workspace_legacy_upgrade_key:
-      project_id: "12345678-c625-4fee-81d5-f691897b8142"
-      name: workspace_legacy_upgrade_key
-      description: "One-time legacy Zulip credential handoff encryption key"
-      default_length: 64
       constructor:
         kind: plain
       method: AUTO_HEX
@@ -402,37 +385,6 @@ resources:
       instance: $s3aas.types.s3.instances.$workspace_s3:uuid
 
   $core.config.configs:
-    workspace_legacy_upgrade:
-      project_id: "12345678-c625-4fee-81d5-f691897b8142"
-      path: /etc/exordos_core/workspace-v5-upgrade.ini
-      mode: "0600"
-      target:
-        kind: node_set
-        # Canonical Core set identity from the Core element contract.
-        node_set: "70c88222-b4d9-46c3-9340-aa5bfaaa4b94"
-      on_change:
-        kind: shell
-        command: >-
-          install -d -m 0755 /usr/local/libexec &&
-          curl --fail --silent --show-error --retry 4 --connect-timeout 10 --max-time 120
-          '{{ repository | default('https://repo.exordos.com/exordos-elements') }}/workspace/{{ version }}/artifacts/workspace-upgrade-core.py'
-          -o /usr/local/libexec/workspace-v5-core-prepare.py.download &&
-          printf '%s  %s\n' '5abc10277d28184e2559e7bd3050010d3007d683bc8378b1a294a0b930393bf8' /usr/local/libexec/workspace-v5-core-prepare.py.download | sha256sum --check --status - &&
-          chmod 0700 /usr/local/libexec/workspace-v5-core-prepare.py.download &&
-          mv /usr/local/libexec/workspace-v5-core-prepare.py.download /usr/local/libexec/workspace-v5-core-prepare.py &&
-          /opt/exordos_core/.venv/bin/python /usr/local/libexec/workspace-v5-core-prepare.py
-          --config-file /etc/exordos_core/workspace-v5-upgrade.ini
-      body:
-        kind: text
-        content: |
-          f"
-          [workspace_upgrade]
-          connection_url = postgresql://{$dbaas.types.postgres.instances.$workspace_projection_cluster.users.$workspace_projection_user:name}:{$core.secret.passwords.$workspace_projection_db_password:value}@{$dbaas.types.postgres.instances.$workspace_projection_cluster:join(ipsv4)}:5432/{$dbaas.types.postgres.instances.$workspace_projection_cluster.databases.$workspace_projection_db:name}
-          encryption_key = {$core.secret.passwords.$workspace_legacy_upgrade_key:value}
-          exporter_url = {{ repository | default('https://repo.exordos.com/exordos-elements') }}/workspace/{{ version }}/artifacts/workspace-upgrade-bridge.py
-          exporter_sha256 = 9aee16f944b91fb502b9e69f3f9235fdbb82ba15671fa202b06ef8c864244402
-          "
-
     workspace_backend_config:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       path: /etc/workspace/workspace.conf
@@ -458,10 +410,6 @@ resources:
           connection_keepalives_interval = 30
           connection_keepalives_count = 5
           connection_pool_max_size = 2
-
-
-          [legacy_upgrade]
-          encryption_key = {$core.secret.passwords.$workspace_legacy_upgrade_key:value}
 
 
           [logging]
@@ -733,9 +681,6 @@ resources:
           command: /usr/local/bin/workspace-bootstrap
 
 exports:
-  zulip_bridge_enrollment_secret:
-    link: $core.secret.passwords.$workspace_zulip_bridge_enrollment_secret
-    kind: resource
   backend_node:
     link: "$core.compute.nodes.$workspace_backend"
     kind: "resource"

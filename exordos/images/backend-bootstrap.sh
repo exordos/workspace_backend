@@ -44,7 +44,7 @@ fi
 rm -f "$READY_FILE"
 
 # Running units restart through this same bootstrap lock. They cannot reopen
-# database writers until the migrations and the credential handoff have finished.
+# database writers until the schema migrations have finished.
 SERVICE_NAMES=(
     workspace-api
     workspace-messenger-api
@@ -124,9 +124,7 @@ until PGPASSWORD="$WORKSPACE_PG_PASS" psql \
 done
 
 source "$GC_PATH/.venv/bin/activate"
-workspace-prepare-upgrade --config-file "$WORKSPACE_CONFIG"
 ra-apply-migration --config-dir "$GC_CFG_DIR" --path "$GC_PATH/migrations"
-workspace-migrate-legacy-data --config-file "$WORKSPACE_CONFIG"
 deactivate
 unset WORKSPACE_PG_PASS
 
