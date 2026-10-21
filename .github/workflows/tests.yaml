@@ -23,9 +23,9 @@ jobs:
         uses: astral-sh/setup-uv@v7
       - name: Install tox-uv
         run: uv tool install tox --with tox-uv
-      - name: ruff
+      - name: Ruff and mypy
         run: |
-          tox -e ruff-check
+          tox -e ruff-check,mypy
   Tests:
     runs-on: ubuntu-24.04
     strategy:

@@ -15,6 +15,7 @@
 #    under the License.
 
 import collections.abc
+import typing
 
 from restalchemy.dm import properties
 from restalchemy.dm import types
@@ -26,7 +27,9 @@ E2EE_CONTENT_MAX_LENGTH = 4 * ((4 * MARKDOWN_CONTENT_MAX_LENGTH + 2) // 3)
 PUBLIC_KEY_MAX_LENGTH = 2048
 
 
-def markdown_content(payload) -> str:
+def markdown_content(
+    payload: collections.abc.Mapping[str, typing.Any] | types_dynamic.AbstractKindModel,
+) -> str:
     if isinstance(payload, collections.abc.Mapping):
         return payload["content"] if payload["kind"] == MarkdownPayload.KIND else ""
     return payload.content if payload.kind == MarkdownPayload.KIND else ""

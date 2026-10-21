@@ -24,6 +24,7 @@ from restalchemy.common import contexts
 from restalchemy.common import exceptions as ra_exc
 from restalchemy.dm import filters as dm_filters
 from restalchemy.storage import exceptions as storage_exc
+from restalchemy.storage.sql import sessions
 
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api import exceptions as messenger_exc
@@ -637,7 +638,12 @@ def mark_stale_workspace_users_offline(
     return users
 
 
-def get_workspace_user_folder_item(project_id, user_uuid, item_uuid, session=None):
+def get_workspace_user_folder_item(
+    project_id: sys_uuid.UUID,
+    user_uuid: sys_uuid.UUID,
+    item_uuid: sys_uuid.UUID,
+    session: sessions.PgSQLSession | None = None,
+) -> v2_models.WorkspaceUserFolderItem:
     return v2_models.WorkspaceUserFolderItem.objects.get_one(
         filters={
             "project_id": dm_filters.EQ(project_id),
@@ -976,8 +982,8 @@ def _validate_stream_binding_roles_payload(
 
 
 def get_or_create_workspace_stream_bindings(
-    project_id: object,
-    stream_uuid: object,
+    project_id: sys_uuid.UUID,
+    stream_uuid: sys_uuid.UUID,
     who_uuid: object,
     role_user_uuids: typing.Any,
     session: typing.Any = None,
@@ -1301,7 +1307,13 @@ def _validate_topic_notification_mode(
         raise messenger_exc.InvalidTopicNotificationModeError(mode=notification_mode)
 
 
-def _enqueue_stream_folders(project_id, user_uuid, stream_uuid, private, session):
+def _enqueue_stream_folders(
+    project_id: sys_uuid.UUID,
+    user_uuid: sys_uuid.UUID,
+    stream_uuid: sys_uuid.UUID,
+    private: bool,
+    session: sessions.PgSQLSession,
+) -> None:
     folder_uuids = {
         ALL_CHATS_FOLDER_UUID,
         PERSONAL_FOLDER_UUID if private else CHANNELS_FOLDER_UUID,

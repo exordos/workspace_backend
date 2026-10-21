@@ -37,6 +37,7 @@ from restalchemy.dm import types
 from restalchemy.dm import types_dynamic
 from restalchemy.storage import exceptions as storage_exceptions
 from restalchemy.storage.sql import orm
+from restalchemy.storage.sql import sessions
 from restalchemy.storage.sql import utils
 
 from workspace.bridges.zulip import client
@@ -123,7 +124,13 @@ class MessageContent(
         required=True,
     )
 
-    def convert(self, converter, data, stream_uuid, zulip):
+    def convert(
+        self,
+        converter: content_conversion.ConversionContext,
+        data: dict[str, typing.Any],
+        stream_uuid: sys_uuid.UUID,
+        zulip: client.ZulipClient | None,
+    ) -> None:
         delivered = converter.delivered_content(data["id"])
         if delivered is not None:
             self.workspace_content = delivered["content"]
@@ -538,7 +545,7 @@ class ZulipTopicState(
     @classmethod
     def reconcile_batch(cls, limit: int) -> int:
         changes = ZulipTopicChange.objects.get_all(limit=limit)
-        projects = {}
+        projects: dict[sys_uuid.UUID, list[sys_uuid.UUID]] = {}
         for change in changes:
             projects.setdefault(change.project_id, []).append(change.topic_uuid)
         for project_id, topic_uuids in projects.items():
@@ -880,8 +887,17 @@ class ZulipMessageState(
         return self.project_id, self.message_uuid
 
     @classmethod
-    def reconcile_batch(cls, limit: int, *, project_id=None, message_uuids=None) -> int:
-        changes = {}
+    def reconcile_batch(
+        cls,
+        limit: int,
+        *,
+        project_id: sys_uuid.UUID | None = None,
+        message_uuids: list[sys_uuid.UUID] | None = None,
+    ) -> int:
+        changes: dict[
+            tuple[sys_uuid.UUID, sys_uuid.UUID],
+            list[ZulipMessageChange | v2_models.WorkspaceMessageChange],
+        ] = {}
         scope = (
             {
                 "project_id": filters.EQ(project_id),
@@ -914,10 +930,12 @@ class ZulipMessageState(
         )
         if not batch:
             return 0
-        projects = {}
+        projects: dict[sys_uuid.UUID, list[sys_uuid.UUID]] = {}
         for project_id, message_uuid in batch:
             projects.setdefault(project_id, []).append(message_uuid)
-        counter_scopes = set()
+        counter_scopes: set[
+            tuple[sys_uuid.UUID, sys_uuid.UUID, sys_uuid.UUID, sys_uuid.UUID | None]
+        ] = set()
         # Suppress only our own marks for this batch. Other connections still
         # advance revisions, so acknowledgement below cannot consume their work.
         with utils.savepoint(name="zulip_message_reconciliation") as session:
@@ -972,7 +990,7 @@ class ZulipMessageState(
         ZulipMessageCounterChange.mark_many(counter_scopes)
         # A write can affect another message sharing source data. Keep its
         # original mark if any reconciliation stage still has a difference.
-        unreconciled = set()
+        unreconciled: set[tuple[sys_uuid.UUID, sys_uuid.UUID]] = set()
         for project_id, message_uuids in projects.items():
             for model in (cls, ZulipMessagePlacementState, ZulipUserMessageState):
                 unreconciled.update(
@@ -996,7 +1014,9 @@ class ZulipMessageState(
         return len(batch)
 
     @classmethod
-    def _workspace_messages(cls, project_id, message_uuids):
+    def _workspace_messages(
+        cls, project_id: sys_uuid.UUID, message_uuids: list[sys_uuid.UUID]
+    ) -> dict[tuple[sys_uuid.UUID, sys_uuid.UUID], v2_models.WorkspaceUserMessage]:
         return {
             (message.uuid, message.user_uuid): message
             for message in v2_models.WorkspaceUserMessage.objects.get_all(
@@ -1010,11 +1030,23 @@ class ZulipMessageState(
         }
 
     @classmethod
-    def _publish_message_events(cls, project_id, before, after, session):
+    def _publish_message_events(
+        cls,
+        project_id: sys_uuid.UUID,
+        before: dict[
+            tuple[sys_uuid.UUID, sys_uuid.UUID], v2_models.WorkspaceUserMessage
+        ],
+        after: dict[
+            tuple[sys_uuid.UUID, sys_uuid.UUID], v2_models.WorkspaceUserMessage
+        ],
+        session: sessions.PgSQLSession,
+    ) -> None:
         # Read projections include each recipient's flags and access. Publish
         # only after content, placement and viewer state agree, and retain the
         # previous projection for rows removed by cascading deletes.
-        created, updated, deleted = {}, {}, {}
+        created: dict[sys_uuid.UUID, list[v2_models.WorkspaceUserMessage]] = {}
+        updated: dict[sys_uuid.UUID, list[v2_models.WorkspaceUserMessage]] = {}
+        deleted: dict[sys_uuid.UUID, list[v2_models.WorkspaceUserMessage]] = {}
         for key, message in after.items():
             if not messenger_events.is_recent_message(message.created_at):
                 continue
@@ -1555,7 +1587,7 @@ class ZulipTopic(
     )
 
     @classmethod
-    def observe(cls, **values):
+    def observe(cls, **values: typing.Any) -> "ZulipTopic":
         topic = cls(**values)
         contexts.Context().get_session().execute(
             """INSERT INTO bridge_zulip_v5_topics (uuid,stream_id,name,max_id,created_at,updated_at)
@@ -2262,7 +2294,7 @@ class ImportChannelsContent(AbstractZulipTaskContent):
         server_namespace = sys_uuid.uuid5(sys_uuid.NAMESPACE_DNS, hostname)
         zulip = client.ZulipClient(account)
         try:
-            topic_notifications = {}
+            topic_notifications: dict[int, list[dict[str, typing.Any]]] = {}
             for data in zulip.get_topic_notifications():
                 topic_notifications.setdefault(data["stream_id"], []).append(data)
             stream_ids = set()
@@ -2746,7 +2778,7 @@ class UpdateMessageFlagsContent(AbstractZulipTaskContent):
                     "NOT_SUBSCRIBED",
                     "Cannot mark messages in unsubscribed Zulip channels as unread",
                 )
-            by_time = {}
+            by_time: dict[datetime.datetime, set[int]] = {}
             for row in batch:
                 by_time.setdefault(row["local_updated_at"], set()).add(
                     row["message_id"]
@@ -2886,7 +2918,7 @@ class OutboundMessageContent(AbstractTaskContent):
         types.String(max_length=40000), required=True, read_only=True
     )
 
-    def prepare_content(self, task, delivery):
+    def prepare_content(self, task: "Task", delivery: "MessageDelivery") -> str:
         session = contexts.Context().get_session()
         snapshot = session.execute(
             "SELECT zulip_content FROM bridge_zulip_v5_content_snapshots WHERE uuid=%s",
@@ -2915,7 +2947,7 @@ class OutboundMessageContent(AbstractTaskContent):
         )
         return text
 
-    def ready_to_prepare(self, task):
+    def ready_to_prepare(self, task: "Task") -> bool:
         row = (
             contexts.Context()
             .get_session()
@@ -2935,7 +2967,7 @@ class OutboundMessageContent(AbstractTaskContent):
             <= datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
         )
 
-    def claim(self, task):
+    def claim(self, task: "Task") -> None:
         task.lease_owner = getattr(task, "_worker_owner", None) or sys_uuid.uuid4()
         task.lease_expires_at = datetime.datetime.now(
             datetime.timezone.utc
@@ -3083,7 +3115,7 @@ class SendMessageContent(OutboundMessageContent):
 class EditMessageContent(OutboundMessageContent):
     KIND = "edit_message"
 
-    def prepare(self, task):
+    def prepare(self, task: "Task") -> bool:
         delivery = self.delivery(task)
         if not self.ready_to_prepare(task):
             return False
@@ -3186,7 +3218,7 @@ class ConvertMessageContent(AbstractTaskContent):
     )
     content_uuid = properties.property(types.AllowNone(types.UUID()), default=None)
 
-    def execute(self, task):
+    def execute(self, task: "Task") -> None:
         rows = (
             contexts.Context()
             .get_session()
@@ -3234,7 +3266,9 @@ class ConvertMessageContent(AbstractTaskContent):
             if rows
             else {}
         )
-        converters = {}
+        converters: dict[
+            sys_uuid.UUID, content_conversion.ConversionContext | None
+        ] = {}
         for account_uuid in dict.fromkeys(row["external_account_uuid"] for row in rows):
             converters[account_uuid] = None
             try:
@@ -3242,8 +3276,8 @@ class ConvertMessageContent(AbstractTaskContent):
                     account = external_models.ExternalAccount.objects.get_one(
                         filters={"uuid": filters.EQ(account_uuid)}
                     )
-                    converter = content_conversion.ConversionContext(account)
-                    converter.prefetch(
+                    prefetched = content_conversion.ConversionContext(account)
+                    prefetched.prefetch(
                         [
                             {
                                 "id": row["message_id"],
@@ -3253,7 +3287,7 @@ class ConvertMessageContent(AbstractTaskContent):
                             if row["external_account_uuid"] == account_uuid
                         ]
                     )
-                    converters[account_uuid] = converter
+                    converters[account_uuid] = prefetched
             except Exception:
                 LOG.exception(
                     "Failed to prefetch Zulip content; resolving messages individually"
@@ -3302,7 +3336,7 @@ class ConvertMessageContent(AbstractTaskContent):
                 ),
             ).insert()
 
-    def on_error(self, task, error):
+    def on_error(self, task: "Task", error: Exception) -> None:
         task.status = TaskStatus.RETRY.value
         task.next_retry_at = datetime.datetime.now(
             datetime.timezone.utc
@@ -3317,7 +3351,7 @@ class ReconcileRealtimeContent(AbstractTaskContent):
         types.TypedList(types.Integer(min_value=1)), required=True
     )
 
-    def execute(self, task):
+    def execute(self, task: "Task") -> None:
         session = contexts.Context().get_session()
         rows = session.execute(
             """SELECT messenger_uuid_v5(observed.project_id,observed.message_uuid::text) AS message_uuid,
@@ -3361,7 +3395,7 @@ class ReconcileRealtimeContent(AbstractTaskContent):
                 content=self,
             ).insert()
 
-    def on_error(self, task, error):
+    def on_error(self, task: "Task", error: Exception) -> None:
         task.status = TaskStatus.RETRY.value
         task.next_retry_at = datetime.datetime.now(
             datetime.timezone.utc
@@ -3539,7 +3573,9 @@ class Task(
     )
 
     def __init__(self, **kwargs: object) -> None:
-        if "queue" not in kwargs and kwargs["content"].kind in (
+        if "queue" not in kwargs and typing.cast(
+            AbstractTaskContent, kwargs["content"]
+        ).kind in (
             "send_message",
             "edit_message",
             "delete_message",
@@ -3550,13 +3586,14 @@ class Task(
         ):
             kwargs["queue"] = "realtime"
         if "concurrency_key" not in kwargs:
+            content = typing.cast(AbstractTaskContent, kwargs["content"])
             account_uuid = kwargs.get("external_account_uuid")
             kwargs["concurrency_key"] = (
                 f"{kwargs.get('project_id')}:catalog"
-                if kwargs["content"].kind in ("import_users", "import_channels")
+                if content.kind in ("import_users", "import_channels")
                 else f"{kwargs.get('project_id')}:{account_uuid}"
                 if account_uuid is not None
-                else kwargs["content"].kind
+                else content.kind
             )
         super().__init__(**kwargs)
         if (
@@ -4477,7 +4514,12 @@ class MessageDelivery(
         delivery.insert()
         return delivery
 
-    def observe(self, data: dict, observer=None, zulip=None) -> None:
+    def observe(
+        self,
+        data: dict,
+        observer: external_models.ExternalAccount | None = None,
+        zulip: client.ZulipClient | None = None,
+    ) -> None:
         account = self.account(sending=False)
         if data["sender_id"] != int(account.external_account_id.rsplit(":", 1)[1]):
             raise SubscriptionChangedError()
@@ -4552,7 +4594,13 @@ class MessageDelivery(
         ):
             self._update_observed_message(session, replace_content, text, edited_at)
 
-    def _update_observed_message(self, session, replace_content, text, edited_at):
+    def _update_observed_message(
+        self,
+        session: sessions.PgSQLSession,
+        replace_content: bool,
+        text: str,
+        edited_at: datetime.datetime,
+    ) -> None:
         session.execute(
             """
             UPDATE messenger_messages SET created_at=%s, updated_at=NOW() AT TIME ZONE 'UTC',

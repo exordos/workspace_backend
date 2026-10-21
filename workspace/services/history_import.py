@@ -7,6 +7,7 @@ import concurrent.futures
 import datetime
 import logging
 import time
+import typing
 import uuid
 
 from gcl_looper.services import basic
@@ -22,14 +23,20 @@ LOG = logging.getLogger(__name__)
 
 
 class HistoryImportService(basic.BasicService):
-    def __init__(self, *args, queue="all", workers=1, **kwargs):
+    def __init__(
+        self,
+        *args: typing.Any,
+        queue: str = "all",
+        workers: int = 1,
+        **kwargs: typing.Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
         self.queue = queue
         self.workers = workers
-        self._executor = None
-        self._futures = set()
+        self._executor: concurrent.futures.ThreadPoolExecutor | None = None
+        self._futures: set[concurrent.futures.Future[None]] = set()
 
-    def stop(self):
+    def stop(self) -> None:
         super().stop()
         if self._executor is not None:
             self._executor.shutdown(wait=True)
@@ -134,7 +141,7 @@ class HistoryImportService(basic.BasicService):
         if tasks:
             self.boost(iterations=2)
 
-    def _claim_tasks(self, limit):
+    def _claim_tasks(self, limit: int) -> list[tuple[uuid.UUID, uuid.UUID]]:
         session = contexts.Context().get_session()
         queues = ("background", "realtime") if self.queue == "all" else (self.queue,)
         for queue in queues:
@@ -185,7 +192,7 @@ class HistoryImportService(basic.BasicService):
         return claimed
 
     @staticmethod
-    def _locked_task(task_uuid, owner):
+    def _locked_task(task_uuid: uuid.UUID, owner: uuid.UUID) -> models.Task | None:
         session = contexts.Context().get_session()
         task = models.Task.objects.get_one(filters={"uuid": filters.EQ(task_uuid)})
         # Keep account-before-task locking consistent with rebind and send paths.
@@ -240,7 +247,7 @@ class HistoryImportService(basic.BasicService):
         task._worker_owner = owner
         return task
 
-    def _run_task(self, task_uuid, owner):
+    def _run_task(self, task_uuid: uuid.UUID, owner: uuid.UUID) -> None:
         unsubmitted_delivery = None
         try:
             imported, prepare_error, prepare_seconds = self._fetch_import(
@@ -300,7 +307,13 @@ class HistoryImportService(basic.BasicService):
                     )
 
     @staticmethod
-    def _fetch_import(task_uuid, owner):
+    def _fetch_import(
+        task_uuid: uuid.UUID, owner: uuid.UUID
+    ) -> tuple[
+        tuple[str, datetime.datetime, list[dict[str, typing.Any]]] | None,
+        Exception | None,
+        float,
+    ]:
         """Fetch history before holding account/task rows; fence writes afterwards."""
         started = time.monotonic()
         try:
@@ -336,7 +349,7 @@ class HistoryImportService(basic.BasicService):
         except Exception as error:
             return None, error, time.monotonic() - started
 
-    def _pool_iteration(self):
+    def _pool_iteration(self) -> None:
         for future in list(self._futures):
             if future.done():
                 self._futures.remove(future)

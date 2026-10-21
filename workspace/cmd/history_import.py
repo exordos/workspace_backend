@@ -41,12 +41,12 @@ ra_config_opts.register_posgresql_db_opts(CONF)
 file_storage_opts.register_opts(CONF)
 
 
-def _configure_database(queue, workers):
+def _configure_database(queue: str, workers: int) -> None:
     CONF.set_override("connection_pool_max_size", workers + 1, group="db")
     database.configure_postgresql(f"workspace-zulip-{queue}-tasks", conf=CONF)
 
 
-def main(queue=None) -> None:
+def main(queue: str | None = None) -> None:
     config.parse(sys.argv[1:])
     infra_log.configure()
     log = logging.getLogger(__name__)
