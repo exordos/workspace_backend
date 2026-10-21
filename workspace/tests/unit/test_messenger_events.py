@@ -62,6 +62,23 @@ async def _call_in_current_thread(callback, *args, **kwargs):
 
 
 class MessengerEventsTestCase(unittest.TestCase):
+    def test_recent_message_boundary_uses_utc_creation_time(self):
+        now = datetime.datetime(2026, 10, 21, 12, tzinfo=datetime.timezone.utc)
+        cutoff = now - datetime.timedelta(days=14)
+        with mock.patch.object(events, "datetime") as clock:
+            clock.datetime.now.return_value = now
+            clock.timezone = datetime.timezone
+            self.assertTrue(events.is_recent_message(cutoff))
+            self.assertTrue(events.is_recent_message(cutoff.replace(tzinfo=None)))
+            self.assertTrue(
+                events.is_recent_message(
+                    cutoff.astimezone(zoneinfo.ZoneInfo("Europe/Moscow"))
+                )
+            )
+            self.assertFalse(
+                events.is_recent_message(cutoff - datetime.timedelta(microseconds=1))
+            )
+
     def setUp(self):
         to_thread = mock.patch.object(
             asyncio,

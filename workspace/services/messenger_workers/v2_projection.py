@@ -1113,7 +1113,8 @@ def _emit_message_updated_rows(
 ) -> None:
     grouped: dict[object, list[typing.Any]] = {}
     for row in rows:
-        grouped.setdefault(row.uuid, []).append(row)
+        if messenger_events.is_recent_message(row.created_at):
+            grouped.setdefault(row.uuid, []).append(row)
     for placement_uuid in sorted(grouped, key=str):
         placement_rows = grouped[placement_uuid]
         emitted = messenger_events.create_message_updated_events(
@@ -1702,7 +1703,9 @@ def _process_fanout(
             ),
         )
     recipient_uuids = accepted_recipients
-    if task["payload"].get("emit_public_event", True):
+    if task["payload"].get(
+        "emit_public_event", True
+    ) and messenger_events.is_recent_message(message.created_at):
         emitted = messenger_events.create_message_events(
             project_id,
             message,
@@ -1964,7 +1967,7 @@ def _process_reaction_snapshot(
         task["_execution_stats"]["reaction_placement_count"] = len(
             event_placement_uuids
         )
-    session.execute(
+    changed = session.execute(
         """
         UPDATE messenger_messages AS message
         SET reactions = COALESCE(snapshot.reactions, '{}'::jsonb),
@@ -1991,6 +1994,10 @@ def _process_reaction_snapshot(
             GROUP BY target.uuid
         ) AS snapshot
         WHERE message.project_id = %s AND message.uuid = snapshot.uuid
+          AND (message.reactions, message.reaction_users) IS DISTINCT FROM
+              (COALESCE(snapshot.reactions, '{}'::jsonb),
+               COALESCE(snapshot.reaction_users, '{}'::jsonb))
+        RETURNING message.uuid
         """,
         (
             task["project_id"],
@@ -2000,7 +2007,7 @@ def _process_reaction_snapshot(
             placement_uuid,
             task["project_id"],
         ),
-    )
+    ).fetchone()
     for snapshot in snapshots:
         payload = snapshot["payload"]
         if not payload.get("emit_reaction_event"):
@@ -2008,6 +2015,8 @@ def _process_reaction_snapshot(
         event_message = messages_by_placement[
             _uuid(payload.get("placement_uuid", placement_uuid))
         ]
+        if not messenger_events.is_recent_message(event_message.created_at):
+            continue
         reaction_values = dict(payload["reaction"])
         for field in ("uuid", "project_id", "message_uuid", "user_uuid"):
             if reaction_values.get(field) is not None:
@@ -2041,8 +2050,13 @@ def _process_reaction_snapshot(
             project_id=task["project_id"],
             stream_uuid=event_message.stream_uuid,
         )
-    if any(
-        snapshot["payload"].get("emit_message_updated", True) for snapshot in snapshots
+    if (
+        changed is not None
+        and messenger_events.is_recent_message(message.created_at)
+        and any(
+            snapshot["payload"].get("emit_message_updated", True)
+            for snapshot in snapshots
+        )
     ):
         rows = _v2_rows(
             v2_models.WorkspaceUserMessage,
@@ -2187,7 +2201,7 @@ def _process_read_counters(
                 "user_uuid": dm_filters.EQ(user_uuid),
             },
         )
-        if messages:
+        if messages and messenger_events.is_recent_message(messages[0].created_at):
             emitted = messenger_events.create_message_read_event(
                 messages[0], session=session
             )

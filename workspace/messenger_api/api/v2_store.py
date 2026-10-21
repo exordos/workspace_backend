@@ -1084,18 +1084,24 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         message.validate_payload_update(
             resource_projection.simple(values["payload"]), session
         )
-        session.execute(
+        payload = json.dumps(resource_projection.simple(values["payload"]))
+        changed = session.execute(
             """
             UPDATE messenger_messages
             SET payload = %s::jsonb, updated_at = NOW()
             WHERE project_id = %s AND uuid = %s
+              AND payload IS DISTINCT FROM %s::jsonb
+            RETURNING uuid
             """,
             (
-                json.dumps(resource_projection.simple(values["payload"])),
+                payload,
                 self.project_uuid,
                 message.canonical_message_uuid,
+                payload,
             ),
-        )
+        ).fetchone()
+        if changed is None:
+            return _public(self._message(message_uuid), "messages")
         placements = session.execute(
             """
             SELECT uuid, topic_uuid
@@ -1336,21 +1342,30 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                     **values,
                     "emoji_name": emoji.normalize_name(values["emoji_name"]),
                 }
-            session.execute(
+            emoji_name = values.get("emoji_name", reaction.emoji_name)
+            changed = session.execute(
                 """
                 UPDATE messenger_message_reaction_facts
                 SET canonical_message_uuid = %s, placement_uuid = %s,
                     emoji_name = %s, updated_at = NOW()
                 WHERE project_id = %s AND uuid = %s
+                  AND (canonical_message_uuid, placement_uuid, emoji_name)
+                      IS DISTINCT FROM (%s::uuid, %s::uuid, %s::text)
+                RETURNING uuid
                 """,
                 (
                     message.canonical_message_uuid,
                     message.uuid,
-                    values.get("emoji_name", reaction.emoji_name),
+                    emoji_name,
                     self.project_uuid,
                     reaction.uuid,
+                    message.canonical_message_uuid,
+                    message.uuid,
+                    emoji_name,
                 ),
-            )
+            ).fetchone()
+            if changed is None:
+                return self.get_resource(resource, reaction.uuid)
             updated_reaction = self.get_resource(resource, reaction.uuid)
             self._enqueue(
                 "reaction_snapshot",
@@ -1685,14 +1700,19 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         if field not in {"starred", "pinned"}:
             raise ValueError(field)
         message = self._message(message_uuid)
-        contexts.Context().get_session().execute(
+        session = contexts.Context().get_session()
+        changed = session.execute(
             f"""
             UPDATE messenger_user_message_states
             SET {field} = %s, updated_at = NOW()
             WHERE project_id = %s AND placement_uuid = %s AND user_uuid = %s
+              AND {field} IS DISTINCT FROM %s
+            RETURNING uuid
             """,
-            (value, self.project_uuid, message.uuid, self.user_uuid),
-        )
+            (value, self.project_uuid, message.uuid, self.user_uuid, value),
+        ).fetchone()
+        if changed is None:
+            return _public(self._message(message.uuid), "messages")
         self._enqueue(
             "delivery_snapshot_event",
             "message",

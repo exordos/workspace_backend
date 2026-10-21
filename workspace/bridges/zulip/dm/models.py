@@ -1016,10 +1016,12 @@ class ZulipMessageState(
         # previous projection for rows removed by cascading deletes.
         created, updated, deleted = {}, {}, {}
         for key, message in after.items():
+            if not messenger_events.is_recent_message(message.created_at):
+                continue
             previous = before.get(key)
             if previous is None:
                 created.setdefault(message.uuid, []).append(message)
-            elif dict(previous) != dict(message):
+            elif messenger_events.message_snapshot_changed(previous, message):
                 updated.setdefault(message.uuid, []).append(message)
         for key, message in before.items():
             if key not in after:

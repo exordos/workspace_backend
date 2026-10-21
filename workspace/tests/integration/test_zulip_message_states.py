@@ -31,8 +31,18 @@ from workspace.tests.integration import test_messenger_v2 as messenger_tests
 @pytest.fixture
 def message_sources(_database, db):
     accounts = []
+    created_at = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+        days=2
+    )
 
-    def create(project_id=None, host=None, message_id=42, sender_id=7, stream_id=42):
+    def create(
+        project_id=None,
+        host=None,
+        message_id=42,
+        sender_id=7,
+        stream_id=42,
+        timestamp=None,
+    ):
         owner_uuid = uuid.uuid4()
         conftest.seed_workspace_user(db, owner_uuid, f"message-owner-{owner_uuid}")
         account = external_models.ExternalAccount(
@@ -67,7 +77,10 @@ def message_sources(_database, db):
                 uuid=topic_uuid, stream_id=stream_id, name="General", max_id=message_id
             )
             topic.insert()
-        edited_at = datetime.datetime(2023, 8, 4, tzinfo=datetime.timezone.utc)
+        timestamp = int(created_at.timestamp()) if timestamp is None else timestamp
+        edited_at = datetime.datetime.fromtimestamp(
+            timestamp, tz=datetime.timezone.utc
+        ) + datetime.timedelta(days=1)
         content = models.MessageContent(
             zulip_content="Original **message**",
             workspace_content="Workspace **message**",
@@ -83,7 +96,7 @@ def message_sources(_database, db):
             message_uuid=uuid.uuid5(namespace, str(message_id)),
             message_id=message_id,
             sender_id=7,
-            timestamp=1691057093,
+            timestamp=timestamp,
             channel=channel,
             topic=topic,
             content=content,

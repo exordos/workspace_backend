@@ -140,6 +140,7 @@ WORKSPACE_EVENT_RESOURCE = ra_resources.ResourceByRAModel(
     process_filters=True,
 )
 DEFAULT_EVENTS_LIMIT = 100
+MESSAGE_EVENT_MAX_AGE = datetime.timedelta(weeks=2)
 WORKSPACE_USER_MESSAGE_FIELDS = tuple(models.WorkspaceUserMessage.properties.properties)
 WORKSPACE_USER_STREAM_FIELDS = tuple(
     name
@@ -225,6 +226,25 @@ def _message_from_event_payload(
             continue
         result[name] = _event_payload_value(name, value)
     return result
+
+
+def is_recent_message(created_at: datetime.datetime) -> bool:
+    created_at = event_payloads.MESSAGE_EVENT_TIMESTAMP_TYPE.from_simple_type(
+        created_at
+    )
+    return (
+        created_at
+        >= datetime.datetime.now(datetime.timezone.utc) - MESSAGE_EVENT_MAX_AGE
+    )
+
+
+def message_snapshot_changed(before: typing.Any, after: typing.Any) -> bool:
+    previous = _message_from_event_payload(before)
+    current = _message_from_event_payload(after)
+    # Synchronization timestamps alone do not change the client-visible state.
+    previous.pop("updated_at", None)
+    current.pop("updated_at", None)
+    return previous != current
 
 
 def _folder_from_event_payload(event_payload: typing.Any) -> typing.Any:

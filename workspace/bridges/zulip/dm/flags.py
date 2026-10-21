@@ -262,6 +262,7 @@ class FlagChange(models.ModelWithID, models.ModelWithProject, orm.SQLStorableMix
         processed = 0
         for change in changes:
             verifying_account = False
+            changed_target = None
             targets = flag_states(change.project_id, change.state_uuid)
             for target in targets:
                 state = lock_state(
@@ -302,8 +303,8 @@ class FlagChange(models.ModelWithID, models.ModelWithProject, orm.SQLStorableMix
                             f"UPDATE messenger_user_message_states SET {flag}_updated_at=%s WHERE project_id=%s AND uuid=%s",
                             (remote_time, state.project_id, state.uuid),
                         )
-                    if changed:
-                        publish(state, target)
+                    if changed and (changed_target is None or flag == "read"):
+                        changed_target = target
                 elif (
                     local_time is not None
                     and target["local_value"] != target["remote_value"]
@@ -346,6 +347,8 @@ class FlagChange(models.ModelWithID, models.ModelWithProject, orm.SQLStorableMix
                                 account_revision=account_revision,
                             ),
                         ).insert()
+            if changed_target is not None:
+                publish(state, changed_target)
             if verifying_account:
                 continue
             contexts.Context().get_session().execute(
