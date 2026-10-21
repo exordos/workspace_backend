@@ -31,7 +31,7 @@ class ServerSettingsMiddlewareTest(unittest.TestCase):
 
     def test_returns_workspace_server_settings(self):
         req = webob.Request.blank(
-            "/v1/server_settings",
+            "/v1/messenger/server_settings",
             base_url="http://127.0.0.1:3000",
         )
 
@@ -55,7 +55,7 @@ class ServerSettingsMiddlewareTest(unittest.TestCase):
 
     def test_uses_forwarded_proto_for_realm_url(self):
         req = webob.Request.blank(
-            "/v1/server_settings",
+            "/v1/messenger/server_settings",
             headers={
                 "Host": "workspace.exordos.local",
                 "X-Forwarded-Proto": "https",
@@ -70,7 +70,7 @@ class ServerSettingsMiddlewareTest(unittest.TestCase):
 
     def test_explicit_forwarded_http_is_preserved(self):
         req = webob.Request.blank(
-            "/v1/server_settings",
+            "/v1/messenger/server_settings",
             headers={
                 "Host": "workspace.test.local",
                 "X-Forwarded-Proto": "http",
@@ -85,7 +85,7 @@ class ServerSettingsMiddlewareTest(unittest.TestCase):
 
     def test_reports_unsupported_parameters(self):
         req = webob.Request.blank(
-            "/v1/server_settings?foo=1&bar=2",
+            "/v1/messenger/server_settings?foo=1&bar=2",
             base_url="http://127.0.0.1:3000",
         )
 
@@ -96,7 +96,7 @@ class ServerSettingsMiddlewareTest(unittest.TestCase):
 
     def test_trailing_slash_is_supported(self):
         req = webob.Request.blank(
-            "/v1/server_settings/",
+            "/v1/messenger/server_settings/",
             base_url="http://127.0.0.1:3000",
         )
 

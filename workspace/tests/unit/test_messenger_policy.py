@@ -20,6 +20,7 @@ from restalchemy.api import routes as ra_routes
 from workspace.messenger_api import exceptions as messenger_exc
 from workspace.messenger_api.api import controllers
 from workspace.messenger_api.api import routes
+from workspace.workspace_api.api import routes as workspace_routes
 from workspace.messenger_api.api import resource_projection
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.dm import helpers
@@ -54,6 +55,7 @@ class RecordingStore:
             "content_type": "text/plain",
             "hash": "a" * 64,
             "storage_type": "s3",
+            "storage_id": "workspace-files",
             "storage_object_id": "key",
         }
 
@@ -374,7 +376,7 @@ def test_stream_resource_hides_internal_private_index():
 
 
 def test_route_permissions_and_action_owners_are_preserved():
-    assert routes.ApiEndpointRoute.files is routes.WorkspaceFileRoute
+    assert workspace_routes.MessengerRoute.files is routes.WorkspaceFileRoute
     assert ra_routes.DELETE in routes.WorkspaceStreamRoute.__allow_methods__
     assert ra_routes.UPDATE in routes.WorkspaceStreamRoute.__allow_methods__
     assert ra_routes.UPDATE in routes.WorkspaceMessageRoute.__allow_methods__
@@ -439,38 +441,6 @@ def test_file_filter_is_delegated_with_current_scope(store_factory):
     assert operation[3] == {"uuid": "asc"}
 
 
-def test_reaction_projection_hides_raw_provider_fields_and_nests_delivery():
-    account_uuid = sys_uuid.uuid4()
-    result = resource_projection.as_dict(
-        {
-            "uuid": sys_uuid.uuid4(),
-            "provider_uuid": sys_uuid.uuid4(),
-            "external_account_uuid": account_uuid,
-            "provider_external_id": "remote-reaction",
-            "delivery_status": "failed",
-            "delivery_error": "Retry later",
-            "delivery_updated_at": "2026-07-16T10:00:00Z",
-        },
-        "message_reactions",
-    )
-
-    assert result["provider"] == {
-        "kind": "zulip",
-        "account_uuid": str(account_uuid),
-        "external_id": "remote-reaction",
-        "capabilities": {},
-    }
-    assert result["delivery"] == {
-        "status": "failed",
-        "safe_error": "Retry later",
-        "updated_at": "2026-07-16T10:00:00Z",
-    }
-    assert "provider_uuid" not in result
-    assert "external_account_uuid" not in result
-    assert "provider_external_id" not in result
-    assert "delivery_status" not in result
-
-
 def test_file_create_uses_current_scope_and_storage_metadata(store_factory):
     store, opened_scopes = store_factory
     controller = _controller(controllers.WorkspaceFileController)
@@ -493,8 +463,6 @@ def test_file_create_uses_current_scope_and_storage_metadata(store_factory):
             size_bytes=12,
             hash="abc",
             storage_type="s3",
-            provider_uuid=sys_uuid.uuid4(),
-            external_account_uuid=sys_uuid.uuid4(),
         )
 
     get_storage_info.assert_called_once()
@@ -635,13 +603,28 @@ def test_multipart_upload_rejects_invalid_acl_scope(store_factory, parts):
         controller.create(multipart=True, parts=parts)
 
 
-def test_file_download_and_delete_use_store_authorization(store_factory):
+@pytest.mark.parametrize("has_other_references", (False, True))
+def test_file_download_and_delete_use_store_authorization(
+    store_factory, has_other_references
+):
     store, opened_scopes = store_factory
     controller = _controller(controllers.WorkspaceFileController)
     file_uuid = sys_uuid.uuid4()
     resource = controller.get(file_uuid)
 
     with (
+        mock.patch.object(
+            controllers.contexts.Context, "get_session", return_value=object()
+        ),
+        mock.patch.object(
+            controllers.models.WorkspaceFile,
+            "objects",
+            types.SimpleNamespace(
+                get_all=mock.Mock(
+                    return_value=[object()] if has_other_references else []
+                )
+            ),
+        ),
         mock.patch.object(
             controllers.file_storage,
             "read_workspace_file",
@@ -677,11 +660,14 @@ def test_file_download_and_delete_use_store_authorization(store_factory):
         ("delete", "files", file_uuid),
     ]
     assert opened_scopes == [(PROJECT_UUID, USER_UUID), (PROJECT_UUID, USER_UUID)]
-    delete_file.assert_called_once_with(
-        file_uuid=file_uuid,
-        storage_type="s3",
-        storage_object_id="key",
-    )
+    if has_other_references:
+        delete_file.assert_not_called()
+    else:
+        delete_file.assert_called_once_with(
+            file_uuid=file_uuid,
+            storage_type="s3",
+            storage_object_id="key",
+        )
     delete_metadata.assert_called_once_with(
         file_uuid=file_uuid,
         storage_type="s3",

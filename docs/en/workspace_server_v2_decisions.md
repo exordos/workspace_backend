@@ -1,8 +1,10 @@
 # Workspace Server v2: The decisions taken to implement
 
-Status: **Active addition to architecture and closed Provider API v2**.
+Historical reference. This page describes the retired private bridge HTTP and mTLS/HPKE design. The current backend has no private bridge listener.
 
-[← The main index](index.md) · [Provider API v2](../workspace_provider_api_v2.yaml) · [The target architecture Zulip Bridge](zulip_bridge/README.md)
+Status: **Historical reference**.
+
+[← The main index](index.md) · Provider API v2 · The target architecture Zulip Bridge
 
 This document records the decisions `1B`, `2A`, `3A`, `4A`, `5A` agreed
 They're specifying the first implementation of the new Workspace server. docs-first
@@ -460,4 +462,4 @@ commit. Native messages and unselected provider history are not expanded.
 - V1 transport is stored only as a rolling adapter; a new source of truth
   for provider identity is v2 contract.
 - The full wire-contract is at
-    [`workspace_provider_api_v2.yaml`](../workspace_provider_api_v2.yaml).
+    `workspace_provider_api_v2.yaml`.

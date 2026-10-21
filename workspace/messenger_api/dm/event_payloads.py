@@ -22,6 +22,7 @@ from restalchemy.dm import models
 from restalchemy.dm import types
 from restalchemy.dm import types_dynamic
 
+from workspace.common import models as common_models
 from workspace.messenger_api.dm import base
 from workspace.messenger_api.dm import models as messenger_models
 
@@ -42,21 +43,9 @@ class MessageEventTimestampType(types.UTCDateTimeZ):
 MESSAGE_EVENT_TIMESTAMP_TYPE = MessageEventTimestampType()
 
 
-class ProviderDeliveryEventPayloadBase(models.Model):
-    provider = properties.property(
-        types.AllowNone(types.Dict()),
-        default=None,
-    )
-    delivery = properties.property(
-        types.AllowNone(types.Dict()),
-        default=None,
-    )
-
-
 class MessageEventPayloadBase(
     types_dynamic.AbstractKindModel,
     base.WorkspaceUserMessageBase,
-    ProviderDeliveryEventPayloadBase,
 ):
     created_at = properties.property(
         MESSAGE_EVENT_TIMESTAMP_TYPE,
@@ -118,8 +107,8 @@ class MessageDeletedEventPayload(
     )
     source = properties.property(
         types_dynamic.KindModelSelectorType(
-            types_dynamic.KindModelType(base.ZulipSource),
             types_dynamic.KindModelType(base.NativeSource),
+            types_dynamic.KindModelType(base.ZulipSource),
         ),
         required=True,
     )
@@ -129,7 +118,6 @@ class MessageReactionEventPayloadBase(
     types_dynamic.AbstractKindModel,
     models.ModelWithUUID,
     models.ModelWithProject,
-    ProviderDeliveryEventPayloadBase,
 ):
     message_uuid = properties.property(
         types.UUID(),
@@ -149,7 +137,6 @@ class MessageReactionEventPayloadBase(
     )
     source = properties.property(
         types_dynamic.KindModelSelectorType(
-            types_dynamic.KindModelType(base.ZulipSource),
             types_dynamic.KindModelType(base.NativeSource),
         ),
         required=True,
@@ -171,7 +158,6 @@ class MessageReactionEventPayloadBase(
     old_source = properties.property(
         types.AllowNone(
             types_dynamic.KindModelSelectorType(
-                types_dynamic.KindModelType(base.ZulipSource),
                 types_dynamic.KindModelType(base.NativeSource),
             ),
         ),
@@ -218,7 +204,6 @@ class FolderUpdatedEventPayload(FolderEventPayloadBase):
 class StreamEventPayloadBase(
     types_dynamic.AbstractKindModel,
     base.WorkspaceUserStreamBase,
-    ProviderDeliveryEventPayloadBase,
 ):
     created_at = properties.property(
         MESSAGE_EVENT_TIMESTAMP_TYPE,
@@ -248,7 +233,7 @@ class TopicEventPayloadBase(
     types_dynamic.AbstractKindModel,
     base.UserScopedModelWithUUID,
     models.ModelWithProject,
-    ProviderDeliveryEventPayloadBase,
+    base.WorkspaceTopicSourceBase,
 ):
     name = properties.property(
         types.String(max_length=128),
@@ -325,14 +310,14 @@ class TopicDeletedEventPayload(
         required=True,
     )
     source_name = properties.property(
-        types.AllowNone(types.Enum([source.value for source in base.SourceName])),
+        types.AllowNone(types.Enum([source.value for source in base.TopicSourceName])),
         default=None,
     )
     source = properties.property(
         types.AllowNone(
             types_dynamic.KindModelSelectorType(
-                types_dynamic.KindModelType(base.ZulipSource),
                 types_dynamic.KindModelType(base.NativeSource),
+                types_dynamic.KindModelType(base.ZulipSource),
             )
         ),
         default=None,
@@ -346,14 +331,14 @@ class StreamDeletedEventPayload(
     KIND = "stream.deleted"
 
     source_name = properties.property(
-        types.AllowNone(types.Enum([source.value for source in base.SourceName])),
+        types.AllowNone(types.Enum([source.value for source in base.StreamSourceName])),
         default=None,
     )
     source = properties.property(
         types.AllowNone(
             types_dynamic.KindModelSelectorType(
-                types_dynamic.KindModelType(base.ZulipSource),
                 types_dynamic.KindModelType(base.NativeSource),
+                types_dynamic.KindModelType(base.ZulipSource),
             )
         ),
         default=None,
@@ -422,12 +407,7 @@ class UserUpdatedEventPayload(
         required=True,
     )
     source = properties.property(
-        types.Enum(
-            [
-                messenger_models.WorkspaceUserSource.IAM.value,
-                messenger_models.WorkspaceUserSource.ZULIP.value,
-            ]
-        ),
+        types.Enum([source.value for source in messenger_models.WorkspaceUserSource]),
         required=True,
     )
     status = properties.property(
@@ -482,7 +462,7 @@ class FileEventPayloadBase(
     types_dynamic.AbstractKindModel,
     models.ModelWithUUID,
     models.ModelWithProject,
-    models.ModelWithRequiredNameDesc,
+    common_models.ModelWithRequiredNameDesc,
     models.ModelWithTimestamp,
 ):
     user_uuid = properties.property(types.UUID(), required=True)
@@ -540,30 +520,6 @@ class ExternalAccountDeletedEventPayload(ExternalEventPayloadBase):
     KIND = "external_account.deleted"
 
 
-class ExternalChatCreatedEventPayload(ExternalEventPayloadBase):
-    KIND = "external_chat.created"
-
-
-class ExternalChatUpdatedEventPayload(ExternalEventPayloadBase):
-    KIND = "external_chat.updated"
-
-
-class ExternalChatDeletedEventPayload(ExternalEventPayloadBase):
-    KIND = "external_chat.deleted"
-
-
-class ExternalOperationCreatedEventPayload(ExternalEventPayloadBase):
-    KIND = "external_operation.created"
-
-
-class ExternalOperationUpdatedEventPayload(ExternalEventPayloadBase):
-    KIND = "external_operation.updated"
-
-
-class ExternalOperationDeletedEventPayload(ExternalEventPayloadBase):
-    KIND = "external_operation.deleted"
-
-
 WORKSPACE_EVENT_PAYLOAD_TYPE = types_dynamic.KindModelSelectorType(
     types_dynamic.KindModelType(MessageCreatedEventPayload),
     types_dynamic.KindModelType(MessageUpdatedEventPayload),
@@ -595,10 +551,4 @@ WORKSPACE_EVENT_PAYLOAD_TYPE = types_dynamic.KindModelSelectorType(
     types_dynamic.KindModelType(ExternalAccountCreatedEventPayload),
     types_dynamic.KindModelType(ExternalAccountUpdatedEventPayload),
     types_dynamic.KindModelType(ExternalAccountDeletedEventPayload),
-    types_dynamic.KindModelType(ExternalChatCreatedEventPayload),
-    types_dynamic.KindModelType(ExternalChatUpdatedEventPayload),
-    types_dynamic.KindModelType(ExternalChatDeletedEventPayload),
-    types_dynamic.KindModelType(ExternalOperationCreatedEventPayload),
-    types_dynamic.KindModelType(ExternalOperationUpdatedEventPayload),
-    types_dynamic.KindModelType(ExternalOperationDeletedEventPayload),
 )

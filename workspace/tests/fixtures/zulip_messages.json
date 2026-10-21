@@ -1,0 +1,2345 @@
+[
+  {
+    "name": "plain_text",
+    "description": "Synthetic channel message with no formatting.",
+    "message": {
+      "id": 1001,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000000,
+      "content_type": "text/x-markdown",
+      "content": "The deployment finished successfully.",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1001"
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "The deployment finished successfully."
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "The deployment finished successfully."
+  },
+  {
+    "name": "paragraphs_and_line_breaks",
+    "description": "Single line breaks, blank lines, and trailing spaces.",
+    "message": {
+      "id": 1002,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000001,
+      "content_type": "text/x-markdown",
+      "content": "First line.\nSecond line.  \nThird line.\n\nA separate paragraph.\n\nFinal paragraph.",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1002"
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "First line.\nSecond line.  \nThird line.\n\nA separate paragraph.\n\nFinal paragraph."
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "First line.\nSecond line.  \nThird line.\n\nA separate paragraph.\n\nFinal paragraph."
+  },
+  {
+    "name": "unicode_and_combining_characters",
+    "description": "Accented names, combining marks, nonbreaking spaces, and Unicode emoji.",
+    "message": {
+      "id": 1003,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000002,
+      "content_type": "text/x-markdown",
+      "content": "Zoë and José reviewed the café notes. The same accent can be written as é or é.\nA nonbreaking space: first second. Emoji: 👍🏽 👩‍💻 👨‍👩‍👧‍👦.",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1003"
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "Zoë and José reviewed the café notes. The same accent can be written as é or é.\nA nonbreaking space: first second. Emoji: 👍🏽 👩‍💻 👨‍👩‍👧‍👦."
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "Zoë and José reviewed the café notes. The same accent can be written as é or é.\nA nonbreaking space: first second. Emoji: 👍🏽 👩‍💻 👨‍👩‍👧‍👦."
+  },
+  {
+    "name": "emphasis_and_strikethrough",
+    "description": "Bold, italic, strikethrough, and nested emphasis.",
+    "message": {
+      "id": 1004,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000003,
+      "content_type": "text/x-markdown",
+      "content": "**Bold** and *italic* and _also italic_ and ~~removed~~.\n\n**Bold with *nested italic* inside**.",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1004"
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "**Bold** and *italic* and _also italic_ and ~~removed~~.\n\n**Bold with *nested italic* inside**."
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "**Bold** and *italic* and _also italic_ and ~~removed~~.\n\n**Bold with *nested italic* inside**."
+  },
+  {
+    "name": "escaped_markdown",
+    "description": "Escaped formatting and mention syntax must remain literal.",
+    "message": {
+      "id": 1005,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000004,
+      "content_type": "text/x-markdown",
+      "content": "\\*not italic\\* and \\_not italic\\_ and \\~\\~not removed\\~\\~.\n\\@**Bob Example|12** and \\#**general**.",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1005",
+      "mention_uuids": {
+        "id:12": "7af731c9-ccd4-5318-9a12-bab962ee4679"
+      },
+      "stream_uuids": {
+        "general": "15465556-ef95-57a2-bc7a-d8c5cea801f1"
+      }
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "\\*not italic\\* and \\_not italic\\_ and \\~\\~not removed\\~\\~.\n\\@**Bob Example|12** and \\#**general**."
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "\\*not italic\\* and \\_not italic\\_ and \\~\\~not removed\\~\\~.\n\\@**Bob Example|12** and \\#**general**."
+  },
+  {
+    "name": "headings_and_horizontal_rule",
+    "description": "Heading levels and a section separator.",
+    "message": {
+      "id": 1006,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000005,
+      "content_type": "text/x-markdown",
+      "content": "# Release notes\n\n## Changes\n\n### Details\n\nA paragraph before the separator.\n\n---\n\nA paragraph after it.",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1006"
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "# Release notes\n\n## Changes\n\n### Details\n\nA paragraph before the separator.\n\n---\n\nA paragraph after it."
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "# Release notes\n\n## Changes\n\n### Details\n\nA paragraph before the separator.\n\n---\n\nA paragraph after it."
+  },
+  {
+    "name": "bulleted_list",
+    "description": "An unordered list containing emphasis and a link.",
+    "message": {
+      "id": 1007,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000006,
+      "content_type": "text/x-markdown",
+      "content": "- Review **schema changes**\n- Read the [guide](https://docs.example.test/guide)\n- Deploy the release",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1007"
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "- Review **schema changes**\n- Read the [guide](urn:url:https://docs.example.test/guide)\n- Deploy the release"
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "- Review **schema changes**\n- Read the [guide](https://docs.example.test/guide)\n- Deploy the release"
+  },
+  {
+    "name": "numbered_list",
+    "description": "An ordered list with an explicit non-default starting number.",
+    "message": {
+      "id": 1008,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000007,
+      "content_type": "text/x-markdown",
+      "content": "3. Download the archive\n4. Verify its checksum\n5. Extract the files",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1008"
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "3. Download the archive\n4. Verify its checksum\n5. Extract the files"
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "3. Download the archive\n4. Verify its checksum\n5. Extract the files"
+  },
+  {
+    "name": "nested_lists",
+    "description": "Nested unordered and ordered lists with continuation paragraphs.",
+    "message": {
+      "id": 1009,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000008,
+      "content_type": "text/x-markdown",
+      "content": "- Backend\n    - API\n    - Worker\n- Frontend\n    1. Install dependencies\n    2. Start the application\n\n        Keep the terminal open.",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1009"
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "- Backend\n    - API\n    - Worker\n- Frontend\n    1. Install dependencies\n    2. Start the application\n\n        Keep the terminal open."
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "- Backend\n    - API\n    - Worker\n- Frontend\n    1. Install dependencies\n    2. Start the application\n\n        Keep the terminal open."
+  },
+  {
+    "name": "table",
+    "description": "A Markdown table with alignment and inline formatting.",
+    "message": {
+      "id": 1010,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000009,
+      "content_type": "text/x-markdown",
+      "content": "| Component | State | Owner |\n| :--- | :---: | ---: |\n| **API** | Ready | Alice |\n| Worker | `retry` | Bob |",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1010"
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "| Component | State | Owner |\n| :--- | :---: | ---: |\n| **API** | Ready | Alice |\n| Worker | `retry` | Bob |"
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "| Component | State | Owner |\n| :--- | :---: | ---: |\n| **API** | Ready | Alice |\n| Worker | `retry` | Bob |"
+  },
+  {
+    "name": "block_quotes",
+    "description": "Standard and nested quotes are preserved in an existing forward snapshot URN, with unknown as the author.",
+    "message": {
+      "id": 1011,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000010,
+      "content_type": "text/x-markdown",
+      "content": "> Original proposal.\n>\n> - Keep the import idempotent.\n> - Preserve message order.\n>\n>> A reply inside the quote.\n\nMy reply is outside the quote.",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1011",
+      "message_uuids": {
+        "1011": "3ba51ad6-176b-5edf-aa00-69ce615772f5"
+      }
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "[unknown](urn:forward:3ba51ad6-176b-5edf-aa00-69ce615772f5?snapshot=T3JpZ2luYWwgcHJvcG9zYWwuCgotIEtlZXAgdGhlIGltcG9ydCBpZGVtcG90ZW50LgotIFByZXNlcnZlIG1lc3NhZ2Ugb3JkZXIuCgo-IEEgcmVwbHkgaW5zaWRlIHRoZSBxdW90ZS4)\n\nMy reply is outside the quote."
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "```quote\nOriginal proposal.\n\n- Keep the import idempotent.\n- Preserve message order.\n\n> A reply inside the quote.\n```\n\nMy reply is outside the quote."
+  },
+  {
+    "name": "fenced_quote",
+    "description": "An anonymous quote uses the existing forward snapshot URN with an unknown author. The source UUID identifies the containing message; formatting and links remain inside the snapshot.",
+    "message": {
+      "id": 1012,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000011,
+      "content_type": "text/x-markdown",
+      "content": "```quote\nQuoted **text** with a [reference](https://docs.example.test/reference).\n\nA second quoted paragraph.\n```\n\nA reply outside the quotation.",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1012",
+      "message_uuids": {
+        "1012": "c5626519-9906-58e8-b8c8-93611b399bd4"
+      }
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "[unknown](urn:forward:c5626519-9906-58e8-b8c8-93611b399bd4?snapshot=UXVvdGVkICoqdGV4dCoqIHdpdGggYSBbcmVmZXJlbmNlXSh1cm46dXJsOmh0dHBzOi8vZG9jcy5leGFtcGxlLnRlc3QvcmVmZXJlbmNlKS4KCkEgc2Vjb25kIHF1b3RlZCBwYXJhZ3JhcGgu)\n\nA reply outside the quotation."
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "```quote\nQuoted **text** with a [reference](https://docs.example.test/reference).\n\nA second quoted paragraph.\n```\n\nA reply outside the quotation."
+  },
+  {
+    "name": "quoted_message_reference",
+    "description": "A reply converted to a native Workspace quote reference; the quoted author is not an unsupported silent mention.",
+    "message": {
+      "id": 1013,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000012,
+      "content_type": "text/x-markdown",
+      "content": "@_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1001):\n```quote\nThe deployment finished successfully.\n```\n\nThanks, confirmed.",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1013",
+      "mention_uuids": {
+        "id:9": "b7828b6c-13f2-59d3-88ec-8883e8b5acab"
+      },
+      "message_uuids": {
+        "1001": "38c6b1e8-3017-53c6-b963-1694633751bb"
+      }
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "[Alice Example](urn:quote:38c6b1e8-3017-53c6-b963-1694633751bb)\n\nThanks, confirmed."
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "@_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1001):\n```quote\nThe deployment finished successfully.\n```\n\nThanks, confirmed."
+  },
+  {
+    "name": "partial_quoted_message_reference",
+    "description": "A selected quote fragment is stored in the quote URN text parameter and rendered as plain text inside the native quote card.",
+    "message": {
+      "id": 1056,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 12,
+      "sender_full_name": "Bob Example",
+      "sender_email": "bob@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000055,
+      "content_type": "text/x-markdown",
+      "content": "@_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1001):\n```quote\ndeployment finished successfully.\n```\n\nThe quoted fragment is enough.",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1056",
+      "mention_uuids": {
+        "id:9": "b7828b6c-13f2-59d3-88ec-8883e8b5acab"
+      },
+      "message_uuids": {
+        "1001": "38c6b1e8-3017-53c6-b963-1694633751bb"
+      }
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "[Alice Example](urn:quote:38c6b1e8-3017-53c6-b963-1694633751bb?text=deployment%20finished%20successfully.)\n\nThe quoted fragment is enough."
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "@_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1001):\n```quote\ndeployment finished successfully.\n```\n\nThe quoted fragment is enough."
+  },
+  {
+    "name": "nested_message_quote",
+    "description": "A two-level message quote used as the source of the three-level quote example; each level references an existing fixture message.",
+    "message": {
+      "id": 1057,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 13,
+      "sender_full_name": "Zoë Example",
+      "sender_email": "zoe@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000056,
+      "content_type": "text/x-markdown",
+      "content": "@_**Bob Example|12** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1056):\n````quote\n@_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1001):\n```quote\ndeployment finished successfully.\n```\n\nThe quoted fragment is enough.\n````\n\nZoë's reply is outside both quotes.",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1057",
+      "mention_uuids": {
+        "id:12": "7af731c9-ccd4-5318-9a12-bab962ee4679"
+      },
+      "message_uuids": {
+        "1056": "e5ccdf1d-ed8f-5d68-b096-ee17baca17f2"
+      }
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "[Bob Example](urn:quote:e5ccdf1d-ed8f-5d68-b096-ee17baca17f2)\n\nZoë's reply is outside both quotes."
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "@_**Bob Example|12** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1056):\n````quote\n@_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1001):\n```quote\ndeployment finished successfully.\n```\n\nThe quoted fragment is enough.\n````\n\nZoë's reply is outside both quotes."
+  },
+  {
+    "name": "triple_nested_quote",
+    "description": "A quote inside a quote inside a quote: three native Workspace quote URNs with distinct message UUIDs, followed by a reply outside every quote.",
+    "message": {
+      "id": 1058,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000057,
+      "content_type": "text/x-markdown",
+      "content": "@_**Zoë Example|13** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1057):\n`````quote\n@_**Bob Example|12** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1056):\n````quote\n@_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1001):\n```quote\ndeployment finished successfully.\n```\n\nThe quoted fragment is enough.\n````\n\nZoë's reply is outside both quotes.\n`````\n\nAlice's reply is outside all three quotes.",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1058",
+      "mention_uuids": {
+        "id:13": "0b596ff7-0956-5783-9ad4-0660396b0543"
+      },
+      "message_uuids": {
+        "1057": "ee2ca07c-91c3-5dcc-a28b-47dcb38f902f"
+      }
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "[Zoë Example](urn:quote:ee2ca07c-91c3-5dcc-a28b-47dcb38f902f)\n\nAlice's reply is outside all three quotes."
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "@_**Zoë Example|13** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1057):\n`````quote\n@_**Bob Example|12** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1056):\n````quote\n@_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1001):\n```quote\ndeployment finished successfully.\n```\n\nThe quoted fragment is enough.\n````\n\nZoë's reply is outside both quotes.\n`````\n\nAlice's reply is outside all three quotes."
+  },
+  {
+    "name": "inline_code",
+    "description": "Inline code keeps its code formatting while embedded Zulip mentions are converted to Workspace URNs.",
+    "message": {
+      "id": 1014,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000013,
+      "content_type": "text/x-markdown",
+      "content": "Run `python -m pytest`.\nKeep `@**Bob Example|12**` literal.\nA backtick inside a code span: ``value = `literal` ``.",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1014",
+      "mention_uuids": {
+        "id:12": "7af731c9-ccd4-5318-9a12-bab962ee4679"
+      }
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "Run `python -m pytest`.\nKeep `[Bob Example](urn:user:7af731c9-ccd4-5318-9a12-bab962ee4679)` literal.\nA backtick inside a code span: ``value = `literal` ``."
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "Run `python -m pytest`.\nKeep `@**Bob Example|12**` literal.\nA backtick inside a code span: ``value = `literal` ``."
+  },
+  {
+    "name": "fenced_python",
+    "description": "A language-tagged code block containing indentation and a blank line.",
+    "message": {
+      "id": 1015,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000014,
+      "content_type": "text/x-markdown",
+      "content": "```python\ndef greeting(name: str) -> str:\n    return f\"Hello, {name}!\"\n\nprint(greeting(\"Alice\"))\n```",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1015"
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "```python\ndef greeting(name: str) -> str:\n    return f\"Hello, {name}!\"\n\nprint(greeting(\"Alice\"))\n```"
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "```python\ndef greeting(name: str) -> str:\n    return f\"Hello, {name}!\"\n\nprint(greeting(\"Alice\"))\n```"
+  },
+  {
+    "name": "fenced_literal_markup",
+    "description": "Zulip references are converted inside fenced code; unsupported math is marked as plain text, with one original-message link at the end.",
+    "message": {
+      "id": 1016,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000015,
+      "content_type": "text/x-markdown",
+      "content": "```text\n@**Bob Example|12**\n#**general>Roadmap**\n[file](/user_uploads/1/abc123/report.pdf)\n:smile: $$x^2$$\n```\n\nOutside code: @**Bob Example|12**.",
+      "is_me_message": false,
+      "flags": ["mentioned"],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1016",
+      "mention_uuids": {
+        "id:12": "7af731c9-ccd4-5318-9a12-bab962ee4679"
+      },
+      "stream_uuids": {
+        "general": "15465556-ef95-57a2-bc7a-d8c5cea801f1"
+      },
+      "topic_uuids": {
+        "general>Roadmap": "40000000-0000-4000-8000-000000000042"
+      },
+      "message_uuids": {
+        "1001": "38c6b1e8-3017-53c6-b963-1694633751bb"
+      },
+      "files": {
+        "/user_uploads/1/abc123/report.pdf": "urn:file:60000000-0000-4000-8000-000000000002?name=report.pdf&content_type=application%2Fpdf"
+      }
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "```text\n[Bob Example](urn:user:7af731c9-ccd4-5318-9a12-bab962ee4679)\n[#general > Roadmap](urn:topic:40000000-0000-4000-8000-000000000042)\n[file](urn:file:60000000-0000-4000-8000-000000000002?name=report.pdf&content_type=application%2Fpdf)\n:smile: (Not supported in Workspace: inline LaTeX)\n```\n\nOutside code: [Bob Example](urn:user:7af731c9-ccd4-5318-9a12-bab962ee4679).\n\n[Original message](urn:url:https://zulip.example.test/#narrow/near/1016)"
+    },
+    "unsupported_features": ["inline_latex"],
+    "expected_zulip_content": "```text\n@**Bob Example|12**\n#**general>Roadmap**\n[file](/user_uploads/1/abc123/report.pdf)\n:smile: (Not supported in Workspace: inline LaTeX)\n```\n\nOutside code: @**Bob Example|12**.\n\n[Original message](https://zulip.example.test/#narrow/near/1016)"
+  },
+  {
+    "name": "nested_code_fences",
+    "description": "A longer outer fence contains a shorter fence as literal code.",
+    "message": {
+      "id": 1017,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000016,
+      "content_type": "text/x-markdown",
+      "content": "````markdown\nExample input:\n```python\nprint(\"hello\")\n```\n````",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1017"
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "````markdown\nExample input:\n```python\nprint(\"hello\")\n```\n````"
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "````markdown\nExample input:\n```python\nprint(\"hello\")\n```\n````"
+  },
+  {
+    "name": "incomplete_markdown",
+    "description": "An unclosed fence and incomplete formatting are valid message text.",
+    "message": {
+      "id": 1018,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000017,
+      "content_type": "text/x-markdown",
+      "content": "An unfinished **emphasis and [link](\n\n```python\nprint(\"unfinished\")",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1018"
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "An unfinished **emphasis and [link](\n\n```python\nprint(\"unfinished\")"
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "An unfinished **emphasis and [link](\n\n```python\nprint(\"unfinished\")"
+  },
+  {
+    "name": "inline_math",
+    "description": "Zulip inline LaTeX uses double dollar delimiters.",
+    "message": {
+      "id": 1019,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000018,
+      "content_type": "text/x-markdown",
+      "content": "The identity is $$a^2 + b^2 = c^2$$, and $$\\frac{1}{2} + \\frac{1}{2} = 1$$.",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1019"
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "Not supported in Workspace: inline LaTeX\n\n[Original message](urn:url:https://zulip.example.test/#narrow/near/1019)"
+    },
+    "unsupported_features": ["inline_latex"],
+    "expected_zulip_content": "Not supported in Workspace: inline LaTeX\n\n[Original message](https://zulip.example.test/#narrow/near/1019)"
+  },
+  {
+    "name": "display_math",
+    "description": "A fenced math block with multiple lines and LaTeX commands.",
+    "message": {
+      "id": 1020,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000019,
+      "content_type": "text/x-markdown",
+      "content": "```math\n\\begin{aligned}\nx + y &= 3 \\\\\nx - y &= 1\n\\end{aligned}\n```",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1020"
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "Not supported in Workspace: LaTeX block\n\n[Original message](urn:url:https://zulip.example.test/#narrow/near/1020)"
+    },
+    "unsupported_features": ["block_latex"],
+    "expected_zulip_content": "Not supported in Workspace: LaTeX block\n\n[Original message](https://zulip.example.test/#narrow/near/1020)"
+  },
+  {
+    "name": "spoiler",
+    "description": "Zulip spoiler fence with a title and formatted hidden content.",
+    "message": {
+      "id": 1021,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000020,
+      "content_type": "text/x-markdown",
+      "content": "```spoiler Release details\nThe **feature flag** is enabled.\n\n- Restart the worker.\n- Check the import.\n```\n\nVisible text after the spoiler.",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1021"
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "```spoiler Release details\nThe **feature flag** is enabled.\n\n- Restart the worker.\n- Check the import.\n```\n\nVisible text after the spoiler."
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "```spoiler Release details\nThe **feature flag** is enabled.\n\n- Restart the worker.\n- Check the import.\n```\n\nVisible text after the spoiler."
+  },
+  {
+    "name": "spoiler_inside_quote",
+    "description": "The existing forward snapshot URN preserves an anonymous quote containing a nested spoiler.",
+    "message": {
+      "id": 1022,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000021,
+      "content_type": "text/x-markdown",
+      "content": "~~~~quote\nA quoted message:\n```spoiler Solution\nThe answer is **42**.\n```\n~~~~",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1022",
+      "message_uuids": {
+        "1022": "0a930c38-3cb9-545d-b611-ff9515f53fc2"
+      }
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "[unknown](urn:forward:0a930c38-3cb9-545d-b611-ff9515f53fc2?snapshot=QSBxdW90ZWQgbWVzc2FnZToKYGBgc3BvaWxlciBTb2x1dGlvbgpUaGUgYW5zd2VyIGlzICoqNDIqKi4KYGBg)"
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "````quote\nA quoted message:\n```spoiler Solution\nThe answer is **42**.\n```\n````"
+  },
+  {
+    "name": "user_mentions_by_id",
+    "description": "Several mentions, including different IDs sharing the same display name.",
+    "message": {
+      "id": 1023,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000022,
+      "content_type": "text/x-markdown",
+      "content": "@**Bob Example|12**, please ask @**Zoë Example|13** to review this.\nTwo different users: @**Alex Example|14** and @**Alex Example|15**.",
+      "is_me_message": false,
+      "flags": ["mentioned"],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1023",
+      "mention_uuids": {
+        "id:12": "7af731c9-ccd4-5318-9a12-bab962ee4679",
+        "id:13": "0b596ff7-0956-5783-9ad4-0660396b0543",
+        "id:14": "a5fbf77f-5146-5f54-9e70-f11517981127",
+        "id:15": "4284ffb1-3e93-5687-9770-da00fe7038f6"
+      }
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "[Bob Example](urn:user:7af731c9-ccd4-5318-9a12-bab962ee4679), please ask [Zoë Example](urn:user:0b596ff7-0956-5783-9ad4-0660396b0543) to review this.\nTwo different users: [Alex Example](urn:user:a5fbf77f-5146-5f54-9e70-f11517981127) and [Alex Example](urn:user:4284ffb1-3e93-5687-9770-da00fe7038f6)."
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "@**Bob Example|12**, please ask @**Zoë Example|13** to review this.\nTwo different users: @**Alex Example|14** and @**Alex Example|15**."
+  },
+  {
+    "name": "user_mention_by_name",
+    "description": "A mention using only the user's full name.",
+    "message": {
+      "id": 1024,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000023,
+      "content_type": "text/x-markdown",
+      "content": "Thanks, @**Bob Example**!",
+      "is_me_message": false,
+      "flags": ["mentioned"],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1024",
+      "mention_uuids": {
+        "name:Bob Example": "7af731c9-ccd4-5318-9a12-bab962ee4679"
+      }
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "Thanks, [Bob Example](urn:user:7af731c9-ccd4-5318-9a12-bab962ee4679)!"
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "Thanks, @**Bob Example**!"
+  },
+  {
+    "name": "silent_user_mention",
+    "description": "A silent mention refers to the user without triggering a notification.",
+    "message": {
+      "id": 1025,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000024,
+      "content_type": "text/x-markdown",
+      "content": "Following @_**Bob Example|12**'s suggestion.",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1025",
+      "mention_uuids": {
+        "id:12": "7af731c9-ccd4-5318-9a12-bab962ee4679"
+      }
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "Following (Not supported in Workspace: silent mention of Bob Example)'s suggestion.\n\n[Original message](urn:url:https://zulip.example.test/#narrow/near/1025)"
+    },
+    "unsupported_features": ["silent_user_mention"],
+    "expected_zulip_content": "Following (Not supported in Workspace: silent mention of Bob Example)'s suggestion.\n\n[Original message](https://zulip.example.test/#narrow/near/1025)"
+  },
+  {
+    "name": "user_group_mention",
+    "description": "A Zulip user group is distinct from a group direct conversation.",
+    "message": {
+      "id": 1026,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000025,
+      "content_type": "text/x-markdown",
+      "content": "@*Engineering* please review the migration.",
+      "is_me_message": false,
+      "flags": ["mentioned"],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1026",
+      "user_group_ids": {
+        "Engineering": 101
+      }
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "(Not supported in Workspace: mention of user group Engineering) please review the migration.\n\n[Original message](urn:url:https://zulip.example.test/#narrow/near/1026)"
+    },
+    "unsupported_features": ["user_group_mention"],
+    "expected_zulip_content": "(Not supported in Workspace: mention of user group Engineering) please review the migration.\n\n[Original message](https://zulip.example.test/#narrow/near/1026)"
+  },
+  {
+    "name": "channel_wildcard_mention",
+    "description": "A channel-wide wildcard mention and the corresponding message flags.",
+    "message": {
+      "id": 1027,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000026,
+      "content_type": "text/x-markdown",
+      "content": "@**all** the maintenance window starts in ten minutes.",
+      "is_me_message": false,
+      "flags": ["wildcard_mentioned", "stream_wildcard_mentioned"],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1027"
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "(Not supported in Workspace: channel-wide mention) the maintenance window starts in ten minutes.\n\n[Original message](urn:url:https://zulip.example.test/#narrow/near/1027)"
+    },
+    "unsupported_features": ["channel_wildcard_mention"],
+    "expected_zulip_content": "(Not supported in Workspace: channel-wide mention) the maintenance window starts in ten minutes.\n\n[Original message](https://zulip.example.test/#narrow/near/1027)"
+  },
+  {
+    "name": "topic_wildcard_mention",
+    "description": "A mention of participants in the current topic.",
+    "message": {
+      "id": 1028,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000027,
+      "content_type": "text/x-markdown",
+      "content": "@**topic** the issue is resolved.",
+      "is_me_message": false,
+      "flags": ["wildcard_mentioned", "topic_wildcard_mentioned"],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1028"
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "(Not supported in Workspace: topic-wide mention) the issue is resolved.\n\n[Original message](urn:url:https://zulip.example.test/#narrow/near/1028)"
+    },
+    "unsupported_features": ["topic_wildcard_mention"],
+    "expected_zulip_content": "(Not supported in Workspace: topic-wide mention) the issue is resolved.\n\n[Original message](https://zulip.example.test/#narrow/near/1028)"
+  },
+  {
+    "name": "unresolved_mentions",
+    "description": "Unresolvable user and group references remain possible message input.",
+    "message": {
+      "id": 1029,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000028,
+      "content_type": "text/x-markdown",
+      "content": "Please ask @**Former member|999** or @*Missing group* about the old deployment.",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1029"
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "Please ask (Not supported in Workspace: unresolved user Former member) or (Not supported in Workspace: unresolved user group Missing group) about the old deployment.\n\n[Original message](urn:url:https://zulip.example.test/#narrow/near/1029)"
+    },
+    "unsupported_features": [
+      "unresolved_user_mention",
+      "unresolved_user_group_mention"
+    ],
+    "expected_zulip_content": "Please ask (Not supported in Workspace: unresolved user Former member) or (Not supported in Workspace: unresolved user group Missing group) about the old deployment.\n\n[Original message](https://zulip.example.test/#narrow/near/1029)"
+  },
+  {
+    "name": "external_links",
+    "description": "Named links, bare URLs, angle-bracket links, and email addresses.",
+    "message": {
+      "id": 1030,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000029,
+      "content_type": "text/x-markdown",
+      "content": "[Documentation](https://docs.example.test/guide?q=one&lang=en#setup)\nhttps://example.test/path_(v2)\n<https://example.test/contact>\nContact support@example.test.",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1030"
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "[Documentation](urn:url:https://docs.example.test/guide?q=one&lang=en#setup)\n[https://example.test/path_(v2)](urn:url:https://example.test/path_(v2))\n[https://example.test/contact](urn:url:https://example.test/contact)\nContact support@example.test."
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "[Documentation](https://docs.example.test/guide?q=one&lang=en#setup)\n[https://example.test/path_(v2)](https://example.test/path_(v2))\n[https://example.test/contact](https://example.test/contact)\nContact support@example.test."
+  },
+  {
+    "name": "links_with_escaped_characters",
+    "description": "Spaces and parentheses in link labels and percent-encoded URL paths.",
+    "message": {
+      "id": 1031,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000030,
+      "content_type": "text/x-markdown",
+      "content": "[Release notes (v2)](https://docs.example.test/releases/v2%20notes)\n[Report](https://files.example.test/reports/annual%20report.pdf?download=1&version=2)",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1031"
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "[Release notes (v2)](urn:url:https://docs.example.test/releases/v2%20notes)\n[Report](urn:url:https://files.example.test/reports/annual%20report.pdf?download=1&version=2)"
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "[Release notes (v2)](https://docs.example.test/releases/v2%20notes)\n[Report](https://files.example.test/reports/annual%20report.pdf?download=1&version=2)"
+  },
+  {
+    "name": "channel_topic_and_message_links",
+    "description": "Zulip shorthand references to a channel, a topic, and a specific message.",
+    "message": {
+      "id": 1032,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000031,
+      "content_type": "text/x-markdown",
+      "content": "Channel: #**general**\nTopic: #**general>Roadmap**\nMessage: #**general>Roadmap@1001**",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1032",
+      "stream_uuids": {
+        "general": "15465556-ef95-57a2-bc7a-d8c5cea801f1"
+      },
+      "topic_uuids": {
+        "general>Roadmap": "40000000-0000-4000-8000-000000000042"
+      },
+      "message_uuids": {
+        "1001": "38c6b1e8-3017-53c6-b963-1694633751bb"
+      }
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "Channel: [#general](urn:stream:15465556-ef95-57a2-bc7a-d8c5cea801f1)\nTopic: [#general > Roadmap](urn:topic:40000000-0000-4000-8000-000000000042)\nMessage: [#general > Roadmap](urn:message:38c6b1e8-3017-53c6-b963-1694633751bb)"
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "Channel: #**general**\nTopic: #**general>Roadmap**\nMessage: #**general>Roadmap@1001**"
+  },
+  {
+    "name": "internal_message_urls",
+    "description": "Absolute and relative links to messages and narrow views.",
+    "message": {
+      "id": 1033,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000032,
+      "content_type": "text/x-markdown",
+      "content": "[Original message](https://zulip.example.test/#narrow/channel/42-general/topic/Roadmap/near/1001)\n[Conversation](#narrow/channel/42-general/topic/Roadmap)\n[Search](https://zulip.example.test/#narrow/search/deployment)",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1033",
+      "stream_uuids": {
+        "general": "15465556-ef95-57a2-bc7a-d8c5cea801f1"
+      },
+      "topic_uuids": {
+        "general>Roadmap": "40000000-0000-4000-8000-000000000042"
+      },
+      "message_uuids": {
+        "1001": "38c6b1e8-3017-53c6-b963-1694633751bb"
+      },
+      "stream_ids": {
+        "general": 42
+      }
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "[Original message](urn:message:38c6b1e8-3017-53c6-b963-1694633751bb)\n[Conversation](urn:topic:40000000-0000-4000-8000-000000000042)\n[Search](urn:url:https://zulip.example.test/#narrow/search/deployment)"
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "[Original message](https://zulip.example.test/#narrow/near/1001)\n[Conversation](https://zulip.example.test/#narrow/channel/42-general/topic/Roadmap)\n[Search](https://zulip.example.test/#narrow/search/deployment)"
+  },
+  {
+    "name": "custom_linkifier",
+    "description": "Ticket text and topic link metadata from a configured organization linkifier.",
+    "message": {
+      "id": 1034,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "TASK-123",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000033,
+      "content_type": "text/x-markdown",
+      "content": "See TASK-123 and TASK-456 for the implementation.",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": [
+        {
+          "text": "TASK-123",
+          "url": "https://issues.example.test/TASK-123"
+        }
+      ]
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1034",
+      "linkifier_urls": {
+        "TASK-123": "https://issues.example.test/TASK-123",
+        "TASK-456": "https://issues.example.test/TASK-456"
+      }
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "See [TASK-123](urn:url:https://issues.example.test/TASK-123) and [TASK-456](urn:url:https://issues.example.test/TASK-456) for the implementation."
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "See [TASK-123](https://issues.example.test/TASK-123) and [TASK-456](https://issues.example.test/TASK-456) for the implementation."
+  },
+  {
+    "name": "uploaded_document",
+    "description": "An uploaded file uses a relative Zulip upload URL.",
+    "message": {
+      "id": 1035,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000034,
+      "content_type": "text/x-markdown",
+      "content": "[deployment-notes.pdf](/user_uploads/1/abc123/deployment-notes.pdf)",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1035",
+      "files": {
+        "/user_uploads/1/abc123/deployment-notes.pdf": "urn:file:60000000-0000-4000-8000-000000000001?name=deployment-notes.pdf&content_type=application%2Fpdf&size=23142"
+      }
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "[deployment-notes.pdf](urn:file:60000000-0000-4000-8000-000000000001?name=deployment-notes.pdf&content_type=application%2Fpdf&size=23142)"
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "[deployment-notes.pdf](/user_uploads/1/abc123/deployment-notes.pdf)"
+  },
+  {
+    "name": "multiple_attachments",
+    "description": "Several uploaded files, including spaces and a Unicode filename.",
+    "message": {
+      "id": 1036,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000035,
+      "content_type": "text/x-markdown",
+      "content": "The requested files:\n\n[report.pdf](/user_uploads/1/abc123/report.pdf)\n[build log.txt](/user_uploads/1/def456/build%20log.txt)\n[café.csv](/user_uploads/1/ghi789/caf%C3%A9.csv)",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1036",
+      "files": {
+        "/user_uploads/1/abc123/report.pdf": "urn:file:60000000-0000-4000-8000-000000000002?name=report.pdf&content_type=application%2Fpdf",
+        "/user_uploads/1/def456/build%20log.txt": "urn:file:60000000-0000-4000-8000-000000000003?name=build+log.txt&content_type=text%2Fplain",
+        "/user_uploads/1/ghi789/caf%C3%A9.csv": "urn:file:60000000-0000-4000-8000-000000000004?name=caf%C3%A9.csv&content_type=text%2Fcsv"
+      }
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "The requested files:\n\n[report.pdf](urn:file:60000000-0000-4000-8000-000000000002?name=report.pdf&content_type=application%2Fpdf)\n[build log.txt](urn:file:60000000-0000-4000-8000-000000000003?name=build+log.txt&content_type=text%2Fplain)\n[café.csv](urn:file:60000000-0000-4000-8000-000000000004?name=caf%C3%A9.csv&content_type=text%2Fcsv)"
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "The requested files:\n\n[report.pdf](/user_uploads/1/abc123/report.pdf)\n[build log.txt](/user_uploads/1/def456/build%20log.txt)\n[café.csv](/user_uploads/1/ghi789/caf%C3%A9.csv)"
+  },
+  {
+    "name": "image_markdown",
+    "description": "An image with alt text and a caption.",
+    "message": {
+      "id": 1037,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000036,
+      "content_type": "text/x-markdown",
+      "content": "![Architecture overview](/user_uploads/1/img123/architecture.png)\n\n**Figure 1:** The API and history worker.",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1037",
+      "files": {
+        "/user_uploads/1/img123/architecture.png": "urn:image:60000000-0000-4000-8000-000000000005?name=architecture.png&content_type=image%2Fpng&w=480&h=240"
+      }
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "![Architecture overview](urn:image:60000000-0000-4000-8000-000000000005?name=architecture.png&content_type=image%2Fpng&w=480&h=240)\n\n**Figure 1:** The API and history worker."
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "![Architecture overview](/user_uploads/1/img123/architecture.png)\n\n**Figure 1:** The API and history worker."
+  },
+  {
+    "name": "image_link",
+    "description": "A plain link to an image can produce an inline image preview in Zulip.",
+    "message": {
+      "id": 1038,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000037,
+      "content_type": "text/x-markdown",
+      "content": "Screenshot: [screen.png](/user_uploads/1/img456/screen.png)\n\nExternal image: https://images.example.test/diagram.png",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1038",
+      "files": {
+        "/user_uploads/1/img456/screen.png": "urn:image:60000000-0000-4000-8000-000000000006?name=screen.png&content_type=image%2Fpng",
+        "https://images.example.test/diagram.png": "urn:image:60000000-0000-4000-8000-000000000007?name=diagram.png&content_type=image%2Fpng"
+      }
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "Screenshot: ![screen.png](urn:image:60000000-0000-4000-8000-000000000006?name=screen.png&content_type=image%2Fpng)\n\nExternal image: ![diagram.png](urn:image:60000000-0000-4000-8000-000000000007?name=diagram.png&content_type=image%2Fpng)"
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "Screenshot: ![screen.png](/user_uploads/1/img456/screen.png)\n\nExternal image: ![diagram.png](https://images.example.test/diagram.png)"
+  },
+  {
+    "name": "animated_image",
+    "description": "An uploaded animated GIF is represented by a Markdown file link.",
+    "message": {
+      "id": 1039,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000038,
+      "content_type": "text/x-markdown",
+      "content": "[demo.gif](/user_uploads/1/gif123/demo.gif)",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1039",
+      "files": {
+        "/user_uploads/1/gif123/demo.gif": "urn:image:60000000-0000-4000-8000-000000000008?name=demo.gif&content_type=image%2Fgif"
+      }
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "![demo.gif](urn:image:60000000-0000-4000-8000-000000000008?name=demo.gif&content_type=image%2Fgif)"
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "![demo.gif](/user_uploads/1/gif123/demo.gif)"
+  },
+  {
+    "name": "video_attachment",
+    "description": "An uploaded video and an external video link.",
+    "message": {
+      "id": 1040,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000039,
+      "content_type": "text/x-markdown",
+      "content": "[walkthrough.mp4](/user_uploads/1/video123/walkthrough.mp4)\nhttps://video.example.test/watch/demo",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1040",
+      "files": {
+        "/user_uploads/1/video123/walkthrough.mp4": "urn:video:60000000-0000-4000-8000-000000000009?name=walkthrough.mp4&content_type=video%2Fmp4"
+      }
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "[walkthrough.mp4](urn:video:60000000-0000-4000-8000-000000000009?name=walkthrough.mp4&content_type=video%2Fmp4)\n[https://video.example.test/watch/demo](urn:url:https://video.example.test/watch/demo)"
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "[walkthrough.mp4](/user_uploads/1/video123/walkthrough.mp4)\n[https://video.example.test/watch/demo](https://video.example.test/watch/demo)"
+  },
+  {
+    "name": "audio_attachment",
+    "description": "An uploaded audio recording remains a link in the original Markdown.",
+    "message": {
+      "id": 1041,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000040,
+      "content_type": "text/x-markdown",
+      "content": "[voice-note.ogg](/user_uploads/1/audio123/voice-note.ogg)",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1041",
+      "files": {
+        "/user_uploads/1/audio123/voice-note.ogg": "urn:file:60000000-0000-4000-8000-000000000010?name=voice-note.ogg&content_type=audio%2Fogg"
+      }
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "[voice-note.ogg](urn:file:60000000-0000-4000-8000-000000000010?name=voice-note.ogg&content_type=audio%2Fogg)"
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "[voice-note.ogg](/user_uploads/1/audio123/voice-note.ogg)"
+  },
+  {
+    "name": "emoji",
+    "description": "Unicode emoji, skin tones, standard shortcodes, and a configured custom emoji.",
+    "message": {
+      "id": 1042,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000041,
+      "content_type": "text/x-markdown",
+      "content": "Looks good 👍🏽! :smile: :+1: :heart:\nCustom organization emoji: :party_parrot:",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1042",
+      "custom_emoji_names": ["party_parrot"]
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "Looks good 👍🏽! :smile: :+1: :heart:\nCustom organization emoji: (Not supported in Workspace: custom emoji party_parrot)\n\n[Original message](urn:url:https://zulip.example.test/#narrow/near/1042)"
+    },
+    "unsupported_features": ["custom_emoji"],
+    "expected_zulip_content": "Looks good 👍🏽! :smile: :+1: :heart:\nCustom organization emoji: (Not supported in Workspace: custom emoji party_parrot)\n\n[Original message](https://zulip.example.test/#narrow/near/1042)"
+  },
+  {
+    "name": "global_times",
+    "description": "Zulip global time markup using an ISO timestamp and a Unix timestamp.",
+    "message": {
+      "id": 1043,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000042,
+      "content_type": "text/x-markdown",
+      "content": "The review starts at <time:2026-10-18T18:00:00+03:00>.\nA Unix timestamp also works: <time:1496701800>.",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1043"
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "The review starts at (Not supported in Workspace: global time 2026-10-18T18:00:00+03:00).\nA Unix timestamp also works: (Not supported in Workspace: global time 1496701800).\n\n[Original message](urn:url:https://zulip.example.test/#narrow/near/1043)"
+    },
+    "unsupported_features": ["global_time"],
+    "expected_zulip_content": "The review starts at (Not supported in Workspace: global time 2026-10-18T18:00:00+03:00).\nA Unix timestamp also works: (Not supported in Workspace: global time 1496701800).\n\n[Original message](https://zulip.example.test/#narrow/near/1043)"
+  },
+  {
+    "name": "me_action",
+    "description": "A /me action keeps the command in the original Markdown.",
+    "message": {
+      "id": 1044,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000043,
+      "content_type": "text/x-markdown",
+      "content": "/me is checking **the latest deployment**.",
+      "is_me_message": true,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1044"
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "Not supported in Workspace: /me action\n\n[Original message](urn:url:https://zulip.example.test/#narrow/near/1044)"
+    },
+    "unsupported_features": ["me_action"],
+    "expected_zulip_content": "Not supported in Workspace: /me action\n\n[Original message](https://zulip.example.test/#narrow/near/1044)"
+  },
+  {
+    "name": "edited_message",
+    "description": "Current Markdown plus previous Markdown and edit timestamps.",
+    "message": {
+      "id": 1045,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000044,
+      "content_type": "text/x-markdown",
+      "content": "The deployment starts at **18:00**.",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": [],
+      "last_edit_timestamp": 1788000200,
+      "edit_history": [
+        {
+          "user_id": 9,
+          "timestamp": 1788000200,
+          "prev_content": "The deployment starts at **17:00**."
+        }
+      ]
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1045"
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "The deployment starts at **18:00**."
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "The deployment starts at **18:00**."
+  },
+  {
+    "name": "reactions",
+    "description": "Emoji reactions are metadata and use three different reaction namespaces.",
+    "message": {
+      "id": 1046,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000045,
+      "content_type": "text/x-markdown",
+      "content": "The migration is ready for review.",
+      "is_me_message": false,
+      "flags": ["read", "starred"],
+      "reactions": [
+        {
+          "user_id": 12,
+          "emoji_name": "+1",
+          "emoji_code": "1f44d",
+          "reaction_type": "unicode_emoji"
+        },
+        {
+          "user_id": 13,
+          "emoji_name": "party_parrot",
+          "emoji_code": "17",
+          "reaction_type": "realm_emoji"
+        },
+        {
+          "user_id": 9,
+          "emoji_name": "zulip",
+          "emoji_code": "zulip",
+          "reaction_type": "zulip_extra_emoji"
+        }
+      ],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1046"
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "The migration is ready for review."
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "The migration is ready for review."
+  },
+  {
+    "name": "poll",
+    "description": "A poll command with its initialization and vote stored as JSON-encoded submessages.",
+    "message": {
+      "id": 1047,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000046,
+      "content_type": "text/x-markdown",
+      "content": "/poll Which deployment window works best?\nMonday\nTuesday\nWednesday",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [
+        {
+          "sender_id": 9,
+          "msg_type": "widget",
+          "content": "{\"widget_type\":\"poll\",\"extra_data\":{\"question\":\"Which deployment window works best?\",\"options\":[\"Monday\",\"Tuesday\",\"Wednesday\"]}}",
+          "id": 10470,
+          "message_id": 1047
+        },
+        {
+          "sender_id": 12,
+          "msg_type": "widget",
+          "content": "{\"type\":\"vote\",\"key\":\"canned,1\",\"vote\":1}",
+          "id": 10471,
+          "message_id": 1047
+        }
+      ],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1047"
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "Not supported in Workspace: interactive poll\n\n[Original message](urn:url:https://zulip.example.test/#narrow/near/1047)"
+    },
+    "unsupported_features": ["interactive_poll"],
+    "expected_zulip_content": "Not supported in Workspace: interactive poll\n\n[Original message](https://zulip.example.test/#narrow/near/1047)"
+  },
+  {
+    "name": "collaborative_todo_list",
+    "description": "A collaborative to-do command with task data and a completion event in submessages.",
+    "message": {
+      "id": 1048,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000047,
+      "content_type": "text/x-markdown",
+      "content": "/todo Release checklist\nReview migration: Check the rollback path.\nDeploy API\nRestart worker",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [
+        {
+          "sender_id": 9,
+          "msg_type": "widget",
+          "content": "{\"widget_type\":\"todo\",\"extra_data\":{\"task_list_title\":\"Release checklist\",\"tasks\":[{\"task\":\"Review migration\",\"desc\":\"Check the rollback path.\"},{\"task\":\"Deploy API\",\"desc\":\"\"},{\"task\":\"Restart worker\",\"desc\":\"\"}]}}",
+          "id": 10480,
+          "message_id": 1048
+        },
+        {
+          "sender_id": 12,
+          "msg_type": "widget",
+          "content": "{\"type\":\"strike\",\"key\":\"0,9\"}",
+          "id": 10481,
+          "message_id": 1048
+        }
+      ],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1048"
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "Not supported in Workspace: collaborative to-do list\n\n[Original message](urn:url:https://zulip.example.test/#narrow/near/1048)"
+    },
+    "unsupported_features": ["collaborative_todo_list"],
+    "expected_zulip_content": "Not supported in Workspace: collaborative to-do list\n\n[Original message](https://zulip.example.test/#narrow/near/1048)"
+  },
+  {
+    "name": "empty_topic",
+    "description": "A channel message with an empty topic when allow_empty_topic_name=true.",
+    "message": {
+      "id": 1049,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000048,
+      "content_type": "text/x-markdown",
+      "content": "This message has no topic.",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1049"
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "This message has no topic."
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "This message has no topic."
+  },
+  {
+    "name": "resolved_topic",
+    "description": "A resolved topic uses Zulip's checkmark prefix.",
+    "message": {
+      "id": 1050,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "✔ Release checklist",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000049,
+      "content_type": "text/x-markdown",
+      "content": "All changes are deployed.",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1050"
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "All changes are deployed."
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "All changes are deployed."
+  },
+  {
+    "name": "direct_message",
+    "description": "One-to-one incoming direct message; type is private and stream_id is absent.",
+    "message": {
+      "id": 1051,
+      "type": "private",
+      "display_recipient": [
+        {
+          "id": 9,
+          "email": "alice@example.test",
+          "full_name": "Alice Example",
+          "is_mirror_dummy": false
+        },
+        {
+          "id": 12,
+          "email": "bob@example.test",
+          "full_name": "Bob Example",
+          "is_mirror_dummy": false
+        }
+      ],
+      "recipient_id": 2012,
+      "subject": "",
+      "sender_id": 12,
+      "sender_full_name": "Bob Example",
+      "sender_email": "bob@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000050,
+      "content_type": "text/x-markdown",
+      "content": "Hi @**Alice Example|9**! Can you review [the proposal](https://docs.example.test/proposal)?",
+      "is_me_message": false,
+      "flags": ["mentioned"],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1051",
+      "mention_uuids": {
+        "id:9": "b7828b6c-13f2-59d3-88ec-8883e8b5acab"
+      }
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "Hi [Alice Example](urn:user:b7828b6c-13f2-59d3-88ec-8883e8b5acab)! Can you review [the proposal](urn:url:https://docs.example.test/proposal)?"
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "Hi @**Alice Example|9**! Can you review [the proposal](https://docs.example.test/proposal)?"
+  },
+  {
+    "name": "group_direct_message",
+    "description": "A group direct message also uses type=private, with more than two participants.",
+    "message": {
+      "id": 1052,
+      "type": "private",
+      "display_recipient": [
+        {
+          "id": 9,
+          "email": "alice@example.test",
+          "full_name": "Alice Example",
+          "is_mirror_dummy": false
+        },
+        {
+          "id": 12,
+          "email": "bob@example.test",
+          "full_name": "Bob Example",
+          "is_mirror_dummy": false
+        },
+        {
+          "id": 13,
+          "email": "zoe@example.test",
+          "full_name": "Zoë Example",
+          "is_mirror_dummy": false
+        }
+      ],
+      "recipient_id": 3013,
+      "subject": "",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000051,
+      "content_type": "text/x-markdown",
+      "content": "**Planning notes**\n\n- Alice: API\n- Bob: worker\n- Zoë: UI",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1052"
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "**Planning notes**\n\n- Alice: API\n- Bob: worker\n- Zoë: UI"
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "**Planning notes**\n\n- Alice: API\n- Bob: worker\n- Zoë: UI"
+  },
+  {
+    "name": "self_direct_message",
+    "description": "A direct conversation with oneself has one display_recipient entry.",
+    "message": {
+      "id": 1053,
+      "type": "private",
+      "display_recipient": [
+        {
+          "id": 9,
+          "email": "alice@example.test",
+          "full_name": "Alice Example",
+          "is_mirror_dummy": false
+        }
+      ],
+      "recipient_id": 2009,
+      "subject": "",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000052,
+      "content_type": "text/x-markdown",
+      "content": "Note to self: run `python -m pytest` before the next commit.",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1053"
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "Note to self: run `python -m pytest` before the next commit."
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "Note to self: run `python -m pytest` before the next commit."
+  },
+  {
+    "name": "system_bot_message",
+    "description": "An incoming direct message from a cross-realm system bot.",
+    "message": {
+      "id": 1054,
+      "type": "private",
+      "display_recipient": [
+        {
+          "id": 6,
+          "email": "notification-bot@zulip.com",
+          "full_name": "Notification Bot",
+          "is_mirror_dummy": false
+        },
+        {
+          "id": 9,
+          "email": "alice@example.test",
+          "full_name": "Alice Example",
+          "is_mirror_dummy": false
+        }
+      ],
+      "recipient_id": 2006,
+      "subject": "",
+      "sender_id": 6,
+      "sender_full_name": "Notification Bot",
+      "sender_email": "notification-bot@zulip.com",
+      "sender_realm_str": "zulipinternal",
+      "avatar_url": null,
+      "client": "internal",
+      "timestamp": 1788000053,
+      "content_type": "text/x-markdown",
+      "content": "Your organization settings have been updated.\n\n[Review settings](https://zulip.example.test/#organization/settings)",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1054"
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "Your organization settings have been updated.\n\n[Review settings](urn:url:https://zulip.example.test/#organization/settings)"
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "Your organization settings have been updated.\n\n[Review settings](https://zulip.example.test/#organization/settings)"
+  },
+  {
+    "name": "mixed_formatting",
+    "description": "Several formatting features coexist; Zulip references are converted both inside code and in the surrounding Markdown.",
+    "message": {
+      "id": 1055,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000054,
+      "content_type": "text/x-markdown",
+      "content": "@**Bob Example|12**, here is the **release summary** for #**general>Roadmap**.\n\n1. Read [the report](/user_uploads/1/abc123/report.pdf).\n2. Check the formula $$n(n+1)/2$$.\n\n```python\n# This is literal: @**Zoë Example|13** :smile:\nprint(\"ready\")\n```\n\n```spoiler Internal notes\n> Preserve the original link: https://docs.example.test/runbook\n\nRestart the worker at <time:2026-10-18T18:00:00+03:00>.\n```\n\n![Deployment diagram](/user_uploads/1/img123/architecture.png)\n\nThanks! :+1:",
+      "is_me_message": false,
+      "flags": ["mentioned"],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1055",
+      "mention_uuids": {
+        "id:12": "7af731c9-ccd4-5318-9a12-bab962ee4679",
+        "id:13": "0b596ff7-0956-5783-9ad4-0660396b0543"
+      },
+      "stream_uuids": {
+        "general": "15465556-ef95-57a2-bc7a-d8c5cea801f1"
+      },
+      "topic_uuids": {
+        "general>Roadmap": "40000000-0000-4000-8000-000000000042"
+      },
+      "message_uuids": {
+        "1001": "38c6b1e8-3017-53c6-b963-1694633751bb"
+      },
+      "files": {
+        "/user_uploads/1/abc123/report.pdf": "urn:file:60000000-0000-4000-8000-000000000002?name=report.pdf&content_type=application%2Fpdf",
+        "/user_uploads/1/img123/architecture.png": "urn:image:60000000-0000-4000-8000-000000000005?name=architecture.png&content_type=image%2Fpng&w=480&h=240"
+      }
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "[Bob Example](urn:user:7af731c9-ccd4-5318-9a12-bab962ee4679), here is the **release summary** for [#general > Roadmap](urn:topic:40000000-0000-4000-8000-000000000042).\n\n1. Read [the report](urn:file:60000000-0000-4000-8000-000000000002?name=report.pdf&content_type=application%2Fpdf).\n2. Check the formula (Not supported in Workspace: inline LaTeX).\n\n```python\n# This is literal: [Zoë Example](urn:user:0b596ff7-0956-5783-9ad4-0660396b0543) :smile:\nprint(\"ready\")\n```\n\n```spoiler Internal notes\n> Preserve the original link: [https://docs.example.test/runbook](urn:url:https://docs.example.test/runbook)\n\nRestart the worker at (Not supported in Workspace: global time 2026-10-18T18:00:00+03:00).\n```\n\n![Deployment diagram](urn:image:60000000-0000-4000-8000-000000000005?name=architecture.png&content_type=image%2Fpng&w=480&h=240)\n\nThanks! :+1:\n\n[Original message](urn:url:https://zulip.example.test/#narrow/near/1055)"
+    },
+    "unsupported_features": ["inline_latex", "global_time"],
+    "expected_zulip_content": "@**Bob Example|12**, here is the **release summary** for #**general>Roadmap**.\n\n1. Read [the report](/user_uploads/1/abc123/report.pdf).\n2. Check the formula (Not supported in Workspace: inline LaTeX).\n\n```python\n# This is literal: @**Zoë Example|13** :smile:\nprint(\"ready\")\n```\n\n```spoiler Internal notes\n> Preserve the original link: [https://docs.example.test/runbook](https://docs.example.test/runbook)\n\nRestart the worker at (Not supported in Workspace: global time 2026-10-18T18:00:00+03:00).\n```\n\n![Deployment diagram](/user_uploads/1/img123/architecture.png)\n\nThanks! :+1:\n\n[Original message](https://zulip.example.test/#narrow/near/1055)"
+  }
+]

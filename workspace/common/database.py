@@ -11,25 +11,24 @@ from oslo_config import cfg
 from restalchemy.storage.sql import engines
 
 
-def connection_url_with_application_name(connection_url: str, name: str) -> str:
+def connection_url_for_process(connection_url: str, name: str) -> str:
+    """Use UTC for timestamp storage and identify the service connection."""
     parts = urllib.parse.urlsplit(connection_url)
-    query = [
-        (key, value)
-        for key, value in urllib.parse.parse_qsl(
-            parts.query,
-            keep_blank_values=True,
+    query = dict(urllib.parse.parse_qsl(parts.query, keep_blank_values=True))
+    query["application_name"] = name
+    query["options"] = f"{query.get('options', '')} -c timezone=UTC".strip()
+    return urllib.parse.urlunsplit(
+        parts._replace(
+            query=urllib.parse.urlencode(query, quote_via=urllib.parse.quote),
         )
-        if key != "application_name"
-    ]
-    query.append(("application_name", name))
-    return urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
+    )
 
 
 def configure_postgresql(
     application_name: str,
     conf: cfg.ConfigOpts = cfg.CONF,
 ) -> None:
-    connection_url = connection_url_with_application_name(
+    connection_url = connection_url_for_process(
         conf["db"].connection_url,
         application_name,
     )

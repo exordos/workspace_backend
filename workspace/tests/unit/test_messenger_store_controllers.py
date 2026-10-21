@@ -12,6 +12,7 @@ import pytest
 
 from workspace.messenger_api.api import controllers
 from workspace.messenger_api.api import routes
+from workspace.workspace_api.api import routes as workspace_routes
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.dm import helpers
 
@@ -161,8 +162,8 @@ def test_message_mutations_use_dedicated_canonical_store_operations(fake_store):
 
     assert created["source_name"] == "native"
     assert created["source"] == {"kind": "native"}
-    assert created["provider"] is None
-    assert created["delivery"] is None
+    assert "provider" not in created
+    assert "delivery" not in created
     assert updated["uuid"] == MESSAGE_UUID
     assert deleted == {"uuid": MESSAGE_UUID}
     assert [call[0] for call in fake_store.calls] == [
@@ -289,24 +290,6 @@ def test_event_pagination_pushes_limit_plus_one_into_visible_event_query(fake_st
     ]
 
 
-def test_reaction_mutations_reject_internal_provider_projection_fields(fake_store):
-    controller = _controller(controllers.WorkspaceMessageReactionController)
-
-    with pytest.raises(Exception):
-        controller.create(
-            message_uuid=MESSAGE_UUID,
-            emoji_name="eyes",
-            provider_uuid=sys_uuid.uuid4(),
-        )
-    with pytest.raises(Exception):
-        controller.update(
-            sys_uuid.uuid4(),
-            delivery_status="pending",
-        )
-
-    assert fake_store.calls == []
-
-
 def test_draft_mutations_use_postgres_only_store_operations_and_if_match(fake_store):
     draft_uuid = sys_uuid.uuid4()
     stream_uuid = sys_uuid.uuid4()
@@ -356,7 +339,7 @@ def test_draft_mutations_require_if_match(fake_store):
 
 
 def test_external_accounts_are_part_of_messenger_routes():
-    assert routes.ApiEndpointRoute.external_accounts is routes.ExternalAccountRoute
+    assert workspace_routes.MessengerRoute.external_accounts is routes.ExternalAccountRoute
 
 
 def test_controllers_do_not_access_sql_objects_or_deleted_provider_api():

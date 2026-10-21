@@ -158,7 +158,7 @@ Repeaters use stable business keys and the current state of the outbox. Each imm
 ## The sources
 
 - [`workspace_api.md`](../../../../workspace_api.md) — authoritative public routes, general JSON, page, events and contract WebSocket.
-- [`zulip_bridge_v1_product_and_api.md`](../../../../zulip_bridge_v1_product_and_api.md) — sanitized lifecycle of external resources, permissions and provider semantics.
+- `zulip_bridge_v1_product_and_api.md` — sanitized lifecycle of external resources, permissions and provider semantics.
 
 [← The main index of the documentation](../../../../index.md) ·
 [Index of sequence diagrams](../../README.md) ·

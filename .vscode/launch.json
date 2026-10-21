@@ -1,43 +1,32 @@
 {
-    // Use IntelliSense to learn about possible attributes.
-    // Hover to view descriptions of existing attributes.
-    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Python Debugger: User API",
+            "name": "Python Debugger: Workspace API",
             "type": "debugpy",
             "request": "launch",
-            "program": ".tox/develop/bin/workspace-user-api",
+            "python": "${workspaceFolder}/.tox/develop/bin/python",
+            "module": "workspace.cmd.workspace_api",
+            "cwd": "${workspaceFolder}",
             "args": [
                 "--config-file",
-                "etc/workspace/workspace.conf"
+                "${workspaceFolder}/etc/workspace/workspace.local.conf"
             ],
             "console": "integratedTerminal",
             "justMyCode": false,
-            "subProcess": true
-        },
-        {
-            "name": "Python Debugger: Messenger API",
-            "type": "debugpy",
-            "request": "launch",
-            "program": ".tox/develop/bin/workspace-messenger-api",
-            "args": [
-                "--config-file",
-                "etc/workspace/workspace.conf"
-            ],
-            "console": "integratedTerminal",
-            "justMyCode": false,
-            "subProcess": true
+            "subProcess": true,
+            "preLaunchTask": "Workspace: Start nginx"
         },
         {
             "name": "Python Debugger: Messenger Events",
             "type": "debugpy",
             "request": "launch",
-            "program": ".tox/develop/bin/workspace-messenger-events",
+            "python": "${workspaceFolder}/.tox/develop/bin/python",
+            "module": "workspace.cmd.messenger_events",
+            "cwd": "${workspaceFolder}",
             "args": [
                 "--config-file",
-                "etc/workspace/workspace.conf"
+                "${workspaceFolder}/etc/workspace/workspace.local.conf"
             ],
             "console": "integratedTerminal",
             "justMyCode": false,
@@ -47,23 +36,57 @@
             "name": "Python Debugger: Messenger Worker",
             "type": "debugpy",
             "request": "launch",
-            "program": ".tox/develop/bin/workspace-messenger-worker",
+            "python": "${workspaceFolder}/.tox/develop/bin/python",
+            "module": "workspace.cmd.messenger_worker",
+            "cwd": "${workspaceFolder}",
             "args": [
                 "--config-file",
-                "etc/workspace/workspace.conf"
+                "${workspaceFolder}/etc/workspace/workspace.local.conf"
             ],
             "console": "integratedTerminal",
             "justMyCode": false,
             "subProcess": true
         },
         {
-            "name": "Python Debugger: Integration Bridge Worker",
+            "name": "Python Debugger: History Import",
             "type": "debugpy",
             "request": "launch",
-            "program": ".tox/develop/bin/workspace-integration-bridge-worker",
+            "python": "${workspaceFolder}/.tox/develop/bin/python",
+            "module": "workspace.cmd.history_import",
+            "cwd": "${workspaceFolder}",
             "args": [
                 "--config-file",
-                "etc/workspace/workspace.conf"
+                "${workspaceFolder}/etc/workspace/workspace.local.conf"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "subProcess": true
+        },
+        {
+            "name": "Python Debugger: Zulip Realtime Tasks",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${workspaceFolder}/.tox/develop/bin/python",
+            "module": "workspace.cmd.zulip_task_worker",
+            "cwd": "${workspaceFolder}",
+            "args": [
+                "--config-file",
+                "${workspaceFolder}/etc/workspace/workspace.local.conf"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "subProcess": true
+        },
+        {
+            "name": "Python Debugger: Zulip Realtime",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${workspaceFolder}/.tox/develop/bin/python",
+            "module": "workspace.cmd.zulip_realtime",
+            "cwd": "${workspaceFolder}",
+            "args": [
+                "--config-file",
+                "${workspaceFolder}/etc/workspace/workspace.local.conf"
             ],
             "console": "integratedTerminal",
             "justMyCode": false,
@@ -73,31 +96,35 @@
             "name": "Python Debugger: Apply Migrations",
             "type": "debugpy",
             "request": "launch",
-            "program": ".tox/develop/bin/ra-apply-migration",
+            "program": "${workspaceFolder}/.tox/develop/bin/ra-apply-migration",
             "args": [
                 "--config-file",
-                "etc/workspace/workspace.conf",
+                "${workspaceFolder}/etc/workspace/workspace.local.conf",
                 "-p",
                 "migrations"
             ],
             "console": "integratedTerminal",
-            "justMyCode": false
+            "justMyCode": false,
+            "python": "${workspaceFolder}/.tox/develop/bin/python",
+            "cwd": "${workspaceFolder}"
         },
         {
             "name": "Python Debugger: Rollback Migrations",
             "type": "debugpy",
             "request": "launch",
-            "program": ".tox/develop/bin/ra-rollback-migration",
+            "program": "${workspaceFolder}/.tox/develop/bin/ra-rollback-migration",
             "args": [
                 "--config-file",
-                "etc/workspace/workspace.conf",
+                "${workspaceFolder}/etc/workspace/workspace.local.conf",
                 "-p",
                 "migrations",
                 "-m",
-                "0000"
+                "${input:rollbackMigration}"
             ],
             "console": "integratedTerminal",
-            "justMyCode": false
+            "justMyCode": false,
+            "python": "${workspaceFolder}/.tox/develop/bin/python",
+            "cwd": "${workspaceFolder}"
         },
         {
             "name": "Python: Integration tests (messenger_api)",
@@ -109,7 +136,29 @@
                 "-v"
             ],
             "console": "integratedTerminal",
-            "justMyCode": false
+            "justMyCode": false,
+            "python": "${workspaceFolder}/.tox/develop/bin/python",
+            "cwd": "${workspaceFolder}"
+        }
+    ],
+    "inputs": [
+        {
+            "id": "rollbackMigration",
+            "type": "promptString",
+            "description": "Migration to roll back, including its dependent migrations (filename or prefix)"
+        }
+    ],
+    "compounds": [
+        {
+            "name": "Workspace: All Backend Services",
+            "configurations": [
+                "Python Debugger: Workspace API",
+                "Python Debugger: Messenger Events",
+                "Python Debugger: Messenger Worker",
+                "Python Debugger: History Import",
+                "Python Debugger: Zulip Realtime"
+            ],
+            "stopAll": true
         }
     ]
 }

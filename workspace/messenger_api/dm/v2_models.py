@@ -11,13 +11,20 @@ the public message UUID is the placement UUID while the canonical UUID stays
 internal.
 """
 
+import datetime
 import typing
+import uuid as sys_uuid
 
+from restalchemy.common import contexts
+from restalchemy.dm import filters as dm_filters
 from restalchemy.dm import models
 from restalchemy.dm import properties
 from restalchemy.dm import types
 from restalchemy.storage.sql import orm
 
+from workspace.common import models as common_models
+from workspace.common import types as common_types
+from workspace.messenger_api import exceptions as messenger_exceptions
 from workspace.messenger_api.dm import base
 from workspace.messenger_api.dm import message_payloads
 
@@ -142,28 +149,123 @@ class WorkspaceMessage(
         default=base.SourceName.NATIVE.value,
     )
     source = properties.property(types.Dict(), default=base.native_source)
-    provider_uuid = properties.property(
-        types.AllowNone(types.UUID()), default=None, read_only=True
+    content_hash = properties.property(
+        types.AllowNone(types.String(max_length=64)), default=None, read_only=True
     )
-    external_account_uuid = properties.property(
-        types.AllowNone(types.UUID()), default=None, read_only=True
+    content_updated_at = properties.property(
+        types.AllowNone(types.UTCDateTimeZ()), default=None, read_only=True
     )
-    provider_external_id = properties.property(
-        types.AllowNone(types.String(max_length=2048)), default=None, read_only=True
-    )
-    provider_realm_uuid = properties.property(
-        types.AllowNone(types.UUID()), default=None, read_only=True
-    )
-    provider_message_id = properties.property(
-        types.AllowNone(types.String(max_length=32)), default=None, read_only=True
-    )
-    provider = properties.property(types.AllowNone(types.Dict()), default=None)
-    delivery = properties.property(types.AllowNone(types.Dict()), default=None)
     reactions = properties.property(types.Dict(), default=dict, read_only=True)
     reaction_users = properties.property(types.Dict(), default=dict, read_only=True)
     ingest_sequence = properties.property(
         types.Integer(min_value=1), required=False, read_only=True
     )
+    deleted_at = properties.property(
+        types.AllowNone(types.UTCDateTimeZ()), default=None, read_only=True
+    )
+
+
+class WorkspaceMessageChange(
+    models.ModelWithID,
+    models.ModelWithProject,
+    orm.SQLStorableMixin,
+):
+    __tablename__ = "messenger_message_changes"
+
+    project_id = properties.property(
+        types.UUID(), required=True, read_only=True, id_property=True
+    )
+    message_uuid = properties.property(
+        types.UUID(), required=True, read_only=True, id_property=True
+    )
+    revision = properties.property(
+        types.Integer(min_value=1), required=True, read_only=True
+    )
+    message_created_at = properties.property(
+        types.UTCDateTimeZ(),
+        default=datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc),
+        read_only=True,
+    )
+    message_sequence = properties.property(
+        types.Integer(min_value=0), default=0, read_only=True
+    )
+
+    @classmethod
+    def get_id_property(cls) -> dict[str, typing.Any]:
+        return cls.id_properties.copy()
+
+    def get_id(self) -> tuple[sys_uuid.UUID, sys_uuid.UUID]:
+        return self.project_id, self.message_uuid
+
+    def acknowledge(self) -> None:
+        self.acknowledge_many([self])
+
+    @classmethod
+    def acknowledge_many(
+        cls, changes: typing.Sequence["WorkspaceMessageChange"]
+    ) -> None:
+        contexts.Context().get_session().execute(
+            f"DELETE FROM {cls.__tablename__} AS pending "
+            "USING unnest(%s::uuid[], %s::uuid[], %s::bigint[]) "
+            "AS checked(project_id, message_uuid, revision) "
+            "WHERE pending.project_id = checked.project_id "
+            "AND pending.message_uuid = checked.message_uuid "
+            "AND pending.revision = checked.revision",
+            (
+                [change.project_id for change in changes],
+                [change.message_uuid for change in changes],
+                [change.revision for change in changes],
+            ),
+        )
+
+
+class WorkspaceMessageCounterChange(
+    models.ModelWithID,
+    models.ModelWithProject,
+    orm.SQLStorableMixin,
+):
+    __tablename__ = "messenger_message_counter_changes"
+
+    project_id = properties.property(
+        types.UUID(), required=True, read_only=True, id_property=True
+    )
+    user_uuid = properties.property(
+        types.UUID(), required=True, read_only=True, id_property=True
+    )
+    placement_uuid = properties.property(
+        types.UUID(), required=True, read_only=True, id_property=True
+    )
+    stream_uuid = properties.property(
+        types.UUID(), required=True, read_only=True, id_property=True
+    )
+    topic_uuid = properties.property(types.UUID(), required=True, read_only=True)
+    revision = properties.property(
+        types.Integer(min_value=1), required=True, read_only=True
+    )
+
+    @classmethod
+    def get_id_property(cls) -> dict[str, typing.Any]:
+        return cls.id_properties.copy()
+
+    def get_id(
+        self,
+    ) -> tuple[sys_uuid.UUID, sys_uuid.UUID, sys_uuid.UUID, sys_uuid.UUID]:
+        return self.project_id, self.user_uuid, self.stream_uuid, self.placement_uuid
+
+    @classmethod
+    def reconcile_batch(
+        cls, project_id: object, user_uuid: object, stream_uuid: object, limit: int
+    ) -> bool:
+        result = (
+            contexts.Context()
+            .get_session()
+            .execute(
+                "SELECT * FROM messenger_apply_message_counter_changes(%s, %s, %s, %s)",
+                (project_id, user_uuid, stream_uuid, limit),
+            )
+            .fetchone()
+        )
+        return result["pending"]
 
 
 class WorkspaceMessagePlacement(
@@ -210,7 +312,34 @@ class WorkspaceUserMessageState(
     membership_generation = properties.property(
         types.Integer(min_value=1), required=True, read_only=True
     )
-    read_at = properties.property(types.AllowNone(types.UTCDateTimeZ()), default=None)
+    binding_uuid = properties.property(
+        types.AllowNone(types.UUID()), default=None, read_only=True
+    )
+    zulip_source_uuid = properties.property(
+        types.AllowNone(types.UUID()), default=None, read_only=True
+    )
+    zulip_flags_updated_at = properties.property(
+        types.AllowNone(types.UTCDateTimeZ()), default=None, read_only=True
+    )
+    created_at = properties.property(
+        common_types.UTCDateTimeWithOffset(),
+        read_only=True,
+        default=lambda: datetime.datetime.now(datetime.timezone.utc),
+    )
+    updated_at = properties.property(
+        common_types.UTCDateTimeWithOffset(),
+        read_only=True,
+        default=lambda: datetime.datetime.now(datetime.timezone.utc),
+    )
+    read_at = properties.property(
+        types.AllowNone(common_types.UTCDateTimeWithOffset()), default=None
+    )
+    read_updated_at = properties.property(
+        types.AllowNone(types.UTCDateTimeZ()), default=None
+    )
+    starred_updated_at = properties.property(
+        types.AllowNone(types.UTCDateTimeZ()), default=None
+    )
     mentioned = properties.property(types.Boolean(), default=False)
     starred = properties.property(types.Boolean(), default=False)
     pinned = properties.property(types.Boolean(), default=False)
@@ -225,12 +354,6 @@ class WorkspaceUserMessage(
     binding_uuid = properties.property(types.UUID(), required=True, read_only=True)
     canonical_message_uuid = properties.property(
         types.UUID(), required=True, read_only=True
-    )
-    provider = properties.property(
-        types.AllowNone(types.Dict()), default=None, read_only=True
-    )
-    delivery = properties.property(
-        types.AllowNone(types.Dict()), default=None, read_only=True
     )
     deleted_at = properties.property(
         types.AllowNone(types.UTCDateTimeZ()), default=None, read_only=True
@@ -267,7 +390,7 @@ class WorkspaceUserMessage(
 class WorkspaceStream(
     models.ModelWithUUID,
     models.ModelWithProject,
-    models.ModelWithRequiredNameDesc,
+    common_models.ModelWithRequiredNameDesc,
     models.ModelWithTimestamp,
     orm.SQLStorableMixin,
 ):
@@ -279,7 +402,7 @@ class WorkspaceStream(
         types.AllowNone(types.UUID()), default=None
     )
     source_name = properties.property(
-        types.Enum([source.value for source in base.SourceName]),
+        types.Enum([source.value for source in base.StreamSourceName]),
         default=base.SourceName.NATIVE.value,
     )
     source = properties.property(types.Dict(), default=base.native_source)
@@ -295,8 +418,12 @@ class WorkspaceStream(
     default_topic_uuid = properties.property(
         types.AllowNone(types.UUID()), default=None, read_only=True
     )
-    provider = properties.property(types.AllowNone(types.Dict()), default=None)
-    delivery = properties.property(types.AllowNone(types.Dict()), default=None)
+
+    def validate(self) -> None:
+        super().validate()
+        base.WorkspaceStreamBase.validate_private_identity(
+            self.private, self.direct_user_uuid
+        )
 
 
 class WorkspaceStreamBinding(
@@ -335,12 +462,6 @@ class WorkspaceUserStream(
 ):
     __tablename__ = "messenger_api_user_streams_v1"
 
-    provider = properties.property(
-        types.AllowNone(types.Dict()), default=None, read_only=True
-    )
-    delivery = properties.property(
-        types.AllowNone(types.Dict()), default=None, read_only=True
-    )
     deleted_at = properties.property(
         types.AllowNone(types.UTCDateTimeZ()), default=None, read_only=True
     )
@@ -372,7 +493,7 @@ class WorkspaceStreamTopic(
     models.ModelWithUUID,
     models.ModelWithProject,
     models.ModelWithTimestamp,
-    base.WorkspaceSourceBase,
+    base.WorkspaceTopicSourceBase,
     orm.SQLStorableMixin,
 ):
     __tablename__ = "messenger_topics"
@@ -393,8 +514,6 @@ class WorkspaceStreamTopic(
     summary_reasoning_effort = properties.property(
         types.AllowNone(types.String(max_length=16)), default=None
     )
-    provider = properties.property(types.AllowNone(types.Dict()), default=None)
-    delivery = properties.property(types.AllowNone(types.Dict()), default=None)
     is_done = properties.property(types.Boolean(), default=False)
     version = properties.property(types.Integer(min_value=0), default=0, read_only=True)
 
@@ -426,7 +545,7 @@ class WorkspaceUserTopic(
     base.UserScopedModelWithUUID,
     models.ModelWithProject,
     models.ModelWithTimestamp,
-    base.WorkspaceSourceBase,
+    base.WorkspaceTopicSourceBase,
     orm.SQLStorableMixin,
 ):
     __tablename__ = "messenger_api_user_topics_v1"
@@ -464,16 +583,26 @@ class WorkspaceUserTopic(
     summary_reasoning_effort = properties.property(
         types.AllowNone(types.String(max_length=16)), default=None, read_only=True
     )
-    provider = properties.property(
-        types.AllowNone(types.Dict()), default=None, read_only=True
-    )
-    delivery = properties.property(
-        types.AllowNone(types.Dict()), default=None, read_only=True
-    )
     deleted_at = properties.property(
         types.AllowNone(types.UTCDateTimeZ()), default=None, read_only=True
     )
     visible = properties.property(types.Boolean(), default=True, read_only=True)
+
+    def validate_summary_prompt_update(self, session: typing.Any) -> None:
+        binding = WorkspaceStreamBinding.objects.get_one(
+            filters={
+                "project_id": dm_filters.EQ(self.project_id),
+                "stream_uuid": dm_filters.EQ(self.stream_uuid),
+                "user_uuid": dm_filters.EQ(self.user_uuid),
+                "active": dm_filters.EQ(True),
+            },
+            session=session,
+        )
+        if binding.role not in {
+            base.WorkspaceStreamRole.OWNER.value,
+            base.WorkspaceStreamRole.ADMINISTRATOR.value,
+        }:
+            raise messenger_exceptions.TopicSummaryPromptForbiddenError()
 
 
 class WorkspaceMessageReactionFact(
@@ -504,12 +633,6 @@ class WorkspaceMessageReactionView(
     message_uuid = properties.property(types.UUID(), required=True)
     user_uuid = properties.property(types.UUID(), required=True, read_only=True)
     emoji_name = properties.property(types.String(max_length=128), required=True)
-    provider = properties.property(
-        types.AllowNone(types.Dict()), default=None, read_only=True
-    )
-    delivery = properties.property(
-        types.AllowNone(types.Dict()), default=None, read_only=True
-    )
     deleted_at = properties.property(
         types.AllowNone(types.UTCDateTimeZ()), default=None, read_only=True
     )

@@ -115,7 +115,7 @@ class WorkspaceEpochController(controllers.BaseResourceController):
 ## Источники
 
 - [`workspace_api.md`](../../../../workspace_api.md) — авторитетные публичные маршруты, общий JSON, пагинация, события и контракт WebSocket.
-- [`zulip_bridge_v1_product_and_api.md`](../../../../zulip_bridge_v1_product_and_api.md) — санитизированный жизненный цикл внешних ресурсов, разрешения и семантика провайдера.
+- `zulip_bridge_v1_product_and_api.md` — санитизированный жизненный цикл внешних ресурсов, разрешения и семантика провайдера.
 
 [← Главный индекс документации](../../../../index.md) ·
 [Индекс диаграмм последовательностей](../../README.md) ·

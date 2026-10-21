@@ -1,8 +1,13 @@
 # Canonical inventory of the Messenger proposal architecture
 
+> Historical reference: the rolling compatibility tables and compact read-state
+> maintenance were retired by migration `0231`. See
+> [the current cutover procedure](messenger_domain_model.md#retiring-the-compatibility-schema).
+
+
 Status: **proposal; machine-verifiable dictionary for documentation, not production schema**.
 
-[← Main documentation index](index.md) · [Domain model](messenger_domain_model.md) · [RestAlchemy API](messenger_restalchemy_api_spec.md) · [Sequence index](diagrams/sequence/README.md) · [Zulip Bridge proposal](zulip_bridge/README.md)
+[← Main documentation index](index.md) · [Domain model](messenger_domain_model.md) · [RestAlchemy API](messenger_restalchemy_api_spec.md) · [Sequence index](diagrams/sequence/README.md) · Zulip Bridge proposal
 
 This document is the sole canonical inventory of names, keys,
 UUID algorithms, task/event types, and remaining OPEN decisions. Detailed
@@ -227,11 +232,11 @@ at-least-once and clients dedupe by event UUID.
 
 Target ingestion, service identity, registration boundary and recovery for
 Zulip are described without duplicating this inventory in
-[`zulip_bridge/README.md`](zulip_bridge/README.md). Its OPEN-list specifies
+`zulip_bridge/README.md`. Its OPEN-list specifies
 transport/provider-key questions for Bridge; current mTLS authentication is already chosen,
 and common Messenger model/task/event
 names remain canonical here. Exact Zulip event/op directions and
 echo-prevention boundary are canonically defined in
-[`zulip_bridge/event_coverage.md`](zulip_bridge/event_coverage.md).
+`zulip_bridge/event_coverage.md`.
 
-[← Main documentation index](index.md) · [Domain model](messenger_domain_model.md) · [RestAlchemy API](messenger_restalchemy_api_spec.md) · [Sequence index](diagrams/sequence/README.md) · [Zulip Bridge proposal](zulip_bridge/README.md)
+[← Main documentation index](index.md) · [Domain model](messenger_domain_model.md) · [RestAlchemy API](messenger_restalchemy_api_spec.md) · [Sequence index](diagrams/sequence/README.md) · Zulip Bridge proposal

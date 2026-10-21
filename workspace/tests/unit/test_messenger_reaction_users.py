@@ -8,7 +8,7 @@ import types
 import uuid as sys_uuid
 
 from workspace.common import messenger_reaction_opts
-from workspace.messenger_api import reaction_users
+from migrations import legacy_messenger_reaction_users as reaction_users
 
 
 PROJECT_UUID = sys_uuid.UUID("10000000-0000-0000-0000-000000000001")

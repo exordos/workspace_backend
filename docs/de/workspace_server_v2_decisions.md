@@ -1,8 +1,10 @@
 # Workspace Server v2: die von der Kommission
 
-Status: **Aktive Ergänzung zur Architektur und geschlossen Provider API v2**.
+Historical reference. This page describes the retired private bridge HTTP and mTLS/HPKE design. The current backend has no private bridge listener.
 
-[← Hauptindex](index.md) · [Provider API v2](../workspace_provider_api_v2.yaml) · [Zilarchitektur Zulip Bridge](zulip_bridge/README.md)
+Status: **Historical reference**.
+
+[← Hauptindex](index.md) · Provider API v2 · Zilarchitektur Zulip Bridge
 
 Dieses Dokument enthält die Entscheidungen `1B`, `2A`, `3A`, `4A`, `5A`, die vereinbart wurden
 Sie haben die ersten Implementierungen des neuen Workspace Servers vorbereitet. docs-first
@@ -490,4 +492,4 @@ Stream-, Topic- und Folder-Zähler neu aufgebaut und vor dem Commit geprüft.
 - V1 transport nur als rolling adapter gespeichert; eine neue Quelle der Wahrheit
   Für provider identity ist v2 contract.
 - Der vollständige Wire-Kontrakt ist hier zu finden:
-    [`workspace_provider_api_v2.yaml`](../workspace_provider_api_v2.yaml).
+    `workspace_provider_api_v2.yaml`.

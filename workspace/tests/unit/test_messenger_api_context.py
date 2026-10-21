@@ -33,8 +33,8 @@ def test_schema_lock_failure_releases_stored_session(monkeypatch):
         lambda name: engine,
     )
     monkeypatch.setattr(
-        messenger_context.read_state,
-        "lock_read_state_schema_shared",
+        messenger_context.schema,
+        "lock_shared",
         mock.Mock(side_effect=[lock_error, None]),
     )
     context = messenger_context.WorkspaceMessengerAuthContext(req=object())

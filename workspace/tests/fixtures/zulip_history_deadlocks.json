@@ -1,0 +1,112 @@
+[
+  {
+    "name": "captured_deadlock_1",
+    "queue": "background",
+    "wrapped": true,
+    "content": {
+      "kind": "import_history",
+      "since": null,
+      "last_message_id": 7496100,
+      "first_message_id": 7496001
+    },
+    "message": "Deadlock found when trying to get lock. Original message: deadlock detected\nDETAIL:  Process 2197829 waits for ShareLock on transaction 100405355; blocked by process 2197828.\nProcess 2197828 waits for ShareLock on transaction 100405466; blocked by process 2197829.\nHINT:  See server log for query details.\nCONTEXT:  while inserting index tuple (0,61) in relation \"bridge_zulip_v5_topic_changes\"\nSQL function \"bridge_zulip_v5_mark_topic_changed\" statement 1\nSQL statement \"SELECT bridge_zulip_v5_mark_topic_changed(NEW.project_id, NEW.topic)\"\nPL/pgSQL function bridge_zulip_v5_track_message_topic_changes() line 11 at PERFORM"
+  },
+  {
+    "name": "captured_deadlock_2",
+    "queue": "background",
+    "wrapped": false,
+    "content": {
+      "kind": "import_history",
+      "since": null,
+      "last_message_id": 7495000,
+      "first_message_id": 7494901
+    },
+    "message": "deadlock detected\nDETAIL:  Process 2197828 waits for ShareLock on transaction 100408980; blocked by process 2197829.\nProcess 2197829 waits for ShareLock on transaction 100409019; blocked by process 2197828.\nHINT:  See server log for query details.\nCONTEXT:  while locking tuple (6,69) in relation \"bridge_zulip_v5_topics\""
+  },
+  {
+    "name": "captured_deadlock_3",
+    "queue": "background",
+    "wrapped": true,
+    "content": {
+      "kind": "import_history",
+      "since": null,
+      "last_message_id": 7499500,
+      "first_message_id": 7499401
+    },
+    "message": "Deadlock found when trying to get lock. Original message: deadlock detected\nDETAIL:  Process 2197828 waits for ShareLock on transaction 100408561; blocked by process 2197829.\nProcess 2197829 waits for AccessExclusiveLock on tuple (16,27) of relation 2876153 of database 16387; blocked by process 2197857.\nProcess 2197857 waits for ShareLock on transaction 100408672; blocked by process 2197828.\nHINT:  See server log for query details.\nCONTEXT:  while inserting index tuple (0,144) in relation \"bridge_zulip_v5_topic_changes\"\nSQL function \"bridge_zulip_v5_mark_topic_changed\" statement 1\nSQL statement \"SELECT bridge_zulip_v5_mark_topic_changed(NEW.project_id, NEW.topic)\"\nPL/pgSQL function bridge_zulip_v5_track_message_topic_changes() line 11 at PERFORM"
+  },
+  {
+    "name": "captured_deadlock_4",
+    "queue": "background",
+    "wrapped": false,
+    "content": {
+      "kind": "import_history",
+      "since": null,
+      "last_message_id": 7502500,
+      "first_message_id": 7502401
+    },
+    "message": "deadlock detected\nDETAIL:  Process 2197829 waits for ShareLock on transaction 100399359; blocked by process 2197828.\nProcess 2197828 waits for ShareLock on transaction 100399363; blocked by process 2197829.\nHINT:  See server log for query details.\nCONTEXT:  while locking tuple (3,112) in relation \"bridge_zulip_v5_topics\""
+  },
+  {
+    "name": "captured_deadlock_5",
+    "queue": "realtime",
+    "wrapped": true,
+    "content": {
+      "kind": "import_history",
+      "since": null,
+      "last_message_id": 8429740,
+      "first_message_id": 8429740
+    },
+    "message": "Deadlock found when trying to get lock. Original message: deadlock detected\nDETAIL:  Process 2197857 waits for ShareLock on transaction 100399252; blocked by process 2197829.\nProcess 2197829 waits for ShareLock on transaction 100399250; blocked by process 2197857.\nHINT:  See server log for query details.\nCONTEXT:  while inserting index tuple (1,30) in relation \"bridge_zulip_v5_topic_changes\"\nSQL function \"bridge_zulip_v5_mark_topic_changed\" statement 1\nSQL statement \"SELECT bridge_zulip_v5_mark_topic_changed(NEW.project_id, NEW.topic)\"\nPL/pgSQL function bridge_zulip_v5_track_message_topic_changes() line 11 at PERFORM"
+  },
+  {
+    "name": "captured_deadlock_6",
+    "queue": "realtime",
+    "wrapped": true,
+    "content": {
+      "kind": "import_history",
+      "since": null,
+      "last_message_id": 8429741,
+      "first_message_id": 8429741
+    },
+    "message": "Deadlock found when trying to get lock. Original message: deadlock detected\nDETAIL:  Process 2197857 waits for ShareLock on transaction 100399484; blocked by process 2197828.\nProcess 2197828 waits for ShareLock on transaction 100399487; blocked by process 2197857.\nHINT:  See server log for query details.\nCONTEXT:  while locking tuple (1,109) in relation \"bridge_zulip_v5_topic_changes\"\nSQL function \"bridge_zulip_v5_mark_topic_changed\" statement 1\nSQL statement \"SELECT bridge_zulip_v5_mark_topic_changed(NEW.project_id, NEW.topic)\"\nPL/pgSQL function bridge_zulip_v5_track_message_topic_changes() line 11 at PERFORM"
+  },
+  {
+    "name": "captured_deadlock_7",
+    "queue": "background",
+    "wrapped": false,
+    "content": {
+      "kind": "import_history",
+      "since": null,
+      "last_message_id": 7498600,
+      "first_message_id": 7498501
+    },
+    "message": "deadlock detected\nDETAIL:  Process 2197829 waits for ShareLock on transaction 100401680; blocked by process 2197828.\nProcess 2197828 waits for ShareLock on transaction 100401651; blocked by process 2197829.\nHINT:  See server log for query details.\nCONTEXT:  while locking tuple (3,16) in relation \"bridge_zulip_v5_topics\""
+  },
+  {
+    "name": "captured_realtime_handler_deadlock",
+    "queue": "realtime",
+    "wrapped": true,
+    "content": {
+      "kind": "import_history",
+      "since": null,
+      "last_message_id": 8429784,
+      "first_message_id": 8429784
+    },
+    "message": "Deadlock found when trying to get lock. Original message: deadlock detected\nDETAIL:  Process 2200378 waits for ShareLock on transaction 100432000; blocked by process 2200408.\nProcess 2200408 waits for AccessExclusiveLock on tuple (0,3) of relation 2876153 of database 16387; blocked by process 2200421.\nProcess 2200421 waits for ShareLock on transaction 100436070; blocked by process 2200378.\nHINT:  See server log for query details.\nCONTEXT:  while locking tuple (3,24) in relation \"bridge_zulip_v5_topic_changes\"\nSQL function \"bridge_zulip_v5_mark_topic_changed\" statement 1\nSQL statement \"SELECT bridge_zulip_v5_mark_topic_changed(NEW.project_id, NEW.topic)\"\nPL/pgSQL function bridge_zulip_v5_track_message_topic_changes() line 11 at PERFORM",
+    "handler_message": "deadlock detected\nDETAIL:  Process 2200378 waits for ExclusiveLock on advisory lock [16387,3422601438,1659173557,1]; blocked by process 2200408.\nProcess 2200408 waits for AccessExclusiveLock on tuple (0,3) of relation 2876153 of database 16387; blocked by process 2200421.\nProcess 2200421 waits for ShareLock on transaction 100436070; blocked by process 2200378.\nHINT:  See server log for query details."
+  },
+  {
+    "name": "captured_background_handler_deadlock",
+    "queue": "background",
+    "wrapped": true,
+    "content": {
+      "kind": "import_history",
+      "since": null,
+      "last_message_id": 7489800,
+      "first_message_id": 7489701
+    },
+    "message": "Deadlock found when trying to get lock. Original message: deadlock detected\nDETAIL:  Process 2200410 waits for ShareLock on transaction 100438327; blocked by process 2200408.\nProcess 2200408 waits for ShareLock on transaction 100438320; blocked by process 2200410.\nHINT:  See server log for query details.\nCONTEXT:  while inserting index tuple (3,29) in relation \"bridge_zulip_v5_topic_changes\"\nSQL function \"bridge_zulip_v5_mark_topic_changed\" statement 1\nSQL statement \"SELECT bridge_zulip_v5_mark_topic_changed(NEW.project_id, NEW.topic)\"\nPL/pgSQL function bridge_zulip_v5_track_message_topic_changes() line 11 at PERFORM",
+    "handler_message": "deadlock detected\nDETAIL:  Process 2200410 waits for ExclusiveLock on advisory lock [16387,3422601438,1659173557,1]; blocked by process 2200408.\nProcess 2200408 waits for ShareLock on transaction 100438320; blocked by process 2200410.\nHINT:  See server log for query details."
+  }
+]

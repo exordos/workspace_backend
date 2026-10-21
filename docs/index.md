@@ -8,15 +8,24 @@ and diagram source trees have the same structure in every language.
 - [Deutsch](de/index.md)
 - [中文](zh/index.md)
 
+## Zulip message conversion examples
+
+[Open the rendered Zulip → Workspace Markdown comparison](zulip_messages_preview.html).
+The offline preview shows the source and expected converted messages side by
+side, including nested quotes, mentions, attachments, and unsupported features.
+
 ## Canonical machine-readable contracts
 
 OpenAPI documents are not translated: identifiers, schemas, enum values, paths,
 and protocol descriptions remain one canonical source of truth.
 
-- [Workspace Provider API v1](workspace_provider_api_v1.yaml)
-- [Workspace Provider API v2](workspace_provider_api_v2.yaml)
-- [Zulip Bridge Control API v1](zulip_bridge_control_api_v1.yaml)
-- [Zulip Bridge File API v1](zulip_bridge_file_api_v1.yaml)
+- [Workspace public API](public_workspace_api.yaml)
+
+External accounts contain their owner, provider and generic settings.
+Workspace does not process external chats, provider delivery or synchronization.
+Messages, streams and topics retain `source_name` and `source` as
+`native` and `{"kind":"native"}`. Architecture proposals below predate this
+cleanup; the generated public API describes the current supported contract.
 
 ## Translation contract
 

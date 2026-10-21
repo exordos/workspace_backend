@@ -3,6 +3,8 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
+import typing
+
 from gcl_iam import middlewares as iam_mw
 from restalchemy.api import applications
 from restalchemy.api import middlewares
@@ -11,7 +13,6 @@ from restalchemy.api.middlewares import logging as logging_mw
 from restalchemy.openapi import constants as openapi_constants
 from restalchemy.openapi import engines as openapi_engines
 from restalchemy.openapi import structures as openapi_structures
-from typing import Any
 
 from workspace import version as app_version
 from workspace.messenger_api.api import context as auth_context
@@ -28,7 +29,7 @@ WorkspaceApiApp.v1 = routes.route(app_routes.WorkspaceApiEndpointRoute)
 
 
 class WorkspaceOpenApiComponents(openapi_structures.OpenApiComponents):
-    def build(self, request: Any) -> dict[str, Any]:
+    def build(self, request: typing.Any) -> dict[str, typing.Any]:
         specification = super().build(request)
         specification["components"]["securitySchemes"] = {
             "bearerAuth": {
@@ -42,12 +43,18 @@ class WorkspaceOpenApiComponents(openapi_structures.OpenApiComponents):
 
 
 class WorkspaceOpenApiPaths(openapi_structures.OpenApiPaths):
-    def build(self, request: Any, components: Any) -> dict[str, Any]:
+    def build(
+        self, request: typing.Any, components: typing.Any
+    ) -> dict[str, typing.Any]:
         specification = super().build(request, components)
-        for path in specification["paths"].values():
-            for operation in path.values():
+        for path, operations in specification["paths"].items():
+            for operation in operations.values():
                 if isinstance(operation, dict) and "responses" in operation:
                     operation["security"] = [{"bearerAuth": []}]
+                    if path == "/v1/messenger/me/" or path.startswith(
+                        "/v1/messenger/users/"
+                    ):
+                        operation["deprecated"] = True
         specification = openapi_contract.add_collection_pagination_contract(
             specification,
             components,
@@ -77,20 +84,19 @@ class WorkspaceOpenApiPaths(openapi_structures.OpenApiPaths):
             "/v1/messenger/",
             components,
         )
-        specification = openapi_contract.add_external_bridge_public_contract(
-            specification,
-            "/v1/messenger/",
-            components,
-        )
         specification = openapi_contract.add_events_cursor_contract(
             specification,
             "/v1/events/",
             "/v1/epoch/",
             components,
         )
-        return openapi_contract.add_current_user_contract(
+        specification = openapi_contract.add_current_user_contract(
             specification,
             "/v1/me/",
+        )
+        return openapi_contract.add_current_user_contract(
+            specification,
+            "/v1/messenger/me/",
         )
 
 
@@ -112,7 +118,7 @@ def get_openapi_engine() -> openapi_engines.OpenApiEngine:
     )
 
 
-def build_wsgi_application(iam_engine_driver: Any) -> Any:
+def build_wsgi_application(iam_engine_driver: typing.Any) -> typing.Any:
     return middlewares.attach_middlewares(
         applications.OpenApiApplication(
             route_class=get_api_application(),
@@ -125,6 +131,7 @@ def build_wsgi_application(iam_engine_driver: Any) -> Any:
                 context_class=auth_context.WorkspaceMessengerAuthContext,
             ),
             app_middlewares.ServerSettingsMiddleware,
+            app_middlewares.DatabaseDeadlockRetryMiddleware,
             app_middlewares.ErrorsHandlerMiddleware,
             logging_mw.LoggingMiddleware,
         ],

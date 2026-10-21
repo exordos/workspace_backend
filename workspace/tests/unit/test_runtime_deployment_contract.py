@@ -39,9 +39,9 @@ def test_manifest_has_one_postgresql_messenger_runtime():
     assert all(value not in manifest for value in forbidden)
     assert "workspace_backend_config:" in manifest
     assert "name: workspace-backend" in manifest
-    assert "label: external-bridge-control" in manifest
+    assert "external-bridge-control" not in manifest
     assert "[messenger_files_s3]" in manifest
-    assert manifest.count("command: /usr/local/bin/workspace-bootstrap") >= 5
+    assert manifest.count("command: /usr/local/bin/workspace-bootstrap") >= 3
 
 
 def test_manifest_scales_s3_disk_size_by_core_profile():
@@ -110,20 +110,18 @@ def test_postgresql_runtime_has_bounded_connection_lifetimes():
             assert f"{name} = {value}" in config
 
 
-def test_messenger_runtime_has_two_workers_with_bounded_pool_budget():
+def test_workspace_runtime_has_two_workers_with_bounded_pool_budget():
     for config_path in (
         "etc/workspace/workspace.conf",
         "exordos/manifests/workspace.yaml.j2",
     ):
         config = _read(config_path)
-        messenger = config.split("[messenger_api]", 1)[1].split("[", 1)[0]
-        assert "workers = 2" in messenger
+        workspace = config.split("[workspace_api]", 1)[1].split("[", 1)[0]
+        assert "workers = 2" in workspace
         assert "connection_pool_max_size = 2" in config
 
-    messenger_source = _read("workspace/cmd/messenger_api.py")
-    provider_source = _read("workspace/cmd/external_bridge_api.py")
-    assert '"workspace-messenger-api"' in messenger_source
-    assert '"workspace-provider-control"' in provider_source
+    workspace_source = _read("workspace/cmd/workspace_api.py")
+    assert '"workspace-api"' in workspace_source
 
 
 def test_postgresql_runtime_has_import_scale_session_tuning():
@@ -146,15 +144,14 @@ def test_reaction_user_lists_have_bounded_runtime_defaults():
         assert "user_list_max_entries_per_message" not in config
 
 
-def test_compact_read_state_rollout_is_opt_in():
+def test_retired_compact_read_state_is_not_configured():
     for config_path in (
         "etc/workspace/workspace.conf",
         "exordos/manifests/workspace.yaml.j2",
     ):
         config = _read(config_path)
-        assert "read_state_compaction_enabled = false" in config
-        assert "read_state_cleanup_enabled = false" in config
-        assert "only after every Workspace API and worker" in config
+        assert "read_state_compaction_enabled" not in config
+        assert "read_state_cleanup_enabled" not in config
 
 
 def test_messenger_v2_projection_worker_is_explicitly_enabled():
@@ -169,45 +166,13 @@ def test_messenger_v2_projection_worker_is_explicitly_enabled():
         assert "v2_metrics_log_interval_seconds = 30" in config
 
 
-def test_manifest_provisions_unassigned_external_integration_roles():
+def test_manifest_provisions_only_generic_account_permissions():
     manifest = _read("exordos/manifests/workspace.yaml.j2")
-    account_permissions = {
-        "workspace.external_account.read",
-        "workspace.external_account.create",
-        "workspace.external_account.update",
-        "workspace.external_account.reconnect",
-        "workspace.external_account.disconnect",
-        "workspace.external_account.delete",
-    }
-    admin_permissions = {
-        "workspace.external_provider_policy.read",
-        "workspace.external_provider_policy.update",
-        "workspace.external_provider_policy.suspend",
-        "workspace.external_provider_policy.resume",
-        "workspace.external_provider_health.read",
-        "workspace.external_bridge_instance.read",
-        "workspace.external_bridge_instance.suspend",
-        "workspace.external_bridge_instance.resume",
-        "workspace.external_bridge_instance.revoke",
-    }
-
-    for permission in account_permissions | admin_permissions:
-        assert f'name: "{permission}"' in manifest
-    assert 'name: "workspace-external-integration"' in manifest
-    assert 'name: "workspace-external-integration-admin"' in manifest
+    for action in ("read", "create", "update", "delete"):
+        assert f'name: "workspace.external_account.{action}"' in manifest
+    assert "external_provider_policy" not in manifest
+    assert "external_bridge_instance" not in manifest
     assert "  $core.iam.rolebinding:" not in manifest
-    assert "  $core.iam.role_bindings:" not in manifest
-    assert "  $core.iam.permission_bindings:" not in manifest
-
-    bindings = manifest.split("  $core.iam.permissionbinding:\n", 1)[1].split(
-        "\n  $core.compute.nodes:", 1
-    )[0]
-    assert bindings.count(
-        "role: $core.iam.roles.$workspace_external_integration:uuid"
-    ) == len(account_permissions)
-    assert bindings.count(
-        "role: $core.iam.roles.$workspace_external_integration_admin:uuid"
-    ) == len(admin_permissions)
 
 
 def test_manifest_provisions_topic_summary_admin_and_encryption_secret():
@@ -288,3 +253,22 @@ def test_event_retention_migration_follows_canonical_schema_directly():
 
     assert "0109-add-scalable-Messenger-visibility-views-0ae35f.py" in migration
     assert "canonical-import-ledger" not in migration
+
+
+def test_only_workspace_rest_service_is_deployed():
+    for relative_path in (
+        "pyproject.toml",
+        "etc/workspace/workspace.conf",
+        "exordos/manifests/workspace.yaml.j2",
+        "exordos/images/backend-install.sh",
+        "exordos/images/workspace-restart-services.sh",
+    ):
+        source = _read(relative_path)
+        assert "workspace-messenger-api" not in source
+        assert "[messenger_api]" not in source
+        assert "21081" not in source
+
+    manifest = _read("exordos/manifests/workspace.yaml.j2")
+    assert "location /api/workspace/v1/messenger/" not in manifest
+    assert "proxy_pass http://127.0.0.1:21084/;" in manifest
+    assert "proxy_pass http://127.0.0.1:21082/v1/events/ws;" in manifest

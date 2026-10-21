@@ -15,8 +15,6 @@
 #    under the License.
 
 import collections.abc
-import re
-import uuid as sys_uuid
 
 from restalchemy.dm import properties
 from restalchemy.dm import types
@@ -41,16 +39,6 @@ class MarkdownPayload(types_dynamic.AbstractKindModel):
         types.String(min_length=1, max_length=MARKDOWN_CONTENT_MAX_LENGTH),
         required=True,
     )
-
-    def is_user_mentioned(self, user_uuid: sys_uuid.UUID) -> bool:
-        return (
-            re.search(
-                r"\]\(urn:user:" + re.escape(str(user_uuid)) + r"\)",
-                self.content,
-                flags=re.IGNORECASE,
-            )
-            is not None
-        )
 
 
 class E2EEPayload(types_dynamic.AbstractKindModel):

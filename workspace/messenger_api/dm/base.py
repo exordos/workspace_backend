@@ -17,6 +17,7 @@
 import enum
 import random
 import typing
+import uuid as sys_uuid
 
 from restalchemy.common import exceptions as ra_exc
 from restalchemy.dm import models
@@ -24,6 +25,7 @@ from restalchemy.dm import properties
 from restalchemy.dm import types
 from restalchemy.dm import types_dynamic
 
+from workspace.common import models as common_models
 from workspace.messenger_api.dm import message_payloads
 
 
@@ -57,38 +59,27 @@ class Color(types.Integer):
         return super().to_openapi_spec(prop_kwargs)
 
 
-class ZulipSource(types_dynamic.AbstractKindModel):
-    KIND = "zulip"
-
-    stream_id = properties.property(
-        types.Integer(min_value=0, max_value=2**31 - 1),
-        required=True,
-    )
-    server_url = properties.property(
-        types.AllowNone(types.String(max_length=2048)),
-        default=None,
-    )
-    source_scope = properties.property(
-        types.AllowNone(types.String(max_length=2048)),
-        default=None,
-    )
-    topic_name = properties.property(
-        types.AllowNone(types.String(max_length=128)),
-        default=None,
-    )
-    message_id = properties.property(
-        types.AllowNone(types.Integer(min_value=0, max_value=2**63 - 1)),
-        default=None,
-    )
-
-
 class NativeSource(types_dynamic.AbstractKindModel):
     KIND = "native"
 
 
+class ZulipSource(types_dynamic.AbstractKindModel):
+    KIND = "zulip"
+
+
 class SourceName(str, enum.Enum):
-    ZULIP = ZulipSource.KIND
     NATIVE = NativeSource.KIND
+    ZULIP = ZulipSource.KIND
+
+
+class StreamSourceName(str, enum.Enum):
+    NATIVE = NativeSource.KIND
+    ZULIP = ZulipSource.KIND
+
+
+class TopicSourceName(str, enum.Enum):
+    NATIVE = NativeSource.KIND
+    ZULIP = ZulipSource.KIND
 
 
 def native_source() -> NativeSource:
@@ -102,8 +93,22 @@ class WorkspaceSourceBase(models.Model):
     )
     source = properties.property(
         types_dynamic.KindModelSelectorType(
-            types_dynamic.KindModelType(ZulipSource),
             types_dynamic.KindModelType(NativeSource),
+            types_dynamic.KindModelType(ZulipSource),
+        ),
+        default=native_source,
+    )
+
+
+class WorkspaceTopicSourceBase(WorkspaceSourceBase):
+    source_name = properties.property(
+        types.Enum([source.value for source in TopicSourceName]),
+        default=SourceName.NATIVE.value,
+    )
+    source = properties.property(
+        types_dynamic.KindModelSelectorType(
+            types_dynamic.KindModelType(NativeSource),
+            types_dynamic.KindModelType(ZulipSource),
         ),
         default=native_source,
     )
@@ -245,7 +250,7 @@ class WorkspaceTopicNotificationMode(str, enum.Enum):
 class WorkspaceStreamBase(
     models.ModelWithUUID,
     models.ModelWithProject,
-    models.ModelWithRequiredNameDesc,
+    common_models.ModelWithRequiredNameDesc,
     models.ModelWithTimestamp,
 ):
     user_uuid = properties.property(
@@ -253,13 +258,13 @@ class WorkspaceStreamBase(
         required=True,
     )
     source_name = properties.property(
-        types.Enum([source.value for source in SourceName]),
+        types.Enum([source.value for source in StreamSourceName]),
         required=True,
     )
     source = properties.property(
         types_dynamic.KindModelSelectorType(
-            types_dynamic.KindModelType(ZulipSource),
             types_dynamic.KindModelType(NativeSource),
+            types_dynamic.KindModelType(ZulipSource),
         ),
         required=True,
     )
@@ -296,10 +301,21 @@ class WorkspaceStreamBase(
         default=None,
     )
 
+    @staticmethod
+    def validate_private_identity(
+        private: bool, direct_user_uuid: sys_uuid.UUID | None
+    ) -> None:
+        if private and direct_user_uuid is None:
+            raise ra_exc.ValidationErrorException()
+
+    def validate(self) -> None:
+        super().validate()
+        self.validate_private_identity(self.private, self.direct_user_uuid)
+
 
 class WorkspaceStreamEncryptionCreation(models.Model):
     source_name = properties.property(
-        types.Enum([source.value for source in SourceName]),
+        types.Enum([source.value for source in StreamSourceName]),
         default=SourceName.NATIVE.value,
     )
     encryption = properties.property(StrictBoolean(), default=False)
@@ -311,13 +327,13 @@ class WorkspaceStreamEncryptionCreation(models.Model):
         super().validate()
         if self.encryption != (self.current_encryption_key_uuid is not None):
             raise ra_exc.ValidationErrorException()
-        if self.encryption and self.source_name == SourceName.ZULIP.value:
+        if self.encryption and self.source_name == "zulip":
             raise ra_exc.ValidationErrorException()
 
 
 class WorkspaceUserStreamBase(
     UserScopedModelWithUUID,
-    models.ModelWithRequiredNameDesc,
+    common_models.ModelWithRequiredNameDesc,
     models.ModelWithProject,
     models.ModelWithTimestamp,
 ):
@@ -352,13 +368,13 @@ class WorkspaceUserStreamBase(
         default=0,
     )
     source_name = properties.property(
-        types.Enum([source.value for source in SourceName]),
+        types.Enum([source.value for source in StreamSourceName]),
         required=True,
     )
     source = properties.property(
         types_dynamic.KindModelSelectorType(
-            types_dynamic.KindModelType(ZulipSource),
             types_dynamic.KindModelType(NativeSource),
+            types_dynamic.KindModelType(ZulipSource),
         ),
         required=True,
     )
@@ -407,10 +423,7 @@ class WorkspaceUserStreamBase(
 
     @staticmethod
     def validate_message_kind(source_name: str, kind: str) -> None:
-        if (
-            source_name == SourceName.ZULIP.value
-            and kind == message_payloads.E2EEPayload.KIND
-        ):
+        if source_name == "zulip" and kind == message_payloads.E2EEPayload.KIND:
             raise ra_exc.ValidationErrorException()
 
     def validate_message_creation(self, kind: str) -> None:

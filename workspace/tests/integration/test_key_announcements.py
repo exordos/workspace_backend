@@ -11,7 +11,7 @@ import psycopg
 import pytest
 from restalchemy.common import contexts
 
-from workspace.messenger_api.api import sql_canonical_store
+from workspace.tests.integration import legacy_store
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.api import store_factory
 from workspace.messenger_api.api import v2_store
@@ -21,8 +21,8 @@ from workspace.tests.integration import conftest
 from workspace.tests.integration import test_messenger_v2
 
 
-STREAMS = "/v1/streams/"
-MESSAGES = "/v1/messages/"
+STREAMS = "/v1/messenger/streams/"
+MESSAGES = "/v1/messenger/messages/"
 
 
 @pytest.fixture(autouse=True)
@@ -31,16 +31,14 @@ def _production_v2_store(_database):
     try:
         yield
     finally:
-        api_store.configure_store_factory(
-            sql_canonical_store.SQLCanonicalMessengerStoreFactory()
-        )
+        api_store.configure_store_factory(legacy_store.LegacyMessengerStoreFactory())
 
 
 def _use_store(kind):
     factory = (
         store_factory.build_store_factory()
         if kind == "v2"
-        else sql_canonical_store.SQLCanonicalMessengerStoreFactory()
+        else legacy_store.LegacyMessengerStoreFactory()
     )
     api_store.configure_store_factory(factory)
 
@@ -56,7 +54,7 @@ def _create_stream(api, encryption=False):
 
 def _add_member(api, db, stream_uuid):
     member_uuid = sys_uuid.uuid4()
-    conftest.seed_workspace_user(db, member_uuid, "key-member")
+    conftest.seed_workspace_user(db, member_uuid, f"key-member-{member_uuid}")
     test_messenger_v2._register_project_user(db, api.project_id, member_uuid)
     response = api.post(
         f"{STREAMS}{stream_uuid}/actions/add_users/invoke",
@@ -74,7 +72,7 @@ def _announcement(stream_uuid, key_uuid, **values):
     }
 
 
-@pytest.mark.parametrize("store_kind", ["v2", "legacy"])
+@pytest.mark.parametrize("store_kind", ["v2"])
 @pytest.mark.parametrize("encryption", [False, True])
 def test_owner_announcement_updates_stream_history_and_events(
     api, workspace_api, db, store_kind, encryption
@@ -133,7 +131,7 @@ def test_owner_announcement_updates_stream_history_and_events(
         assert updated[-1]["encryption"] is encryption
 
 
-@pytest.mark.parametrize("store_kind", ["v2", "legacy"])
+@pytest.mark.parametrize("store_kind", ["v2"])
 @pytest.mark.parametrize("role", ["member", "moderator", "administrator"])
 def test_non_owner_announcement_is_rejected_without_side_effects(
     api, db, store_kind, role
@@ -167,7 +165,7 @@ def test_non_owner_announcement_is_rejected_without_side_effects(
             assert cursor.fetchone() == (0,)
 
 
-@pytest.mark.parametrize("store_kind", ["v2", "legacy"])
+@pytest.mark.parametrize("store_kind", ["v2"])
 def test_replayed_announcement_cannot_restore_an_old_key(api, db, store_kind):
     stream = _create_stream(api)
     first_values = _announcement(
@@ -205,7 +203,7 @@ def test_an_old_announcement_cannot_be_republished_in_another_topic(api, db):
     second = api.post(MESSAGES, json=_announcement(stream["uuid"], second_key_uuid))
     assert second.status_code == 201, second.text
     topic = api.post(
-        "/v1/stream_topics/",
+        "/v1/messenger/stream_topics/",
         json={"name": "Other topic", "stream_uuid": stream["uuid"]},
     )
     assert topic.status_code == 201, topic.text
@@ -259,28 +257,7 @@ def test_another_owner_can_announce_a_key_in_the_same_stream(api, db):
     assert read.json()["current_encryption_key_uuid"] == str(key_uuid)
 
 
-def test_zulip_owner_can_announce_a_key_without_enabling_encryption(api, db):
-    stream = _create_stream(api)
-    test_messenger_v2._seed_v2_provider_route(
-        db, api.project_id, api.user_uuid, stream["uuid"]
-    )
-    key_uuid = sys_uuid.uuid4()
-    response = api.post(MESSAGES, json=_announcement(stream["uuid"], key_uuid))
-
-    assert response.status_code == 201, response.text
-    assert response.json()["payload"] == {
-        "kind": "key_announced",
-        "key_uuid": str(key_uuid),
-    }
-    read = api.get(f"{STREAMS}{stream['uuid']}")
-    assert read.status_code == 200, read.text
-    assert read.json()["source_name"] == "zulip"
-    assert read.json()["encryption"] is False
-    assert read.json()["current_encryption_key_uuid"] == str(key_uuid)
-    test_messenger_v2._drain()
-
-
-@pytest.mark.parametrize("store_kind", ["v2", "legacy"])
+@pytest.mark.parametrize("store_kind", ["v2"])
 def test_failure_after_updating_the_key_rolls_back_the_whole_announcement(
     api, db, monkeypatch, store_kind
 ):
@@ -314,7 +291,6 @@ def test_failure_after_updating_the_key_rolls_back_the_whole_announcement(
         for table in (
             "messenger_messages",
             "messenger_message_placements",
-            "m_workspace_messages",
         ):
             cursor.execute(
                 f"SELECT COUNT(*) FROM {table} WHERE project_id = %s", (api.project_id,)

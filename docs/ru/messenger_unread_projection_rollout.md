@@ -1,5 +1,10 @@
 # Messenger нечитаемая проекция обновления и обратного отвода
 
+> Historical reference: the rolling compatibility tables and compact read-state
+> maintenance were retired by migration `0231`. See
+> [the current cutover procedure](messenger_domain_model.md#retiring-the-compatibility-schema).
+
+
 В данном руководстве применяется коррекция плана запроса, введенная миграцией
 `0149-split-messenger-unread-read-state-branches-c84ae9.py`.
 заменяет определения вида; не переписывает сообщения или данные состояния чтения.

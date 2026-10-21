@@ -1,10 +1,12 @@
 # Workspace Messenger 建筑
 
+Historical reference. This page describes the retired private bridge HTTP and mTLS/HPKE design. The current backend has no private bridge listener.
+
 本文档定义了当前Workspace后端服务的边界和
 浏览器合同仍然存在
 [`workspace_api.md`](workspace_api.md)个人提供商数据平面是
 定义为
-[`workspace_provider_api_v1.yaml`](../workspace_provider_api_v1.yaml),以及
+`workspace_provider_api_v1.yaml`,以及
 实时客户端行为记录在
 [`workspace_ui_realtime_integration.md`](workspace_ui_realtime_integration.md).
 

@@ -344,3 +344,37 @@ batch. 一个批次具有短交易; root 存储 cursor/count/status.
 唯一的正规名单是
 [`messenger_architecture_inventory.md`](messenger_architecture_inventory.md#единственный-список-open-решений).
 这个文档只保存已接受的域名变量.
+
+## Retiring the compatibility schema
+
+Migration `0231-Retire-duplicate-Messenger-compatibility-tables-bc9678.py` completes
+storage cutover to Messenger v2. It removes the duplicate message, placement,
+stream, topic, folder, reaction, and per-user flag tables under the old
+`m_workspace_*` and `m_folder*` names, together with the compact read-state
+bitmaps, statistics, and rolling mirror/import triggers. Public message aliases
+remain in `messenger_message_placements.legacy_public_uuid`.
+
+Requests, Zulip membership reconciliation, topic summaries, file visibility,
+drafts, and events use canonical Messenger tables and views. Existing v2 viewer
+state remains authoritative. Missing viewer states are recovered from retained
+legacy flags, bitmap reads, and mentions before those sources are removed.
+Files, drafts, summary jobs, and the summary journal retain their rows and gain
+foreign keys to canonical streams, topics, placements, and memberships.
+
+This migration requires a coordinated cutover. Stop every API, Messenger
+worker, and Zulip worker that can write the database, and make a verified
+PostgreSQL backup before applying it. Deploy the matching application revision
+before starting the writers again. Mixed old/new writers and rollback to the
+old application are unsupported after this migration; recovery requires the
+pre-cutover database backup and matching application revision.
+
+```bash
+.tox/develop/bin/ra-apply-migration --config-file etc/workspace/workspace.conf --path migrations --migration 0231-Retire-duplicate-Messenger-compatibility-tables-bc9678.py
+```
+
+The migration aborts atomically if an old message or container has no canonical
+projection. Resolve that difference before retrying; do not bypass the gate or
+delete the unmatched source rows. Tables that still own unique data, including
+`m_workspace_users`, `m_workspace_files`, `m_workspace_events`,
+`m_workspace_drafts`, external accounts, and summary configuration/history,
+are retained.

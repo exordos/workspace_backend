@@ -21,7 +21,8 @@ import uuid as sys_uuid
 from restalchemy.api import routes as ra_routes
 import webob
 
-from workspace.messenger_api.api import app
+from workspace.workspace_api.api import app
+from workspace.workspace_api.api import routes as workspace_routes
 from workspace.messenger_api.api import controllers
 from workspace.messenger_api.api import middlewares
 from workspace.messenger_api.api import routes
@@ -106,31 +107,6 @@ ROUTE_MANIFEST = {
             ra_routes.DELETE,
         },
     ),
-    "external_chats": (
-        routes.ExternalChatRoute,
-        controllers.ExternalChatController,
-        {ra_routes.FILTER, ra_routes.GET},
-    ),
-    "external_operations": (
-        routes.ExternalOperationRoute,
-        controllers.ExternalOperationController,
-        {ra_routes.FILTER, ra_routes.GET, ra_routes.DELETE},
-    ),
-    "external_bridge_instances": (
-        routes.ExternalBridgeInstanceRoute,
-        controllers.ExternalBridgeInstanceController,
-        {ra_routes.FILTER, ra_routes.GET},
-    ),
-    "external_provider_policies": (
-        routes.ExternalProviderPolicyRoute,
-        controllers.ExternalProviderPolicyController,
-        {ra_routes.GET, ra_routes.UPDATE},
-    ),
-    "external_provider_health": (
-        routes.ExternalProviderHealthRoute,
-        controllers.ExternalProviderHealthController,
-        {ra_routes.GET},
-    ),
     "topic_summary_endpoints": (
         routes.TopicSummaryEndpointRoute,
         controllers.TopicSummaryEndpointController,
@@ -183,50 +159,6 @@ ROUTE_MANIFEST = {
 
 
 ACTION_MANIFEST = {
-    (routes.ExternalAccountRoute, "reconnect"): (
-        controllers.ExternalAccountController,
-        True,
-    ),
-    (routes.ExternalAccountRoute, "disconnect"): (
-        controllers.ExternalAccountController,
-        True,
-    ),
-    (routes.ExternalChatRoute, "select"): (
-        controllers.ExternalChatController,
-        True,
-    ),
-    (routes.ExternalChatRoute, "deselect"): (
-        controllers.ExternalChatController,
-        True,
-    ),
-    (routes.ExternalChatRoute, "move"): (
-        controllers.ExternalChatController,
-        True,
-    ),
-    (routes.ExternalOperationRoute, "retry"): (
-        controllers.ExternalOperationController,
-        True,
-    ),
-    (routes.ExternalBridgeInstanceRoute, "suspend"): (
-        controllers.ExternalBridgeInstanceController,
-        True,
-    ),
-    (routes.ExternalBridgeInstanceRoute, "resume"): (
-        controllers.ExternalBridgeInstanceController,
-        True,
-    ),
-    (routes.ExternalBridgeInstanceRoute, "revoke"): (
-        controllers.ExternalBridgeInstanceController,
-        True,
-    ),
-    (routes.ExternalProviderPolicyRoute, "suspend"): (
-        controllers.ExternalProviderPolicyController,
-        True,
-    ),
-    (routes.ExternalProviderPolicyRoute, "resume"): (
-        controllers.ExternalProviderPolicyController,
-        True,
-    ),
     (routes.FolderItemRoute, "pin"): (
         controllers.FolderItemController,
         True,
@@ -303,18 +235,22 @@ ACTION_MANIFEST = {
 
 
 def test_messenger_v1_route_and_method_manifest_is_preserved():
-    assert app.MessengerApiApp.v1 is routes.ApiEndpointRoute
-    assert set(routes.ApiEndpointRoute.__allow_methods__) == {ra_routes.FILTER}
+    assert app.WorkspaceApiApp.v1 is workspace_routes.WorkspaceApiEndpointRoute
+    assert set(workspace_routes.MessengerRoute.__allow_methods__) == {ra_routes.FILTER}
 
     root_routes = {
         name
-        for name, value in routes.ApiEndpointRoute.__dict__.items()
+        for name, value in workspace_routes.MessengerRoute.__dict__.items()
         if inspect.isclass(value) and issubclass(value, ra_routes.Route)
     }
     assert root_routes == set(ROUTE_MANIFEST)
 
     for name, (route_class, controller_class, methods) in ROUTE_MANIFEST.items():
-        assert getattr(routes.ApiEndpointRoute, name) is route_class
+        assert getattr(workspace_routes.MessengerRoute, name) is route_class
+        if name in {"users", "me"}:
+            assert (
+                getattr(workspace_routes.WorkspaceApiEndpointRoute, name) is route_class
+            )
         assert route_class.__controller__ is controller_class
         assert set(route_class.__allow_methods__) == methods
 
@@ -328,7 +264,7 @@ def test_messenger_action_manifest_is_preserved():
 
 
 def test_server_settings_origin_path_and_fields_are_preserved():
-    assert middlewares.SERVER_SETTINGS_PATH == "/v1/server_settings"
+    assert middlewares.SERVER_SETTINGS_PATH == "/v1/messenger/server_settings"
     request = webob.Request.blank(
         middlewares.SERVER_SETTINGS_PATH,
         base_url="http://127.0.0.1:3000",
@@ -414,7 +350,7 @@ def test_file_upload_openapi_keeps_required_multipart_contract():
             "type": "string",
         },
         "name": {"type": "string"},
-        "description": {"type": "string"},
+        "description": {"type": "string", "maxLength": 10000},
     }
 
 

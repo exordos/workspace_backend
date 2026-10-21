@@ -57,7 +57,9 @@ def test_markdown_structure_and_machine_values_are_identical():
         for language in LANGUAGES[1:]:
             translated_path = DOCS_ROOT / language / relative
             assert _markdown_contract(translated_path) == expected
-            assert machine_values <= set(INLINE_CODE_RE.findall(translated_path.read_text()))
+            assert machine_values <= set(
+                INLINE_CODE_RE.findall(translated_path.read_text())
+            )
 
 
 def test_each_plantuml_source_has_a_rendered_svg():
@@ -67,12 +69,7 @@ def test_each_plantuml_source_has_a_rendered_svg():
 
 
 def test_machine_readable_contracts_have_one_canonical_copy():
-    expected = {
-        "workspace_provider_api_v1.yaml",
-        "workspace_provider_api_v2.yaml",
-        "zulip_bridge_control_api_v1.yaml",
-        "zulip_bridge_file_api_v1.yaml",
-    }
+    expected = {"public_workspace_api.yaml"}
 
     assert {path.name for path in DOCS_ROOT.glob("*.yaml")} == expected
     for language in LANGUAGES:
@@ -83,7 +80,9 @@ def test_local_documentation_links_resolve():
     failures = []
     for markdown in DOCS_ROOT.rglob("*.md"):
         for destination in LINK_RE.findall(markdown.read_text()):
-            if destination.startswith(("http://", "https://", "mailto:", "urn:", "#", "/")):
+            if destination.startswith(
+                ("http://", "https://", "mailto:", "urn:", "#", "/")
+            ):
                 continue
             path = destination.split("#", 1)[0]
             if path and not (markdown.parent / path).resolve().exists():

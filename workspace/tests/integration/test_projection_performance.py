@@ -8,13 +8,14 @@ import itertools
 import json
 import threading
 import time
+import types
 import uuid as sys_uuid
 
 import psycopg
 import pytest
 from restalchemy.common import contexts
 
-from workspace.messenger_api.api import sql_canonical_store
+from workspace.tests.integration import legacy_store
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.api import store_factory
 from workspace.services.messenger_workers import v2_projection
@@ -22,9 +23,9 @@ from workspace.tests.integration import conftest
 
 
 V1 = "/v1"
-STREAMS = f"{V1}/streams/"
-MESSAGES = f"{V1}/messages/"
-MESSAGE_REACTIONS = f"{V1}/message_reactions/"
+STREAMS = f"{V1}/messenger/streams/"
+MESSAGES = f"{V1}/messenger/messages/"
+MESSAGE_REACTIONS = f"{V1}/messenger/message_reactions/"
 
 
 @pytest.fixture(autouse=True)
@@ -33,9 +34,7 @@ def _production_v2_store():
     try:
         yield
     finally:
-        api_store.configure_store_factory(
-            sql_canonical_store.SQLCanonicalMessengerStoreFactory()
-        )
+        api_store.configure_store_factory(legacy_store.LegacyMessengerStoreFactory())
 
 
 @pytest.fixture(autouse=True)
@@ -124,6 +123,180 @@ def _plan_nodes(plan):
     yield plan
     for child in plan.get("Plans", []):
         yield from _plan_nodes(child)
+
+
+@pytest.mark.parametrize("scope_kind", ["user-stream", "user-topic"])
+def test_old_scope_preview_does_not_scan_unrelated_project_history(
+    api, db, monkeypatch, scope_kind
+):
+    stream, message = _create_message(api, "old-preview-target")
+    noise_stream, _noise_message = _create_message(api, "recent-preview-noise")
+    monkeypatch.setattr(v2_projection, "PREVIEW_CANDIDATE_LIMIT", 32)
+    db.execute(
+        "UPDATE messenger_messages SET created_at='2020-01-01' "
+        "WHERE project_id=%s AND uuid=(SELECT message_uuid FROM messenger_message_placements WHERE project_id=%s AND uuid=%s)",
+        (api.project_id, api.project_id, message["uuid"]),
+    )
+    db.execute(
+        "UPDATE messenger_message_placements SET created_at='2020-01-01' WHERE project_id=%s AND uuid=%s",
+        (api.project_id, message["uuid"]),
+    )
+    db.execute(
+        """
+        WITH messages AS (
+            INSERT INTO messenger_messages
+                (uuid,project_id,author_uuid,payload,source_name,source,created_at)
+            SELECT gen_random_uuid(),%s,%s,
+                   '{"kind":"markdown","content":"Recent unrelated message"}'::jsonb,
+                   'native','{"kind":"native"}'::jsonb,
+                   NOW()+number*interval '1 millisecond'
+            FROM generate_series(1,20000) AS input(number)
+            RETURNING uuid,project_id,created_at
+        ), placements AS (
+            INSERT INTO messenger_message_placements
+                (uuid,project_id,message_uuid,stream_uuid,topic_uuid,created_at)
+            SELECT gen_random_uuid(),project_id,uuid,%s,%s,created_at FROM messages
+            RETURNING uuid,project_id
+        ), access AS (
+            INSERT INTO messenger_user_message_bindings
+                (uuid,project_id,placement_uuid,user_uuid,membership_generation,
+                 relation_role,visibility,permissions)
+            SELECT gen_random_uuid(),project_id,uuid,%s,1,'author','visible','{}'::jsonb
+            FROM placements
+            RETURNING uuid,project_id,placement_uuid,user_uuid,membership_generation
+        )
+        INSERT INTO messenger_user_message_states
+            (uuid,project_id,placement_uuid,user_uuid,membership_generation,binding_uuid,read_at)
+        SELECT gen_random_uuid(),project_id,placement_uuid,user_uuid,membership_generation,uuid,NOW()
+        FROM access
+        """,
+        (
+            api.project_id,
+            api.user_uuid,
+            noise_stream["uuid"],
+            noise_stream["default_topic_uuid"],
+            api.user_uuid,
+        ),
+    )
+    for table in (
+        "messenger_messages",
+        "messenger_message_placements",
+        "messenger_user_message_states",
+        "messenger_user_message_bindings",
+    ):
+        db.execute(f"ANALYZE {table}")
+
+    snapshots = []
+    with contexts.Context().session_manager() as session:
+
+        def execute(query, parameters=None):
+            if query.lstrip().startswith("WITH unread AS"):
+                snapshots.append((query, parameters))
+            return session.execute(query, parameters)
+
+        v2_projection._refresh_recipient_counters(
+            types.SimpleNamespace(execute=execute),
+            api.project_id,
+            sys_uuid.UUID(stream["uuid"]),
+            sys_uuid.UUID(stream["default_topic_uuid"]),
+            [api.user_uuid],
+            scope_kind,
+        )
+    table, column, scope_uuid = (
+        ("messenger_stream_bindings", "stream_uuid", stream["uuid"])
+        if scope_kind == "user-stream"
+        else (
+            "messenger_user_topic_bindings",
+            "topic_uuid",
+            stream["default_topic_uuid"],
+        )
+    )
+    assert db.execute(
+        f"SELECT last_message_uuid FROM {table} WHERE project_id=%s AND {column}=%s AND user_uuid=%s",
+        (api.project_id, scope_uuid, api.user_uuid),
+    ).fetchone() == (sys_uuid.UUID(message["uuid"]),)
+    ((query, parameters),) = snapshots
+    plan = db.execute(
+        "EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) " + query, parameters
+    ).fetchone()[0][0]
+    examined_project_messages = sum(
+        node["Actual Rows"] * node["Actual Loops"]
+        for node in _plan_nodes(plan["Plan"])
+        if node.get("Relation Name") == "messenger_messages"
+    )
+    assert examined_project_messages <= v2_projection.PREVIEW_CANDIDATE_LIMIT + 4
+
+
+@pytest.mark.parametrize("scope_kind", ["user-stream", "user-topic"])
+def test_old_scope_preview_preserves_visibility_dates_and_uuid_ties(
+    api, db, monkeypatch, scope_kind
+):
+    stream, original = _create_message(api, "preview-visibility-target")
+    messages = []
+    for label in ("visible-a", "visible-b", "hidden", "old-generation", "deleted"):
+        response = api.post(
+            MESSAGES,
+            json={
+                "stream_uuid": stream["uuid"],
+                "topic_uuid": stream["default_topic_uuid"],
+                "payload": {"kind": "markdown", "content": label},
+            },
+        )
+        assert response.status_code == 201, response.text
+        messages.append(sys_uuid.UUID(response.json()["uuid"]))
+        _drain()
+    _create_message(api, "preview-visibility-noise")
+    monkeypatch.setattr(v2_projection, "PREVIEW_CANDIDATE_LIMIT", 1)
+    for position, placement_uuid in enumerate(messages):
+        db.execute(
+            "UPDATE messenger_messages SET created_at='2020-01-01'::timestamptz+%s*interval '1 day' "
+            "WHERE project_id=%s AND uuid=(SELECT message_uuid FROM messenger_message_placements WHERE project_id=%s AND uuid=%s)",
+            (max(1, position), api.project_id, api.project_id, placement_uuid),
+        )
+    db.execute(
+        "UPDATE messenger_user_message_bindings SET visibility='hidden' "
+        "WHERE project_id=%s AND placement_uuid=ANY(%s::uuid[])",
+        (api.project_id, [sys_uuid.UUID(original["uuid"]), messages[2]]),
+    )
+    for table in ("messenger_user_message_states", "messenger_user_message_bindings"):
+        db.execute(
+            f"UPDATE {table} SET membership_generation=2 WHERE project_id=%s AND placement_uuid=%s",
+            (api.project_id, messages[3]),
+        )
+    db.execute(
+        "UPDATE messenger_messages SET deleted_at=NOW() "
+        "WHERE project_id=%s AND uuid=(SELECT message_uuid FROM messenger_message_placements WHERE project_id=%s AND uuid=%s)",
+        (api.project_id, api.project_id, messages[4]),
+    )
+    table, column, scope_uuid = (
+        ("messenger_stream_bindings", "stream_uuid", stream["uuid"])
+        if scope_kind == "user-stream"
+        else (
+            "messenger_user_topic_bindings",
+            "topic_uuid",
+            stream["default_topic_uuid"],
+        )
+    )
+    for expected in (*sorted(messages[:2], reverse=True), None):
+        with contexts.Context().session_manager() as session:
+            v2_projection._refresh_recipient_counters(
+                session,
+                api.project_id,
+                sys_uuid.UUID(stream["uuid"]),
+                sys_uuid.UUID(stream["default_topic_uuid"]),
+                [api.user_uuid],
+                scope_kind,
+            )
+        assert db.execute(
+            f"SELECT last_message_uuid FROM {table} WHERE project_id=%s AND {column}=%s AND user_uuid=%s",
+            (api.project_id, scope_uuid, api.user_uuid),
+        ).fetchone() == (expected,)
+        if expected is not None:
+            db.execute(
+                "UPDATE messenger_user_message_bindings SET visibility='hidden' "
+                "WHERE project_id=%s AND placement_uuid=%s",
+                (api.project_id, expected),
+            )
 
 
 def test_reaction_snapshot_uses_message_scoped_covering_index(api, db):
@@ -520,7 +693,7 @@ def test_concurrent_reaction_workers_keep_one_exact_snapshot(api, db, monkeypatc
     assert actually_claimed <= 2
     snapshot = api.get(f"{MESSAGES}{message['uuid']}").json()
     assert snapshot["reactions"] == {
-        "check": 1,
+        "check_mark_button": 1,
         "eyes": 1,
         "heart": 1,
         "rocket": 1,

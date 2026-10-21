@@ -1,10 +1,9 @@
 # Workspace v1 API
 
-Dieses Dokument beschreibt den browser-orientierten API Vertrag, der von nginx aus
-die aufbewahrten `workspace-messenger-api`, die gemeinsamen `workspace-api` und die
-- Ich bin ein Freund .`workspace-messenger-events`Websocket-Dienstleistung.Messenger
-Anfragen verwenden den dedizierten Messenger Prozess; gemeinsame Benutzer, Kundenservice
-Einstellungen, Registrierungen von Push-Geräten und REST Ereignisse verwenden `workspace-api`.
+This document describes the browser-facing API contract served by the unified
+`workspace-api` REST service and the companion `workspace-messenger-events`
+websocket service. Messenger resources, users, client service settings,
+push-device registrations, and REST events all use `workspace-api`.
 Alleine Mail, Kalender und Externe Benutzer Endpunkte sind nicht Teil dieser
 Anbieter-neutrale externe Konten, Chat, Betrieb, Richtlinien, Gesundheit,
 und Brückeninstanzressourcen sind Teil derMessenger API.
@@ -18,11 +17,11 @@ die Anbieteridentität ohne Browserwechsel bewahren API.
 Direktes örtliches Angebot:
 
 ```text
-Messenger REST API:  http://127.0.0.1:21081/v1
+Messenger REST API:  http://127.0.0.1:21084/v1/messenger
 Events WebSocket:    ws://127.0.0.1:21082/v1/events/ws
 Workspace REST API:  http://127.0.0.1:21084/v1
 Worker:              workspace-messenger-worker
-Messenger OpenAPI:   http://127.0.0.1:21081/specifications/3.0.3
+History importer:    workspace-history-import
 Workspace OpenAPI:   http://127.0.0.1:21084/specifications/3.0.3
 ```
 
@@ -38,11 +37,11 @@ Events WebSocket:    /api/workspace/v1/events/ws?last_epoch_version=<number>&epo
 OpenAPI spec:        /api/workspace/specifications/3.0.3
 ```
 
-`/api/workspace/v1/messenger/` ist an die gespeicherte Messenger REST
-Dienst am `127.0.0.1:21081`; der Rest von `/api/workspace/` wird durch
-der Workspace REST-Dienst am `127.0.0.1:21084`.
-Der genaue nginx-Standort `/api/workspace/v1/events/ws` ist dem
-Websocket-Dienst-Endpunkt `/v1/events/ws` auf `127.0.0.1:21082`.
+All REST requests under `/api/workspace/`, including
+`/api/workspace/v1/messenger/`, are proxied to `workspace-api` on
+`127.0.0.1:21084` without changing the public URL structure. The exact nginx
+location `/api/workspace/v1/events/ws` is proxied to the websocket service
+endpoint `/v1/events/ws` on `127.0.0.1:21082`.
 
 Das Backend-Nginx-Manifest setzt `client_max_body_size 50m` für Proxy-Anfragen.
 Es dient nicht der Web-Benutzeroberfläche; nicht übereinstimmende nicht-API Pfade kehren `404` zurück.
@@ -208,7 +207,7 @@ Die Ausführungszeiten verwenden die private Brücke-Authentifizierung API mit R
 `/api/workspace-provider/v1`; seine Geschäfte verpflichten sich zu gewöhnlichen Messenger
 Ressourcen in PostgreSQL, so dass es den beschriebenen Browservertrag nicht ändert
 Die private Vereinbarung ist in diesem Dokument definiert.
-[`workspace_provider_api_v1.yaml`](../workspace_provider_api_v1.yaml).
+`workspace_provider_api_v1.yaml`.
 
 ## Seitenaufzeichnung und Filter
 
@@ -322,11 +321,11 @@ Autoritative Momentaufnahmen vor dem Start eines neuen Cursors.
 | `GET` | `/api/workspace/v1/messenger/drafts/{draft_uuid}` | Erhalten Sie einen eigenen Entwurf und seine starke Revision ETag. |
 | `PUT` | `/api/workspace/v1/messenger/drafts/{draft_uuid}` | Ersetzen Sie nur die Markdown-Nutzlast mit `If-Match`. |
 | `DELETE` | `/api/workspace/v1/messenger/drafts/{draft_uuid}` | Ein Eigentumsentwurf mit `If-Match` hart löschen. |
-| `GET` | `/api/workspace/v1/messenger/external_accounts/` | Liste der externen Konten des aktuellen Benutzers im Bereich Global; erfordert `workspace.external_account.read`. |
-| `POST` | `/api/workspace/v1/messenger/external_accounts/` | Erstellen eines externen Kontos mit einem vom Client generierten UUID und nur schreibbaren Zugangsdatum; erfordert `workspace.external_account.create`. |
+| `GET` | `/api/workspace/v1/messenger/external_accounts/` | List the current user's external accounts in the request project; requires `workspace.external_account.read`. |
+| `POST` | `/api/workspace/v1/messenger/external_accounts/` | Create an external account using `project_id` from the request context; requires `workspace.external_account.create`. |
 | `GET` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Erhalten Sie den entlasteten externen Account-Snapshot des Eigentümers; erfordert `workspace.external_account.read`. |
-| `PUT` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Die nicht geheimen Einstellungen, die geändert werden können, durch `If-Match` ersetzen; erfordert `workspace.external_account.update`. |
-| `DELETE` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Das Konto und seine Projektion löschen; erfordert `workspace.external_account.delete`. |
+| `PUT` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Replace mutable settings; requires `workspace.external_account.update`. |
+| `DELETE` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Unbind a verified Zulip account, clear credentials, cancel pending tasks, and return ownership to its imported user while retaining bridge data. Other or unverified accounts are deleted. Requires `workspace.external_account.delete`. |
 | `POST` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}/actions/reconnect/invoke` | Validieren und ersetzen Sie die Schreibkredienzial, dann die Synchronisation wieder aufnehmen; erfordert `workspace.external_account.reconnect`. |
 | `POST` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}/actions/disconnect/invoke` | Synchronisierung unter Beibehaltung der Leseschaltvorlage stoppen; erfordert `workspace.external_account.disconnect`. |
 | `GET` | `/api/workspace/v1/messenger/external_chats/` | Liste des vom Besitzer entfernten externen Chat-Katalogs und Zuteilungsstatus auf. |
@@ -373,6 +372,15 @@ Autoritative Momentaufnahmen vor dem Start eines neuen Cursors.
 | `POST` | `/api/workspace/v1/users/{user_uuid}/actions/avatar_reset/invoke` | Entfernen Sie den benutzerdefinierten Avatar des aktuellen Benutzers und stellen Sie den kanonischen Gravatar URN wieder her. |
 | `GET` | `/api/workspace/v1/me/` | Die aktuelle authentifizierte Workspace Benutzer zurückgeben. |
 
+Zulip connection verification creates a deterministic imported user with
+`source="hidden"`, including for the first account connected to a server.
+Hidden users remain available by UUID and are excluded from user collection
+responses. An existing imported external account is rebound to the connecting
+IAM user without changing its UUID or bridge references; an account already
+owned by another real user cannot be claimed. Unbinding returns ownership to
+the imported profile and restores `source="zulip"`. User synchronization keeps
+hidden profiles up to date without making them visible.
+
 ### Grenze des Außenintegrationsvertrags
 
 Die obige Endpunktabelle ist die kanonische Bestandsaufnahme der aktuellen
@@ -388,7 +396,7 @@ Die Datenbank wird nicht für die Bereitstellung von Daten verwendet.
 Beispiele, ETag und `If-Match`-Regeln, Handlungserlaubnisse, Lebenszyklussemantik,
 und Verwaltung Verhalten für Konten, Chats, Operationen, Brücken Instanzen,
 Die Gesundheitspolitik der Anbieter und die Gesundheitspolitik der Anbieter sind in den Abschnitten 5 und 6 der
-[`zulip_bridge_v1_product_and_api.md`](zulip_bridge_v1_product_and_api.md).
+`zulip_bridge_v1_product_and_api.md`.
 Die private Steuerung, die Datenbereitstellung und die Dateiübertragung beschreiben
 Backend-to-Bridge-Verträge und sind nicht Teil des öffentlichen Browsers API.
 
@@ -780,8 +788,8 @@ Roh-Providerprotokoll-Identifikatoren, Anmeldeinformationen und Synchronisations
 | `source` | Gegenstand | - Nein. | - Nein. | Quelle Nutzlast; Standard für `{"kind": "native"}`. |
 | `invite_only` | Boolean | - Nein. | - Nein. | Streaming-Flagge nur auf Einladung. |
 | `announce` | Boolean | - Nein. | - Nein. | Ankündigung der Streaming-Flagge. |
-| `direct_user_uuid` | UUID | - Nein. | - Nein. | Gleich dem aktuellen Benutzer UUID nur für einen Selbstchat. |
-| `private` | Boolean | - Nein. | - Ja, das ist es. | Privater Stromflagge. |
+| `direct_user_uuid` | UUID | Bedingt | Nur bei Erstellung | Für private Streams erforderlich. UUID des Gesprächspartners; entspricht nur im Selbstchat dem aktuellen Benutzer. |
+| `private` | Boolean | Nein | Ja | Aus `direct_user_uuid` abgeleitet. Native private Gruppen werden nicht unterstützt. |
 | `is_archived` | Boolean | - Nein. | Aktionsmanagement | Archivflagge. |
 | `color` | - Eine ganze Zahl .`0..0xFFFFFF` | - Nein. | - Nein. | Strömungsfarbe; wird zufällig erzeugt, wenn sie weggelassen wird oder `null`. |
 | `last_message_uuid` | UUID oder `null` | - Nein. | - Ja, das ist es. | Letzte Nachricht im Stream oder `null`, wenn es leer ist. |
@@ -834,24 +842,24 @@ Selbst-Chat-Erstellungsanfrage:
 }
 ```
 
-Für einen Selbstchat muss `direct_user_uuid` dem aktuellen IAM Benutzer UUID entsprechen,
-einschließlich des SymbolsubjektsUUIDSelbst-Chats sind nur nativ.
-die Standardstrommenge mit `private: true`, einem Strombenutzer `owner`
-Bindung und derselbe aktuelle Benutzer UUID in `direct_user_uuid`; kein separater Chat
-Sie können die Daten des Types oder der Selbst-Chat-Flagge anzeigen.
-`private && direct_user_uuid == current_user_uuid` die stabile Kundenseite
-Identitätsprüfung bei gleichzeitiger Erhaltung der normalen privaten Gruppenströme, deren
-`direct_user_uuid` bleibt `null`.
+Für einen Selbstchat muss `direct_user_uuid` der UUID des aktuellen IAM-Benutzers
+einschließlich des Token-Subjekts entsprechen. Selbstchats sind nur nativ verfügbar.
+Die Antwort enthält die normale Stream-Ressource mit `private: true`, einer
+`owner`-Bindung für den aktuellen Benutzer und dessen UUID in `direct_user_uuid`;
+es gibt keinen zusätzlichen Chattyp oder Selbstchat-Schalter. Clients erkennen
+Selbstchats an `private && direct_user_uuid == current_user_uuid`. Native Workspace
+unterstützt keine privaten Gruppen: Jeder private Stream benötigt eine nicht leere
+`direct_user_uuid`. `private: true` ohne Gesprächspartner ergibt HTTP `400`.
 
 Die direkte Mitgliedschaft ist unveränderlich.
 Das Identitätspaar: eine Bindung für einen Selbstchat und zwei für einen gewöhnlichen direkten
 Chat. Hinzufügen oder Entfernen von Teilnehmern und Aktualisierung einer verbindlichen Rollenrückgabe HTTP
 `400`. Das Löschen eines Selbst-Chat-Streams gibt auch HTTP `400` zurück, also Nachrichtenverlauf
 Die Definition der deterministischen Identität kann nicht durch Löschen und Neugestaltung ersetzt werden.
-`source_name` muss mit `source.kind` übereinstimmen, wenn ein Stream erstellt wird.
-Für einen direkten Chat, `direct_user_uuid`,
-`private`, und die inneren `private_index` sind ebenfalls unveränderlich; Versuche,
-Änderungen eines dieser Identitätsfelder geben HTTP `400` zurück.
+Bei der Erstellung muss `source_name` mit `source.kind` übereinstimmen.
+Beide Quellfelder, `direct_user_uuid`, `private` und der interne `private_index`
+sind für jeden Stream unveränderlich; Änderungsversuche ergeben HTTP `400`.
+Ein gewöhnlicher Stream kann nicht in einen privaten Stream umgewandelt werden.
 
 Stream-Benachrichtigungsmodus-Anfrage:
 
@@ -1730,7 +1738,7 @@ Ein gültiges Workspace Träger-Token kann eine
 `public`Die Teilnehmer sind unabhängig von der Mitgliedschaft in einem Projekt oder einem Strom.`public`Seitenwagen
 darf nicht `stream_uuid` enthalten; es behält `owner_uuid` und alle Integrität
 Nginx lehnt mehrere Anfragen ab, die größer als `50m` sind, bevor sie erreicht werden
-`workspace-messenger-api`.
+`workspace-api`.
 
 | Feld | Typ | Erforderlich bei JSON erstellen | Nur für Lesen | Beschreibung |
 | --- | --- | --- | --- | --- |
@@ -2003,6 +2011,12 @@ Daten werden nicht gelöscht.
 Workspace Benutzer werden in `m_workspace_users` gespeichert.
 Die Kommission hat die Kommission aufgefordert,
 
+The compatibility routes `/api/workspace/v1/messenger/me/` and
+`/api/workspace/v1/messenger/users/` (including user lookups and actions)
+return the same responses through the shared controllers. They are deprecated
+and will be removed after clients migrate to `/api/workspace/v1/me/` and
+`/api/workspace/v1/users/`. New clients must use the shared Workspace routes.
+
 `GET /api/workspace/v1/me/` gibt das gleiche `WorkspaceUser_Get` Objekt zurück wie
 `GET /api/workspace/v1/users/{user_uuid}`, mit dem Benutzer UUID aus dem IAM
 Der Client sendet oder leitet keinen Benutzer UUID für diese Anfrage ab.
@@ -2144,20 +2158,21 @@ Die von der Middleware bereitgestellten `server_settings` Alias-Namen und die
 separate Ereignisse WebSocket sind dokumentierte Laufzeitschnittstellen, erscheinen aber nicht
 wie erzeugt .OpenAPIDer Privatanbietervertrag wird beibehalten.
 getrennt in
-[`workspace_provider_api_v1.yaml`](../workspace_provider_api_v1.yaml).
+`workspace_provider_api_v1.yaml`.
 
-Das Backend-Element Workspace installiert unabhängige `workspace-messenger-api`,
-`workspace-api`, `workspace-messenger-events` und
-`workspace-messenger-worker` Prozesse plus die privaten
-`workspace-external-bridge-api` Dienst. Die PostgreSQL-kanonische Laufzeit macht
-Das Element benötigt S3aaS für binäre
-Objekte und JSON Sidecars und DBaaS für den kanonischen Messenger- und Provider-Zustand.
-Es baut die vorhandene Workspace Benutzeroberfläche im Messenger-Modus und bedient sie von
-- Ich bin nicht sicher.
+The Workspace backend element installs `workspace-api`,
+`workspace-messenger-events`, `workspace-messenger-worker`, and
+`workspace-history-import`. The history importer is a scaffold with an empty
+`step()` method, called every three seconds by default; configure its minimum
+period with `[history_import] step_interval`. The REST API
+uses two HTTP workers by default. DBaaS provides PostgreSQL storage, and
+S3aaS stores file bytes and JSON sidecars. The separately versioned
+`workspace_ui` element serves the web UI and proxies API requests to the
+backend nginx gateway.
 
 Verwandte Dokumente:
 
 - [Workspace Architektur](architecture.md)
 - [Workspace Echtzeit-Integration der Benutzeroberfläche](workspace_ui_realtime_integration.md)
-- [Privater Workspace Anbieter API](../workspace_provider_api_v1.yaml)
-- [Zulip Lieferantprodukt und öffentlicher API-Vertrag](zulip_bridge_v1_product_and_api.md)
+- Privater Workspace Anbieter API
+- Zulip Lieferantprodukt und öffentlicher API-Vertrag

@@ -1,0 +1,467 @@
+# Frozen from 724bb466b6d7fab96470c0b4c0131c302e90392e for historical migration tests.
+#    Copyright 2025 Genesis Corporation.
+#
+#    All Rights Reserved.
+#
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    License for the specific language governing permissions and limitations
+#    under the License.
+
+import datetime
+import contextlib
+import logging
+import time
+import typing
+import uuid as sys_uuid
+
+from restalchemy.common import contexts
+from gcl_looper.services import basic
+
+from workspace.common import topic_summary_opts
+from workspace.tests.integration.legacy_messenger import helpers as messenger_dm_helpers
+from migrations import legacy_messenger_read_state as read_state
+from workspace.tests.integration.legacy_messenger import sql_canonical_store
+from workspace.tests.integration.legacy_messenger import topic_summarization
+from workspace.services.messenger_workers import projection_wakeup
+from workspace.services.messenger_workers import v2_projection
+
+LOG = logging.getLogger(__name__)
+EVENT_PRUNE_INTERVAL_SECONDS = 5 * 60
+READ_STATE_FAILURE_BACKOFF_BASE_SECONDS = 5.0
+READ_STATE_FAILURE_BACKOFF_MAX_SECONDS = 5 * 60.0
+V2_METRICS_LOG_INTERVAL_SECONDS = 30
+V2_IDLE_SLEEP_SECONDS = 0.5
+
+
+@contextlib.contextmanager
+def database_session_context() -> typing.Iterator[typing.Any]:
+    """Own one transaction at a worker or operator-command boundary."""
+    ctx = contexts.Context()
+    with ctx.session_manager() as session:
+        read_state.lock_read_state_schema_shared(session)
+        yield session
+
+
+def _read_state_failure_backoff_seconds(failure_count: int) -> float:
+    exponent = min(max(failure_count - 1, 0), 16)
+    return min(
+        READ_STATE_FAILURE_BACKOFF_BASE_SECONDS * (2**exponent),
+        READ_STATE_FAILURE_BACKOFF_MAX_SECONDS,
+    )
+
+
+class MessengerWorkerAgent(basic.BasicService):
+    def __init__(
+        self,
+        event_retention: datetime.timedelta = (sql_canonical_store.EVENT_RETENTION),
+        event_prune_interval_seconds: int = EVENT_PRUNE_INTERVAL_SECONDS,
+        event_prune_batch_size: int = (sql_canonical_store.EVENT_PRUNE_BATCH_SIZE),
+        read_state_compaction_enabled: bool = False,
+        read_state_cleanup_enabled: bool = False,
+        read_state_batch_size: int = read_state.COMPACTION_BATCH_SIZE,
+        read_state_max_batches_per_iteration: int = 1,
+        v2_projection_enabled: bool = False,
+        v2_projection_max_tasks_per_iteration: int = 100,
+        v2_fanout_batch_size: int = v2_projection.DEFAULT_FANOUT_BATCH_SIZE,
+        v2_metrics_log_interval_seconds: int = V2_METRICS_LOG_INTERVAL_SECONDS,
+        v2_idle_sleep_seconds: float = V2_IDLE_SLEEP_SECONDS,
+        v2_projection_db_url: str | None = None,
+        projection_only: bool = False,
+        summary_secret_key: str | None = None,
+        summary_connect_timeout_seconds: int = (
+            topic_summary_opts.DEFAULT_CONNECT_TIMEOUT_SECONDS
+        ),
+        summary_request_timeout_seconds: int = (
+            topic_summary_opts.DEFAULT_REQUEST_TIMEOUT_SECONDS
+        ),
+        summary_topic_claim_seconds: int = (
+            topic_summary_opts.DEFAULT_TOPIC_CLAIM_SECONDS
+        ),
+        summary_endpoint_claim_seconds: int = (
+            topic_summary_opts.DEFAULT_ENDPOINT_CLAIM_SECONDS
+        ),
+        **kwargs: typing.Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self._event_retention = event_retention
+        self._event_prune_interval_seconds = event_prune_interval_seconds
+        self._event_prune_batch_size = event_prune_batch_size
+        self._read_state_compaction_enabled = read_state_compaction_enabled
+        self._read_state_cleanup_enabled = read_state_cleanup_enabled
+        self._read_state_batch_size = read_state_batch_size
+        self._read_state_max_batches_per_iteration = (
+            read_state_max_batches_per_iteration
+        )
+        self._read_state_failures: dict[object, tuple[int, float]] = {}
+        self._v2_projection_enabled = v2_projection_enabled
+        self._v2_projection_max_tasks_per_iteration = (
+            v2_projection_max_tasks_per_iteration
+        )
+        self._v2_fanout_batch_size = v2_fanout_batch_size
+        self._v2_worker_id = f"workspace-messenger:{sys_uuid.uuid4()}"
+        self._v2_metrics_log_interval_seconds = v2_metrics_log_interval_seconds
+        self._v2_metrics: dict[str, float] = {}
+        self._v2_metrics_started_at = time.monotonic()
+        self._v2_idle_sleep_seconds = v2_idle_sleep_seconds
+        self._v2_projection_wakeup = (
+            projection_wakeup.ProjectionQueueWakeup(v2_projection_db_url)
+            if v2_projection_db_url is not None
+            else None
+        )
+        self._projection_only = projection_only
+        self._summary_secret_key = summary_secret_key
+        self._summary_connect_timeout_seconds = summary_connect_timeout_seconds
+        self._summary_request_timeout_seconds = summary_request_timeout_seconds
+        self._summary_topic_claim_seconds = max(
+            summary_topic_claim_seconds,
+            topic_summarization.MAX_PROVIDER_ATTEMPTS
+            * (
+                summary_request_timeout_seconds + topic_summary_opts.CLAIM_GRACE_SECONDS
+            ),
+        )
+        self._summary_endpoint_claim_seconds = max(
+            summary_endpoint_claim_seconds,
+            summary_request_timeout_seconds + topic_summary_opts.CLAIM_GRACE_SECONDS,
+        )
+        self._last_event_prune: float | None = None
+
+    def _prune_expired_events(
+        self,
+        session: typing.Any,
+        now: datetime.datetime,
+    ) -> int:
+        return sql_canonical_store.prune_expired_events(
+            session,
+            now,
+            retention=self._event_retention,
+            batch_size=self._event_prune_batch_size,
+        )
+
+    def _iteration(self) -> None:
+        processed_v2 = False
+        if self._v2_projection_enabled:
+            processed_v2 = self._run_v2_projection_tasks()
+        if self._projection_only:
+            if not processed_v2:
+                self._wait_for_v2_projection_work()
+            return
+        now = datetime.datetime.now(datetime.timezone.utc)
+        monotonic_now = time.monotonic()
+        prune_due = (
+            self._last_event_prune is None
+            or monotonic_now - self._last_event_prune
+            >= self._event_prune_interval_seconds
+        )
+        if prune_due:
+            try:
+                with database_session_context() as session:
+                    pruned = self._prune_expired_events(session, now)
+            except Exception:
+                LOG.exception("Failed to prune expired Workspace event rows")
+            else:
+                self._last_event_prune = monotonic_now
+                if pruned:
+                    LOG.info("Pruned %d expired Workspace event rows", pruned)
+        try:
+            with database_session_context() as session:
+                messenger_dm_helpers.mark_stale_workspace_users_offline(
+                    session=session,
+                )
+        except Exception:
+            LOG.exception("Failed to refresh stale Workspace presence")
+
+        if self._read_state_compaction_enabled:
+            for _batch in range(self._read_state_max_batches_per_iteration):
+                retry_now = time.monotonic()
+                excluded_projects = {
+                    project_id
+                    for project_id, (_failure_count, retry_at) in (
+                        self._read_state_failures.items()
+                    )
+                    if retry_at > retry_now
+                }
+                try:
+                    with database_session_context() as session:
+                        read_state_maintenance = read_state.maintain_next_project(
+                            session,
+                            batch_size=self._read_state_batch_size,
+                            cleanup_enabled=self._read_state_cleanup_enabled,
+                            excluded_project_ids=excluded_projects,
+                        )
+                except read_state.MaintenanceProjectError as error:
+                    failure_now = time.monotonic()
+                    failure_count = (
+                        self._read_state_failures.get(
+                            error.project_id,
+                            (0, 0.0),
+                        )[0]
+                        + 1
+                    )
+                    backoff = _read_state_failure_backoff_seconds(
+                        failure_count,
+                    )
+                    self._read_state_failures[error.project_id] = (
+                        failure_count,
+                        failure_now + backoff,
+                    )
+                    LOG.exception(
+                        "Failed to maintain compact Workspace read state",
+                        extra={
+                            "project_id": str(error.project_id),
+                            "retry_in_seconds": backoff,
+                        },
+                    )
+                    continue
+                except Exception:
+                    LOG.exception("Failed to maintain compact Workspace read state")
+                    break
+                if read_state_maintenance is None:
+                    break
+                action, project_id, processed = read_state_maintenance
+                self._read_state_failures.pop(project_id, None)
+                LOG.info(
+                    "Completed bounded Workspace read-state maintenance",
+                    extra={
+                        "action": action,
+                        "project_id": str(project_id),
+                        "processed": processed,
+                    },
+                )
+
+        self._summarize_one_topic()
+        if self._v2_projection_enabled and not processed_v2:
+            self._wait_for_v2_projection_work()
+
+    def _wait_for_v2_projection_work(self) -> None:
+        if self._v2_projection_wakeup is None:
+            time.sleep(self._v2_idle_sleep_seconds)
+            return
+        self._v2_projection_wakeup.wait(self._v2_idle_sleep_seconds)
+
+    def _run_v2_projection_tasks(self) -> bool:
+        metrics: dict[str, float] = {}
+        processed_any = False
+        deferred = False
+        scan_continued = False
+        for task_index in range(self._v2_projection_max_tasks_per_iteration):
+            try:
+                with database_session_context() as session:
+                    contention_before = metrics.get("event_lock_contention", 0.0)
+                    scan_continuation_before = metrics.get(
+                        "partition_scan_continuation",
+                        0.0,
+                    )
+                    processed = v2_projection.process_one_projection_task(
+                        session,
+                        self._v2_worker_id,
+                        fanout_batch_size=self._v2_fanout_batch_size,
+                        metrics=metrics,
+                    )
+                    deferred = (
+                        metrics.get("event_lock_contention", 0.0) > contention_before
+                    )
+                    scan_continued = (
+                        metrics.get("partition_scan_continuation", 0.0)
+                        > scan_continuation_before
+                    )
+                    processed_any = processed_any or processed
+            except Exception:
+                LOG.exception("Failed to run the Messenger v2 projection queue")
+                metrics["worker_failures"] = metrics.get("worker_failures", 0.0) + 1
+                break
+            if deferred or (not processed and not scan_continued):
+                break
+        self._record_v2_projection_metrics(metrics)
+        return processed_any
+
+    def stop(self) -> None:
+        super().stop()
+        if self._v2_projection_wakeup is not None:
+            self._v2_projection_wakeup.close()
+
+    def _record_v2_projection_metrics(self, metrics: dict[str, float]) -> None:
+        for name, value in metrics.items():
+            self._v2_metrics[name] = self._v2_metrics.get(name, 0.0) + value
+        now = time.monotonic()
+        interval = now - self._v2_metrics_started_at
+        if interval < self._v2_metrics_log_interval_seconds:
+            return
+        fields = {
+            "projection_worker_id": self._v2_worker_id,
+            "projection_worker_role": (
+                "projection" if self._projection_only else "primary"
+            ),
+            "projection_metrics_interval_seconds": interval,
+            "projection_claim_rate_per_second": (
+                self._v2_metrics.get("claimed", 0.0) / interval
+            ),
+            "projection_completed_rate_per_second": (
+                self._v2_metrics.get("completed", 0.0) / interval
+            ),
+            "projection_active_lease_high_watermark": float(
+                self._v2_metrics.get("claimed", 0.0) > 0
+            ),
+        }
+        claim_samples = self._v2_metrics.get("claimed", 0.0) + self._v2_metrics.get(
+            "empty_claims", 0.0
+        )
+        fields.update(
+            {
+                "projection_claim_duration_ms_avg": (
+                    self._v2_metrics.get("claim_seconds", 0.0)
+                    / max(claim_samples, 1.0)
+                    * 1000
+                ),
+                "projection_claim_duration_ms_max": (
+                    self._v2_metrics.get("claim_seconds_max", 0.0) * 1000
+                ),
+                "projection_processing_duration_ms_avg": (
+                    self._v2_metrics.get("processing_seconds", 0.0)
+                    / max(self._v2_metrics.get("claimed", 0.0), 1.0)
+                    * 1000
+                ),
+                "projection_task_age_seconds_max": self._v2_metrics.get(
+                    "task_age_seconds_max", 0.0
+                ),
+            }
+        )
+        fields.update(
+            {
+                f"projection_{name}": value
+                for name, value in sorted(self._v2_metrics.items())
+            }
+        )
+        if not self._projection_only:
+            try:
+                with database_session_context() as session:
+                    queue_metrics = v2_projection.projection_queue_metrics(session)
+            except Exception:
+                LOG.exception("Failed to read Messenger v2 projection queue metrics")
+            else:
+                fields.update(
+                    {
+                        f"projection_queue_{name}": value
+                        for name, value in queue_metrics.items()
+                    }
+                )
+        LOG.info(
+            "Messenger v2 projection worker metrics worker=%s role=%s "
+            "claimed=%.0f completed=%.0f user_partitions=%.0f "
+            "project_partitions=%.0f partition_contention=%.0f "
+            "event_lock_contention=%.0f claim_ms_avg=%.3f "
+            "claim_ms_max=%.3f processing_ms_avg=%.3f task_age_max_s=%.3f",
+            self._v2_worker_id,
+            fields["projection_worker_role"],
+            self._v2_metrics.get("claimed", 0.0),
+            self._v2_metrics.get("completed", 0.0),
+            self._v2_metrics.get("claimed_partition_user", 0.0),
+            self._v2_metrics.get("claimed_partition_project", 0.0),
+            self._v2_metrics.get("partition_contention", 0.0),
+            self._v2_metrics.get("event_lock_contention", 0.0),
+            fields["projection_claim_duration_ms_avg"],
+            fields["projection_claim_duration_ms_max"],
+            fields["projection_processing_duration_ms_avg"],
+            fields["projection_task_age_seconds_max"],
+            extra=fields,
+        )
+        self._v2_metrics = {}
+        self._v2_metrics_started_at = now
+
+    def _summarize_one_topic(self) -> bool:
+        if self._summary_secret_key is None:
+            return False
+        now = datetime.datetime.now(datetime.timezone.utc)
+        try:
+            with database_session_context() as session:
+                work = topic_summarization.claim_summary_work(
+                    session,
+                    now=now,
+                    key_material=self._summary_secret_key,
+                    topic_claim_seconds=self._summary_topic_claim_seconds,
+                    endpoint_claim_seconds=self._summary_endpoint_claim_seconds,
+                )
+        except Exception:
+            LOG.exception("Failed to claim bounded topic summary work")
+            return False
+        if work is None:
+            return False
+
+        while True:
+            try:
+                summary = topic_summarization.call_openai_compatible_endpoint(
+                    work,
+                    connect_timeout_seconds=(self._summary_connect_timeout_seconds),
+                    timeout_seconds=self._summary_request_timeout_seconds,
+                )
+            except topic_summarization.ProviderCallError as error:
+                try:
+                    with database_session_context() as session:
+                        work = topic_summarization.fail_summary_work(
+                            session,
+                            work,
+                            error,
+                            now=datetime.datetime.now(datetime.timezone.utc),
+                            key_material=self._summary_secret_key,
+                            endpoint_claim_seconds=(
+                                self._summary_endpoint_claim_seconds
+                            ),
+                        )
+                except Exception:
+                    LOG.exception("Failed to persist topic summary provider failure")
+                    return True
+                if work is None:
+                    return True
+                continue
+            except Exception:
+                LOG.exception("Failed to construct topic summary provider request")
+                failure = topic_summarization.ProviderCallError(
+                    "worker_error",
+                    retryable=False,
+                )
+                try:
+                    with database_session_context() as session:
+                        topic_summarization.fail_summary_work(
+                            session,
+                            work,
+                            failure,
+                            now=datetime.datetime.now(datetime.timezone.utc),
+                            key_material=self._summary_secret_key,
+                            endpoint_claim_seconds=(
+                                self._summary_endpoint_claim_seconds
+                            ),
+                        )
+                except Exception:
+                    LOG.exception("Failed to persist topic summary worker failure")
+                return True
+
+            try:
+                with database_session_context() as session:
+                    topic_summarization.complete_summary_work(
+                        session,
+                        work,
+                        summary,
+                        now=datetime.datetime.now(datetime.timezone.utc),
+                    )
+            except Exception:
+                LOG.exception(
+                    "Failed to persist topic summary result",
+                    extra={"topic_uuid": str(work.topic_uuid)},
+                )
+            else:
+                LOG.info(
+                    "Completed bounded topic summary",
+                    extra={
+                        "topic_uuid": str(work.topic_uuid),
+                        "endpoint_uuid": str(work.endpoint.uuid),
+                        "attempt": work.attempt,
+                    },
+                )
+            return True

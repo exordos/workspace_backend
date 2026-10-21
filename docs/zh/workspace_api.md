@@ -1,10 +1,9 @@
 # Workspace v1 API
 
-这份文件描述了由nginx编写的浏览器面向的API合同
-保存的 `workspace-messenger-api`,普通的 `workspace-api` 和
-伴随服务 `workspace-messenger-events` 网接口服务. 公共服务 Messenger
-请求使用专用Messenger过程;普通用户,客户端服务
-设置,按设备注册,以及 REST 事件使用 `workspace-api`.
+This document describes the browser-facing API contract served by the unified
+`workspace-api` REST service and the companion `workspace-messenger-events`
+websocket service. Messenger resources, users, client service settings,
+push-device registrations, and REST events all use `workspace-api`.
 独立邮件,日历和外部用户终端点不是此项的组成部分
 提供者中立的外部帐户,聊天,运营,政策,健康,
 桥接实例资源是 Messenger API 的一部分.
@@ -18,11 +17,11 @@
 直接的本地服务:
 
 ```text
-Messenger REST API:  http://127.0.0.1:21081/v1
+Messenger REST API:  http://127.0.0.1:21084/v1/messenger
 Events WebSocket:    ws://127.0.0.1:21082/v1/events/ws
 Workspace REST API:  http://127.0.0.1:21084/v1
 Worker:              workspace-messenger-worker
-Messenger OpenAPI:   http://127.0.0.1:21081/specifications/3.0.3
+History importer:    workspace-history-import
 Workspace OpenAPI:   http://127.0.0.1:21084/specifications/3.0.3
 ```
 
@@ -38,11 +37,11 @@ Events WebSocket:    /api/workspace/v1/events/ws?last_epoch_version=<number>&epo
 OpenAPI spec:        /api/workspace/specifications/3.0.3
 ```
 
-`/api/workspace/v1/messenger/`是被保存到Messenger REST的代理
-在 `127.0.0.1:21081` 上服务;剩余的 `/api/workspace/` 代为
-在 `127.0.0.1:21084` 上的 Workspace REST 服务.
-确切的nginx位置 `/api/workspace/v1/events/ws`是代理到
-在 `127.0.0.1:21082` 上的websocket服务终点 `/v1/events/ws`.
+All REST requests under `/api/workspace/`, including
+`/api/workspace/v1/messenger/`, are proxied to `workspace-api` on
+`127.0.0.1:21084` without changing the public URL structure. The exact nginx
+location `/api/workspace/v1/events/ws` is proxied to the websocket service
+endpoint `/v1/events/ws` on `127.0.0.1:21082`.
 
 后端 nginx 显示设置 `client_max_body_size 50m` 作为代理请求.
 它不支持WebUI;不匹配的非API路径返回`404`.
@@ -208,7 +207,7 @@ Messenger资源保持一个规范的来源投影,而不是暴露
 `/api/workspace-provider/v1`;其运营通常承诺 Messenger
 资源进入PostgreSQL,因此它不会改变描述的浏览器合同
 根据本文的定义,私人合同
-[`workspace_provider_api_v1.yaml`](../workspace_provider_api_v1.yaml).
+`workspace_provider_api_v1.yaml`.
 
 ## 页面排序和过器
 
@@ -322,11 +321,11 @@ GET /api/workspace/v1/events/?epoch_version%3E=123&epoch_generation=781203&page_
 | `GET` | `/api/workspace/v1/messenger/drafts/{draft_uuid}` | 获得一个拥有草案及其强度修改 ETag. |
 | `PUT` | `/api/workspace/v1/messenger/drafts/{draft_uuid}` | 仅使用 `If-Match` 替换标记载荷. |
 | `DELETE` | `/api/workspace/v1/messenger/drafts/{draft_uuid}` | 使用 `If-Match` 硬删除所有草稿. |
-| `GET` | `/api/workspace/v1/messenger/external_accounts/` | 列出当前用户的区域-全球外部帐户;需要 `workspace.external_account.read`. |
-| `POST` | `/api/workspace/v1/messenger/external_accounts/` | 创建一个外部帐户,使用客户端生成的 UUID 和仅可写的凭证;需要 `workspace.external_account.create`. |
+| `GET` | `/api/workspace/v1/messenger/external_accounts/` | List the current user's external accounts in the request project; requires `workspace.external_account.read`. |
+| `POST` | `/api/workspace/v1/messenger/external_accounts/` | Create an external account using `project_id` from the request context; requires `workspace.external_account.create`. |
 | `GET` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | 获取所有者清理的外部帐户快照;需要 `workspace.external_account.read`. |
-| `PUT` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | 取代可变的非秘密设置使用 `If-Match`;需要 `workspace.external_account.update`. |
-| `DELETE` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | 删除帐户及其投影;需要 `workspace.external_account.delete`. |
+| `PUT` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Replace mutable settings; requires `workspace.external_account.update`. |
+| `DELETE` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Unbind a verified Zulip account, clear credentials, cancel pending tasks, and return ownership to its imported user while retaining bridge data. Other or unverified accounts are deleted. Requires `workspace.external_account.delete`. |
 | `POST` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}/actions/reconnect/invoke` | 验证并更换仅写凭证,然后恢复同步;需要 `workspace.external_account.reconnect`. |
 | `POST` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}/actions/disconnect/invoke` | 停止同步,同时保留仅读投影;需要 `workspace.external_account.disconnect`. |
 | `GET` | `/api/workspace/v1/messenger/external_chats/` | 列出所有者清洁的外部聊天目录和分配状态. |
@@ -373,6 +372,15 @@ GET /api/workspace/v1/events/?epoch_version%3E=123&epoch_generation=781203&page_
 | `POST` | `/api/workspace/v1/users/{user_uuid}/actions/avatar_reset/invoke` | 删除当前用户的自定义化身,并恢复正规的Gravatar URN. |
 | `GET` | `/api/workspace/v1/me/` | 返回当前认证的 Workspace 用户. |
 
+Zulip connection verification creates a deterministic imported user with
+`source="hidden"`, including for the first account connected to a server.
+Hidden users remain available by UUID and are excluded from user collection
+responses. An existing imported external account is rebound to the connecting
+IAM user without changing its UUID or bridge references; an account already
+owned by another real user cannot be claimed. Unbinding returns ownership to
+the imported profile and restores `source="zulip"`. User synchronization keeps
+hidden profiles up to date without making them visible.
+
 ### 外部整合合同的边界
 
 上面的终点表是当前的标准清单
@@ -388,7 +396,7 @@ GET /api/workspace/v1/events/?epoch_version%3E=123&epoch_generation=781203&page_
 例子, ETag 和 `If-Match` 规则,操作权限,生命周期语义,
 管理行为, 帐户,聊天,操作,桥接实例,
 提供者健康政策,在第5和第6节
-[`zulip_bridge_v1_product_and_api.md`](zulip_bridge_v1_product_and_api.md).
+`zulip_bridge_v1_product_and_api.md`.
 提供者数据平面,文件转移部分描述
 后端到桥接合约,并不是公共浏览器的一部分 API.
 
@@ -780,8 +788,8 @@ UUID 在 `direct_user_uuid` 中.重复或同时发送相同的请求
 | `source` | 目标 | 不需要 | 不需要 | 源载荷;默认为 `{"kind": "native"}`. |
 | `invite_only` | 布尔式 | 不需要 | 不需要 | 只有邀请者可以播放. |
 | `announce` | 布尔式 | 不需要 | 不需要 | 广告流旗. |
-| `direct_user_uuid` | UUID | 不需要 | 不需要 | 直接聊天对应.仅用于自动聊天,即当前用户 UUID. |
-| `private` | 布尔式 | 不需要 | 是的 | 个人流旗. |
+| `direct_user_uuid` | UUID | 有条件 | 仅创建时 | 私有流必填。对方的 UUID；仅在自聊时等于当前用户 UUID。 |
+| `private` | 布尔值 | 否 | 是 | 由 `direct_user_uuid` 确定的私有流标志。native 不支持私有群聊。 |
 | `is_archived` | 布尔式 | 不需要 | 行动管理 | 档案的旗. |
 | `color` | 整数 `0..0xFFFFFF` | 不需要 | 不需要 | 流色;如果省略或 `null`,则随机生成. |
 | `last_message_uuid` | UUID没有`null` | 不需要 | 是的 | 最后的消息在流中,或者是空时是 `null`. |
@@ -834,24 +842,21 @@ UUID 在 `direct_user_uuid` 中.重复或同时发送相同的请求
 }
 ```
 
-对于自我聊天, `direct_user_uuid`必须等于当前的 IAM 用户 UUID,
-包含标志主题 UUID.自动聊天是本地. 响应是
-标准流资源,其中 `private: true`,一个当前用户 `owner`
-绑定,并且在 `direct_user_uuid` 中具有相同的当前用户 UUID;没有单独的聊天
-显示了自行聊天的标志.
-`private && direct_user_uuid == current_user_uuid` 稳定的客户端
-通过检查身份,同时保留普通私人集团流,
-`direct_user_uuid`仍然存在`null`.
+自聊的 `direct_user_uuid` 必须等于当前 IAM 用户的 UUID，包括令牌主体 UUID。
+自聊仅支持 native。响应为标准流资源，包含 `private: true`、当前用户的一条
+`owner` 绑定，以及作为 `direct_user_uuid` 的当前用户 UUID；没有额外的聊天类型
+或自聊标志。客户端可用 `private && direct_user_uuid == current_user_uuid` 识别自聊。
+Native Workspace 不支持私有群聊：每个私有流都必须有非空的 `direct_user_uuid`。
+使用 `private: true` 但未指定对方的创建请求返回 HTTP `400`。
 
 直接会员是不可变的.
 身份对:一个约束自行聊天和两个普通直接
 添加或删除参与者,更新约束作用返回 HTTP
 `400`.删除自行聊天流也返回HTTP `400`所以消息历史记录
 通过删除和重建确定性身份来取代.
-`source_name`必须与 `source.kind`相匹配,当创建流.
-对于每一个流, 字段是不变的.`direct_user_uuid`,
-`private`并且是内部`private_index`它们也不可变;
-改变这些身份字段中的任何一个返回 HTTP `400`.
+创建流时，`source_name` 必须与 `source.kind` 一致。两个来源字段、
+`direct_user_uuid`、`private` 和内部 `private_index` 对所有流均不可更改；
+修改这些字段的请求返回 HTTP `400`。普通流不能通过更新转换为私有流。
 
 流通通知模式请求:
 
@@ -1730,7 +1735,7 @@ Workspace IAM中间件,以及没有有效的 Workspace 持有人的任何请求
 `public`无论项目或流程成员是谁.`public`侧车
 不应包含 `stream_uuid`;它保留`owner_uuid`和所有完整性
 超级数据. Nginx 拒绝超过 `50m` 的多部分请求,
-`workspace-messenger-api`.
+`workspace-api`.
 
 | 场地 | 类型 | 需要在 JSON 创建时 | 仅供读取 | 描述 |
 | --- | --- | --- | --- | --- |
@@ -2003,6 +2008,12 @@ GET /api/workspace/v1/events/?epoch_version%3E=<last_epoch_version>&epoch_genera
 Workspace用户存储在`m_workspace_users`.路线是全球性的
 项目范围.
 
+The compatibility routes `/api/workspace/v1/messenger/me/` and
+`/api/workspace/v1/messenger/users/` (including user lookups and actions)
+return the same responses through the shared controllers. They are deprecated
+and will be removed after clients migrate to `/api/workspace/v1/me/` and
+`/api/workspace/v1/users/`. New clients must use the shared Workspace routes.
+
 `GET /api/workspace/v1/me/`返回相同的`WorkspaceUser_Get`作为对象
 `GET /api/workspace/v1/users/{user_uuid}`,使用用户UUID从IAM
 客户端没有发送或导出一个用户UUID这个请求.
@@ -2144,20 +2155,21 @@ IAM-认证的HTTP表面,没有提供商,邮件或日历
 单独事件 WebSocket 是记录的运行时接口,但没有显示
 作为生成的 OpenAPI 路径.私人提供商合同是保持
 单独在
-[`workspace_provider_api_v1.yaml`](../workspace_provider_api_v1.yaml).
+`workspace_provider_api_v1.yaml`.
 
-后端元素 Workspace 安装独立的 `workspace-messenger-api`,
-`workspace-api`, `workspace-messenger-events`,以及
-`workspace-messenger-worker` 过程加上私人
-`workspace-external-bridge-api`服务. PostgreSQL-规范运行时间是
-没有启动或连接到邮件服务.该元素需要S3aaS
-对象和 JSON 侧车和 DBaaS 对于可规性 Messenger 和提供者状态.
-它将现有的 Workspace UI 构建为 Messenger 模式,并从
-现在我们要做什么?
+The Workspace backend element installs `workspace-api`,
+`workspace-messenger-events`, `workspace-messenger-worker`, and
+`workspace-history-import`. The history importer is a scaffold with an empty
+`step()` method, called every three seconds by default; configure its minimum
+period with `[history_import] step_interval`. The REST API
+uses two HTTP workers by default. DBaaS provides PostgreSQL storage, and
+S3aaS stores file bytes and JSON sidecars. The separately versioned
+`workspace_ui` element serves the web UI and proxies API requests to the
+backend nginx gateway.
 
 相关文件:
 
 - [Workspace 建筑](architecture.md)
 - [Workspace实时集成UI](workspace_ui_realtime_integration.md)
-- [个人 Workspace 提供者 API](../workspace_provider_api_v1.yaml)
-- [Zulip供应商产品和公共 API合同](zulip_bridge_v1_product_and_api.md)
+- 个人 Workspace 提供者 API
+- Zulip供应商产品和公共 API合同

@@ -6,15 +6,16 @@
 import datetime
 import uuid as sys_uuid
 
+import psycopg
 import pytest
 from restalchemy.common import contexts
 from restalchemy.storage.sql import migrations as ra_migrations
 
 from workspace.messenger_api import topic_summarization
-from workspace.messenger_api.api import sql_canonical_store
+from workspace.tests.integration import legacy_store
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.api import store_factory
-from workspace.messenger_api.dm import read_state
+from migrations import legacy_messenger_read_state as read_state
 from workspace.tests.integration import conftest
 from workspace.tests.integration import test_key_announcements
 from workspace.tests.integration import test_messenger_api
@@ -22,9 +23,28 @@ from workspace.tests.integration import test_messenger_v2
 from workspace.tests.unit import test_messenger_message_payloads
 
 
-STREAMS = "/v1/streams/"
-MESSAGES = "/v1/messages/"
+STREAMS = "/v1/messenger/streams/"
+MESSAGES = "/v1/messenger/messages/"
 MIGRATION = "0187-Process-only-Markdown-message-content-90458e.py"
+
+
+@pytest.fixture
+def content_migration_database(_database, http_server):
+    with conftest.isolated_migration_database(MIGRATION) as database_url:
+        with psycopg.connect(database_url, autocommit=True) as connection:
+            # The current IAM model includes this independent, later catalog field.
+            connection.execute(
+                "ALTER TABLE m_workspace_users ADD COLUMN disabled BOOLEAN NOT NULL DEFAULT FALSE"
+            )
+            client = conftest.ApiClient(
+                base_url=http_server,
+                user_uuid=sys_uuid.uuid4(),
+                project_id=sys_uuid.uuid4(),
+                user_seeder=lambda value: conftest.seed_workspace_user(
+                    connection, value, f"user-{value}"
+                ),
+            )
+            yield client, connection
 
 
 @pytest.fixture(autouse=True)
@@ -33,9 +53,7 @@ def _production_v2_store(_database):
     try:
         yield
     finally:
-        api_store.configure_store_factory(
-            sql_canonical_store.SQLCanonicalMessengerStoreFactory()
-        )
+        api_store.configure_store_factory(legacy_store.LegacyMessengerStoreFactory())
 
 
 def _payloads(content):
@@ -55,7 +73,7 @@ def _post_message(api, stream_uuid, payload):
     return response.json()
 
 
-@pytest.mark.parametrize("store_kind", ["v2", "legacy"])
+@pytest.mark.parametrize("store_kind", ["v2"])
 def test_opaque_payloads_pass_through_history_and_events_without_mentions(
     api, workspace_api, db, store_kind
 ):
@@ -107,7 +125,7 @@ def test_opaque_payloads_pass_through_history_and_events_without_mentions(
     assert peer_stream["active_unread_count"] == 1
     assert peer_stream["passive_unread_count"] == 5
     rebuild = api.post(
-        f"/v1/stream_topics/{stream['default_topic_uuid']}/actions/notifications/invoke",
+        f"/v1/messenger/stream_topics/{stream['default_topic_uuid']}/actions/notifications/invoke",
         user=peer_uuid,
         json={"notification_mode": "follow"},
     )
@@ -117,7 +135,7 @@ def test_opaque_payloads_pass_through_history_and_events_without_mentions(
     assert [row["mentioned"] for row in history.json()] == [True] + [False] * 5
 
 
-@pytest.mark.parametrize("store_kind", ["v2", "legacy"])
+@pytest.mark.parametrize("store_kind", ["v2"])
 @pytest.mark.parametrize("kind", ["e2ee", "key_grant"])
 def test_editing_between_markdown_and_opaque_content_replaces_mentions(
     api, workspace_api, db, store_kind, kind
@@ -163,7 +181,7 @@ def test_editing_between_markdown_and_opaque_content_replaces_mentions(
         assert updates[-1]["mentioned"] is expected
 
 
-@pytest.mark.parametrize("store_kind", ["v2", "legacy"])
+@pytest.mark.parametrize("store_kind", ["v2"])
 def test_summary_selection_counts_only_markdown_messages(
     api, db, store_kind, monkeypatch
 ):
@@ -174,7 +192,7 @@ def test_summary_selection_counts_only_markdown_messages(
         _post_message(api, stream["uuid"], payload)
     key = "integration-test-topic-summary-key"
     endpoint = api.post(
-        "/v1/topic_summary_endpoints/",
+        "/v1/messenger/topic_summary_endpoints/",
         permissions=(topic_summarization.ENDPOINT_MANAGE_PERMISSION,),
         json={
             "uuid": str(sys_uuid.uuid4()),
@@ -186,7 +204,7 @@ def test_summary_selection_counts_only_markdown_messages(
     )
     assert endpoint.status_code == 201, endpoint.text
     settings = api.put(
-        f"/v1/topic_summary_settings/{api.project_id}",
+        f"/v1/messenger/topic_summary_settings/{api.project_id}",
         permissions=(topic_summarization.SETTINGS_MANAGE_PERMISSION,),
         json={"global_enabled": True, "project_enabled": True},
     )
@@ -247,17 +265,21 @@ def test_summary_selection_counts_only_markdown_messages(
         assert claim() is None
     finally:
         api.put(
-            f"/v1/topic_summary_settings/{api.project_id}",
+            f"/v1/messenger/topic_summary_settings/{api.project_id}",
             permissions=(topic_summarization.SETTINGS_MANAGE_PERMISSION,),
             json={"global_enabled": False, "project_enabled": False},
         )
         api.delete(
-            f"/v1/topic_summary_endpoints/{endpoint.json()['uuid']}",
+            f"/v1/messenger/topic_summary_endpoints/{endpoint.json()['uuid']}",
             permissions=(topic_summarization.ENDPOINT_MANAGE_PERMISSION,),
         )
 
 
-def test_content_migration_round_trip_repairs_stored_mentions(api, db):
+@pytest.mark.pre_retirement_schema
+def test_content_migration_round_trip_repairs_stored_mentions(
+    content_migration_database,
+):
+    api, db = content_migration_database
     stream = test_key_announcements._create_stream(api)
     peer_uuid = test_key_announcements._add_member(api, db, stream["uuid"])
     content = f"[Peer](urn:user:{peer_uuid})"
@@ -310,7 +332,7 @@ def test_content_migration_round_trip_repairs_stored_mentions(api, db):
                 session, api.project_id, peer_uuid, stream["uuid"]
             )
     finally:
-        engine.apply_migration(engine.get_latest_migration())
+        engine.apply_migration(MIGRATION)
     test_messenger_v2._drain()
     history = api.get(f"{MESSAGES}{message['uuid']}", user=peer_uuid)
     assert history.status_code == 200, history.text
@@ -330,6 +352,7 @@ def test_content_migration_round_trip_repairs_stored_mentions(api, db):
             assert cursor.fetchone() == (definition,)
 
 
+@pytest.mark.pre_retirement_schema
 def test_compaction_rebuilds_only_markdown_mentions(api, db):
     stream = test_key_announcements._create_stream(api)
     peer_uuid = test_key_announcements._add_member(api, db, stream["uuid"])

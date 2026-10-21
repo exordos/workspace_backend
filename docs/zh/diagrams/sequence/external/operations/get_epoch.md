@@ -115,7 +115,7 @@ class WorkspaceEpochController(controllers.BaseResourceController):
 ## 他们的来源
 
 - [`workspace_api.md`](../../../../workspace_api.md) — 有权威的公共路线,一般JSON,页面,活动和合同 WebSocket.
-- [`zulip_bridge_v1_product_and_api.md`](../../../../zulip_bridge_v1_product_and_api.md) — 外部资源的清洁生命周期,许可和提供商语义.
+- `zulip_bridge_v1_product_and_api.md` — 外部资源的清洁生命周期,许可和提供商语义.
 
 [← 文件的主要索引](../../../../index.md) ·
 [序列图表的索引](../../README.md) ·

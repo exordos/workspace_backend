@@ -19,7 +19,7 @@ import uuid as sys_uuid
 
 from gcl_iam import contexts as iam_contexts
 
-from workspace.messenger_api.dm import read_state
+from workspace.messenger_api.dm import schema
 
 
 class WorkspaceMessengerAuthContext(iam_contexts.GenesisCoreAuthContext):
@@ -29,7 +29,7 @@ class WorkspaceMessengerAuthContext(iam_contexts.GenesisCoreAuthContext):
         """Fence every API transaction before its first relation access."""
         session = super().start_new_session()
         try:
-            read_state.lock_read_state_schema_shared(session)
+            schema.lock_shared(session)
         except Exception:
             self.session_close()
             raise

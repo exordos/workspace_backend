@@ -3,16 +3,29 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
+from unittest import mock
+
+import pytest
 import webob
 
 from workspace.messenger_api.api import middlewares
+from workspace.workspace_api.api import app as workspace_app
 
 
 class _DeadlockDetected(Exception):
     sqlstate = "40P01"
 
 
-def test_idempotent_read_state_request_retries_whole_transaction(monkeypatch):
+@pytest.mark.parametrize(
+    "resource,action",
+    (
+        ("streams", "read"),
+        ("stream_topics", "read"),
+        ("messages", "read"),
+        ("messages", "read_up_to"),
+    ),
+)
+def test_unified_app_retries_read_state_transaction(monkeypatch, resource, action):
     bodies = []
     operation_uuids = []
 
@@ -26,9 +39,20 @@ def test_idempotent_read_state_request_retries_whole_transaction(monkeypatch):
 
     monkeypatch.setattr(middlewares.time, "sleep", lambda _delay: None)
     monkeypatch.setattr(middlewares.random, "uniform", lambda _start, _end: 1.0)
-    app = middlewares.DatabaseDeadlockRetryMiddleware(downstream)
+    monkeypatch.setattr(
+        workspace_app.applications,
+        "OpenApiApplication",
+        lambda **_kwargs: downstream,
+    )
+    monkeypatch.setattr(
+        workspace_app.iam_mw,
+        "GenesisCoreAuthMiddleware",
+        lambda application, **_kwargs: application,
+    )
+    app = workspace_app.build_wsgi_application(mock.Mock())
     request = webob.Request.blank(
-        "/v1/messages/11111111-1111-1111-1111-111111111111/actions/read_up_to/invoke",
+        f"/v1/messenger/{resource}/11111111-1111-1111-1111-111111111111"
+        f"/actions/{action}/invoke",
         method="POST",
         body=b'{"read":true}',
         content_type="application/json",
@@ -56,7 +80,7 @@ def test_non_idempotent_request_does_not_retry(monkeypatch):
     )
     app = middlewares.DatabaseDeadlockRetryMiddleware(downstream)
     request = webob.Request.blank(
-        "/v1/messages/",
+        "/v1/messenger/messages/",
         method="POST",
         body=b"{}",
         content_type="application/json",
@@ -88,7 +112,7 @@ def test_idempotent_read_state_request_returns_safe_retryable_error(monkeypatch)
         middlewares.DatabaseDeadlockRetryMiddleware(downstream)
     )
     request = webob.Request.blank(
-        "/v1/stream_topics/11111111-1111-1111-1111-111111111111/actions/read/invoke",
+        "/v1/messenger/stream_topics/11111111-1111-1111-1111-111111111111/actions/read/invoke",
         method="POST",
     )
 

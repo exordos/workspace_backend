@@ -1,0 +1,14 @@
+[Unit]
+Description=Workspace History Import
+After=network-online.target
+
+[Service]
+TimeoutStopSec=5
+Restart=always
+RestartSec=5s
+KillSignal=SIGINT
+ExecStartPre=/bin/sleep 2
+ExecStart=workspace-history-import --config-file /etc/workspace/workspace.conf
+
+[Install]
+WantedBy=multi-user.target

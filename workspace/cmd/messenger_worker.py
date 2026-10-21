@@ -21,9 +21,9 @@ import sys
 from oslo_config import cfg
 from gcl_looper.services import hub
 from restalchemy.common import config_opts as ra_config_opts
-from restalchemy.storage.sql import engines
 
 from workspace.common import config
+from workspace.common import database
 from workspace.common import file_storage_opts
 from workspace.common import log as infra_log
 from workspace.common import messenger_worker_opts
@@ -57,15 +57,6 @@ def build_worker_services() -> tuple[agents.MessengerWorkerAgent, ...]:
             ),
             event_prune_interval_seconds=(CONF[DOMAIN].event_prune_interval_seconds),
             event_prune_batch_size=CONF[DOMAIN].event_prune_batch_size,
-            heartbeat_retention=datetime.timedelta(
-                seconds=CONF[DOMAIN].heartbeat_retention_seconds,
-            ),
-            read_state_compaction_enabled=(CONF[DOMAIN].read_state_compaction_enabled),
-            read_state_cleanup_enabled=CONF[DOMAIN].read_state_cleanup_enabled,
-            read_state_batch_size=CONF[DOMAIN].read_state_batch_size,
-            read_state_max_batches_per_iteration=(
-                CONF[DOMAIN].read_state_max_batches_per_iteration
-            ),
             v2_projection_enabled=CONF[DOMAIN].v2_projection_enabled,
             v2_projection_max_tasks_per_iteration=(
                 CONF[DOMAIN].v2_projection_max_tasks_per_iteration
@@ -94,7 +85,9 @@ def build_worker_services() -> tuple[agents.MessengerWorkerAgent, ...]:
             ),
         )
         service.add_setup(
-            lambda: engines.engine_factory.configure_postgresql_factory(conf=CONF)
+            lambda: database.configure_postgresql(
+                "workspace-messenger-worker", conf=CONF
+            )
         )
         services.append(service)
     return tuple(services)

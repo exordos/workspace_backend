@@ -27,43 +27,6 @@ messenger_worker_opts = [
         min=1,
         help="Maximum browser event rows removed in one retention pass",
     ),
-    cfg.IntOpt(
-        "heartbeat-retention-seconds",
-        default=24 * 60 * 60,
-        min=60 * 60,
-        help="Private bridge heartbeat idempotency history in seconds",
-    ),
-    cfg.BoolOpt(
-        "read-state-compaction-enabled",
-        default=False,
-        help=(
-            "Enable resumable legacy unread-state cutover only after every "
-            "Workspace API and worker process uses the current revision and "
-            "connected bridges advertise bounded read result retention"
-        ),
-    ),
-    cfg.BoolOpt(
-        "read-state-cleanup-enabled",
-        default=False,
-        help=(
-            "Delete redundant legacy unread rows only after every Workspace "
-            "API and worker process uses the current revision and connected "
-            "bridges advertise bounded read result retention"
-        ),
-    ),
-    cfg.IntOpt(
-        "read-state-batch-size",
-        default=50_000,
-        min=1_000,
-        help="Maximum rows processed by one compact read-state transaction",
-    ),
-    cfg.IntOpt(
-        "read-state-max-batches-per-iteration",
-        default=8,
-        min=1,
-        max=100,
-        help="Maximum separately committed read-state batches per worker pass",
-    ),
     cfg.BoolOpt(
         "v2-projection-enabled",
         default=True,

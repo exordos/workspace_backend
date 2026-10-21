@@ -12,7 +12,6 @@ from restalchemy.api import applications
 from restalchemy.api import constants
 from restalchemy.api import contexts
 
-from workspace.messenger_api.api import app as messenger_app
 from workspace.messenger_api.dm import base as messenger_dm_base
 from workspace.workspace_api.api import app as workspace_app
 
@@ -90,6 +89,7 @@ def _assert_file_upload_contract(operation):
         "hash",
     ]
     assert "storage_type" not in json_schema["properties"]
+    assert json_schema["properties"]["description"]["maxLength"] == 10000
     multipart_schema = content["multipart/form-data"]["schema"]
     assert multipart_schema["required"] == ["file"]
     assert multipart_schema["oneOf"] == [
@@ -103,6 +103,7 @@ def _assert_file_upload_contract(operation):
         },
     ]
     assert "storage_type" not in multipart_schema["properties"]
+    assert multipart_schema["properties"]["description"]["maxLength"] == 10000
 
 
 def _assert_collection_pagination_contract(
@@ -277,11 +278,10 @@ def _assert_all_local_references_resolve(specification):
 
 
 def test_generated_openapi_references_are_self_contained():
-    for app_module in (messenger_app, workspace_app):
-        specification = _build_openapi(app_module)
-        schemas = specification["components"]["schemas"]
-        assert schemas["WorkspaceUser_AvatarUpload"] == schemas["WorkspaceUser_Get"]
-        _assert_all_local_references_resolve(specification)
+    specification = _build_openapi(workspace_app)
+    schemas = specification["components"]["schemas"]
+    assert schemas["WorkspaceUser_AvatarUpload"] == schemas["WorkspaceUser_Get"]
+    _assert_all_local_references_resolve(specification)
 
 
 def test_generated_openapi_color_defaults_are_deterministic():
@@ -290,8 +290,8 @@ def test_generated_openapi_color_defaults_are_deterministic():
         "randint",
         side_effect=AssertionError("OpenAPI generation must not select a color"),
     ):
-        first_specification = _build_openapi(messenger_app)
-        second_specification = _build_openapi(messenger_app)
+        first_specification = _build_openapi(workspace_app)
+        second_specification = _build_openapi(workspace_app)
 
     assert first_specification == second_specification
     color_schemas = {
@@ -304,7 +304,7 @@ def test_generated_openapi_color_defaults_are_deterministic():
 
 
 def test_generated_openapi_message_payload_uses_markdown_content_limit():
-    specification = _build_openapi(messenger_app)
+    specification = _build_openapi(workspace_app)
     payload_schema = _component_schema(
         specification,
         "WorkspaceUserMessage_Create",
@@ -315,7 +315,7 @@ def test_generated_openapi_message_payload_uses_markdown_content_limit():
 
 @pytest.mark.parametrize(
     "app_module,root",
-    [(messenger_app, "/v1/"), (workspace_app, "/v1/messenger/")],
+    [(workspace_app, "/v1/messenger/")],
 )
 def test_generated_openapi_describes_encryption_requests_and_fixed_payloads(
     app_module, root
@@ -442,25 +442,27 @@ def test_generated_openapi_exposes_persisted_complete_reaction_user_lists():
         assert "never partial" in reaction_users_schema["description"]
 
 
-def test_messenger_openapi_keeps_internal_v1_paths_and_add_users_action():
-    specification = _build_openapi(messenger_app)
+def test_workspace_openapi_exposes_messenger_actions():
+    specification = _build_openapi(workspace_app)
     paths = specification["paths"]
 
-    assert "/v1/messages/" in paths
-    assert "/v1/streams/" in paths
-    assert "/v1/messenger/messages/" not in paths
-    assert "/v1/events/" not in paths
-    assert "/v1/epoch/" not in paths
+    assert "/v1/messenger/messages/" in paths
+    assert "/v1/messenger/streams/" in paths
+    assert "/v1/messages/" not in paths
+    assert "/v1/events/" in paths
+    assert "/v1/epoch/" in paths
     _assert_message_pagination_contract(
         specification,
-        paths["/v1/messages/"]["get"],
+        paths["/v1/messenger/messages/"]["get"],
     )
     _assert_message_star_actions(
         paths,
-        "/v1/messages/{WorkspaceUserMessageUuid}",
+        "/v1/messenger/messages/{WorkspaceUserMessageUuid}",
     )
 
-    add_users_path = "/v1/streams/{WorkspaceUserStreamUuid}/actions/add_users/invoke"
+    add_users_path = (
+        "/v1/messenger/streams/{WorkspaceUserStreamUuid}/actions/add_users/invoke"
+    )
     assert set(paths[add_users_path]) == {"post"}
     assert paths[add_users_path]["post"]["operationId"].startswith("Add_users_")
 
@@ -474,18 +476,48 @@ def test_messenger_openapi_keeps_internal_v1_paths_and_add_users_action():
         "$ref": "#/components/schemas/WorkspaceUser_Get"
     }
     _assert_multipart_object(paths[avatar_upload_path]["post"], ["file"])
-    _assert_file_upload_contract(paths["/v1/files/"]["post"])
+    _assert_file_upload_contract(paths["/v1/messenger/files/"]["post"])
     _assert_collection_pagination_contract(
         specification,
-        paths["/v1/folders/"]["get"],
+        paths["/v1/messenger/folders/"]["get"],
         {"type": "string", "format": "uuid"},
     )
-    _assert_draft_contract(paths, "/v1/drafts/")
+    _assert_draft_contract(paths, "/v1/messenger/drafts/")
     _assert_topic_summary_contract(
         paths,
-        "/v1/stream_topics/{WorkspaceUserTopicUuid}",
+        "/v1/messenger/stream_topics/{WorkspaceUserTopicUuid}",
     )
-    _assert_topic_summary_management_contract(specification, "/v1/")
+    _assert_topic_summary_management_contract(specification, "/v1/messenger/")
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    (
+        "me/",
+        "users/",
+        "users/{WorkspaceUserUuid}",
+        "users/{WorkspaceUserUuid}/actions/presence/invoke",
+        "users/{WorkspaceUserUuid}/actions/avatar_upload/invoke",
+        "users/{WorkspaceUserUuid}/actions/avatar_reset/invoke",
+    ),
+)
+def test_deprecated_messenger_user_aliases_keep_the_shared_openapi_contract(suffix):
+    specification = _build_openapi(workspace_app)
+    paths = specification["paths"]
+    canonical = paths[f"/v1/{suffix}"]
+    alias = paths[f"/v1/messenger/{suffix}"]
+
+    assert set(alias) == set(canonical)
+    for method, operation in canonical.items():
+        alias_operation = alias[method]
+        assert alias_operation["deprecated"] is True
+        assert not operation.get("deprecated", False)
+        assert alias_operation["operationId"] != operation["operationId"]
+        assert {
+            key: value
+            for key, value in alias_operation.items()
+            if key not in {"operationId", "deprecated"}
+        } == {key: value for key, value in operation.items() if key != "operationId"}
 
 
 def test_workspace_openapi_exposes_messenger_and_rest_events():
@@ -586,12 +618,7 @@ def test_workspace_openapi_exposes_messenger_and_rest_events():
         "properties"
     ]
     assert raw_provider_fields.isdisjoint(user_properties)
-    assert user_properties["identity_kind"]["enum"] == ["external"]
-    assert user_properties["display_name"]["readOnly"] is True
-    assert set(user_properties["provider"]["properties"]) == {
-        "kind",
-        "account_uuid",
-    }
+    assert {"provider", "identity_kind", "display_name"}.isdisjoint(user_properties)
     assert raw_provider_fields.isdisjoint(
         _component_schema(specification, "WorkspaceFile_Filter")["properties"],
     )
@@ -605,9 +632,8 @@ def test_workspace_openapi_exposes_messenger_and_rest_events():
             "properties"
         ]
         assert raw_provider_fields.isdisjoint(projection_properties)
-        assert {"provider", "delivery"} <= set(projection_properties)
+        assert {"provider", "delivery"}.isdisjoint(projection_properties)
         assert "identity_kind" not in projection_properties
-        assert "external_id" in projection_properties["provider"]["properties"]
     topic_properties = _component_schema(
         specification,
         "WorkspaceUserTopic_Get",
@@ -623,8 +649,6 @@ def test_workspace_openapi_exposes_messenger_and_rest_events():
     )["properties"]
     assert event_properties["object_type"]["enum"] == [
         "external_account",
-        "external_chat",
-        "external_operation",
         "file",
         "folder",
         "folder_item",
@@ -635,3 +659,33 @@ def test_workspace_openapi_exposes_messenger_and_rest_events():
         "topic",
         "user",
     ]
+
+
+def test_external_account_status_contract():
+    specification = _build_openapi(workspace_app)
+    schema = _component_schema(specification, "ExternalAccount_Get")
+
+    assert set(schema["properties"]["status"]["enum"]) == {
+        "new",
+        "backfill",
+        "fast_backfill",
+        "active",
+        "error",
+    }
+    assert schema["properties"]["status"]["default"] == "new"
+    assert "status" not in schema["required"]
+    assert schema["properties"]["error_description"]["type"] == "string"
+    assert schema["properties"]["error_description"]["nullable"] is True
+    assert "revision" not in schema["properties"]
+    assert schema["properties"]["project_id"]["format"] == "uuid"
+    assert schema["properties"]["project_id"]["readOnly"] is True
+    assert "project_id" in schema["required"]
+    resource = specification["paths"][
+        "/v1/messenger/external_accounts/{ExternalAccountUuid}"
+    ]
+    assert all(
+        _component_parameter(specification, parameter)["name"] != "If-Match"
+        for parameter in resource["put"]["parameters"]
+    )
+    for method in ("get", "put"):
+        assert "ETag" not in resource[method]["responses"][200].get("headers", {})

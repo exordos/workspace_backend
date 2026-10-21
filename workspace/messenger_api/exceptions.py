@@ -28,11 +28,6 @@ class PrivateIndexIsTechnicalFieldError(ra_exc.ValidationErrorException):
     code = 400001002
 
 
-class DirectStreamSelfChatError(ra_exc.ValidationErrorException):
-    message = "'direct_user_uuid' must point to another user"
-    code = 400001003
-
-
 class InvalidStreamBindingRoleError(ra_exc.ValidationErrorException):
     message = "Invalid stream binding role '%(role)s'"
     code = 400001004
@@ -56,19 +51,9 @@ class StreamDefaultTopicNotConfiguredError(ra_exc.ValidationErrorException):
     code = 400001007
 
 
-class SelfChatNativeOnlyError(ra_exc.ValidationErrorException):
-    message = "Self chat must use the native source"
-    code = 400001008
-
-
 class SelfChatDeleteNotAllowedError(ra_exc.ValidationErrorException):
     message = "Self chat cannot be deleted"
     code = 400001009
-
-
-class StreamSourceMismatchError(ra_exc.ValidationErrorException):
-    message = "'source_name' must match 'source.kind'"
-    code = 400001010
 
 
 class StreamIdentityImmutableError(ra_exc.ValidationErrorException):
@@ -167,46 +152,3 @@ class DraftPreconditionFailedError(ra_exc.RestAlchemyException):
 class ExternalResourceForbiddenError(ra_exc.RestAlchemyException):
     message = "External resource access is forbidden"
     code = 403
-
-
-class ExternalAccountConflictError(ra_exc.RestAlchemyException):
-    message = "An external account for this provider already exists"
-    code = 409
-
-
-class ExternalProviderScopeConflictError(ra_exc.RestAlchemyException):
-    message = "This provider chat is already assigned to another project"
-    code = 409
-
-    def as_dict(self) -> dict[str, typing.Any]:
-        return {
-            "type": self.__class__.__name__,
-            "code": self.code,
-            "error": "provider_scope_conflict",
-            "message": self.msg,
-            "retryable": False,
-        }
-
-
-class ExternalProjectionMoveConflictError(ra_exc.RestAlchemyException):
-    message = "Provider read delivery is in progress; retry the projection move"
-    code = 409
-
-    def as_dict(self) -> dict[str, typing.Any]:
-        return {
-            "type": self.__class__.__name__,
-            "code": self.code,
-            "error": "external_projection_move_in_progress",
-            "message": self.msg,
-            "retryable": True,
-        }
-
-
-class ExternalPreconditionRequiredError(ra_exc.RestAlchemyException):
-    message = "External resource mutation requires If-Match"
-    code = 428
-
-
-class ExternalPreconditionFailedError(ra_exc.RestAlchemyException):
-    message = "External resource revision does not match If-Match"
-    code = 412

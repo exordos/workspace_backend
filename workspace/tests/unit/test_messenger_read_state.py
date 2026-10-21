@@ -7,7 +7,7 @@ import types
 import unittest.mock
 import uuid as sys_uuid
 
-from workspace.messenger_api.dm import read_state
+from migrations import legacy_messenger_read_state as read_state
 
 
 def test_clear_message_uses_exact_negative_read_counter_deltas(monkeypatch):

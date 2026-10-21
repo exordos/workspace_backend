@@ -27,13 +27,19 @@ request headers.  This keeps the tests hermetic while exercising everything
 below the auth layer, including the composite-primary-key controllers.
 """
 
+import contextlib
+import datetime
+import gc
+import json
 import os
 import pathlib
 import threading
+import urllib.parse
 import uuid as sys_uuid
 import wsgiref.simple_server
 
 import psycopg
+from psycopg import sql
 import pytest
 import requests
 
@@ -50,11 +56,10 @@ from oslo_config import cfg
 from workspace.common import file_storage_opts
 from workspace.common import messenger_reaction_opts
 from workspace.common import topic_summary_opts
-from workspace.common import external_bridge_opts
-from workspace.messenger_api.api import app as messenger_app
+from workspace.bridges.zulip.dm import models as zulip_models
 from workspace.messenger_api.api import context as auth_context
 from workspace.messenger_api.api import middlewares as app_middlewares
-from workspace.messenger_api.api import sql_canonical_store
+from workspace.messenger_api.api import store_factory
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.dm import models as messenger_models
 from workspace.workspace_api.api import app as workspace_app
@@ -169,15 +174,11 @@ class MockedIamAuthMiddleware(iam_mw.GenesisCoreAuthMiddleware):
                 return contexts_mw.ContextMiddleware._get_response(self, ctx, req)
 
 
-def build_test_wsgi_application(app_module=messenger_app):
+def build_test_wsgi_application():
     """Same WSGI app + middleware stack as production, mocked auth layer only."""
     file_storage_opts.register_opts()
     try:
         messenger_reaction_opts.register_opts()
-    except cfg.DuplicateOptError:
-        pass
-    try:
-        external_bridge_opts.register_opts()
     except cfg.DuplicateOptError:
         pass
     try:
@@ -190,8 +191,8 @@ def build_test_wsgi_application(app_module=messenger_app):
         group=topic_summary_opts.DOMAIN,
     )
     application = applications.OpenApiApplication(
-        route_class=app_module.get_api_application(),
-        openapi_engine=app_module.get_openapi_engine(),
+        route_class=workspace_app.get_api_application(),
+        openapi_engine=workspace_app.get_openapi_engine(),
     )
     return middlewares.attach_middlewares(
         application,
@@ -297,14 +298,74 @@ def _database():
 
     engine = ra_migrations.MigrationEngine(migrations_path=str(MIGRATIONS_DIR))
     engine.apply_migration(engine.get_latest_migration())
-    api_store.configure_store_factory(
-        sql_canonical_store.SQLCanonicalMessengerStoreFactory()
-    )
+    api_store.configure_store_factory(store_factory.build_store_factory())
 
     yield
 
     api_store.reset_store_factory()
     engines.engine_factory.destroy_all_engines()
+
+
+@contextlib.contextmanager
+def isolated_migration_database(migration, *, current_models=False):
+    """Own a disposable database for tests of a published schema revision."""
+    database_name = "workspace_migration_" + sys_uuid.uuid4().hex
+    database_url = (
+        urllib.parse.urlsplit(TEST_DB_URL)._replace(path="/" + database_name).geturl()
+    )
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as admin:
+        admin.execute(
+            sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database_name))
+        )
+    try:
+        engines.engine_factory.destroy_all_engines()
+        engines.engine_factory.configure_factory(db_url=database_url)
+        engine = ra_migrations.MigrationEngine(migrations_path=str(MIGRATIONS_DIR))
+        engine.apply_migration(migration)
+        if current_models:
+            # These fields are independent of the historical migration under
+            # test. Keep current ORM fixtures usable without applying 0231,
+            # which would retire the compatibility tables being tested.
+            with psycopg.connect(database_url, autocommit=True) as connection:
+                connection.execute("""
+                    ALTER TABLE m_external_accounts_v2 ADD COLUMN IF NOT EXISTS
+                        has_completed_backfill BOOLEAN NOT NULL DEFAULT FALSE;
+                    ALTER TABLE bridge_zulip_v5_tasks
+                        ADD COLUMN IF NOT EXISTS queue VARCHAR(16) NOT NULL DEFAULT 'background',
+                        ADD COLUMN IF NOT EXISTS concurrency_key TEXT NOT NULL DEFAULT '',
+                        ADD COLUMN IF NOT EXISTS backfill_uuid UUID,
+                        ADD COLUMN IF NOT EXISTS realtime_event_uuid UUID,
+                        ADD COLUMN IF NOT EXISTS execution_time DOUBLE PRECISION,
+                        ADD COLUMN IF NOT EXISTS queue_wait_time DOUBLE PRECISION,
+                        ADD COLUMN IF NOT EXISTS message_created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT 'epoch',
+                        ADD COLUMN IF NOT EXISTS message_sequence BIGINT NOT NULL DEFAULT 0;
+                    ALTER TABLE bridge_zulip_v5_message_contents
+                        ADD COLUMN IF NOT EXISTS conversion_version INTEGER NOT NULL DEFAULT 0,
+                        ADD COLUMN IF NOT EXISTS source_timestamp BIGINT NOT NULL DEFAULT 0,
+                        ADD COLUMN IF NOT EXISTS source_message_id BIGINT NOT NULL DEFAULT 0;
+                    ALTER TABLE IF EXISTS messenger_message_changes ADD COLUMN IF NOT EXISTS
+                        message_created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT 'epoch',
+                        ADD COLUMN IF NOT EXISTS message_sequence BIGINT NOT NULL DEFAULT 0;
+                    ALTER TABLE IF EXISTS bridge_zulip_v5_message_changes ADD COLUMN IF NOT EXISTS
+                        message_created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT 'epoch',
+                        ADD COLUMN IF NOT EXISTS message_sequence BIGINT NOT NULL DEFAULT 0;
+                    ALTER TABLE messenger_user_message_states
+                        ADD COLUMN IF NOT EXISTS read_updated_at TIMESTAMP WITHOUT TIME ZONE,
+                        ADD COLUMN IF NOT EXISTS starred_updated_at TIMESTAMP WITHOUT TIME ZONE;
+                """)
+        yield database_url
+    finally:
+        engines.engine_factory.destroy_all_engines()
+        # Historical-schema tests create many short-lived pools. Restalchemy
+        # closes session/engine reference cycles when they are collected.
+        gc.collect()
+        engines.engine_factory.configure_factory(db_url=TEST_DB_URL)
+        with psycopg.connect(TEST_DB_URL, autocommit=True) as admin:
+            admin.execute(
+                sql.SQL("DROP DATABASE {} WITH (FORCE)").format(
+                    sql.Identifier(database_name)
+                )
+            )
 
 
 @pytest.fixture(scope="session")
@@ -314,25 +375,6 @@ def http_server(_database):
         "127.0.0.1",
         0,
         build_test_wsgi_application(),
-        handler_class=_QuietHandler,
-    )
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    host, port = server.server_address
-    try:
-        yield f"http://{host}:{port}"
-    finally:
-        server.shutdown()
-        thread.join(timeout=5)
-        server.server_close()
-
-
-@pytest.fixture(scope="session")
-def workspace_http_server(_database):
-    server = wsgiref.simple_server.make_server(
-        "127.0.0.1",
-        0,
-        build_test_wsgi_application(workspace_app),
         handler_class=_QuietHandler,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -363,10 +405,10 @@ def api(http_server, db):
 
 
 @pytest.fixture
-def workspace_api(workspace_http_server, db):
+def workspace_api(http_server, db):
     user_uuid = sys_uuid.uuid4()
     return ApiClient(
-        base_url=workspace_http_server,
+        base_url=http_server,
         user_uuid=user_uuid,
         project_id=sys_uuid.uuid4(),
         user_seeder=lambda value: seed_workspace_user(
@@ -377,14 +419,116 @@ def workspace_api(workspace_http_server, db):
     )
 
 
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "pre_retirement_schema: verify a published migration before compatibility retirement",
+    )
+
+
+@pytest.fixture(autouse=True)
+def _test_database_url(_database, request, monkeypatch):
+    if request.node.get_closest_marker("pre_retirement_schema") is None:
+        with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+            if connection.execute(
+                "SELECT to_regclass('messenger_domain_outbox_events')"
+            ).fetchone()[0]:
+                connection.execute("DELETE FROM messenger_domain_outbox_events")
+                connection.execute("DELETE FROM messenger_projection_scope_leases")
+        api_store.configure_store_factory(store_factory.build_store_factory())
+        try:
+            yield TEST_DB_URL
+        finally:
+            api_store.configure_store_factory(store_factory.build_store_factory())
+        return
+    baseline = "0230-Avoid-redundant-project-user-writes-and-bound-Zulip-reconciliation-batches-fc01aa.py"
+    from workspace.tests.integration import legacy_store
+
+    apply = ra_migrations.MigrationEngine.apply_migration
+
+    def apply_with_current_queue_metadata(engine, *args, **kwargs):
+        result = apply(engine, *args, **kwargs)
+        # Historical rollbacks can recreate these tables. Keep the current
+        # queue models usable without applying the compatibility retirement.
+        with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+            connection.execute("""ALTER TABLE bridge_zulip_v5_tasks
+                ADD COLUMN IF NOT EXISTS queue VARCHAR(16) NOT NULL DEFAULT 'background',
+                ADD COLUMN IF NOT EXISTS concurrency_key TEXT NOT NULL DEFAULT ''""")
+            for table in (
+                "messenger_message_changes",
+                "bridge_zulip_v5_message_changes",
+            ):
+                connection.execute(
+                    f"ALTER TABLE IF EXISTS {table} ADD COLUMN IF NOT EXISTS message_created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT 'epoch', ADD COLUMN IF NOT EXISTS message_sequence BIGINT NOT NULL DEFAULT 0"
+                )
+        return result
+
+    if hasattr(request.module, "_historical_database"):
+        api_store.configure_store_factory(legacy_store.LegacyMessengerStoreFactory())
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                ra_migrations.MigrationEngine,
+                "apply_migration",
+                apply_with_current_queue_metadata,
+            )
+            patch.setattr(
+                ra_migrations.MigrationEngine,
+                "get_latest_migration",
+                lambda self: baseline,
+            )
+            yield TEST_DB_URL
+        api_store.configure_store_factory(store_factory.build_store_factory())
+        return
+    with isolated_migration_database(baseline, current_models=True) as database_url:
+        api_store.configure_store_factory(legacy_store.LegacyMessengerStoreFactory())
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                ra_migrations.MigrationEngine,
+                "apply_migration",
+                apply_with_current_queue_metadata,
+            )
+            patch.setitem(globals(), "TEST_DB_URL", database_url)
+            patch.setattr(
+                ra_migrations.MigrationEngine,
+                "get_latest_migration",
+                lambda self: baseline,
+            )
+            try:
+                yield database_url
+            finally:
+                api_store.configure_store_factory(store_factory.build_store_factory())
+
+
 @pytest.fixture
-def db():
+def db(_test_database_url):
     """Direct DB connection for seeding rows the API only needs to read."""
-    conn = psycopg.connect(TEST_DB_URL, autocommit=True)
+    conn = psycopg.connect(_test_database_url, autocommit=True)
     try:
         yield conn
     finally:
         conn.close()
+
+
+@pytest.fixture
+def scheduled_reconciliation(_database):
+    """Keep reconciliation waiting while exercising account-bound queue work."""
+    task = zulip_models.Task(
+        priority=zulip_models.TASK_PRIORITY_RECONCILIATION,
+        not_before_at=datetime.datetime.now(datetime.timezone.utc)
+        + datetime.timedelta(days=1),
+        content=zulip_models.ReconciliationContent(),
+    )
+    task.insert()
+    counters = zulip_models.Task(
+        priority=zulip_models.TASK_PRIORITY_REFRESH_MESSAGE_COUNTERS,
+        not_before_at=datetime.datetime.now(datetime.timezone.utc)
+        + datetime.timedelta(days=1),
+        content=zulip_models.RefreshMessageCountersContent(),
+    )
+    counters.insert()
+    yield task
+    counters.delete()
+    task.delete()
 
 
 # --------------------------------------------------------------------------- #
@@ -399,6 +543,16 @@ def seed_user_stream(conn, project_id, user_uuid, name, description="seeded"):
     """
     seed_workspace_user(conn, user_uuid, f"user-{user_uuid}")
     stream_uuid = sys_uuid.uuid4()
+    if not conn.execute("SELECT to_regclass('m_workspace_streams')").fetchone()[0]:
+        conn.execute(
+            "SELECT messenger_v2_register_project_user(%s,%s)", (project_id, user_uuid)
+        )
+        conn.execute(
+            "INSERT INTO messenger_streams (uuid,project_id,owner_uuid,name,description) VALUES (%s,%s,%s,%s,%s)",
+            (stream_uuid, project_id, user_uuid, name, description),
+        )
+        seed_user_stream_binding(conn, project_id, stream_uuid, user_uuid, role="owner")
+        return str(stream_uuid)
     binding_uuid = sys_uuid.uuid4()
     with conn.cursor() as cur:
         cur.execute(
@@ -427,6 +581,57 @@ def seed_user_stream(conn, project_id, user_uuid, name, description="seeded"):
             ),
         )
     return str(stream_uuid)
+
+
+def seed_legacy_external_account(conn, account):
+    """Seed external-account schemas published before provider identity support."""
+    conn.execute(
+        """
+        INSERT INTO m_external_accounts_v2
+            (uuid, project_id, owner_user_uuid, provider, settings, status,
+             error_description, created_at, updated_at)
+        VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s, NOW(), NOW())
+        """,
+        (
+            account.uuid,
+            account.project_id,
+            account.owner_user_uuid,
+            account.provider,
+            json.dumps(account.settings),
+            account.status,
+            account.error_description,
+        ),
+    )
+
+
+def seed_legacy_zulip_channel(conn, channel):
+    """Seed channel schemas published before channel types were introduced."""
+    conn.execute(
+        """
+        INSERT INTO bridge_zulip_v5_channels
+            (uuid, external_account_uuid, stream_uuid, stream_id, name, description,
+             rendered_description, date_created, creator_id, invite_only,
+             is_web_public, history_public_to_subscribers, is_archived,
+             message_retention_days)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            channel.uuid,
+            channel.external_account_uuid,
+            channel.stream_uuid,
+            channel.stream_id,
+            channel.name,
+            channel.description,
+            channel.rendered_description,
+            channel.date_created,
+            channel.creator_id,
+            channel.invite_only,
+            channel.is_web_public,
+            channel.history_public_to_subscribers,
+            channel.is_archived,
+            channel.message_retention_days,
+        ),
+    )
 
 
 def seed_workspace_user(conn, user_uuid, username, status="active", last_ping_at=None):
@@ -464,10 +669,21 @@ def seed_workspace_user(conn, user_uuid, username, status="active", last_ping_at
 def seed_user_stream_binding(conn, project_id, stream_uuid, user_uuid, role="member"):
     seed_workspace_user(conn, user_uuid, f"user-{user_uuid}")
     binding_uuid = sys_uuid.uuid4()
+    table = (
+        "m_workspace_stream_bindings"
+        if conn.execute("SELECT to_regclass('m_workspace_stream_bindings')").fetchone()[
+            0
+        ]
+        else "messenger_stream_bindings"
+    )
+    if table == "messenger_stream_bindings":
+        conn.execute(
+            "SELECT messenger_v2_register_project_user(%s,%s)", (project_id, user_uuid)
+        )
     with conn.cursor() as cur:
         cur.execute(
-            """
-            INSERT INTO m_workspace_stream_bindings
+            f"""
+            INSERT INTO {table}
                 (uuid, project_id, stream_uuid, user_uuid, who_uuid, role,
                  created_at, updated_at)
             VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW())
@@ -488,6 +704,26 @@ def seed_stream_topic(conn, project_id, stream_uuid, user_uuid, name, is_default
     """Insert a topic and the binding needed for the user topics view."""
     topic_uuid = sys_uuid.uuid4()
     seed_user_stream_binding(conn, project_id, stream_uuid, user_uuid)
+    if not conn.execute("SELECT to_regclass('m_workspace_stream_topics')").fetchone()[
+        0
+    ]:
+        conn.execute(
+            "INSERT INTO messenger_topics (uuid,project_id,stream_uuid,name) VALUES (%s,%s,%s,%s)",
+            (topic_uuid, project_id, stream_uuid, name),
+        )
+        conn.execute(
+            "INSERT INTO messenger_user_topic_bindings (uuid,project_id,user_uuid,topic_uuid,notification_mode) "
+            "SELECT messenger_uuid_v5(%s,user_uuid::text),project_id,user_uuid,%s,'default' "
+            "FROM messenger_stream_bindings WHERE project_id=%s AND stream_uuid=%s AND active "
+            "ON CONFLICT (project_id,user_uuid,topic_uuid) DO NOTHING",
+            (topic_uuid, topic_uuid, project_id, stream_uuid),
+        )
+        if is_default:
+            conn.execute(
+                "UPDATE messenger_streams SET default_topic_uuid=%s WHERE project_id=%s AND uuid=%s",
+                (topic_uuid, project_id, stream_uuid),
+            )
+        return str(topic_uuid)
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -510,6 +746,14 @@ def seed_stream_topic(conn, project_id, stream_uuid, user_uuid, name, is_default
 
 
 def seed_stream_topic_flags(conn, topic_uuid, user_uuid, project_id, is_done=False):
+    if not conn.execute(
+        "SELECT to_regclass('m_workspace_user_topic_flags')"
+    ).fetchone()[0]:
+        conn.execute(
+            "UPDATE messenger_topics SET is_done=%s WHERE project_id=%s AND uuid=%s",
+            (is_done, project_id, topic_uuid),
+        )
+        return
     with conn.cursor() as cur:
         cur.execute(
             """

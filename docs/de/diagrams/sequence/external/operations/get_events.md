@@ -158,7 +158,7 @@ Die Wiederholungen verwenden stabile Geschäftsschlüssel und den aktuellen Ausg
 ## Die Quellen
 
 - [`workspace_api.md`](../../../../workspace_api.md) — Autoritätreiche öffentliche Routen, allgemeine JSON, Pagination, Ereignisse und Vertrag WebSocket.
-- [`zulip_bridge_v1_product_and_api.md`](../../../../zulip_bridge_v1_product_and_api.md) — gesundheitsschützender Lebenszyklus von externen Ressourcen, Berechtigungen und Provider-Semantik.
+- `zulip_bridge_v1_product_and_api.md` — gesundheitsschützender Lebenszyklus von externen Ressourcen, Berechtigungen und Provider-Semantik.
 
 [← Hauptindex der Dokumentation](../../../../index.md) ·
 [Index der Abfolge-Diagramme](../../README.md) ·

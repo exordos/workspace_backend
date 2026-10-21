@@ -1,8 +1,13 @@
 # Канонический инвентарь proposal-архитектуры Messenger
 
+> Historical reference: the rolling compatibility tables and compact read-state
+> maintenance were retired by migration `0231`. See
+> [the current cutover procedure](messenger_domain_model.md#retiring-the-compatibility-schema).
+
+
 Статус: **proposal; машинно-сверяемый словарь для документации, не production schema**.
 
-[← Главный индекс документации](index.md) · [Доменная модель](messenger_domain_model.md) · [RestAlchemy API](messenger_restalchemy_api_spec.md) · [Sequence index](diagrams/sequence/README.md) · [Zulip Bridge proposal](zulip_bridge/README.md)
+[← Главный индекс документации](index.md) · [Доменная модель](messenger_domain_model.md) · [RestAlchemy API](messenger_restalchemy_api_spec.md) · [Sequence index](diagrams/sequence/README.md) · Zulip Bridge proposal
 
 Этот документ является единственным каноническим инвентарём имён, ключей,
 UUID-алгоритмов, видов задач/событий и оставшихся OPEN-решений. Подробные
@@ -227,11 +232,11 @@ at-least-once and clients dedupe by event UUID.
 
 Target ingestion, service identity, registration boundary и recovery для
 Zulip описаны без дублирования этого инвентаря в
-[`zulip_bridge/README.md`](zulip_bridge/README.md). Его OPEN-list конкретизирует
+`zulip_bridge/README.md`. Его OPEN-list конкретизирует
 transport/provider-key вопросы Bridge; current mTLS authentication уже выбрана,
 а общие Messenger model/task/event
 имена по-прежнему каноничны здесь. Exact Zulip event/op directions и
 echo-prevention boundary канонически заданы в
-[`zulip_bridge/event_coverage.md`](zulip_bridge/event_coverage.md).
+`zulip_bridge/event_coverage.md`.
 
-[← Главный индекс документации](index.md) · [Доменная модель](messenger_domain_model.md) · [RestAlchemy API](messenger_restalchemy_api_spec.md) · [Sequence index](diagrams/sequence/README.md) · [Zulip Bridge proposal](zulip_bridge/README.md)
+[← Главный индекс документации](index.md) · [Доменная модель](messenger_domain_model.md) · [RestAlchemy API](messenger_restalchemy_api_spec.md) · [Sequence index](diagrams/sequence/README.md) · Zulip Bridge proposal

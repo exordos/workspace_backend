@@ -53,7 +53,7 @@ also defines rebuild, recovery, scale, and load acceptance.
 | ID | Scenario | Expected result |
 | --- | --- | --- |
 | MSG-NATIVE-001 | Create a public channel. | Owner binding, default topic, folders, and create events are produced once. |
-| MSG-NATIVE-002 | Create direct and group-direct channels repeatedly. | Creation is idempotent and private bindings remain correct. |
+| MSG-NATIVE-002 | Repeatedly create direct chats and self chats; try creating a private stream without a peer and changing private membership or roles. | Creation is idempotent with exactly two participants, or one for self chat. Missing peers and membership or role changes return HTTP `400`; native private groups are not supported. |
 | MSG-NATIVE-003 | Rename, archive, unarchive, and delete a channel. | Authorized users receive the established update or delete events. |
 | MSG-NATIVE-004 | Add and remove users with every supported role. | Visibility, bindings, file access, folders, and events update only for affected users. |
 | MSG-NATIVE-005 | Create, rename, mark done, set default, mute, follow, read, and delete topics. | Topic state, unread counters, and events match the baseline. |

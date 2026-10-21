@@ -1,10 +1,9 @@
 # Workspace v1 API
 
-This document describes the browser-facing API contract composed by nginx from
-the preserved `workspace-messenger-api`, the common `workspace-api`, and the
-companion `workspace-messenger-events` websocket service. Public Messenger
-requests use the dedicated Messenger process; common users, client service
-settings, push-device registrations, and REST events use `workspace-api`.
+This document describes the browser-facing API contract served by the unified
+`workspace-api` REST service and the companion `workspace-messenger-events`
+websocket service. Messenger resources, users, client service settings,
+push-device registrations, and REST events all use `workspace-api`.
 Standalone Mail, Calendar, and External Users endpoints are not part of this
 release. Provider-neutral external account, chat, operation, policy, health,
 and bridge-instance resources are part of the Messenger API.
@@ -18,11 +17,11 @@ preserve provider identity without changing the browser API.
 Direct local services:
 
 ```text
-Messenger REST API:  http://127.0.0.1:21081/v1
+Messenger REST API:  http://127.0.0.1:21084/v1/messenger
 Events WebSocket:    ws://127.0.0.1:21082/v1/events/ws
 Workspace REST API:  http://127.0.0.1:21084/v1
 Worker:              workspace-messenger-worker
-Messenger OpenAPI:   http://127.0.0.1:21081/specifications/3.0.3
+History importer:    workspace-history-import
 Workspace OpenAPI:   http://127.0.0.1:21084/specifications/3.0.3
 ```
 
@@ -38,11 +37,11 @@ Events WebSocket:    /api/workspace/v1/events/ws?last_epoch_version=<number>&epo
 OpenAPI spec:        /api/workspace/specifications/3.0.3
 ```
 
-`/api/workspace/v1/messenger/` is proxied to the preserved Messenger REST
-service on `127.0.0.1:21081`; the remainder of `/api/workspace/` is proxied to
-the Workspace REST service on `127.0.0.1:21084`.
-The exact nginx location `/api/workspace/v1/events/ws` is proxied to the
-websocket service endpoint `/v1/events/ws` on `127.0.0.1:21082`.
+All REST requests under `/api/workspace/`, including
+`/api/workspace/v1/messenger/`, are proxied to `workspace-api` on
+`127.0.0.1:21084` without changing the public URL structure. The exact nginx
+location `/api/workspace/v1/events/ws` is proxied to the websocket service
+endpoint `/v1/events/ws` on `127.0.0.1:21082`.
 
 The backend nginx manifest sets `client_max_body_size 50m` for proxied requests.
 It does not serve the web UI; unmatched non-API paths return `404`.
@@ -208,7 +207,7 @@ runtimes use the private bridge-authenticated API rooted at
 `/api/workspace-provider/v1`; its operations commit ordinary Messenger
 resources into PostgreSQL, so it does not change the browser contract described
 in this document. The private contract is defined in
-[`workspace_provider_api_v1.yaml`](../workspace_provider_api_v1.yaml).
+`workspace_provider_api_v1.yaml`.
 
 ## Pagination And Filters
 
@@ -322,11 +321,11 @@ authoritative snapshots before starting a new cursor.
 | `GET` | `/api/workspace/v1/messenger/drafts/{draft_uuid}` | Get an owned draft and its strong revision ETag. |
 | `PUT` | `/api/workspace/v1/messenger/drafts/{draft_uuid}` | Replace only the Markdown payload using `If-Match`. |
 | `DELETE` | `/api/workspace/v1/messenger/drafts/{draft_uuid}` | Hard-delete an owned draft using `If-Match`. |
-| `GET` | `/api/workspace/v1/messenger/external_accounts/` | List the current user's realm-global external accounts; requires `workspace.external_account.read`. |
-| `POST` | `/api/workspace/v1/messenger/external_accounts/` | Create an external account with a client-generated UUID and write-only credential; requires `workspace.external_account.create`. |
+| `GET` | `/api/workspace/v1/messenger/external_accounts/` | List the current user's external accounts in the request project; requires `workspace.external_account.read`. |
+| `POST` | `/api/workspace/v1/messenger/external_accounts/` | Create an external account using `project_id` from the request context; requires `workspace.external_account.create`. |
 | `GET` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Get the owner's sanitized external-account snapshot; requires `workspace.external_account.read`. |
-| `PUT` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Replace mutable non-secret settings using `If-Match`; requires `workspace.external_account.update`. |
-| `DELETE` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Delete the account and its projection; requires `workspace.external_account.delete`. |
+| `PUT` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Replace mutable settings; requires `workspace.external_account.update`. |
+| `DELETE` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Unbind a verified Zulip account, clear credentials, cancel pending tasks, and return ownership to its imported user while retaining bridge data. Other or unverified accounts are deleted. Requires `workspace.external_account.delete`. |
 | `POST` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}/actions/reconnect/invoke` | Validate and replace the write-only credential, then resume synchronization; requires `workspace.external_account.reconnect`. |
 | `POST` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}/actions/disconnect/invoke` | Stop synchronization while retaining the read-only projection; requires `workspace.external_account.disconnect`. |
 | `GET` | `/api/workspace/v1/messenger/external_chats/` | List the owner's sanitized external chat catalog and assignment state. |
@@ -373,6 +372,15 @@ authoritative snapshots before starting a new cursor.
 | `POST` | `/api/workspace/v1/users/{user_uuid}/actions/avatar_reset/invoke` | Remove the current user's custom avatar and restore the canonical Gravatar URN. |
 | `GET` | `/api/workspace/v1/me/` | Return the current authenticated Workspace user. |
 
+Zulip connection verification creates a deterministic imported user with
+`source="hidden"`, including for the first account connected to a server.
+Hidden users remain available by UUID and are excluded from user collection
+responses. An existing imported external account is rebound to the connecting
+IAM user without changing its UUID or bridge references; an account already
+owned by another real user cannot be claimed. Unbinding returns ownership to
+the imported profile and restores `source="zulip"`. User synchronization keeps
+hidden profiles up to date without making them visible.
+
 ### External integration contract boundary
 
 The endpoint table above is the canonical inventory of the current
@@ -388,7 +396,7 @@ does not add provider-specific collection routes. Detailed sanitized resource
 examples, ETag and `If-Match` rules, action permissions, lifecycle semantics,
 and administration behavior for accounts, chats, operations, bridge instances,
 provider policies, and provider health are defined in sections 5 and 6 of
-[`zulip_bridge_v1_product_and_api.md`](zulip_bridge_v1_product_and_api.md).
+`zulip_bridge_v1_product_and_api.md`.
 Its private control, provider data-plane, and file-transfer sections describe
 backend-to-bridge contracts and are not part of the public browser API.
 
@@ -780,8 +788,8 @@ raw provider protocol identifiers, credentials, and synchronization state.
 | `source` | object | no | no | Source payload; defaults to `{"kind": "native"}`. |
 | `invite_only` | boolean | no | no | Invite-only stream flag. |
 | `announce` | boolean | no | no | Announcement stream flag. |
-| `direct_user_uuid` | UUID | no | no | Direct-chat counterpart. Equals the current user UUID only for a self chat. |
-| `private` | boolean | no | yes | Private stream flag. |
+| `direct_user_uuid` | UUID | conditional | creation-only | Required for a private stream. Direct-chat counterpart; equals the current user UUID only for a self chat. |
+| `private` | boolean | no | yes | Private stream flag, derived from `direct_user_uuid`. Native private groups are not supported. |
 | `is_archived` | boolean | no | action-managed | Archived flag. |
 | `color` | integer `0..0xFFFFFF` | no | no | Stream color; generated randomly when omitted or `null`. |
 | `last_message_uuid` | UUID or `null` | no | yes | Latest message in the stream, or `null` when empty. |
@@ -840,8 +848,9 @@ the standard stream resource with `private: true`, one current-user `owner`
 binding, and the same current-user UUID in `direct_user_uuid`; no separate chat
 type or self-chat flag is exposed. This makes
 `private && direct_user_uuid == current_user_uuid` the stable client-side
-identity check while preserving ordinary private-group streams, whose
-`direct_user_uuid` remains `null`.
+identity check. Native Workspace has no private-group mode: every private stream
+requires a non-null `direct_user_uuid`. Creating a stream with `private: true`
+without a peer returns HTTP `400`.
 
 Direct membership is immutable. Its bindings must equal the unique users in
 the identity pair: one binding for a self chat and two for an ordinary direct
@@ -849,9 +858,9 @@ chat. Adding or removing participants and updating a binding role returns HTTP
 `400`. Deleting a self-chat stream also returns HTTP `400` so message history
 cannot be replaced by deleting and recreating the deterministic identity.
 `source_name` must match `source.kind` when a stream is created. Both source
-fields are immutable for every stream. For a direct chat, `direct_user_uuid`,
-`private`, and the internal `private_index` are also immutable; attempts to
-change any of these identity fields return HTTP `400`.
+fields, `direct_user_uuid`, `private`, and the internal `private_index` are
+immutable for every stream; attempts to change them return HTTP `400`.
+An ordinary stream cannot be converted into a private stream.
 
 Stream notification mode request:
 
@@ -1730,7 +1739,7 @@ token is rejected. A valid Workspace bearer token may read or download a
 `public` file regardless of project or stream membership. A `public` sidecar
 must not contain `stream_uuid`; it retains `owner_uuid` and all integrity
 metadata. Nginx rejects multipart requests larger than `50m` before they reach
-`workspace-messenger-api`.
+`workspace-api`.
 
 | Field | Type | Required on JSON create | Read-only | Description |
 | --- | --- | --- | --- | --- |
@@ -2003,6 +2012,12 @@ data are not deleted.
 Workspace users are stored in `m_workspace_users`. The route is global rather
 than project-scoped.
 
+The compatibility routes `/api/workspace/v1/messenger/me/` and
+`/api/workspace/v1/messenger/users/` (including user lookups and actions)
+return the same responses through the shared controllers. They are deprecated
+and will be removed after clients migrate to `/api/workspace/v1/me/` and
+`/api/workspace/v1/users/`. New clients must use the shared Workspace routes.
+
 `GET /api/workspace/v1/me/` returns the same `WorkspaceUser_Get` object as
 `GET /api/workspace/v1/users/{user_uuid}`, using the user UUID from the IAM
 token. The client does not send or derive a user UUID for this request. The
@@ -2144,20 +2159,21 @@ browser routes. The middleware-provided `server_settings` aliases and the
 separate Events WebSocket are documented runtime interfaces but do not appear
 as generated OpenAPI paths. The private Provider contract is maintained
 separately in
-[`workspace_provider_api_v1.yaml`](../workspace_provider_api_v1.yaml).
+`workspace_provider_api_v1.yaml`.
 
-The Workspace backend element installs independent `workspace-messenger-api`,
-`workspace-api`, `workspace-messenger-events`, and
-`workspace-messenger-worker` processes plus the private
-`workspace-external-bridge-api` service. The PostgreSQL-canonical runtime does
-not start or connect to a mail service. The element requires S3aaS for binary
-objects and JSON sidecars and DBaaS for canonical Messenger and provider state.
-It builds the existing Workspace UI in Messenger-only mode and serves it from
-nginx.
+The Workspace backend element installs `workspace-api`,
+`workspace-messenger-events`, `workspace-messenger-worker`, and
+`workspace-history-import`. The history importer is a scaffold with an empty
+`step()` method, called every three seconds by default; configure its minimum
+period with `[history_import] step_interval`. The REST API
+uses two HTTP workers by default. DBaaS provides PostgreSQL storage, and
+S3aaS stores file bytes and JSON sidecars. The separately versioned
+`workspace_ui` element serves the web UI and proxies API requests to the
+backend nginx gateway.
 
 Related documents:
 
 - [Workspace architecture](architecture.md)
 - [Workspace UI realtime integration](workspace_ui_realtime_integration.md)
-- [Private Workspace Provider API](../workspace_provider_api_v1.yaml)
-- [Zulip provider product and public API contract](zulip_bridge_v1_product_and_api.md)
+- Private Workspace Provider API
+- Zulip provider product and public API contract

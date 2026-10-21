@@ -1,26 +1,16 @@
-[← Главный индекс документации](../../../index.md) ·
-[Индекс диаграмм последовательностей](../README.md) ·
-[Полная матрица операций](operations/README.md)
+# Accounts and events
 
-# Диаграммы последовательностей внешней интеграции и времени исполнения
+External accounts store an owner, a required provider, and generic settings.
+Creating an account does not connect or synchronize it. Workspace provides
+account CRUD; updates require the current `If-Match` revision.
 
-Статус: **полное отображение текущего публичного контракта, начатое с документации**.
-Публичные методы, пути и JSON описывают текущий контракт; целевые внутренние
-модели и фоновые потоки являются предложением.
+Workspace entities retain native `source_name` and `source` fields.
+Messages and attachments use ordinary membership permissions and file ACLs.
 
-В документации используются термины: привязка (binding), размещение
-(placement), транзакционный журнал (transactional outbox), проекция
-(projection), веерная рассылка (fan-out) и воркер (worker).
+See the [current public API contract](../../../../public_workspace_api.yaml).
 
-Полная матрица методов и путей, включая Events, эпоху и внешние учётные
-записи/чаты/операции, экземпляры моста, политику/здоровье провайдера и WebSocket
-Events, находится в
-[`operations/README.md`](operations/README.md).
+Native event operations:
 
-Покрытие: **29 HTTP-операций + 1 точка входа WebSocket времени исполнения**, для каждой
-предусмотрены отдельные Markdown, редактируемый PlantUML и локально
-отрендеренный SVG.
-
-[← Главный индекс документации](../../../index.md) ·
-[Индекс диаграмм последовательностей](../README.md) ·
-[Полная матрица операций](operations/README.md)
+- [Epoch](operations/get_epoch.md)
+- [REST events](operations/get_events.md)
+- [WebSocket events](operations/websocket_events.md)

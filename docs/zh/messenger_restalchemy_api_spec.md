@@ -3463,7 +3463,7 @@ OUTSIDE_CORE_DOMAIN_SPEC = {
 | 草稿 | CRUD 没有 ETag/`If-Match` | 确切的业主领域, 审核和合同没有事件 [`workspace_api.md`](workspace_api.md#drafts)  | 没有变更; 草案的修订与禁令修订的消息连接无关 |
 | 管理总结主题 | CRUD 终点和 GET/PUT 项目的设置 | 关于账户数据,权利和内容的合同 [`workspace_api.md`](workspace_api.md#topic-summary-administration)  | 没有变化; worker 摘要不会重新设计 |
 | 事件/epoch | `GET /api/workspace/v1/events/`, `GET /api/workspace/v1/epoch/` | 持续的形式的事件数据,世代/版本 epoch 标和行为 断 `410` 在 [`workspace_api.md`](workspace_api.md#events-and-epoch)  | 公共合同没有变更; 标签的目标变种如下: |
-| 外部账户 | CRUD 其他 `reconnect`/`disconnect` | 清理动态模型, ETag 和操作 [`zulip_bridge_v1_product_and_api.md`](zulip_bridge_v1_product_and_api.md)  | 没有变化;设计由外部域的规范所掌握 |
+| 外部账户 | CRUD 其他 `reconnect`/`disconnect` | 清理动态模型, ETag 和操作 `zulip_bridge_v1_product_and_api.md`  | 没有变化;设计由外部域的规范所掌握 |
 | 外部聊天 | 列表/收件和 `select`/`deselect`/`move` | 相关的外部合同 | 没有变更 |
 | 外部运营 | 收到/删除/`retry`/`preflight` | 相关的外部合同 | 没有变更 |
 | 桥梁的副本 | 收取/收取/`suspend`/`resume`/`revoke` | 相关的外部合同 | 没有变更 |
