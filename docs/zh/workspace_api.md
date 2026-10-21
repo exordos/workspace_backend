@@ -2162,7 +2162,7 @@ The Workspace backend element installs `workspace-api`,
 `workspace-history-import`. The history importer is a scaffold with an empty
 `step()` method, called every three seconds by default; configure its minimum
 period with `[history_import] step_interval`. The REST API
-uses two HTTP workers by default. DBaaS provides PostgreSQL storage, and
+uses sixteen HTTP workers by default. DBaaS provides PostgreSQL storage, and
 S3aaS stores file bytes and JSON sidecars. The separately versioned
 `workspace_ui` element serves the web UI and proxies API requests to the
 backend nginx gateway.

@@ -16,6 +16,10 @@ from workspace.cmd import workspace_api
 from workspace.common import database
 
 
+def test_api_starts_sixteen_workers_by_default():
+    assert workspace_api.CONF[workspace_api.DOMAIN].workers == 16
+
+
 @pytest.mark.parametrize(
     "options",
     ("", "-c work_mem=32MB -c jit=off", "-c timezone=Europe/Moscow"),

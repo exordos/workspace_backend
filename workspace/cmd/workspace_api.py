@@ -30,7 +30,7 @@ DOMAIN = "workspace_api"
 api_cli_opts = [
     cfg.StrOpt("bind-host", default="127.0.0.1"),
     cfg.IntOpt("bind-port", default=21084),
-    cfg.IntOpt("workers", default=2),
+    cfg.IntOpt("workers", default=16),
 ]
 
 CONF = cfg.CONF

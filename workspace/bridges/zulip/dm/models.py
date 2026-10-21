@@ -2389,10 +2389,13 @@ class ImportHistoryContent(AbstractZulipTaskContent):
                 if messages
                 else {}
             )
-            pending_senders = (
-                MessageDelivery.pending_sender_ids(account) if messages else set()
+            pending_messages = (
+                MessageDelivery.pending_import_ids(account, messages)
+                if messages
+                else set()
             )
             imported_contents = []
+            deferred_messages = []
             topics = {}
             for data in messages:
                 if (
@@ -2411,10 +2414,13 @@ class ImportHistoryContent(AbstractZulipTaskContent):
                     delivery.observe(data, observer=account, zulip=zulip)
                     if local.source_name == "native":
                         continue
-                elif data["sender_id"] in pending_senders:
-                    raise DeliveryPendingError(
-                        "Waiting for the outgoing message identity before import"
-                    )
+                elif data["id"] in pending_messages:
+                    if self.first_message_id == self.last_message_id:
+                        raise DeliveryPendingError(
+                            "Waiting for the outgoing message identity before import"
+                        )
+                    deferred_messages.append(data["id"])
+                    continue
                 if data["type"] == "stream":
                     channel = ZulipChannel.objects.get_one_or_none(
                         filters={
@@ -2633,6 +2639,27 @@ class ImportHistoryContent(AbstractZulipTaskContent):
                             ]
                         ),
                     ).insert()
+            for message_id in deferred_messages:
+                Task(
+                    uuid=sys_uuid.uuid5(task.uuid, f"pending-delivery:{message_id}"),
+                    project_id=task.project_id,
+                    external_account_uuid=task.external_account_uuid,
+                    backfill_uuid=task.backfill_uuid,
+                    realtime_event_uuid=task.realtime_event_uuid,
+                    queue=task.queue,
+                    priority=(
+                        min(task.priority, TASK_PRIORITY_IMPORT_HISTORY - 1)
+                        if task.queue == "background"
+                        else task.priority
+                    ),
+                    not_before_at=datetime.datetime.now(datetime.timezone.utc)
+                    + datetime.timedelta(seconds=30),
+                    content=ImportHistoryContent(
+                        first_message_id=message_id,
+                        last_message_id=message_id,
+                        since=self.since,
+                    ),
+                ).insert()
         finally:
             zulip.close()
 
@@ -3015,7 +3042,6 @@ class SendMessageContent(OutboundMessageContent):
                     raise DeliveryPendingError(
                         "Waiting for the sender's realtime subscription"
                     )
-                self._submit = False
                 text = (
                     contexts.Context()
                     .get_session()
@@ -3025,6 +3051,7 @@ class SendMessageContent(OutboundMessageContent):
                     )
                     .fetchone()["zulip_content"]
                 )
+                self._submit = False
                 delivery.zulip_message_id = zulip.send_message(
                     delivery.recipient["to"],
                     text,
@@ -4234,18 +4261,75 @@ class MessageDelivery(
         return account
 
     @classmethod
-    def pending_sender_ids(cls, account: external_models.ExternalAccount) -> set[int]:
-        return {
-            int(delivery.external_account_id.rsplit(":", 1)[1])
-            for delivery in cls.objects.get_all(
-                filters={
-                    "project_id": filters.EQ(account.project_id),
-                    "hostname": filters.EQ(account.get_host()),
-                    "zulip_message_id": filters.Is(None),
-                    "sending": filters.EQ(True),
-                }
+    def pending_import_ids(
+        cls, account: external_models.ExternalAccount, messages: list[dict]
+    ) -> set[int]:
+        pending = (
+            contexts.Context()
+            .get_session()
+            .execute(
+                """SELECT delivery.external_account_id, delivery.recipient,
+                          delivery.topic_name, snapshot.zulip_content
+                   FROM bridge_zulip_v5_deliveries AS delivery
+                   LEFT JOIN bridge_zulip_v5_content_snapshots AS snapshot
+                     ON snapshot.delivery_uuid=delivery.uuid
+                   WHERE delivery.project_id=%s AND delivery.hostname=%s
+                     AND delivery.sending AND delivery.zulip_message_id IS NULL""",
+                (account.project_id, account.get_host()),
             )
-        }
+            .fetchall()
+        )
+        blocked = set()
+        for data in messages:
+            for delivery in pending:
+                sender = int(delivery["external_account_id"].rsplit(":", 1)[1])
+                if data["sender_id"] != sender:
+                    continue
+                # Edits may have changed both content and destination. Without
+                # an immutable snapshot, retain the conservative identity fence.
+                if (
+                    data.get("last_edit_timestamp") is not None
+                    or delivery["zulip_content"] is None
+                ):
+                    blocked.add(data["id"])
+                    break
+                # Zulip normalizes leading newlines and trailing whitespace.
+                text = delivery["zulip_content"].rstrip().lstrip("\n")
+                if data["content"] != text and not (
+                    data["content"].endswith("\n[message truncated]")
+                    and text.startswith(
+                        data["content"].removesuffix("\n[message truncated]")
+                    )
+                ):
+                    continue
+                if delivery["topic_name"] is None:
+                    matches = data["type"] == "private" and {
+                        user["id"] for user in data["display_recipient"]
+                    } == set(delivery["recipient"]["to"]) | {sender}
+                else:
+                    matches = (
+                        data["type"] == "stream"
+                        and data["stream_id"] == delivery["recipient"]["to"]
+                        and (
+                            data["subject"] == delivery["topic_name"].strip()
+                            or (
+                                data["subject"].endswith("...")
+                                and delivery["topic_name"]
+                                .strip()
+                                .startswith(data["subject"][:-3])
+                            )
+                            or (
+                                not data["subject"]
+                                and delivery["topic_name"] == "(no topic)"
+                            )
+                        )
+                    )
+                if matches:
+                    # Matching content is only a reason to defer. Never infer
+                    # a delivery identity from text or repost an unknown send.
+                    blocked.add(data["id"])
+                    break
+        return blocked
 
     @classmethod
     def route(

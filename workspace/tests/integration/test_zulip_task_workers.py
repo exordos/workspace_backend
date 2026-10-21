@@ -949,3 +949,35 @@ def test_realtime_send_rechecks_local_confirmation_within_250_milliseconds(outgo
     service._run_task(task_uuid, owner)
     zulip.send_message.assert_called_once()
     zulip.get_messages.assert_called_once()
+
+
+def test_send_lock_error_before_http_does_not_leave_an_unknown_attempt(outgoing):
+    _api, account, _channel, _remote, zulip, _constructor = outgoing
+    outgoing_tests.create(outgoing)
+    outgoing_tests.dispatch()
+    service = history_import.HistoryImportService(queue="realtime", workers=1)
+    with contexts.Context().session_manager():
+        [(task_uuid, owner)] = service._claim_tasks(1)
+    original = service._locked_task
+    calls = 0
+
+    def fail_second_lock(claimed_uuid, claimed_owner):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise psycopg.errors.DeadlockDetected("deadlock before HTTP")
+        return original(claimed_uuid, claimed_owner)
+
+    with mock.patch.object(service, "_locked_task", side_effect=fail_second_lock):
+        with pytest.raises(psycopg.errors.DeadlockDetected):
+            service._run_task(task_uuid, owner)
+    zulip.send_message.assert_not_called()
+    task = models.Task.objects.get_one(filters={"uuid": filters.EQ(task_uuid)})
+    delivery = models.MessageDelivery.objects.get_one(
+        filters={"uuid": filters.EQ(task.content.delivery_uuid)}
+    )
+    assert not delivery.sending
+    with contexts.Context().session_manager():
+        [(task_uuid, owner)] = service._claim_tasks(1)
+    service._run_task(task_uuid, owner)
+    zulip.send_message.assert_called_once()
