@@ -37,6 +37,10 @@ def record(
         INSERT INTO bridge_zulip_v5_message_flags
             (project_id, external_account_uuid, message_id, flag, value, updated_at, event_id)
         SELECT %s, %s, message_id, %s, %s, %s, %s FROM unnest(%s::bigint[]) AS message_id
+        WHERE %s < 0 OR message_id=0 OR NOT EXISTS (
+            SELECT 1 FROM bridge_zulip_v5_history_batches AS batch
+            WHERE batch.external_account_uuid=%s AND batch.first_id=(message_id-1)/1000*1000+1
+              AND message_id<=batch.covered_to AND batch.observed_at >= %s)
         ON CONFLICT (external_account_uuid, message_id, flag) DO UPDATE
             SET value=EXCLUDED.value, updated_at=EXCLUDED.updated_at, event_id=EXCLUDED.event_id
             WHERE (bridge_zulip_v5_message_flags.updated_at, bridge_zulip_v5_message_flags.event_id)
@@ -50,6 +54,9 @@ def record(
             observed_at.replace(tzinfo=None),
             event_id,
             message_ids,
+            event_id,
+            account.uuid,
+            observed_at.replace(tzinfo=None),
         ),
     )
     # Keep the imported snapshot consistent without changing its observation time.

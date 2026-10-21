@@ -43,7 +43,9 @@ from restalchemy.storage.sql import utils
 from workspace.bridges.zulip import client
 from workspace.bridges.zulip import content_conversion
 from workspace.bridges.zulip import message_conversion
+from workspace.bridges.zulip import history_fingerprints
 from workspace.bridges.zulip.dm import flags as message_flags
+from workspace.bridges.zulip.dm import history as history_snapshots
 from workspace.bridges.zulip.dm import reactions as message_reactions
 from workspace.common import models as common_models
 from workspace.common import types as common_types
@@ -2019,25 +2021,15 @@ class FullBackfillContent(AbstractZulipTaskContent):
             backfill_uuid=task.backfill_uuid,
             content=ImportChannelsContent(),
         ).insert()
-        for index, first_message_id in enumerate(
-            reversed(
-                range(first_message_id, self.last_message_id + 1, HISTORY_BATCH_SIZE)
-            )
-        ):
+        if first_message_id <= self.last_message_id:
             Task(
                 project_id=task.project_id,
                 external_account_uuid=task.external_account_uuid,
-                priority=max(
-                    TASK_PRIORITY_IMPORT_HISTORY_MIN,
-                    TASK_PRIORITY_IMPORT_HISTORY - index,
-                ),
+                priority=TASK_PRIORITY_IMPORT_HISTORY,
                 backfill_uuid=task.backfill_uuid,
-                content=ImportHistoryContent(
+                content=ScanHistoryContent(
                     first_message_id=first_message_id,
-                    last_message_id=min(
-                        first_message_id + HISTORY_BATCH_SIZE - 1,
-                        self.last_message_id,
-                    ),
+                    last_message_id=self.last_message_id,
                     since=self.since,
                 ),
             ).insert()
@@ -2049,14 +2041,9 @@ class ActualizeBackfillContent(FullBackfillContent):
     since = properties.property(types.UTCDateTimeZ(), required=True, read_only=True)
 
     def execute(self, task: "Task") -> None:
-        super().execute(task)
-        Task(
-            project_id=task.project_id,
-            external_account_uuid=task.external_account_uuid,
-            realtime_event_uuid=task.realtime_event_uuid or task.backfill_uuid,
-            priority=TASK_PRIORITY_IMPORT_HISTORY_MIN,
-            content=RefreshMessageFlagsContent(last_message_id=self.last_message_id),
-        ).insert()
+        # Queue loss can hide old edits and reactions as well as old flags.
+        # Scan the complete visible history, including native deliveries.
+        FullBackfillContent(last_message_id=self.last_message_id).execute(task)
 
 
 class ImportUsersContent(AbstractZulipTaskContent):
@@ -2352,6 +2339,145 @@ class ImportChannelsContent(AbstractZulipTaskContent):
             zulip.close()
 
 
+class HistorySnapshotChangedError(Exception):
+    pass
+
+
+class ScanHistoryContent(AbstractZulipTaskContent):
+    KIND = "scan_history"
+
+    first_message_id = properties.property(types.Integer(min_value=1), default=1)
+    last_message_id = properties.property(types.Integer(min_value=1), required=True)
+    since = properties.property(types.AllowNone(types.UTCDateTimeZ()), default=None)
+
+    def fetch(self, zulip):
+        first_id = history_fingerprints.range_start(self.last_message_id)
+        page = zulip.get_history_batch(first_id, self.last_message_id)
+        # Production workers prepare HTTP and hashes outside account/task locks.
+        page["fingerprints"] = {
+            data["id"]: history_fingerprints.message_hashes(data)
+            for data in page["messages"]
+        }
+        page["hashes"] = history_fingerprints.batch_hashes_from_entries(
+            sorted(page["fingerprints"].items()), first_id, self.last_message_id
+        )
+        return page
+
+    def execute(self, task: "Task") -> None:
+        if getattr(self, "_prepared_error", None) is not None:
+            raise self._prepared_error
+        account = external_models.ExternalAccount.objects.get_one(
+            filters={
+                "uuid": filters.EQ(task.external_account_uuid),
+                "project_id": filters.EQ(task.project_id),
+            }
+        )
+        if account.external_account_id is None:
+            raise ExternalAccountIdPendingError(
+                "Waiting for the importing account's Zulip identity"
+            )
+        prepared = getattr(self, "_prepared_import", None)
+        if prepared is not None:
+            if account.realtime_revision() != prepared[0]:
+                raise SubscriptionChangedError()
+            observed_at, page = prepared[1:]
+        else:
+            observed_at = datetime.datetime.now(datetime.timezone.utc)
+            zulip = client.ZulipClient(account)
+            try:
+                page = self.fetch(zulip)
+            finally:
+                zulip.close()
+        first_id = history_fingerprints.range_start(self.last_message_id)
+        # Incomplete source history is never a successful recovery checkpoint.
+        if page["history_limited"]:
+            raise client.ZulipApiError(
+                "HISTORY_LIMITED", "Zulip history is limited for this account"
+            )
+        messages = page["messages"]
+        compared = history_snapshots.compare(
+            account,
+            first_id,
+            self.last_message_id,
+            messages,
+            observed_at,
+            fingerprints=page["fingerprints"],
+            hashes=page["hashes"],
+        )
+        if compared is None:
+            raise HistorySnapshotChangedError()
+        changed, batch_revision = compared
+        children = []
+        for index in range(0, len(changed), HISTORY_BATCH_SIZE):
+            snapshot = changed[index : index + HISTORY_BATCH_SIZE]
+            child = Task(
+                uuid=sys_uuid.uuid5(task.uuid, f"delta:{index}"),
+                project_id=task.project_id,
+                external_account_uuid=account.uuid,
+                priority=task.priority + 1,
+                backfill_uuid=task.backfill_uuid,
+                realtime_event_uuid=task.realtime_event_uuid,
+                queue=task.queue,
+                content=ImportHistoryContent(
+                    first_message_id=min(item["message"]["id"] for item in snapshot),
+                    last_message_id=max(item["message"]["id"] for item in snapshot),
+                    snapshot=snapshot,
+                    since=self.since,
+                    snapshot_at=observed_at,
+                    account_revision=account.realtime_revision(),
+                    batch_first_id=first_id,
+                    batch_revision=batch_revision,
+                ),
+            )
+            child.insert()
+            children.append(child.uuid)
+        if children:
+            contexts.Context().get_session().execute(
+                "UPDATE bridge_zulip_v5_history_batches SET pending=%s::uuid[] WHERE external_account_uuid=%s AND first_id=%s",
+                (children, account.uuid, first_id),
+            )
+        next_id = min(
+            first_id - 1,
+            max(page["next_id"], history_snapshots.next_known_id(account, first_id)),
+        )
+        if next_id >= self.first_message_id:
+            Task(
+                uuid=sys_uuid.uuid5(task.uuid, "next"),
+                project_id=task.project_id,
+                external_account_uuid=account.uuid,
+                priority=task.priority,
+                backfill_uuid=task.backfill_uuid,
+                realtime_event_uuid=task.realtime_event_uuid,
+                queue=task.queue,
+                content=ScanHistoryContent(
+                    first_message_id=self.first_message_id,
+                    last_message_id=next_id,
+                    since=self.since,
+                ),
+            ).insert()
+        LOG.info(
+            "Zulip history batch account=%s first=%s last=%s observed=%s changed=%s processing_tasks=%s",
+            account.uuid,
+            first_id,
+            self.last_message_id,
+            len(messages),
+            len(changed),
+            len(children),
+        )
+
+    def on_error(self, task: "Task", error: Exception) -> None:
+        if isinstance(error, HistorySnapshotChangedError):
+            task.status = TaskStatus.RETRY.value
+            task.next_retry_at = (
+                datetime.datetime.now(datetime.timezone.utc)
+                + REALTIME_MESSAGE_RETRY_DELAY
+            )
+        elif isinstance(error, SubscriptionChangedError):
+            task.status = TaskStatus.CANCEL.value
+        else:
+            super().on_error(task, error)
+
+
 class ImportHistoryContent(AbstractZulipTaskContent):
     KIND = "import_history"
 
@@ -2363,6 +2489,26 @@ class ImportHistoryContent(AbstractZulipTaskContent):
     last_message_id = properties.property(
         types.Integer(min_value=1), required=True, read_only=True
     )
+    snapshot = properties.property(
+        types.AllowNone(types.TypedList(types.Dict())), default=None
+    )
+    snapshot_at = properties.property(
+        types.AllowNone(types.UTCDateTimeZ()), default=None
+    )
+    account_revision = properties.property(
+        types.AllowNone(types.String()), default=None
+    )
+    batch_first_id = properties.property(
+        types.AllowNone(types.Integer(min_value=1)), default=None
+    )
+    batch_revision = properties.property(
+        types.AllowNone(types.Integer(min_value=1)), default=None
+    )
+
+    def fetch(self, zulip):
+        if self.snapshot is not None:
+            return [item["message"] for item in self.snapshot]
+        return zulip.get_messages(self.first_message_id, self.last_message_id)
 
     def validate(self) -> None:
         count = self.last_message_id - self.first_message_id + 1
@@ -2385,26 +2531,90 @@ class ImportHistoryContent(AbstractZulipTaskContent):
         prepared = getattr(self, "_prepared_import", None)
         if prepared is not None and account.realtime_revision() != prepared[0]:
             raise SubscriptionChangedError()
+        if self.snapshot is not None:
+            current = history_snapshots.batch(account, self.batch_first_id)
+            if current["revision"] != self.batch_revision or current[
+                "source_revision"
+            ] != history_snapshots.revision(account):
+                session = contexts.Context().get_session()
+                remaining = session.execute(
+                    "UPDATE bridge_zulip_v5_history_batches SET pending=array_remove(pending,%s) "
+                    "WHERE external_account_uuid=%s AND first_id=%s AND %s=ANY(pending) RETURNING pending,covered_to",
+                    (task.uuid, account.uuid, self.batch_first_id, task.uuid),
+                ).fetchone()
+                if remaining is not None and not remaining["pending"]:
+                    Task(
+                        project_id=task.project_id,
+                        external_account_uuid=account.uuid,
+                        backfill_uuid=task.backfill_uuid,
+                        realtime_event_uuid=task.realtime_event_uuid,
+                        priority=task.priority,
+                        content=ScanHistoryContent(
+                            first_message_id=self.batch_first_id,
+                            last_message_id=remaining["covered_to"],
+                        ),
+                    ).insert()
+                return
+            if account.realtime_revision() != self.account_revision:
+                raise SubscriptionChangedError()
+            self._accepted = {}
+            self._complete_snapshot = True
+            with history_snapshots.applying(account, self.batch_first_id):
+                self._execute_import(task, account, prepared)
+        else:
+            self._execute_import(task, account, prepared)
+
+    def _execute_import(self, task, account, prepared):
         hostname = account.get_host()
         server_namespace = sys_uuid.uuid5(sys_uuid.NAMESPACE_DNS, hostname)
         zulip = client.ZulipClient(account)
         try:
             observed_at = (
-                prepared[1]
+                self.snapshot_at
+                if self.snapshot is not None
+                else prepared[1]
                 if prepared is not None
                 else datetime.datetime.now(datetime.timezone.utc)
             )
             messages = sorted(
-                prepared[2]
-                if prepared is not None
-                else zulip.get_messages(self.first_message_id, self.last_message_id),
+                prepared[2] if prepared is not None else self.fetch(zulip),
                 key=lambda data: data["id"],
                 reverse=True,
             )
-            observed_flags = message_flags.observe_snapshot(
-                account, messages, observed_at
+            self._missing_ids = []
+            if self.snapshot is not None:
+                self._missing_ids = [
+                    item["message"]["id"]
+                    for item in self.snapshot
+                    if item["components"] == ["visibility"]
+                ]
+                if self._missing_ids:
+                    for observed in ZulipMessage.objects.get_all(
+                        filters={
+                            "external_account_uuid": filters.EQ(account.uuid),
+                            "project_id": filters.EQ(account.project_id),
+                            "message_id": filters.In(self._missing_ids),
+                        }
+                    ):
+                        observed.delete()
+                    messages = [
+                        data for data in messages if data["id"] not in self._missing_ids
+                    ]
+            components = (
+                {item["message"]["id"]: item["components"] for item in self.snapshot}
+                if self.snapshot is not None
+                else {data["id"]: history_fingerprints.COMPONENTS for data in messages}
             )
-            message_reactions.observe_snapshot(account, messages, observed_at)
+            observed_flags = message_flags.observe_snapshot(
+                account,
+                [data for data in messages if "flags" in components[data["id"]]],
+                observed_at,
+            )
+            message_reactions.observe_snapshot(
+                account,
+                [data for data in messages if "reactions" in components[data["id"]]],
+                observed_at,
+            )
             deliveries = (
                 {
                     delivery.zulip_message_id: delivery
@@ -2430,23 +2640,68 @@ class ImportHistoryContent(AbstractZulipTaskContent):
             deferred_messages = []
             topics = {}
             for data in messages:
+                changed = components[data["id"]]
+                if self.snapshot is not None:
+                    self._accepted[data["id"]] = data
+                    if "flags" in changed and any(
+                        value != (flag in data["flags"])
+                        for flag, value in observed_flags[data["id"]].items()
+                    ):
+                        self._accepted.pop(data["id"], None)
+                        self._complete_snapshot = False
+                if not {"text", "metadata"}.intersection(changed):
+                    if "flags" in changed:
+                        contexts.Context().get_session().execute(
+                            "UPDATE bridge_zulip_v5_messages SET "
+                            + ",".join(
+                                f"{flag}=%s" for flag in history_fingerprints.FLAGS
+                            )
+                            + " WHERE external_account_uuid=%s AND project_id=%s AND message_id=%s",
+                            tuple(
+                                observed_flags[data["id"]].get(
+                                    flag, flag in data["flags"]
+                                )
+                                for flag in history_fingerprints.FLAGS
+                            )
+                            + (account.uuid, account.project_id, data["id"]),
+                        )
+                    continue
                 if (
                     self.since is not None
                     and data["timestamp"] < self.since.timestamp()
                 ):
+                    if self.snapshot is not None:
+                        self._accepted.pop(data["id"], None)
+                        self._complete_snapshot = False
                     continue
                 delivery = deliveries.get(data["id"])
                 if delivery is not None:
+                    if (
+                        self.snapshot is not None
+                        and delivery.content_observed_at is not None
+                        and delivery.content_observed_at.timestamp()
+                        > data.get("last_edit_timestamp", data["timestamp"])
+                    ):
+                        self._accepted.pop(data["id"], None)
+                        self._complete_snapshot = False
                     local = v2_models.WorkspaceMessage.objects.get_one(
                         filters={
                             "project_id": filters.EQ(task.project_id),
                             "uuid": filters.EQ(delivery.message_uuid),
                         }
                     )
-                    delivery.observe(data, observer=account, zulip=zulip)
+                    delivery.observe(
+                        data,
+                        observer=account,
+                        zulip=zulip,
+                        convert_text="text" in changed,
+                    )
                     if local.source_name == "native":
                         continue
                 elif data["id"] in pending_messages:
+                    if self.snapshot is not None:
+                        self._accepted.pop(data["id"], None)
+                        self._complete_snapshot = False
                     if self.first_message_id == self.last_message_id:
                         raise DeliveryPendingError(
                             "Waiting for the outgoing message identity before import"
@@ -2462,6 +2717,8 @@ class ImportHistoryContent(AbstractZulipTaskContent):
                         },
                     )
                     if channel is None:
+                        # Catalog removal owns withdrawal. Cache the handled
+                        # observation; a subscription change invalidates it.
                         continue
                 else:
                     if account.external_account_id is None:
@@ -2557,6 +2814,13 @@ class ImportHistoryContent(AbstractZulipTaskContent):
                     data.get("last_edit_timestamp", data["timestamp"]),
                     tz=datetime.timezone.utc,
                 )
+                if (
+                    self.snapshot is not None
+                    and message is not None
+                    and content_updated_at < message.content.zulip_content_updated_at
+                ):
+                    self._accepted.pop(data["id"], None)
+                    self._complete_snapshot = False
                 content_values = {
                     "source_timestamp": data["timestamp"],
                     "source_message_id": data["id"],
@@ -2570,7 +2834,7 @@ class ImportHistoryContent(AbstractZulipTaskContent):
                 if message is None:
                     content = MessageContent(**content_values)
                     content.insert()
-                else:
+                elif "text" in changed:
                     content = message.content
                     source_changed = content_hash != content.zulip_content_hash
                     if content_updated_at < content.zulip_content_updated_at:
@@ -2591,7 +2855,15 @@ class ImportHistoryContent(AbstractZulipTaskContent):
                     if source_changed and "zulip_content" in content_values:
                         content.conversion_version = 0
                     content.update()
-                imported_contents.append((content, data, channel.stream_uuid))
+                else:
+                    content = message.content
+                    if content_updated_at > content.zulip_content_updated_at:
+                        content.zulip_content_updated_at = content_updated_at
+                        if content.workspace_content_updated_at < content_updated_at:
+                            content.workspace_content_updated_at = content_updated_at
+                        content.update()
+                if "text" in changed:
+                    imported_contents.append((content, data, channel.stream_uuid))
                 values = {
                     "message_uuid": sys_uuid.uuid5(server_namespace, str(data["id"])),
                     "message_id": data["id"],
@@ -2616,7 +2888,7 @@ class ImportHistoryContent(AbstractZulipTaskContent):
                             "historical",
                         )
                     },
-                    **observed_flags[data["id"]],
+                    **observed_flags.get(data["id"], {}),
                 }
                 if message is None:
                     ZulipMessage(
@@ -2625,7 +2897,13 @@ class ImportHistoryContent(AbstractZulipTaskContent):
                         **values,
                     ).insert()
                 else:
-                    if content_updated_at <= message.placement_updated_at:
+                    if "flags" not in changed:
+                        for flag in history_fingerprints.FLAGS:
+                            del values[flag]
+                    if content_updated_at < message.placement_updated_at or (
+                        self.snapshot is None
+                        and content_updated_at == message.placement_updated_at
+                    ):
                         for field in ("channel", "topic", "placement_updated_at"):
                             del values[field]
                     message.update_dm(values=values)
@@ -2694,6 +2972,25 @@ class ImportHistoryContent(AbstractZulipTaskContent):
                 ).insert()
         finally:
             zulip.close()
+
+    def on_done(self, task: "Task") -> None:
+        if self.snapshot is not None and hasattr(self, "_accepted"):
+            account = external_models.ExternalAccount.objects.get_one(
+                filters={
+                    "uuid": filters.EQ(task.external_account_uuid),
+                    "project_id": filters.EQ(task.project_id),
+                }
+            )
+            history_snapshots.complete(
+                account,
+                self.batch_first_id,
+                self.batch_revision,
+                task.uuid,
+                list(self._accepted.values()),
+                self._complete_snapshot,
+                self._missing_ids,
+            )
+        super().on_done(task)
 
     def on_error(self, task: "Task", error: Exception) -> None:
         if isinstance(error, SubscriptionChangedError):
@@ -3484,6 +3781,7 @@ class ReconciliationContent(AbstractTaskContent):
 
 
 TASK_CONTENT_TYPE = types_dynamic.KindModelSelectorType(
+    types_dynamic.KindModelType(ScanHistoryContent),
     types_dynamic.KindModelType(ReconcileRealtimeContent),
     types_dynamic.KindModelType(ConvertMessageContent),
     types_dynamic.KindModelType(UpdateReactionContent),
@@ -3761,6 +4059,17 @@ class Task(
             self.lease_owner = None
             self.lease_expires_at = None
             self.update()
+            if (
+                isinstance(self.content, ImportHistoryContent)
+                and self.content.snapshot is not None
+            ):
+                # Preserve retry payloads, then release bodies only after the
+                # completed task has been saved by the ORM.
+                contexts.Context().get_session().execute(
+                    "UPDATE bridge_zulip_v5_tasks SET content=content-ARRAY["
+                    "'snapshot','snapshot_at','account_revision','batch_first_id','batch_revision'] WHERE uuid=%s",
+                    (self.uuid,),
+                )
             if self.backfill_uuid is not None:
                 RealtimeEvent.complete_backfill(self.backfill_uuid)
 
@@ -4519,6 +4828,7 @@ class MessageDelivery(
         data: dict,
         observer: external_models.ExternalAccount | None = None,
         zulip: client.ZulipClient | None = None,
+        convert_text: bool = True,
     ) -> None:
         account = self.account(sending=False)
         if data["sender_id"] != int(account.external_account_id.rsplit(":", 1)[1]):
@@ -4556,6 +4866,8 @@ class MessageDelivery(
         ).fetchone()
         if snapshot is not None:
             text = snapshot["workspace_content"]
+        elif not convert_text:
+            text = self.observed_workspace_content
         else:
             text = content_conversion.ConversionContext(
                 observer or account

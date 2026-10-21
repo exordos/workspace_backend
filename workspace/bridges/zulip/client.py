@@ -256,6 +256,36 @@ class ZulipClient:
             return messages[0]["id"]
         return None
 
+    def get_history_batch(self, first_id: int, last_id: int) -> dict:
+        """Read a fixed ID range and discover the next older visible range.
+
+        At most 1000 IDs fit in the range. Reading backwards also supplies an
+        older visible ID when source IDs are sparse, avoiding empty-range walks.
+        """
+        page = self._get(
+            "/messages",
+            params={
+                "anchor": last_id,
+                "num_before": last_id - first_id,
+                "num_after": 0,
+                "include_anchor": "true",
+                "apply_markdown": "false",
+                "allow_empty_topic_name": "true",
+            },
+        )
+        older = [data["id"] for data in page["messages"] if data["id"] < first_id]
+        return {
+            "messages": [
+                data for data in page["messages"] if first_id <= data["id"] <= last_id
+            ],
+            "next_id": max(older)
+            if older
+            else 0
+            if page["found_oldest"]
+            else first_id - 1,
+            "history_limited": page["history_limited"],
+        }
+
 
 class AsyncZulipClient:
     def __init__(self, account: external_models.ExternalAccount) -> None:

@@ -169,6 +169,33 @@ def record_event(
     event_id: int,
     queue_id: str,
 ) -> None:
+    barrier = (
+        _session()
+        .execute(
+            """SELECT 1 FROM bridge_zulip_v5_history_batches AS batch
+        JOIN bridge_zulip_v5_message_fingerprints AS fingerprint
+          ON fingerprint.external_account_uuid=batch.external_account_uuid
+          AND fingerprint.first_id=batch.first_id
+        WHERE batch.external_account_uuid=%s AND batch.project_id=%s
+          AND batch.hostname=%s AND batch.first_id=(%s::bigint-1)/1000*1000+1
+          AND batch.covered_to>=%s AND batch.observed_at>=%s AND batch.ready
+          AND fingerprint.message_id=%s
+          AND fingerprint.hashes->>'reactions' IS NOT NULL
+          AND NOT fingerprint.hashes @> '{"absent":true}'::jsonb LIMIT 1""",
+            (
+                account.uuid,
+                account.project_id,
+                account.get_host(),
+                data["message_id"],
+                data["message_id"],
+                _naive(observed_at),
+                data["message_id"],
+            ),
+        )
+        .fetchone()
+    )
+    if barrier is not None:
+        return
     message = message_for(account, data["message_id"])
     if (
         message["snapshot_at"] is not None
