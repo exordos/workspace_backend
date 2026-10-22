@@ -485,7 +485,7 @@ def test_subscription_notifications_create_and_update_the_existing_binding(
 
 @pytest.mark.parametrize(
     "muted,previous,expected",
-    [(False, "mentions_only", "all_messages"), (True, "muted", "mentions_only")],
+    [(False, "mentions_only", "all_messages"), (True, "muted", "muted")],
 )
 def test_subscription_snapshot_repairs_notification_modes_from_channel_muting(
     stream_state_account, db, monkeypatch, muted, previous, expected
@@ -539,9 +539,12 @@ def test_subscription_snapshot_repairs_notification_modes_from_channel_muting(
     with contexts.Context().session_manager():
         task.execute()
         assert task.status == "done", task.error_description
-        (state,) = _binding_states(account)
-        assert state.action == "update" and state.notification_mode == expected
-        state.do()
+        if previous == expected:
+            assert _binding_states(account) == []
+        else:
+            (state,) = _binding_states(account)
+            assert state.action == "update" and state.notification_mode == expected
+            state.do()
     restored = models.ZulipChannel.objects.get_one(
         filters={"uuid": filters.EQ(channel.uuid)}
     )

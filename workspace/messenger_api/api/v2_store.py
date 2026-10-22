@@ -18,6 +18,7 @@ from workspace.messenger_api.api import resource_projection
 from workspace.messenger_api.api import sql_canonical_store
 from workspace.messenger_api.api import store as api_store
 from workspace.common import emoji
+from workspace.bridges.zulip.dm import models as zulip_models
 from workspace.common import mutation_journal_opts
 from workspace.messenger_api.dm import base
 from workspace.messenger_api.dm import helpers
@@ -2168,6 +2169,14 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 """,
                 (self.project_uuid, stream.uuid, self.user_uuid),
             ).fetchone()
+            zulip_models.enqueue_notifications(
+                self.project_uuid,
+                self.user_uuid,
+                stream.uuid,
+                None,
+                values["notification_mode"],
+                session,
+            )
             topics = session.execute(
                 """
                 SELECT uuid FROM messenger_topics
@@ -2334,6 +2343,14 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 """,
                 (self.project_uuid, topic.uuid, self.user_uuid),
             ).fetchone()
+            zulip_models.enqueue_notifications(
+                self.project_uuid,
+                self.user_uuid,
+                topic.stream_uuid,
+                topic.uuid,
+                values["notification_mode"],
+                session,
+            )
             self._enqueue_counter_projections(
                 source_kind="topic.updated",
                 user_uuid=self.user_uuid,
