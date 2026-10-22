@@ -310,7 +310,12 @@ class HistoryImportService(basic.BasicService):
     def _fetch_import(
         task_uuid: uuid.UUID, owner: uuid.UUID
     ) -> tuple[
-        tuple[str, datetime.datetime, list[dict[str, typing.Any]]] | None,
+        tuple[
+            str,
+            datetime.datetime,
+            list[dict[str, typing.Any]] | dict[str, typing.Any],
+        ]
+        | None,
         Exception | None,
         float,
     ]:
@@ -322,7 +327,8 @@ class HistoryImportService(basic.BasicService):
                     filters={"uuid": filters.EQ(task_uuid)}
                 )
                 if task.lease_owner != owner or not isinstance(
-                    task.content, models.ImportHistoryContent
+                    task.content,
+                    (models.ImportHistoryContent, models.ScanHistoryContent),
                 ):
                     return None, None, 0.0
                 account = external_models.ExternalAccount.objects.get_one(
@@ -340,11 +346,15 @@ class HistoryImportService(basic.BasicService):
             observed_at = datetime.datetime.now(datetime.timezone.utc)
             zulip = client.ZulipClient(account)
             try:
-                messages = zulip.get_messages(
-                    task.content.first_message_id, task.content.last_message_id
-                )
+                messages = task.content.fetch(zulip)
             finally:
                 zulip.close()
+            if (
+                isinstance(task.content, models.ImportHistoryContent)
+                and task.content.snapshot is not None
+            ):
+                revision = task.content.account_revision
+                observed_at = task.content.snapshot_at
             return (revision, observed_at, messages), None, time.monotonic() - started
         except Exception as error:
             return None, error, time.monotonic() - started

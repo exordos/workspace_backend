@@ -283,7 +283,11 @@ def test_active_only_after_all_backfill_children_finish(
     zulip.get_users.return_value = []
     zulip.get_channels.return_value = []
     zulip.get_topic_notifications.return_value = []
-    zulip.get_messages.return_value = []
+    zulip.get_history_batch.side_effect = lambda first, last: {
+        "messages": [],
+        "next_id": first - 1,
+        "history_limited": False,
+    }
     monkeypatch.setattr(client, "ZulipClient", lambda current: zulip)
     service = history_import.HistoryImportService()
     for _index in range(120):
@@ -300,18 +304,11 @@ def test_active_only_after_all_backfill_children_finish(
     assert stored(account).status == "active"
     assert stored(account).has_completed_backfill
     zulip.get_last_message_id.assert_not_called()
-    if imported:
-        since = datetime.datetime.fromisoformat(event.payload["since"])
-        zulip.get_first_message_id_since.assert_called_once_with(since)
-        assert zulip.get_messages.call_args_list == [
-            mock.call(10001, 10005),
-            *[mock.call(first, first + 99) for first in range(9901, 7000, -100)],
-        ]
-    else:
-        assert zulip.get_messages.call_args_list == [
-            mock.call(10001, 10005),
-            *[mock.call(first, first + 99) for first in range(9901, 0, -100)],
-        ]
+    zulip.get_first_message_id_since.assert_not_called()
+    assert zulip.get_history_batch.call_args_list == [
+        mock.call(10001, 10005),
+        *[mock.call(first, first + 999) for first in range(9001, 0, -1000)],
+    ]
     # A live subscription owns catalog updates; imports do not schedule polling.
     periodic = models.Task.objects.get_all(
         filters={
@@ -613,14 +610,16 @@ def test_partial_monthly_backfill_recovery_does_not_activate_early(
     zulip.get_users.return_value = []
     zulip.get_channels.return_value = []
     zulip.get_topic_notifications.return_value = []
-    zulip.get_messages.side_effect = [requests.Timeout("temporary"), [], []]
+    zulip.get_history_batch.side_effect = [
+        requests.Timeout("temporary"),
+        {"messages": [], "next_id": 0, "history_limited": False},
+    ]
     monkeypatch.setattr(client, "ZulipClient", lambda current: zulip)
     service = history_import.HistoryImportService()
     for _index in range(4):
         service._iteration()
     assert stored(account).status == "error"
-    service._iteration()
-    assert stored(account).status == "fast_backfill"
+    assert stored(account).status == "error"
     (retry,) = models.Task.objects.get_all(
         filters={"external_account_uuid": account.uuid, "status": "retry"}
     )

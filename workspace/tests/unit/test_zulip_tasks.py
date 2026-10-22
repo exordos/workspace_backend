@@ -29,6 +29,9 @@ def _task_storage(monkeypatch):
     update = mock.Mock()
     monkeypatch.setattr(models.Task, "update", update)
     monkeypatch.setattr(models.contexts.Context, "get_session", mock.Mock())
+    monkeypatch.setattr(
+        models.history_snapshots, "retained_upper_bound", mock.Mock(return_value=0)
+    )
     return update
 
 
@@ -542,8 +545,9 @@ def test_client_finds_backfill_boundary_by_exact_date(offset, expected):
         (0, []),
         (1, [(1, 1)]),
         (100, [(1, 100)]),
-        (101, [(101, 101), (1, 100)]),
-        (205, [(201, 205), (101, 200), (1, 100)]),
+        (101, [(1, 101)]),
+        (205, [(1, 205)]),
+        (10_000_000, [(1, 10_000_000)]),
     ],
 )
 def test_full_backfill_creates_user_channel_and_bounded_history_tasks(
@@ -580,7 +584,7 @@ def test_full_backfill_creates_user_channel_and_bounded_history_tasks(
         for child in children[2:]
     ] == expected_ranges
     assert all(
-        isinstance(child.content, models.ImportHistoryContent) for child in children[2:]
+        isinstance(child.content, models.ScanHistoryContent) for child in children[2:]
     )
     assert [child.priority for child in children[2:]] == list(
         range(10_000, 10_000 - len(expected_ranges), -1)
@@ -588,28 +592,62 @@ def test_full_backfill_creates_user_channel_and_bounded_history_tasks(
     constructor.assert_not_called()
 
 
-def test_history_priorities_stop_decreasing_at_the_minimum(monkeypatch):
-    assert models.TASK_PRIORITY_IMPORT_HISTORY_MIN == 10
+def test_initial_history_scan_keeps_the_existing_history_priority(monkeypatch):
     monkeypatch.setattr(models, "TASK_PRIORITY_IMPORT_HISTORY", 12)
     task = _task()
     with (
         mock.patch.object(external_models.ExternalAccount, "objects"),
         mock.patch.object(models.Task, "insert", autospec=True) as insert,
     ):
-        models.FullBackfillContent(last_message_id=401).execute(task)
-    history = [call.args[0] for call in insert.call_args_list[2:]]
-    assert [child.priority for child in history] == [12, 11, 10, 10, 10]
-    assert [child.content.first_message_id for child in history] == [
-        401,
-        301,
-        201,
-        101,
-        1,
+        models.FullBackfillContent(last_message_id=10_000_000).execute(task)
+    (scan,) = [call.args[0] for call in insert.call_args_list[2:]]
+    assert scan.priority == 12
+    assert scan.content.first_message_id == 1
+    assert scan.content.last_message_id == 10_000_000
+
+
+@pytest.mark.parametrize(
+    "page,next_id",
+    [
+        (
+            {
+                "messages": [{"id": 9}, {"id": 1005}, {"id": 1500}, {"id": 1501}],
+                "found_oldest": False,
+                "history_limited": False,
+            },
+            9,
+        ),
+        (
+            {
+                "messages": [{"id": 1005}],
+                "found_oldest": True,
+                "history_limited": False,
+            },
+            0,
+        ),
+        (
+            {
+                "messages": [{"id": 1500}],
+                "found_oldest": False,
+                "history_limited": False,
+            },
+            1000,
+        ),
+    ],
+)
+def test_history_page_is_bounded_and_finds_older_visible_ids_across_gaps(page, next_id):
+    zulip = object.__new__(client.ZulipClient)
+    with mock.patch.object(zulip, "_get", return_value=page) as get:
+        batch = zulip.get_history_batch(1001, 1500)
+    assert batch["messages"] == [
+        data for data in page["messages"] if 1001 <= data["id"] <= 1500
     ]
-    assert all(
-        newer.created_at < older.created_at
-        for newer, older in zip(history, history[1:])
-    )
+    assert batch["next_id"] == next_id
+    params = get.call_args.kwargs["params"]
+    assert params["anchor"] == 1500
+    assert params["num_before"] == 499
+    assert params["num_after"] == 0
+    assert params["apply_markdown"] == "false"
 
 
 def test_other_task_priorities_are_above_history():

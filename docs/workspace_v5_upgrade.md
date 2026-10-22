@@ -28,6 +28,22 @@ Existing native identities and the `workspace_zulip_v5_legacy_archive` recovery
 archive are retained. Ordinary bootstrap still serializes concurrent starts,
 drains database writers and applies schema migrations before starting services.
 
+Migration 0251 introduces the message-recovery fingerprint cache. It does not
+rehash retained history inside the migration: the next bounded recovery scan
+populates the cache as its processing tasks succeed. Existing import task
+payloads remain supported. Keep the separate realtime and background workers.
+Migration 0252 preserves independent observer checkpoints during shared history
+replay; apply it together with the fingerprint implementation. Its downgrade
+restores the previous invalidation function without changing retained data.
+Migration 0253 preserves checkpoints when reaction projection updates its
+derived native-fact link. Apply all three fingerprint migrations together;
+newer provider observations retain their invalidation and timestamp fences.
+For a schema rollback, stop the new workers and use the migration's downgrade
+before starting the older image. The downgrade turns pending scans back into
+legacy full-backfill work, removes the snapshot-only task fields, restores the
+previous flag view and drops the cache tables. It retains canonical messages and
+source message content. A later upgrade rebuilds the cache lazily.
+
 Keep coordinated database and object-storage backups. Reverting an application
 image cannot undo the schema and identity conversion performed by older
 releases. Verify messaging, attachments, WebSocket delivery and representative
