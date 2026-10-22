@@ -16,9 +16,11 @@ import requests
 from restalchemy.common import contexts
 from restalchemy.dm import filters
 from restalchemy.storage.sql import engines
+from restalchemy.storage.sql import migrations
 
 from workspace.bridges.zulip import client
 from workspace.bridges.zulip.dm import models
+from workspace.tests.integration import conftest
 from workspace.tests.integration import test_zulip_channels as channel_tests
 from workspace.tests.integration import test_zulip_message_states as state_tests
 
@@ -601,3 +603,31 @@ def test_http_setting_change_and_in_flight_worker_keep_account_first_lock_order(
     pair[3].update_topic_notifications.side_effect = None
     assert _run(_tasks(pair)[-1]).status == "done"
     assert _mode(pair) == "follow"
+
+
+def test_notification_migration_is_reversible_without_task_history(db):
+    engine = migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    name = "0259-Preserve-bidirectional-Zulip-topic-notification-changes-0e2e4b.py"
+    engine.rollback_migration(name)
+    try:
+        assert (
+            db.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name='messenger_user_topic_bindings' "
+                "AND column_name='notification_updated_at'"
+            ).fetchone()
+            is None
+        )
+        assert (
+            db.execute(
+                "SELECT to_regclass('bridge_zulip_v5_topic_notification_states')"
+            ).fetchone()[0]
+            is not None
+        )
+    finally:
+        engine.apply_migration(name)
+    assert db.execute(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_name='messenger_user_topic_bindings' "
+        "AND column_name='notification_updated_at'"
+    ).fetchone() == ("notification_updated_at",)
