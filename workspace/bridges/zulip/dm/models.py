@@ -1994,6 +1994,12 @@ class FullBackfillContent(AbstractZulipTaskContent):
             },
         )
         first_message_id = 1
+        last_message_id = self.last_message_id
+        if self.since is None:
+            last_message_id = max(
+                last_message_id,
+                history_snapshots.retained_upper_bound(account, task.created_at),
+            )
         if self.since is not None:
             zulip = client.ZulipClient(account)
             try:
@@ -2021,7 +2027,7 @@ class FullBackfillContent(AbstractZulipTaskContent):
             backfill_uuid=task.backfill_uuid,
             content=ImportChannelsContent(),
         ).insert()
-        if first_message_id <= self.last_message_id:
+        if first_message_id <= last_message_id:
             Task(
                 project_id=task.project_id,
                 external_account_uuid=task.external_account_uuid,
@@ -2029,7 +2035,7 @@ class FullBackfillContent(AbstractZulipTaskContent):
                 backfill_uuid=task.backfill_uuid,
                 content=ScanHistoryContent(
                     first_message_id=first_message_id,
-                    last_message_id=self.last_message_id,
+                    last_message_id=last_message_id,
                     since=self.since,
                 ),
             ).insert()

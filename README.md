@@ -121,6 +121,8 @@ snapshots; the barrier is separate from user flag/reaction change timestamps.
 Relevant realtime, delivery and local mutations invalidate the affected ranges.
 An absent source ID withdraws that imported observer, not the shared canonical
 message. Pending native deliveries retain their existing duplicate-send guards.
+The bounded lookup also includes imported observations not yet represented in
+the checkpoint, including records recreated by realtime after an earlier absence.
 
 Flags-only and reactions-only deltas skip body conversion and file access.
 Metadata-only deltas also avoid body conversion. Completed processing tasks shed
@@ -173,9 +175,11 @@ projection and project-event locks.
 
 Registering a new Zulip queue enqueues an internal `full_backfill` event for an
 account that has never completed import, or `actualize_backfill` for an imported
-account. Both use fingerprint scans over visible history up to the message
-boundary returned by registration, including old edits and reactions; neither
-fetches a later upper boundary. The 30-day cutoff remains in legacy task payloads
+account. Both use fingerprint scans over visible history, including old edits and
+reactions. Registration fixes the boundary for new messages. A previously retained
+tail above a smaller boundary is also checked for disappearance; observations
+created after the backfill was queued do not widen that check. The 30-day cutoff
+remains in legacy task payloads
 for compatibility, rather than limiting the new snapshot comparison. The API
 only schedules connection verification when connection settings change; it no
 longer starts backfill or cancels existing imports for a metadata update.

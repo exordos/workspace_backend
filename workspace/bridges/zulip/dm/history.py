@@ -55,6 +55,31 @@ def next_known_id(account, before):
     )
 
 
+def retained_upper_bound(account, at):
+    """Check a disappeared tail without chasing observations newer than this task."""
+    return (
+        contexts.Context()
+        .get_session()
+        .execute(
+            """SELECT GREATEST(
+            COALESCE((SELECT message_id FROM bridge_zulip_v5_messages
+                WHERE external_account_uuid=%s AND project_id=%s AND created_at<=%s
+                ORDER BY message_id DESC LIMIT 1),0),
+            COALESCE((SELECT covered_to FROM bridge_zulip_v5_history_batches
+                WHERE external_account_uuid=%s AND record_count>0 AND observed_at<=%s
+                ORDER BY first_id DESC LIMIT 1),0)) AS message_id""",
+            (
+                account.uuid,
+                account.project_id,
+                at,
+                account.uuid,
+                at.replace(tzinfo=None),
+            ),
+        )
+        .fetchone()["message_id"]
+    )
+
+
 def compare(
     account, first_id, last_id, messages, observed_at, fingerprints=None, hashes=None
 ):
@@ -90,7 +115,6 @@ def compare(
             (at, account.uuid, first_id),
         )
         return [], current["revision"]
-    previous = {}
     if current is not None and current["source_revision"] != source_revision:
         session.execute(
             "UPDATE bridge_zulip_v5_message_fingerprints SET hashes=%s::jsonb "
@@ -101,27 +125,41 @@ def compare(
                 first_id,
             ),
         )
-    if current is not None and current["source_revision"] == source_revision:
-        previous = {
-            row["message_id"]: row["hashes"]
-            for row in session.execute(
-                "SELECT message_id,hashes FROM bridge_zulip_v5_message_fingerprints "
-                "WHERE external_account_uuid=%s AND message_id BETWEEN %s AND %s",
-                (account.uuid, first_id, last_id),
-            ).fetchall()
-        }
-    elif current is None:
-        # Lazy bootstrap also notices imported observations lost during queue
-        # downtime. Absence withdraws this observer, never the shared message.
-        namespace = uuid.uuid5(uuid.NAMESPACE_DNS, account.get_host())
-        previous = {
-            row["message_id"]: dict.fromkeys(history_fingerprints.COMPONENTS)
-            for row in session.execute(
-                "SELECT message_id FROM bridge_zulip_v5_messages WHERE external_account_uuid=%s AND project_id=%s "
-                "AND message_id BETWEEN %s AND %s AND message_uuid=messenger_uuid_v5(%s,message_id::text)",
-                (account.uuid, account.project_id, first_id, last_id, namespace),
-            ).fetchall()
-        }
+    # Realtime imports can add an observation without adding a fingerprint, or
+    # recreate one whose old fingerprint says absent. Include those records in
+    # the same bounded lookup so a missed subsequent deletion is still noticed.
+    namespace = uuid.uuid5(uuid.NAMESPACE_DNS, account.get_host())
+    previous = {
+        row["message_id"]: (
+            row["hashes"]
+            if row["hashes"] is not None
+            else dict.fromkeys(history_fingerprints.COMPONENTS)
+        )
+        for row in session.execute(
+            """SELECT COALESCE(fingerprint.message_id, imported.message_id) AS message_id,
+                CASE WHEN imported.message_id IS NOT NULL
+                          AND fingerprint.hashes @> '{"absent":true}'::jsonb
+                     THEN NULL ELSE fingerprint.hashes END AS hashes
+            FROM (SELECT message_id, hashes FROM bridge_zulip_v5_message_fingerprints
+                  WHERE external_account_uuid=%s AND message_id BETWEEN %s AND %s) AS fingerprint
+            FULL JOIN (SELECT message_id FROM bridge_zulip_v5_messages
+                  WHERE external_account_uuid=%s AND project_id=%s
+                    AND message_id BETWEEN %s AND %s
+                    AND message_uuid=messenger_uuid_v5(%s,message_id::text)) AS imported
+              USING (message_id)
+            ORDER BY message_id""",
+            (
+                account.uuid,
+                first_id,
+                last_id,
+                account.uuid,
+                account.project_id,
+                first_id,
+                last_id,
+                namespace,
+            ),
+        ).fetchall()
+    }
     changed = []
     for data in messages:
         components = history_fingerprints.changed_components(

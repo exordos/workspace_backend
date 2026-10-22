@@ -3,6 +3,7 @@
 # you may not use this file except in compliance with the License.
 
 import datetime
+import json
 from unittest import mock
 
 import pytest
@@ -11,6 +12,7 @@ from restalchemy.dm import filters
 
 from workspace.bridges.zulip import client
 from workspace.bridges.zulip import content_conversion
+from workspace.bridges.zulip import history_fingerprints
 from workspace.bridges.zulip.dm import flags
 from workspace.bridges.zulip.dm import history
 from workspace.bridges.zulip.dm import models
@@ -434,6 +436,176 @@ def test_empty_source_cannot_skip_an_older_known_range(history_account, monkeypa
         }
     )
     assert continuation.content.last_message_id == 1000
+
+
+def _recover(account, messages, maximum, monkeypatch, root=None):
+    zulip = mock.Mock()
+
+    def page(first_id, last_id):
+        older = [data["id"] for data in messages if data["id"] < first_id]
+        return {
+            "messages": [
+                data for data in messages if first_id <= data["id"] <= last_id
+            ],
+            "next_id": max(older, default=0),
+            "history_limited": False,
+        }
+
+    zulip.get_history_batch.side_effect = page
+    monkeypatch.setattr(client, "ZulipClient", lambda _account: zulip)
+    if root is None:
+        root = models.Task(
+            project_id=account.project_id,
+            external_account_uuid=account.uuid,
+            content=models.FullBackfillContent(last_message_id=maximum),
+        )
+        root.insert()
+    root.execute()
+    assert root.status == "done", root.error_description
+    for _ in range(10):
+        cursors = models.Task.objects.get_all(
+            filters={
+                "external_account_uuid": filters.EQ(account.uuid),
+                "content": filters.JSONFields({"kind": "scan_history"}),
+                "status": filters.EQ("new"),
+            }
+        )
+        if not cursors:
+            return zulip
+        for cursor in cursors:
+            cursor.execute()
+            assert cursor.status == "done", cursor.error_description
+            apply(account)
+    pytest.fail("Bounded recovery did not finish")
+
+
+@pytest.mark.parametrize("maximum", [0, 10])
+def test_recovery_with_smaller_watermark_revisits_retained_tail(
+    history_account, monkeypatch, maximum
+):
+    account = history_account
+    scan(account, [message(1005)], monkeypatch, last_id=1005)
+    apply(account)
+    _recover(account, [message(10)] if maximum else [], maximum, monkeypatch)
+    assert (
+        models.ZulipMessage.objects.get_one_or_none(
+            filters={
+                "external_account_uuid": filters.EQ(account.uuid),
+                "message_id": filters.EQ(1005),
+            }
+        )
+        is None
+    )
+
+
+def test_recovery_does_not_chase_observations_created_after_it_was_queued(
+    history_account, monkeypatch
+):
+    account = history_account
+    scan(account, [message(10)], monkeypatch, last_id=10)
+    apply(account)
+    root = models.Task(
+        project_id=account.project_id,
+        external_account_uuid=account.uuid,
+        content=models.FullBackfillContent(last_message_id=10),
+    )
+    root.insert()
+    scan(account, [message(1005)], monkeypatch, last_id=1005)
+    apply(account)
+    for cursor in models.Task.objects.get_all(
+        filters={
+            "external_account_uuid": filters.EQ(account.uuid),
+            "content": filters.JSONFields({"kind": "scan_history"}),
+            "status": filters.EQ("new"),
+        }
+    ):
+        cursor.status = "cancel"
+        cursor.update()
+    zulip = _recover(account, [message(10)], 10, monkeypatch, root=root)
+    assert all(call.args[1] <= 10 for call in zulip.get_history_batch.call_args_list)
+    assert (
+        models.ZulipMessage.objects.get_one_or_none(
+            filters={
+                "external_account_uuid": filters.EQ(account.uuid),
+                "message_id": filters.EQ(1005),
+            }
+        )
+        is not None
+    )
+
+
+@pytest.mark.parametrize("previously_absent", [False, True])
+def test_empty_range_withdraws_realtime_records_not_in_the_checkpoint(
+    history_account, monkeypatch, previously_absent
+):
+    account = history_account
+    scan(
+        account,
+        [message(10), message(42)] if previously_absent else [message(10)],
+        monkeypatch,
+        last_id=42,
+    )
+    apply(account)
+    if previously_absent:
+        scan(account, [message(10)], monkeypatch, last_id=42)
+        apply(account)
+    zulip = mock.Mock()
+    zulip.get_messages.return_value = [message(42)]
+    monkeypatch.setattr(client, "ZulipClient", lambda _account: zulip)
+    realtime = models.Task(
+        project_id=account.project_id,
+        external_account_uuid=account.uuid,
+        queue="realtime",
+        content=models.ImportHistoryContent(first_message_id=42, last_message_id=42),
+    )
+    realtime.insert()
+    realtime.execute()
+    assert realtime.status == "done", realtime.error_description
+    scan(account, [], monkeypatch, last_id=42)
+    apply(account)
+    assert (
+        models.ZulipMessage.objects.get_one_or_none(
+            filters={
+                "external_account_uuid": filters.EQ(account.uuid),
+                "message_id": filters.EQ(42),
+            }
+        )
+        is None
+    )
+
+
+def test_v1_checkpoint_cannot_hide_a_retained_untracked_observation(
+    history_account, monkeypatch
+):
+    account = history_account
+    with monkeypatch.context() as previous:
+        previous.setattr(history_fingerprints, "VERSION", 1)
+        scan(account, [message(42)], monkeypatch, last_id=42)
+        apply(account)
+        session = contexts.Context().get_session()
+        # V1 could keep an absence marker after realtime recreated the record,
+        # then confirm an empty checkpoint without withdrawing that record.
+        session.execute(
+            "UPDATE bridge_zulip_v5_message_fingerprints SET hashes=%s::jsonb "
+            "WHERE external_account_uuid=%s",
+            (json.dumps({"absent": True}), account.uuid),
+        )
+        session.execute(
+            "UPDATE bridge_zulip_v5_history_batches SET hashes=%s::jsonb, "
+            "record_count=0,ready=true WHERE external_account_uuid=%s",
+            (json.dumps(history_fingerprints.batch_hashes([], 1, 42)), account.uuid),
+        )
+    scan(account, [], monkeypatch, last_id=42)
+    apply(account)
+    assert (
+        models.ZulipMessage.objects.get_one_or_none(
+            filters={
+                "external_account_uuid": filters.EQ(account.uuid),
+                "message_id": filters.EQ(42),
+            }
+        )
+        is None
+    )
 
 
 def test_account_delete_cascades_fingerprints_without_updating_orphan_rows(

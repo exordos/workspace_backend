@@ -10,7 +10,7 @@ import json
 from workspace.common import emoji
 
 
-VERSION = 1
+VERSION = 2
 BATCH_SIZE = 1000
 COMPONENTS = ("text", "flags", "metadata", "reactions")
 FLAGS = (

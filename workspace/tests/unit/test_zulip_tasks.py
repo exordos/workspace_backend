@@ -29,6 +29,9 @@ def _task_storage(monkeypatch):
     update = mock.Mock()
     monkeypatch.setattr(models.Task, "update", update)
     monkeypatch.setattr(models.contexts.Context, "get_session", mock.Mock())
+    monkeypatch.setattr(
+        models.history_snapshots, "retained_upper_bound", mock.Mock(return_value=0)
+    )
     return update
 
 
