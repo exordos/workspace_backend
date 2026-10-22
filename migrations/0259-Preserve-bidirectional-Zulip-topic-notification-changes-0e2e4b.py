@@ -18,12 +18,12 @@ from restalchemy.storage.sql import migrations
 
 
 UPGRADE_SQL = """
-ALTER TABLE messenger_user_topic_bindings ADD COLUMN notification_updated_at timestamp;
-ALTER TABLE bridge_zulip_v5_channels ADD COLUMN notification_observed_at timestamp NOT NULL DEFAULT 'epoch';
-ALTER TABLE bridge_zulip_v5_channels ADD COLUMN notification_event_id bigint NOT NULL DEFAULT -1;
-ALTER TABLE bridge_zulip_v5_channels ADD COLUMN topic_notifications_observed_at timestamp NOT NULL DEFAULT 'epoch';
-ALTER TABLE bridge_zulip_v5_topic_notifications ADD COLUMN observed_at timestamp NOT NULL DEFAULT 'epoch';
-ALTER TABLE bridge_zulip_v5_topic_notifications ADD COLUMN event_id bigint NOT NULL DEFAULT -1;
+ALTER TABLE messenger_user_topic_bindings ADD COLUMN IF NOT EXISTS notification_updated_at timestamp;
+ALTER TABLE bridge_zulip_v5_channels ADD COLUMN IF NOT EXISTS notification_observed_at timestamp NOT NULL DEFAULT 'epoch';
+ALTER TABLE bridge_zulip_v5_channels ADD COLUMN IF NOT EXISTS notification_event_id bigint NOT NULL DEFAULT -1;
+ALTER TABLE bridge_zulip_v5_channels ADD COLUMN IF NOT EXISTS topic_notifications_observed_at timestamp NOT NULL DEFAULT 'epoch';
+ALTER TABLE bridge_zulip_v5_topic_notifications ADD COLUMN IF NOT EXISTS observed_at timestamp NOT NULL DEFAULT 'epoch';
+ALTER TABLE bridge_zulip_v5_topic_notifications ADD COLUMN IF NOT EXISTS event_id bigint NOT NULL DEFAULT -1;
 CREATE INDEX bridge_zulip_v5_pending_topic_notifications_idx
 ON bridge_zulip_v5_tasks (external_account_uuid, (content->>'channel_uuid'), (content->>'topic_uuid'))
 WHERE content->>'kind'='update_notifications' AND status IN ('new','waiting','retry');

@@ -857,6 +857,7 @@ def test_reconciliation_tracking_migration_is_reversible(message_sources, db):
     )
     engine.rollback_migration(migration)
     try:
+        conftest._current_notification_metadata(db)
         db.execute(
             "ALTER TABLE bridge_zulip_v5_message_contents ADD COLUMN conversion_version INTEGER NOT NULL DEFAULT 0, ADD COLUMN source_timestamp BIGINT NOT NULL DEFAULT 0, ADD COLUMN source_message_id BIGINT NOT NULL DEFAULT 0"
         )
@@ -2235,6 +2236,9 @@ def test_subscription_notifications_queue_topic_and_stream_counter_refresh(
     (before,) = _viewer_rows(account, v2_models.WorkspaceStreamBinding)
     assert before.active_unread_count == 1
     source.channel.notification_mode = mode
+    source.channel.notification_observed_at = datetime.datetime.now(
+        datetime.timezone.utc
+    )
     source.channel.update()
     with contexts.Context().session_manager():
         (state,) = models.ZulipStreamBindingState.objects.get_all(
