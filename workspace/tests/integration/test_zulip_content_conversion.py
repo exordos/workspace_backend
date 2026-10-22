@@ -29,6 +29,7 @@ from workspace.tests.integration import conftest
 from workspace.tests.integration import test_messenger_v2
 from workspace.tests.integration import test_zulip_messages
 from workspace.tests.integration import test_zulip_outgoing
+from workspace.tests.integration import test_zulip_users
 
 
 history_account = test_zulip_messages.history_account
@@ -114,11 +115,140 @@ def test_imported_references_open_real_api_objects_and_convert_back(
             stream_uuid,
             zulip,
         )
-        assert "urn%3Auser%3A" in selected
+        snapshot = re.search(r"snapshot=([^)]*)", selected)[1]
+        assert message_conversion.parse_snapshot("snapshot=" + snapshot) == (
+            f'[Alias](urn:user:{account.owner_user_uuid} "silent")'
+        )
         selected = content_conversion.ConversionContext(account).to_zulip(
             {"kind": "markdown", "content": selected}, stream_uuid, zulip
         )
-        assert "|7**\n```" in selected and "urn:user:" not in selected
+        assert re.search(r"```quote\n@_\*\*[^*\n]+\|7\*\*\n```", selected)
+        assert "urn:user:" not in selected
+
+
+@pytest.fixture
+def notification_users(history_account, monkeypatch):
+    zulip = mock.Mock()
+    zulip.get_users.return_value = [
+        test_zulip_users._user_data(6, full_name="Notification Bot", is_bot=True),
+        test_zulip_users._user_data(7, full_name="Alias"),
+        test_zulip_users._user_data(8, full_name="Admin Example"),
+    ]
+    monkeypatch.setattr(client, "ZulipClient", lambda account: zulip)
+    assert test_zulip_users._run_user_import(history_account).status == "done"
+    for state in models.ZulipProjectUserState.objects.get_all(
+        filters={"project_id": filters.EQ(history_account.project_id)}
+    ):
+        with contexts.Context().session_manager():
+            state.do()
+    yield zulip
+    for account in test_zulip_users._accounts(history_account):
+        if account.uuid != history_account.uuid:
+            account.delete()
+
+
+def test_silent_notification_names_and_quotes_stay_readable_through_the_api(
+    history_account, notification_users, api, db
+):
+    account = history_account
+    zulip = notification_users
+    assert test_zulip_messages._messages(account) == []
+    body = "@_**Admin Example|8** marked this topic as unresolved."
+    header = (
+        "@_**Notification Bot|6** [said](https://zulip.example.com/#narrow/near/42):\n"
+    )
+    zulip.get_messages.return_value = [
+        test_zulip_messages._message_data(42, sender_id=6, content=body),
+        test_zulip_messages._message_data(
+            43, content=header + f"```quote\n{body}\n```"
+        ),
+        test_zulip_messages._message_data(
+            44, content=header + "```quote\n@_**Admin Example|8**\n```"
+        ),
+    ]
+    assert test_zulip_messages._import_history(account).status == "done"
+    _publish(account, db)
+    api.project_id, api.user_uuid = account.project_id, account.owner_user_uuid
+    rows = test_zulip_messages._messages(account)
+    public = [
+        uuid.uuid5(
+            uuid.uuid5(account.project_id, str(row.message_uuid)), "zulip-placement"
+        )
+        for row in rows
+    ]
+    admin = external_models.ExternalAccount.objects.get_one(
+        filters={
+            "project_id": filters.EQ(account.project_id),
+            "external_account_id": filters.EQ("zulip.example.com:8"),
+        }
+    )
+    silent = f'[Admin Example](urn:user:{admin.owner_user_uuid} "silent")'
+    encoded = base64.urlsafe_b64encode(silent.encode()).decode().rstrip("=")
+    expected = [
+        silent + " marked this topic as unresolved.",
+        f"[Notification Bot](urn:quote:{public[0]})",
+        f"[Notification Bot](urn:forward:{public[0]}?snapshot={encoded})",
+    ]
+    for identifier, content in zip(public, expected):
+        response = api.get(f"/v1/messenger/messages/{identifier}")
+        assert response.status_code == 200, response.text
+        actual = response.json()
+        assert actual["payload"]["content"] == content
+        assert actual["mentioned"] is False
+        assert "Not supported" not in content
+    target = api.get(f"/v1/users/{admin.owner_user_uuid}")
+    assert target.status_code == 200, target.text
+    assert target.json()["first_name"] == "Admin Example"
+    first = api.get(f"/v1/messenger/messages/{public[0]}").json()
+    bot = api.get(f"/v1/users/{first['author_uuid']}")
+    assert bot.status_code == 200, bot.text
+    assert bot.json()["first_name"] == "Notification Bot"
+    assert first["is_own"] is False
+    with contexts.Context().session_manager():
+        converter = content_conversion.ConversionContext(account)
+        rendered = [
+            converter.to_zulip(
+                {"kind": "markdown", "content": content},
+                rows[0].channel.stream_uuid,
+                zulip,
+            )
+            for content in expected
+        ]
+    assert rendered[0] == body
+    assert f"```quote\n{body}\n```" in rendered[1]
+    assert "```quote\n@_**Admin Example|8**\n```" in rendered[2]
+
+
+@pytest.mark.parametrize("silent", [False, True])
+def test_silent_user_link_does_not_set_recipient_mention_state(api, db, silent):
+    recipient = uuid.uuid4()
+    stream = conftest.seed_user_stream(db, api.project_id, api.user_uuid, "Mentions")
+    conftest.seed_workspace_user(db, recipient, "mention-recipient")
+    conftest.seed_user_stream_binding(db, api.project_id, stream, recipient)
+    topic = api.post(
+        "/v1/messenger/stream_topics/", json={"stream_uuid": stream, "name": "Mentions"}
+    )
+    assert topic.status_code == 201, topic.text
+    test_messenger_v2._drain()
+    title = ' "silent"' if silent else ""
+    response = api.post(
+        "/v1/messenger/messages/",
+        json={
+            "stream_uuid": stream,
+            "topic_uuid": topic.json()["uuid"],
+            "payload": {
+                "kind": "markdown",
+                "content": f"[Recipient](urn:user:{recipient}{title})",
+            },
+        },
+    )
+    assert response.status_code == 201, response.text
+    test_messenger_v2._drain()
+    target = api.get(
+        f"/v1/messenger/messages/{response.json()['uuid']}", user=recipient
+    )
+    assert target.status_code == 200, target.text
+    assert target.json()["mentioned"] is not silent
 
 
 @pytest.mark.parametrize(
@@ -940,24 +1070,70 @@ def test_content_conversion_migration_round_trips(_database):
 
 
 @pytest.mark.parametrize("newer_workspace_edit", [False, True])
-def test_contextual_quote_repair_restores_saved_content_without_an_edit(
-    history_account, api, db, monkeypatch, newer_workspace_edit
+@pytest.mark.parametrize(
+    "repair_kind",
+    [
+        "contextual_quote",
+        "silent_mention",
+        "silent_snapshot",
+        "quoted_active_mention",
+        "literal_silent_mention",
+        "id_only_silent",
+        "silent_group",
+    ],
+)
+def test_content_repair_restores_saved_content_without_an_edit(
+    history_account, api, db, monkeypatch, newer_workspace_edit, repair_kind
 ):
     account = history_account
-    target = "0261-Reconvert-Zulip-quotes-with-recipient-and-channel-context-1adfa4.py"
+    target = (
+        "0261-Reconvert-Zulip-quotes-with-recipient-and-channel-context-1adfa4.py"
+        if repair_kind == "contextual_quote"
+        else "0262-Reconvert-stored-Zulip-silent-user-mentions-80e205.py"
+    )
     engine = migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
     engine.rollback_migration(target)
     task = None
     try:
         zulip = mock.Mock()
+        body = (
+            "@_**Alias|7** [said](https://zulip.example.com/#narrow/near/42)"
+            " to @_**Recipient**:\n```quote\nOriginal leaf.\n```"
+        )
+        broken = "Legacy anonymous quote"
+        if repair_kind != "contextual_quote":
+            body = "@_**Alias|7** marked this topic as unresolved."
+            broken = "(Not supported in Workspace: silent mention of Alias) marked this topic as unresolved."
+            if repair_kind == "silent_snapshot":
+                body = (
+                    "@_**Alias|7** [said](https://zulip.example.com/#narrow/near/999):\n"
+                    f"```quote\n{body}\n```"
+                )
+                encoded = base64.urlsafe_b64encode(broken.encode()).decode().rstrip("=")
+                broken = f"[unknown](urn:forward:{uuid.uuid4()}?snapshot={encoded})"
+            broken += "\n\n[Original message](urn:url:https://zulip.example.com/#narrow/near/43)"
+            if repair_kind == "quoted_active_mention":
+                body = "> @**Alias|7**"
+                old_reference = f"[Alias](urn:user:{account.owner_user_uuid})"
+                encoded = (
+                    base64.urlsafe_b64encode(old_reference.encode())
+                    .decode()
+                    .rstrip("=")
+                )
+                broken = f"[unknown](urn:forward:{uuid.uuid4()}?snapshot={encoded})"
+            elif repair_kind == "literal_silent_mention":
+                body = "`@_**Alias|7**`"
+            elif repair_kind == "id_only_silent":
+                body = "@_**|7**"
+                broken = f'[](urn:user:{account.owner_user_uuid} "silent")'
+            elif repair_kind == "silent_group":
+                body = "@_*Engineering*"
+                broken = body
         zulip.get_messages.return_value = [
             test_zulip_messages._message_data(42, content="Original leaf."),
             test_zulip_messages._message_data(
                 43,
-                content=(
-                    "@_**Alias|7** [said](https://zulip.example.com/#narrow/near/42)"
-                    " to @_**Recipient**:\n```quote\nOriginal leaf.\n```"
-                ),
+                content=body,
             ),
         ]
         monkeypatch.setattr(client, "ZulipClient", lambda account: zulip)
@@ -971,7 +1147,6 @@ def test_contextual_quote_repair_restores_saved_content_without_an_edit(
             "SELECT content_updated_at FROM messenger_messages WHERE uuid=%s",
             (canonical,),
         ).fetchone()[0]
-        broken = "Legacy anonymous quote"
         with db.transaction():
             db.execute(
                 "SELECT set_config('workspace.projected_message_content', %s, true)",
@@ -1024,11 +1199,12 @@ def test_contextual_quote_repair_restores_saved_content_without_an_edit(
             if row[0] not in existing_tasks
         ]
         assert len(added) == 1
-        task = models.Task.objects.get_one(filters={"uuid": filters.EQ(added[0])})
-        assert task.queue == "background" and task.content.batch_size == 100
-        with contexts.Context().session_manager():
-            task.execute()
-            assert task.status == "done"
+        if added:
+            task = models.Task.objects.get_one(filters={"uuid": filters.EQ(added[0])})
+            assert task.queue == "background" and task.content.batch_size == 100
+            with contexts.Context().session_manager():
+                task.execute()
+                assert task.status == "done"
         _publish(account, db)
         assert (
             api.get(f"/v1/messenger/messages/{public}").json()["payload"]["content"]
@@ -1039,7 +1215,7 @@ def test_contextual_quote_repair_restores_saved_content_without_an_edit(
             (canonical,),
         ).fetchone() == (before,)
     finally:
-        engine.apply_migration(target)
+        engine.apply_migration(engine.get_latest_migration())
         if task is not None:
             task.delete()
 

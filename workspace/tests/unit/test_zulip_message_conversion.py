@@ -7,6 +7,7 @@ import base64
 import copy
 import json
 import pathlib
+import re
 
 import pytest
 
@@ -28,6 +29,184 @@ FILE_COUNTS = {
     "audio_attachment": 1,
     "mixed_formatting": 2,
 }
+
+
+@pytest.mark.parametrize("mapped", [False, True])
+@pytest.mark.parametrize("suffix", ["", "|8"])
+def test_silent_user_references_keep_the_clickable_identity(mapped, suffix):
+    identifier = "11111111-1111-4111-8111-111111111111"
+    context = {
+        "server_url": "https://zulip.example.test",
+        "original_url": "https://zulip.example.test/#narrow/near/2",
+        "mention_uuids": (
+            {"id:8": identifier, "name:Admin [Ops]": identifier} if mapped else {}
+        ),
+    }
+    payload = message_conversion.zulip_to_workspace(
+        {
+            "id": 2,
+            "content": f"@_**Admin [Ops]{suffix}** пометил/а тему как нерешенную.",
+        },
+        context,
+    )
+
+    if mapped:
+        assert payload == {
+            "kind": "markdown",
+            "content": rf'[Admin \[Ops\]](urn:user:{identifier} "silent") пометил/а тему как нерешенную.',
+        }
+        assert message_conversion.workspace_to_zulip(payload, context) == (
+            "@_**Admin [Ops]|8** пометил/а тему как нерешенную."
+        )
+    else:
+        assert (
+            "Not supported in Workspace: unresolved user Admin [Ops]"
+            in payload["content"]
+        )
+
+
+@pytest.mark.parametrize("mapped_source", [False, True])
+def test_silent_name_inside_a_bot_quote_stays_readable(mapped_source):
+    identifier = "11111111-1111-4111-8111-111111111111"
+    context = {
+        "server_url": "https://zulip.example.test",
+        "original_url": "https://zulip.example.test/#narrow/near/2",
+        "strict_identities": True,
+        "current_message_uuid": "22222222-2222-4222-8222-222222222222",
+        "message_uuids": {"1": identifier} if mapped_source else {},
+        "messages": {"1": {"content": "A longer original notification."}},
+        "mention_uuids": {"id:8": identifier},
+    }
+    payload = message_conversion.zulip_to_workspace(
+        {
+            "id": 2,
+            "content": (
+                "@_**Notification Bot|6** [сказал/а](https://zulip.example.test/#narrow/near/1):\n"
+                "```quote\n@_**Admin Example|8** пометил/а тему как нерешенную.\n```"
+            ),
+        },
+        context,
+    )
+    snapshot = re.search(r"snapshot=([^)]*)", payload["content"])[1]
+    assert message_conversion.parse_snapshot("snapshot=" + snapshot) == (
+        f'[Admin Example](urn:user:{identifier} "silent") пометил/а тему как нерешенную.'
+    )
+    assert (
+        f"urn:forward:{identifier}" in payload["content"]
+        if mapped_source
+        else "urn:forward:" in payload["content"]
+    )
+    assert "Not supported" not in payload["content"]
+    assert "Original message" not in payload["content"]
+
+
+@pytest.mark.parametrize("title", ['"silent"', "'silent'", "(silent)"])
+@pytest.mark.parametrize("strict", [False, True])
+def test_silent_user_link_exports_without_turning_into_an_active_mention(title, strict):
+    identifier = "11111111-1111-4111-8111-111111111111"
+    context = {
+        "strict_identities": strict,
+        "mention_uuids": {"id:8": identifier},
+        "user_ids": {identifier: ("8", "Admin Example")},
+    }
+    assert (
+        message_conversion.workspace_to_zulip(
+            {
+                "kind": "markdown",
+                "content": f"[Admin Example](urn:user:{identifier} {title})",
+            },
+            context,
+        )
+        == "@_**Admin Example|8**"
+    )
+
+
+@pytest.mark.parametrize(
+    "source", ["@_**|8**", "@_**Admin Example|8**", "@_**Admin Example**"]
+)
+def test_silent_reference_variants_resolve_the_same_profile(source):
+    identifier = "11111111-1111-4111-8111-111111111111"
+    context = {
+        "server_url": "https://zulip.example.test",
+        "original_url": "https://zulip.example.test/#narrow/near/2",
+        "mention_uuids": {"id:8": identifier, "name:Admin Example": identifier},
+        "user_ids": {identifier: ("8", "Admin Example")},
+    }
+    assert message_conversion.zulip_to_workspace(
+        {"id": 2, "content": source}, context
+    ) == {
+        "kind": "markdown",
+        "content": f'[Admin Example](urn:user:{identifier} "silent")',
+    }
+
+
+def test_id_only_reference_without_a_persisted_name_keeps_the_original_source():
+    context = {
+        "server_url": "https://zulip.example.test",
+        "original_url": "https://zulip.example.test/#narrow/near/2",
+        "mention_uuids": {"id:8": "11111111-1111-4111-8111-111111111111"},
+    }
+    payload = message_conversion.zulip_to_workspace(
+        {"id": 2, "content": "@_**|8**"}, context
+    )
+    assert "unresolved user |8" in payload["content"]
+    assert "[Original message]" in payload["content"]
+    assert "urn:user:" not in payload["content"]
+
+
+@pytest.mark.parametrize("syntax", ["@**Admin Example|8**", "@_**Admin Example|8**"])
+@pytest.mark.parametrize("wrapper", ["> {}", "```quote\n{}\n```", "> > {}"])
+def test_all_user_mentions_in_quotes_are_silent(syntax, wrapper):
+    identifier = "11111111-1111-4111-8111-111111111111"
+    context = {
+        "server_url": "https://zulip.example.test",
+        "original_url": "https://zulip.example.test/#narrow/near/2",
+        "mention_uuids": {"id:8": identifier},
+    }
+    payload = message_conversion.zulip_to_workspace(
+        {"id": 2, "content": wrapper.format(syntax)}, context
+    )
+    snapshot = re.search(r"snapshot=([^)]*)", payload["content"])[1]
+    content = message_conversion.parse_snapshot("snapshot=" + snapshot)
+    while "snapshot=" in content:
+        snapshot = re.search(r"snapshot=([^)]*)", content)[1]
+        content = message_conversion.parse_snapshot("snapshot=" + snapshot)
+    assert (
+        content.removeprefix("> ") == f'[Admin Example](urn:user:{identifier} "silent")'
+    )
+    assert "Not supported" not in payload["content"]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        r"\@_**Admin Example|8**",
+        "`@_**Admin Example|8**`",
+        "```text\n@_**Admin Example|8**\n```",
+    ],
+)
+def test_literal_silent_mention_is_not_a_user_reference(source):
+    payload = message_conversion.zulip_to_workspace({"id": 2, "content": source}, {})
+    assert payload == {"kind": "markdown", "content": source}
+
+
+@pytest.mark.parametrize("name", ["Engineering", "role:administrators", "Missing"])
+def test_silent_group_mentions_are_explicitly_unsupported(name):
+    context = {
+        "server_url": "https://zulip.example.test",
+        "original_url": "https://zulip.example.test/#narrow/near/2",
+        "user_group_ids": {"Engineering": 101, "role:administrators": 102},
+    }
+    payload = message_conversion.zulip_to_workspace(
+        {"id": 2, "content": f"@_*{name}*"}, context
+    )
+    assert "Not supported in Workspace:" in payload["content"]
+    assert name in payload["content"]
+    assert (
+        "[Original message](urn:url:https://zulip.example.test/#narrow/near/2)"
+        in payload["content"]
+    )
+    assert "urn:user:" not in payload["content"]
 
 
 @pytest.fixture(params=EXAMPLES, ids=lambda example: example["name"])
@@ -517,7 +696,7 @@ def test_malformed_quote_links_preserve_the_source_and_converted_snapshot():
     }
     snapshot = (
         base64.urlsafe_b64encode(
-            f"https://[broken/ [Bob](urn:user:{user_uuid})".encode()
+            f'https://[broken/ [Bob](urn:user:{user_uuid} "silent")'.encode()
         )
         .decode()
         .rstrip("=")
