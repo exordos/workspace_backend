@@ -601,6 +601,7 @@ def test_flag_migration_round_trip(_database):
             migration.migration_step.upgrade(connection)
 
 
+@pytest.mark.isolated_schema
 def test_flag_migration_preserves_existing_local_changes(imported, db):
     account, _source, state, _subscription, _zulip, _constructor = imported
     account_trigger = db.execute(
@@ -647,6 +648,16 @@ def test_flag_migration_preserves_existing_local_changes(imported, db):
     current = reload(state)
     assert current.read_at is None and not current.starred
     assert {task.content.flag for task in pending(account)} == {"read", "starred"}
+
+
+def test_historical_flag_probe_keeps_the_shared_history_trigger(db):
+    # The preceding historical downgrade recreates the flags table. Its
+    # private schema must not remove the current trigger from other scenarios.
+    assert db.execute(
+        "SELECT count(*) FROM pg_trigger "
+        "WHERE tgrelid='bridge_zulip_v5_message_flags'::regclass "
+        "AND tgname='bridge_zulip_v5_track_history_source' AND NOT tgisinternal"
+    ).fetchone() == (1,)
 
 
 def test_flags_for_a_missing_message_schedule_its_import(imported):

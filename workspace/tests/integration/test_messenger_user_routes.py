@@ -78,6 +78,19 @@ def test_messenger_user_detail_alias_preserves_not_found(api):
     assert alias.json() == canonical.json()
 
 
+def test_directory_aliases_keep_current_user_timestamps_stable(api):
+    # Force the actor onto the first page instead of depending on random UUIDs
+    # and users left by earlier modules to hide repeated fixture writes.
+    api.user_uuid = str(sys_uuid.UUID(int=0))
+    params = {"page_limit": 1, "sort_key": "uuid", "sort_dir": "asc"}
+    canonical = api.get("/v1/users/", params=params)
+    alias = api.get("/v1/messenger/users/", params=params)
+
+    assert canonical.status_code == alias.status_code == 200
+    assert canonical.json()[0]["uuid"] == api.user_uuid
+    assert alias.json() == canonical.json()
+
+
 def test_messenger_user_presence_alias_preserves_actor_checks(api, db):
     response = api.post(
         f"/v1/messenger/users/{api.user_uuid}/actions/presence/invoke",

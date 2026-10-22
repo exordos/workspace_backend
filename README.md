@@ -382,3 +382,32 @@ do not use `ra-rollback-migration` for this upgrade path.
 
 Use the `admin/admin` account for local manual checks when the environment
 provides the test IAM user.
+
+## Test execution
+
+Run the full local integration suite against a disposable PostgreSQL database:
+
+```bash
+WORKSPACE_TEST_DB_URL=postgresql://workspace:pass@localhost:5432/workspace_test \
+  tox -e 3.12-integration-nocoverage
+```
+
+CI runs the same integration cases in four jobs, each with its own PostgreSQL
+service. `--integration-shard INDEX COUNT` assigns each test module to exactly
+one job using its stable relative path. Its tests and parameterized cases retain
+their order and share the same module-scoped fixtures as an unsharded run. For
+example, run the first of four shards with:
+
+```bash
+tox -e 3.12-integration-nocoverage -- --integration-shard 0 4
+```
+
+Omit the option to run every case. Shards must never share a database: migration
+fixtures switch the entire schema and configure process-wide ORM state. Every
+shard remains mandatory through the `Integration` check, and each uploads its own
+JUnit results. `--durations=20` reports setup and teardown as well as test calls.
+
+The Python 3.10–3.14 unit and functional jobs use the `nocoverage` tox factor.
+Coverage is still collected and reported separately with `tox -e begin,3.12,end`;
+other tox environments retain coverage by default. CI runs for every PR, pushes
+to `master`, and tags. A newer PR revision cancels that PR's obsolete run.
