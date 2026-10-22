@@ -1254,7 +1254,16 @@ in `active_unread_count`; all remaining raw unread messages stay in
 For provider-backed Zulip streams and topics, notification actions are queued
 for the provider in the same transaction. Provider updates are applied back to
 Workspace with a per-setting timestamp, so an older update cannot replace a
-newer one.
+newer one. Pending local choices survive catalog refreshes until their queued
+operation succeeds or a newer provider event supersedes them. The queue survives
+worker restarts; stale retries and replayed events do not send an older choice.
+
+Zulip exposes a single channel mute flag. It is imported as `mentions_only`;
+Workspace sends both `mentions_only` and its stricter `muted` mode as a muted
+Zulip channel. Workspace retains a locally selected `muted` mode while the
+provider flag stays muted. Unmuting the channel in Zulip restores
+`all_messages` in Workspace. Topic policies preserve the four Zulip values,
+including the empty topic name and an explicit reset to `default`.
 
 Topic read action:
 

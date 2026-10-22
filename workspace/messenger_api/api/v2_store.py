@@ -18,6 +18,7 @@ from workspace.messenger_api.api import resource_projection
 from workspace.messenger_api.api import sql_canonical_store
 from workspace.messenger_api.api import store as api_store
 from workspace.common import emoji
+from workspace.bridges.zulip.dm import models as zulip_models
 from workspace.common import mutation_journal_opts
 from workspace.messenger_api.dm import base
 from workspace.messenger_api.dm import helpers
@@ -2144,11 +2145,14 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             return _public(self._stream(stream.uuid), "streams")
         if resource == "streams" and action == "notifications":
             stream = self._stream(resource_uuid)
+            zulip_models.lock_notification_accounts(
+                self.project_uuid, self.user_uuid, stream.uuid, session
+            )
             session.execute(
                 """
                 UPDATE messenger_stream_bindings
                 SET notification_mode = %s,
-                    notification_updated_at = NOW(), updated_at = NOW()
+                    notification_updated_at = clock_timestamp() AT TIME ZONE 'UTC', updated_at = NOW()
                 WHERE project_id = %s AND stream_uuid = %s AND user_uuid = %s
                   AND active
                 """,
@@ -2159,7 +2163,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                     self.user_uuid,
                 ),
             )
-            session.execute(
+            changed = session.execute(
                 """
                 SELECT notification_mode, notification_updated_at
                 FROM messenger_stream_bindings
@@ -2168,6 +2172,15 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 """,
                 (self.project_uuid, stream.uuid, self.user_uuid),
             ).fetchone()
+            zulip_models.enqueue_notifications(
+                self.project_uuid,
+                self.user_uuid,
+                stream.uuid,
+                None,
+                changed["notification_mode"],
+                changed["notification_updated_at"],
+                session,
+            )
             topics = session.execute(
                 """
                 SELECT uuid FROM messenger_topics
@@ -2313,10 +2326,13 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 stream_notification_mode=stream.notification_mode,
                 notification_mode=values["notification_mode"],
             )
+            zulip_models.lock_notification_accounts(
+                self.project_uuid, self.user_uuid, topic.stream_uuid, session
+            )
             session.execute(
                 """
                 UPDATE messenger_user_topic_bindings
-                SET notification_mode = %s, updated_at = NOW()
+                SET notification_mode = %s, notification_updated_at = clock_timestamp() AT TIME ZONE 'UTC', updated_at = NOW()
                 WHERE project_id = %s AND topic_uuid = %s AND user_uuid = %s
                 """,
                 (
@@ -2326,14 +2342,23 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                     self.user_uuid,
                 ),
             )
-            session.execute(
+            changed = session.execute(
                 """
-                SELECT notification_mode, updated_at
+                SELECT notification_mode, notification_updated_at
                 FROM messenger_user_topic_bindings
                 WHERE project_id = %s AND topic_uuid = %s AND user_uuid = %s
                 """,
                 (self.project_uuid, topic.uuid, self.user_uuid),
             ).fetchone()
+            zulip_models.enqueue_notifications(
+                self.project_uuid,
+                self.user_uuid,
+                topic.stream_uuid,
+                topic.uuid,
+                changed["notification_mode"],
+                changed["notification_updated_at"],
+                session,
+            )
             self._enqueue_counter_projections(
                 source_kind="topic.updated",
                 user_uuid=self.user_uuid,

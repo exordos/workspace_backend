@@ -184,3 +184,59 @@ def test_attachment_download_does_not_forward_credentials_to_object_storage():
     )
     assert "auth" not in anonymous.__dict__
     assert anonymous.trust_env is False
+
+
+@pytest.mark.parametrize("policy", [0, 1, 2, 3])
+@pytest.mark.parametrize("topic", ["General", ""])
+def test_topic_notification_update_uses_the_personal_zulip_endpoint(policy, topic):
+    account = mock.Mock(
+        settings={
+            "server_url": "https://zulip.example.com",
+            "email": "sender@example.com",
+            "api_key": "sender-key",
+        }
+    )
+    session = mock.Mock()
+    session.request.return_value.json.return_value = {"result": "success"}
+    with mock.patch.object(client.requests, "Session", return_value=session):
+        zulip = client.ZulipClient(account)
+        try:
+            zulip.update_topic_notifications(42, topic, policy)
+        finally:
+            zulip.close()
+    session.request.assert_called_once_with(
+        "POST",
+        "https://zulip.example.com/api/v1/user_topics",
+        timeout=(5, 30),
+        data={"stream_id": 42, "topic": topic, "visibility_policy": policy},
+    )
+    session.close.assert_called_once()
+
+
+@pytest.mark.parametrize("is_muted", [False, True])
+def test_stream_notification_update_uses_the_personal_subscription(is_muted):
+    account = mock.Mock(
+        settings={
+            "server_url": "https://zulip.example.com",
+            "email": "sender@example.com",
+            "api_key": "sender-key",
+        }
+    )
+    session = mock.Mock()
+    session.request.return_value.json.return_value = {"result": "success"}
+    with mock.patch.object(client.requests, "Session", return_value=session):
+        zulip = client.ZulipClient(account)
+        try:
+            zulip.update_stream_notifications(42, is_muted)
+        finally:
+            zulip.close()
+    session.request.assert_called_once_with(
+        "POST",
+        "https://zulip.example.com/api/v1/users/me/subscriptions/properties",
+        timeout=(5, 30),
+        data={
+            "subscription_data": json.dumps(
+                [{"stream_id": 42, "property": "is_muted", "value": is_muted}]
+            )
+        },
+    )

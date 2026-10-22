@@ -222,6 +222,36 @@ class ZulipClient:
         finally:
             self._request("DELETE", "/events", data={"queue_id": data["queue_id"]})
 
+    def update_stream_notifications(self, stream_id: int, is_muted: bool) -> None:
+        self._request(
+            "POST",
+            "/users/me/subscriptions/properties",
+            data={
+                "subscription_data": json.dumps(
+                    [
+                        {
+                            "stream_id": stream_id,
+                            "property": "is_muted",
+                            "value": is_muted,
+                        }
+                    ]
+                )
+            },
+        )
+
+    def update_topic_notifications(
+        self, stream_id: int, topic: str, visibility_policy: int
+    ) -> None:
+        self._request(
+            "POST",
+            "/user_topics",
+            data={
+                "stream_id": stream_id,
+                "topic": topic,
+                "visibility_policy": visibility_policy,
+            },
+        )
+
     def get_messages(self, first_message_id: int, last_message_id: int) -> list[dict]:
         messages = self._get(
             "/messages",

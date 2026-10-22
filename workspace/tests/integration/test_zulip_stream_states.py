@@ -184,6 +184,9 @@ def test_binding_states_show_only_required_actions(
             binding_uuid=binding_uuid,
             action=action,
             notification_mode=None,
+            observed_at=datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+            if has_channel
+            else None,
         )
         assert state.get_id() == (
             account.project_id,
@@ -331,7 +334,12 @@ def test_binding_state_uses_current_transaction(stream_state_account, db, action
             db, account.project_id, stream_uuid, account.owner_user_uuid
         )
         if action == "update":
-            _channel(account, stream_uuid, notification_mode="muted")
+            _channel(
+                account,
+                stream_uuid,
+                notification_mode="muted",
+                notification_observed_at=datetime.datetime.now(datetime.timezone.utc),
+            )
     (state,) = _binding_states(account)
     counter_changes = [
         change.as_plain_dict()
