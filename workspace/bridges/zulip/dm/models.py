@@ -2641,6 +2641,7 @@ class ImportHistoryContent(AbstractZulipTaskContent):
                         content=ScanHistoryContent(
                             first_message_id=self.batch_first_id,
                             last_message_id=remaining["covered_to"],
+                            since=self.since,
                         ),
                     ).insert()
                 return
