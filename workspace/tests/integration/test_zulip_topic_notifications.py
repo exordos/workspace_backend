@@ -404,7 +404,7 @@ def test_native_topic_notification_scope_migration_is_reversible(notification_pa
         _event(pair, 1)
         assert _mode(pair) == "default"
     finally:
-        engine.apply_migration(name)
+        engine.apply_migration(engine.get_latest_migration())
     _event(pair, 3, last_updated=101)
     assert _mode(pair) == "follow"
 
@@ -471,4 +471,4 @@ def test_notification_migration_rollback_removes_only_the_new_task_type(
         assert _tasks(pair) == []
         assert models.Task.objects.get_one(filters={"uuid": filters.EQ(other.uuid)})
     finally:
-        engine.apply_migration(name)
+        engine.apply_migration(engine.get_latest_migration())

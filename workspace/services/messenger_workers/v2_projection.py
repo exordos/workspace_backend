@@ -3245,6 +3245,7 @@ def _purge_completed_tombstone(
             """
             DELETE FROM messenger_topics
             WHERE project_id = %s AND uuid = %s AND deleted_at IS NOT NULL
+              AND to_jsonb(messenger_topics)->>'redirect_topic_uuid' IS NULL
             """,
             (project_id, _uuid(payload["topic_uuid"])),
         )

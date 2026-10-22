@@ -199,6 +199,93 @@ def workspace_reference_text(text: str) -> str:
     return "\n".join(contents)
 
 
+def rewrite_workspace_references(text: str, replacements: dict[str, str]) -> str:
+    """Remap actual entity links, including embedded snapshots, without changing prose."""
+    output = []
+    position = 0
+    tokens = re.compile(r"\\[^\n]|`+|!?\[|(?m:^ {0,3}~{3,})")
+    while match := tokens.search(text, position):
+        output.append(text[position : match.start()])
+        start = match.start()
+        position = match.end()
+        token = match[0]
+        if token.startswith("\\"):
+            output.append(token)
+            continue
+        if "`" in token or "~" in token:
+            line_start = text.rfind("\n", 0, start) + 1
+            indentation = text[line_start:start]
+            opening = (
+                _FENCE.match(text, line_start)
+                if len(indentation) <= 3 and not indentation.strip(" ")
+                else None
+            )
+            block = _fenced(text, line_start) if opening is not None else None
+            if block is not None and opening is not None:
+                info, body, position = block
+                if info in ("quote", "spoiler") or info.startswith("spoiler "):
+                    body_start = opening.end()
+                    output.append(text[start:body_start])
+                    output.append(rewrite_workspace_references(body, replacements))
+                    output.append(text[body_start + len(body) : position])
+                else:
+                    output.append(text[start:position])
+                continue
+            if opening is not None:
+                output.append(text[start:])
+                return "".join(output)
+            if "`" in token:
+                closing = re.search(rf"(?<!`){re.escape(token)}(?!`)", text[position:])
+                if closing is not None:
+                    position += closing.end()
+            output.append(text[start:position])
+            continue
+        link = _link(text, start)
+        if link is None:
+            output.append(token)
+            continue
+        label, target, title, image, position = link
+        reference = _workspace_reference(target)
+        if reference is None:
+            output.append(text[start:position])
+            continue
+        kind, identifier, query = reference
+        original = f"urn:{kind}:{identifier}"
+        destination = replacements.get(original, original)
+        parameters = urllib.parse.parse_qsl(query, keep_blank_values=True)
+        changed = False
+        for index, (key, value) in enumerate(parameters):
+            if kind == "forward" and key == "snapshot":
+                embedded = parse_snapshot(query)
+            elif kind == "quote" and key == "text":
+                embedded = value
+            else:
+                continue
+            if embedded is None:
+                continue
+            rewritten = rewrite_workspace_references(embedded, replacements)
+            if rewritten == embedded:
+                continue
+            if kind == "forward":
+                rewritten = (
+                    base64.urlsafe_b64encode(rewritten.encode()).decode().rstrip("=")
+                )
+            parameters[index] = key, rewritten
+            changed = True
+        if changed:
+            query = urllib.parse.urlencode(parameters)
+        if destination == original and not changed:
+            output.append(text[start:position])
+        else:
+            output.append(
+                _markdown_link(
+                    label, destination + ("?" + query if query else ""), title, image
+                )
+            )
+    output.append(text[position:])
+    return "".join(output)
+
+
 def get_workspace_files(payload: dict, *, include_quotes: bool = False) -> list[str]:
     """Return this message's file URNs in occurrence order, excluding quotes."""
     text = message_payloads.markdown_content(payload)

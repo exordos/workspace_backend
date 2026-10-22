@@ -8,6 +8,8 @@ import copy
 import json
 import pathlib
 import re
+import urllib.parse
+import uuid
 
 import pytest
 
@@ -207,6 +209,53 @@ def test_silent_group_mentions_are_explicitly_unsupported(name):
         in payload["content"]
     )
     assert "urn:user:" not in payload["content"]
+
+
+def test_rewrite_topic_references_preserves_labels_queries_and_code():
+    old = f"urn:topic:{uuid.uuid4()}"
+    new = f"urn:topic:{uuid.uuid4()}"
+    text = (
+        f"[Custom label]({old}?x=1 'title')\n"
+        f"`[inline]({old})`\n```python\n[code]({old})\n```\n"
+        f"Literal {old} and escaped \\[link]({old})\n"
+        f"> [quoted]({old})\n```spoiler Details\n[hidden]({old})\n```\n"
+    )
+    expected = text.replace(f"[Custom label]({old}", f"[Custom label]({new}")
+    expected = expected.replace(f"[quoted]({old}", f"[quoted]({new}")
+    expected = expected.replace(f"[hidden]({old}", f"[hidden]({new}")
+    assert message_conversion.rewrite_workspace_references(text, {old: new}) == expected
+
+
+def test_rewrite_topic_references_updates_nested_forward_and_quote_selection():
+    old = f"urn:topic:{uuid.uuid4()}"
+    new = f"urn:topic:{uuid.uuid4()}"
+    query = urllib.parse.urlencode({"text": f"[selected]({old})", "other": "kept"})
+    quote = f"[quote](urn:quote:{uuid.uuid4()}?{query})"
+    snapshot = base64.urlsafe_b64encode(quote.encode()).decode().rstrip("=")
+    text = f"[forward](urn:forward:{uuid.uuid4()}?snapshot={snapshot})"
+    actual = message_conversion.rewrite_workspace_references(text, {old: new})
+    nested = message_conversion.workspace_reference_text(actual)
+    assert new in nested
+    assert old not in nested
+    assert "other=kept" in nested
+    assert message_conversion.rewrite_workspace_references(actual, {old: new}) == actual
+
+
+@pytest.mark.parametrize("query", ["snapshot=!", "text=%FF%XX"])
+def test_rewrite_topic_references_keeps_malformed_embedded_content(query):
+    text = f"[bad](urn:forward:{uuid.uuid4()}?{query})"
+    assert message_conversion.rewrite_workspace_references(text, {}) == text
+
+
+def test_rewrite_topic_references_handles_indented_spoilers_and_unclosed_code():
+    old = f"urn:topic:{uuid.uuid4()}"
+    new = f"urn:topic:{uuid.uuid4()}"
+    spoiler = f"  ```spoiler Details\n[topic]({old})\n  ```\n"
+    literal = f"```python\n[example]({old})\n"
+    assert (
+        message_conversion.rewrite_workspace_references(spoiler + literal, {old: new})
+        == spoiler.replace(old, new) + literal
+    )
 
 
 @pytest.fixture(params=EXAMPLES, ids=lambda example: example["name"])

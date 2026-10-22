@@ -19,6 +19,7 @@ from workspace.messenger_api.api import sql_canonical_store
 from workspace.messenger_api.api import store as api_store
 from workspace.common import emoji
 from workspace.bridges.zulip.dm import models as zulip_models
+from workspace.bridges.zulip import message_conversion
 from workspace.common import mutation_journal_opts
 from workspace.messenger_api.dm import base
 from workspace.messenger_api.dm import helpers
@@ -141,6 +142,8 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             return super().get_resource(resource, resource_uuid)
         if resource == "messages":
             return _public(self._message(resource_uuid), resource)
+        if resource == "stream_topics":
+            return _public(self._topic(resource_uuid), resource)
         row = CORE_RESOURCE_MODELS[resource].objects.get_one(
             filters=self._v2_scope_filters(
                 resource,
@@ -358,12 +361,64 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         )
 
     def _topic(self, topic_uuid: object) -> v2_models.WorkspaceUserTopic:
+        current = v2_models.WorkspaceUserTopic.objects.get_one_or_none(
+            filters=self._v2_scope_filters(
+                "stream_topics", {"uuid": dm_filters.EQ(topic_uuid)}
+            )
+        )
+        if current is not None:
+            return current
+        redirect = (
+            contexts.Context()
+            .get_session()
+            .execute(
+                "SELECT (to_jsonb(topic)->>'redirect_topic_uuid')::uuid AS destination "
+                "FROM messenger_topics AS topic WHERE project_id=%s AND uuid=%s AND deleted_at IS NOT NULL",
+                (self.project_uuid, topic_uuid),
+            )
+            .fetchone()
+        )
+        if redirect is not None and redirect["destination"] is not None:
+            topic_uuid = redirect["destination"]
         return v2_models.WorkspaceUserTopic.objects.get_one(
             filters=self._v2_scope_filters(
                 "stream_topics",
                 {"uuid": dm_filters.EQ(topic_uuid)},
             )
         )
+
+    def _normalize_topic_links(self, payload: dict) -> dict:
+        if payload["kind"] != "markdown":
+            return payload
+        references = [
+            sys_uuid.UUID(value)
+            for kind, value, _query in message_conversion.workspace_references(
+                message_conversion.workspace_reference_text(payload["content"])
+            )
+            if kind == "topic"
+        ]
+        if not references:
+            return payload
+        aliases = (
+            contexts.Context()
+            .get_session()
+            .execute(
+                "SELECT uuid,to_jsonb(topic)->>'redirect_topic_uuid' AS destination FROM messenger_topics AS topic "
+                "WHERE project_id=%s AND uuid=ANY(%s) AND deleted_at IS NOT NULL AND to_jsonb(topic)->>'redirect_topic_uuid' IS NOT NULL",
+                (self.project_uuid, references),
+            )
+            .fetchall()
+        )
+        return {
+            **payload,
+            "content": message_conversion.rewrite_workspace_references(
+                payload["content"],
+                {
+                    f"urn:topic:{row['uuid']}": f"urn:topic:{row['destination']}"
+                    for row in aliases
+                },
+            ),
+        }
 
     def _folder(self, folder_uuid: object) -> v2_models.WorkspaceUserFolder:
         return v2_models.WorkspaceUserFolder.objects.get_one(
@@ -611,21 +666,43 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         session = contexts.Context().get_session()
         stream = self._stream(values["stream_uuid"])
         topic_uuid = sys_uuid.UUID(str(values.get("uuid") or sys_uuid.uuid4()))
+        external_channel = (
+            stream.source_name == "zulip"
+            and session.execute(
+                "SELECT 1 FROM bridge_zulip_v5_channels AS channel JOIN m_external_accounts_v2 AS account "
+                "ON account.uuid=channel.external_account_uuid WHERE account.project_id=%s AND account.provider='zulip' "
+                "AND channel.stream_uuid=%s AND channel.channel_type='channel' LIMIT 1",
+                (self.project_uuid, stream.uuid),
+            ).fetchone()
+            is not None
+        )
+        name = values["name"]
+        is_done = external_channel and name.startswith("✔ ")
+        if external_channel:
+            name = name.removeprefix("✔ ")
+            topic_uuid = sys_uuid.uuid5(stream.uuid, name)
+        conflict = (
+            "ON CONFLICT (project_id,uuid) DO UPDATE SET name=EXCLUDED.name,is_done=EXCLUDED.is_done,"
+            "source_name=EXCLUDED.source_name,source=EXCLUDED.source,deleted_at=NULL WHERE messenger_topics.deleted_at IS NOT NULL"
+            if external_channel
+            else ""
+        )
         source = _simple_source(values.get("source", {"kind": "native"}))
         now = session.execute("SELECT NOW() AS value", ()).fetchone()["value"]
         session.execute(
-            """
+            f"""
             INSERT INTO messenger_topics (
-                uuid, project_id, stream_uuid, name, color,
+                uuid, project_id, stream_uuid, name, color,is_done,
                 source_name, source, created_at, updated_at
-            ) VALUES (%s, %s, %s, %s, %s, 'native', %s::jsonb, %s, %s)
+            ) VALUES (%s, %s, %s, %s, %s, %s,'native', %s::jsonb, %s, %s) {conflict}
             """,
             (
                 topic_uuid,
                 self.project_uuid,
                 stream.uuid,
-                values["name"],
+                name or "General Topic",
                 values.get("color", base.random_color()),
+                is_done,
                 json.dumps(source),
                 now,
                 now,
@@ -868,7 +945,9 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         values: dict[str, typing.Any],
     ) -> dict[str, typing.Any]:
         session = contexts.Context().get_session()
-        canonical_payload = resource_projection.simple(values["payload"])
+        canonical_payload = self._normalize_topic_links(
+            resource_projection.simple(values["payload"])
+        )
         announced = (
             canonical_payload["kind"] == message_payloads.KeyAnnouncedPayload.KIND
         )
@@ -1083,10 +1162,11 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         message = self._message(message_uuid)
         if message.author_uuid != self.user_uuid:
             raise ra_exceptions.ValidationErrorException()
-        message.validate_payload_update(
-            resource_projection.simple(values["payload"]), session
+        canonical_payload = self._normalize_topic_links(
+            resource_projection.simple(values["payload"])
         )
-        payload = json.dumps(resource_projection.simple(values["payload"]))
+        message.validate_payload_update(canonical_payload, session)
+        payload = json.dumps(canonical_payload)
         changed = session.execute(
             """
             UPDATE messenger_messages
@@ -1315,9 +1395,22 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             updates = {name: values[name] for name in allowed if name in values}
             if not updates or set(values) - allowed:
                 raise ra_exceptions.ValidationErrorException()
+            if (
+                "name" in updates
+                and updates["name"] != topic.name
+                and self._stream(topic.stream_uuid).source_name == "zulip"
+            ):
+                zulip_models.enqueue_topic_update(
+                    self.project_uuid,
+                    self.user_uuid,
+                    topic,
+                    updates["name"],
+                    topic.is_done,
+                    session,
+                )
             assignments = ", ".join(f'"{name}" = %s' for name in updates)
             session.execute(
-                f"UPDATE messenger_topics SET {assignments}, updated_at = NOW() "
+                f"UPDATE messenger_topics SET {assignments}, version=version+1,updated_at = NOW() "
                 "WHERE project_id = %s AND uuid = %s",
                 (*updates.values(), self.project_uuid, topic.uuid),
             )
@@ -2213,6 +2306,15 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             return row
         if resource == "stream_topics" and action == "toggle_done":
             topic = self._topic(resource_uuid)
+            if self._stream(topic.stream_uuid).source_name == "zulip":
+                zulip_models.enqueue_topic_update(
+                    self.project_uuid,
+                    self.user_uuid,
+                    topic,
+                    topic.name,
+                    not topic.is_done,
+                    session,
+                )
             session.execute(
                 """
                 UPDATE messenger_topics
