@@ -4,6 +4,7 @@
 
 import base64
 import datetime
+import hashlib
 import re
 from unittest import mock
 import uuid
@@ -120,14 +121,23 @@ def test_imported_references_open_real_api_objects_and_convert_back(
         assert "|7**\n```" in selected and "urn:user:" not in selected
 
 
+@pytest.mark.parametrize(
+    "quote_context",
+    [
+        "",
+        " to @_**Recipient**",
+        " to @_**Recipient** and @_**Another|9**",
+        " in [#**Channel 42>General**](https://zulip.example.com/#narrow/near/999)",
+    ],
+)
 def test_nested_edited_quote_keeps_snapshot_structure_through_the_api(
-    history_account, api, db, monkeypatch
+    history_account, api, db, monkeypatch, quote_context
 ):
     account = history_account
 
     def quote(message_id, body, fence="```", url="near"):
         return (
-            f"@_**Alias|7** [wrote](https://zulip.example.com/#narrow/{url}/{message_id}):\n"
+            f"@_**Alias|7** [wrote](https://zulip.example.com/#narrow/{url}/{message_id}){quote_context}:\n"
             f"{fence}quote\n{body}\n{fence}"
         )
 
@@ -927,6 +937,111 @@ def test_content_conversion_migration_round_trips(_database):
             assert connection.execute(
                 "SELECT to_regclass('bridge_zulip_v5_content_snapshots') IS NOT NULL"
             ).fetchone() == (True,)
+
+
+@pytest.mark.parametrize("newer_workspace_edit", [False, True])
+def test_contextual_quote_repair_restores_saved_content_without_an_edit(
+    history_account, api, db, monkeypatch, newer_workspace_edit
+):
+    account = history_account
+    target = "0261-Reconvert-Zulip-quotes-with-recipient-and-channel-context-1adfa4.py"
+    engine = migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    engine.rollback_migration(target)
+    task = None
+    try:
+        zulip = mock.Mock()
+        zulip.get_messages.return_value = [
+            test_zulip_messages._message_data(42, content="Original leaf."),
+            test_zulip_messages._message_data(
+                43,
+                content=(
+                    "@_**Alias|7** [said](https://zulip.example.com/#narrow/near/42)"
+                    " to @_**Recipient**:\n```quote\nOriginal leaf.\n```"
+                ),
+            ),
+        ]
+        monkeypatch.setattr(client, "ZulipClient", lambda account: zulip)
+        assert test_zulip_messages._import_history(account, last=43).status == "done"
+        _publish(account, db)
+        leaf, source = test_zulip_messages._messages(account)
+        canonical = uuid.uuid5(account.project_id, str(source.message_uuid))
+        public = uuid.uuid5(canonical, "zulip-placement")
+        expected = source.content.workspace_content
+        before = db.execute(
+            "SELECT content_updated_at FROM messenger_messages WHERE uuid=%s",
+            (canonical,),
+        ).fetchone()[0]
+        broken = "Legacy anonymous quote"
+        with db.transaction():
+            db.execute(
+                "SELECT set_config('workspace.projected_message_content', %s, true)",
+                (f"{account.project_id}:{canonical}",),
+            )
+            db.execute(
+                "UPDATE messenger_messages SET payload=jsonb_build_object('kind','markdown','content',%s::text) WHERE uuid=%s",
+                (broken, canonical),
+            )
+            db.execute(
+                "UPDATE bridge_zulip_v5_message_contents SET workspace_content=%s,workspace_content_hash=%s,conversion_version=1 WHERE uuid=%s",
+                (
+                    broken,
+                    hashlib.sha256(broken.encode()).hexdigest(),
+                    source.content.uuid,
+                ),
+            )
+        api.project_id, api.user_uuid = account.project_id, account.owner_user_uuid
+        assert (
+            api.get(f"/v1/messenger/messages/{public}").json()["payload"]["content"]
+            == broken
+        )
+        if newer_workspace_edit:
+            expected = "A newer Workspace edit."
+            response = api.put(
+                f"/v1/messenger/messages/{public}",
+                json={"payload": {"kind": "markdown", "content": expected}},
+            )
+            assert response.status_code == 200, response.text
+            _publish(account, db)
+            before = db.execute(
+                "SELECT content_updated_at FROM messenger_messages WHERE uuid=%s",
+                (canonical,),
+            ).fetchone()[0]
+        existing_tasks = set(
+            row[0] for row in db.execute("SELECT uuid FROM bridge_zulip_v5_tasks")
+        )
+        engine.apply_migration(target)
+        assert db.execute(
+            "SELECT conversion_version FROM bridge_zulip_v5_message_contents WHERE uuid=%s",
+            (leaf.content.uuid,),
+        ).fetchone() == (1,)
+        assert db.execute(
+            "SELECT conversion_version FROM bridge_zulip_v5_message_contents WHERE uuid=%s",
+            (source.content.uuid,),
+        ).fetchone() == (0,)
+        added = [
+            row[0]
+            for row in db.execute("SELECT uuid FROM bridge_zulip_v5_tasks")
+            if row[0] not in existing_tasks
+        ]
+        assert len(added) == 1
+        task = models.Task.objects.get_one(filters={"uuid": filters.EQ(added[0])})
+        assert task.queue == "background" and task.content.batch_size == 100
+        with contexts.Context().session_manager():
+            task.execute()
+            assert task.status == "done"
+        _publish(account, db)
+        assert (
+            api.get(f"/v1/messenger/messages/{public}").json()["payload"]["content"]
+            == expected
+        )
+        assert db.execute(
+            "SELECT content_updated_at FROM messenger_messages WHERE uuid=%s",
+            (canonical,),
+        ).fetchone() == (before,)
+    finally:
+        engine.apply_migration(target)
+        if task is not None:
+            task.delete()
 
 
 @pytest.mark.parametrize(
