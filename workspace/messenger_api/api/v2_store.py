@@ -2145,14 +2145,11 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             return _public(self._stream(stream.uuid), "streams")
         if resource == "streams" and action == "notifications":
             stream = self._stream(resource_uuid)
-            zulip_models.lock_notification_accounts(
-                self.project_uuid, self.user_uuid, stream.uuid, session
-            )
             session.execute(
                 """
                 UPDATE messenger_stream_bindings
                 SET notification_mode = %s,
-                    notification_updated_at = clock_timestamp(), updated_at = NOW()
+                    notification_updated_at = NOW(), updated_at = NOW()
                 WHERE project_id = %s AND stream_uuid = %s AND user_uuid = %s
                   AND active
                 """,
@@ -2163,7 +2160,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                     self.user_uuid,
                 ),
             )
-            changed = session.execute(
+            session.execute(
                 """
                 SELECT notification_mode, notification_updated_at
                 FROM messenger_stream_bindings
@@ -2177,8 +2174,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 self.user_uuid,
                 stream.uuid,
                 None,
-                changed["notification_mode"],
-                changed["notification_updated_at"],
+                values["notification_mode"],
                 session,
             )
             topics = session.execute(
@@ -2326,13 +2322,10 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 stream_notification_mode=stream.notification_mode,
                 notification_mode=values["notification_mode"],
             )
-            zulip_models.lock_notification_accounts(
-                self.project_uuid, self.user_uuid, topic.stream_uuid, session
-            )
             session.execute(
                 """
                 UPDATE messenger_user_topic_bindings
-                SET notification_mode = %s, notification_updated_at = clock_timestamp() AT TIME ZONE 'UTC', updated_at = NOW()
+                SET notification_mode = %s, updated_at = NOW()
                 WHERE project_id = %s AND topic_uuid = %s AND user_uuid = %s
                 """,
                 (
@@ -2342,9 +2335,9 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                     self.user_uuid,
                 ),
             )
-            changed = session.execute(
+            session.execute(
                 """
-                SELECT notification_mode, notification_updated_at
+                SELECT notification_mode, updated_at
                 FROM messenger_user_topic_bindings
                 WHERE project_id = %s AND topic_uuid = %s AND user_uuid = %s
                 """,
@@ -2355,8 +2348,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 self.user_uuid,
                 topic.stream_uuid,
                 topic.uuid,
-                changed["notification_mode"],
-                changed["notification_updated_at"],
+                values["notification_mode"],
                 session,
             )
             self._enqueue_counter_projections(

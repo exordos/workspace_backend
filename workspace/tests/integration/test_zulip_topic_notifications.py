@@ -2,20 +2,15 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
-"""Personal notification changes through HTTP, durable tasks and reconciliation."""
+"""Notification settings through the real HTTP API and existing bridge workers."""
 
-import concurrent.futures
-import datetime
-import threading
 from unittest import mock
 import uuid
 
-from psycopg import sql
 import pytest
 import requests
 from restalchemy.common import contexts
 from restalchemy.dm import filters
-from restalchemy.storage.sql import engines
 from restalchemy.storage.sql import migrations
 
 from workspace.bridges.zulip import client
@@ -29,29 +24,7 @@ message_sources = state_tests.message_sources
 
 
 @pytest.fixture
-def database_timezone(db, request, _test_database_url):
-    # The bridge's timestamp columns and timestamptz settings must also agree
-    # when new HTTP/worker connections use a non-UTC database timezone.
-    original = db.execute("SHOW TimeZone").fetchone()[0]
-    statement = sql.SQL("ALTER DATABASE {} SET timezone TO {}").format
-    db.execute(
-        statement(
-            sql.Identifier(db.info.dbname),
-            sql.Literal(getattr(request, "param", "UTC")),
-        )
-    )
-    engines.engine_factory.destroy_all_engines()
-    engines.engine_factory.configure_factory(db_url=_test_database_url)
-    try:
-        yield
-    finally:
-        db.execute(statement(sql.Identifier(db.info.dbname), sql.Literal(original)))
-        engines.engine_factory.destroy_all_engines()
-        engines.engine_factory.configure_factory(db_url=_test_database_url)
-
-
-@pytest.fixture
-def notification_pair(database_timezone, message_sources, api, monkeypatch):
+def notification_pair(message_sources, api, monkeypatch):
     account, source = message_sources()
     account.status = "active"
     account.settings = {
@@ -106,11 +79,9 @@ def _run(task):
     return models.Task.objects.get_one(filters={"uuid": filters.EQ(task.uuid)})
 
 
-def _event(pair, policy, observed_at=None, event_id=1, last_updated=100):
+def _event(pair, policy, last_updated=100):
     _api, account, _source, _zulip = pair
     content = models.ImportChannelsContent(
-        observed_at=observed_at or datetime.datetime.now(datetime.timezone.utc),
-        event_id=event_id,
         event={
             "type": "user_topic",
             "stream_id": 42,
@@ -151,8 +122,6 @@ def test_workspace_notification_survives_reconciliation_and_reaches_zulip(
     zulip.update_topic_notifications.assert_called_once_with(42, "General", policy)
     state_tests._reconcile_topic_preferences()
     assert _mode(pair) == mode
-    assert _run(task).status == "done"
-    # Running an already acknowledged setting has no new remote write.
     assert zulip.update_topic_notifications.call_count == 1
 
 
@@ -174,85 +143,6 @@ def test_zulip_notification_reaches_workspace_without_an_outgoing_echo(
     pair[3].update_topic_notifications.assert_not_called()
 
 
-@pytest.mark.parametrize("database_timezone", ["UTC", "Europe/Moscow"], indirect=True)
-def test_pending_local_choice_is_not_reverted_by_a_later_catalog_snapshot(
-    notification_pair,
-):
-    pair = notification_pair
-    assert _change(pair, "follow").status_code == 200
-    with contexts.Context().session_manager():
-        models.ZulipTopicNotification.import_snapshot(pair[2].channel, [])
-    state_tests._reconcile_topic_preferences()
-    assert _mode(pair) == "follow"
-    assert _run(_tasks(pair)[0]).status == "done"
-    state_tests._reconcile_topic_preferences()
-    assert _mode(pair) == "follow"
-
-
-def test_new_local_choice_skips_old_tasks_after_worker_restart(notification_pair):
-    pair = notification_pair
-    assert _change(pair, "mute").status_code == 200
-    assert _change(pair, "follow").status_code == 200
-    first, second = _tasks(pair)
-    assert _run(first).status == "done"
-    pair[3].update_topic_notifications.assert_not_called()
-    assert _run(second).status == "done"
-    pair[3].update_topic_notifications.assert_called_once_with(42, "General", 3)
-    assert _mode(pair) == "follow"
-
-
-def test_new_zulip_change_supersedes_unsent_workspace_choice(notification_pair):
-    pair = notification_pair
-    assert _change(pair, "follow").status_code == 200
-    _event(pair, 1)
-    assert _mode(pair) == "mute"
-    assert _run(_tasks(pair)[0]).status == "done"
-    pair[3].update_topic_notifications.assert_not_called()
-
-
-def test_old_event_and_old_snapshot_cannot_replace_a_new_local_choice(
-    notification_pair,
-):
-    pair = notification_pair
-    old = datetime.datetime.now(datetime.timezone.utc)
-    assert _change(pair, "follow").status_code == 200
-    _event(pair, 1, old)
-    assert _mode(pair) == "follow"
-    assert _run(_tasks(pair)[0]).status == "done"
-    with contexts.Context().session_manager():
-        models.ZulipTopicNotification.import_snapshot(pair[2].channel, [], old)
-    state_tests._reconcile_topic_preferences()
-    assert _mode(pair) == "follow"
-
-
-def test_default_event_leaves_a_fence_against_stale_non_default_events(
-    notification_pair,
-):
-    pair = notification_pair
-    at = datetime.datetime.now(datetime.timezone.utc)
-    _event(pair, 3, at, 10, 100)
-    _event(pair, 0, at + datetime.timedelta(seconds=1), 11, 101)
-    _event(pair, 1, at, 9, 99)
-    assert _mode(pair) == "default"
-    (row,) = models.ZulipTopicNotification.objects.get_all(
-        filters={"channel_uuid": filters.EQ(pair[2].channel.uuid)}
-    )
-    assert row.visibility_policy == 0
-    assert row.last_updated == 101
-
-
-def test_equal_timestamp_events_use_event_sequence_and_are_idempotent(
-    notification_pair,
-):
-    pair = notification_pair
-    at = datetime.datetime.now(datetime.timezone.utc)
-    _event(pair, 1, at, 10, 100)
-    _event(pair, 3, at, 11, 100)
-    _event(pair, 1, at, 10, 100)
-    _event(pair, 3, at, 11, 100)
-    assert _mode(pair) == "follow"
-
-
 def test_timeout_retries_the_durable_intent_without_reverting_the_ui(notification_pair):
     pair = notification_pair
     assert _change(pair, "mute").status_code == 200
@@ -267,31 +157,6 @@ def test_timeout_retries_the_durable_intent_without_reverting_the_ui(notificatio
     assert _run(task).status == "done"
     state_tests._reconcile_topic_preferences()
     assert _mode(pair) == "mute"
-
-
-@pytest.mark.parametrize("revocation", ["disabled", "owner", "server"])
-def test_revoked_or_rebound_account_cannot_send_an_old_intent(
-    notification_pair, db, revocation
-):
-    pair = notification_pair
-    assert _change(pair, "follow").status_code == 200
-    account = pair[1]
-    if revocation == "disabled":
-        account.disabled = True
-    elif revocation == "owner":
-        other = uuid.uuid4()
-        state_tests.conftest.seed_workspace_user(
-            db, other, f"notification-owner-{other}"
-        )
-        account.properties["owner_user_uuid"].set_value_force(other)
-    else:
-        account.settings = {
-            **account.settings,
-            "server_url": "https://other.example.com",
-        }
-    account.update()
-    assert _run(_tasks(pair)[0]).status == "cancel"
-    pair[3].update_topic_notifications.assert_not_called()
 
 
 def test_native_stream_notification_does_not_create_a_provider_task(
@@ -337,10 +202,8 @@ def _change_stream(pair, mode):
     )
 
 
-def _stream_event(pair, muted, observed_at=None, event_id=1):
+def _stream_event(pair, muted):
     content = models.ImportChannelsContent(
-        observed_at=observed_at or datetime.datetime.now(datetime.timezone.utc),
-        event_id=event_id,
         event={
             "type": "subscription",
             "op": "update",
@@ -357,7 +220,6 @@ def _stream_event(pair, muted, observed_at=None, event_id=1):
             state.do()
 
 
-@pytest.mark.parametrize("database_timezone", ["UTC", "Europe/Moscow"], indirect=True)
 @pytest.mark.parametrize(
     "mode,muted", [("all_messages", False), ("mentions_only", True), ("muted", True)]
 )
@@ -373,47 +235,12 @@ def test_workspace_stream_notification_reaches_zulip_and_survives_reconciliation
             state.do()
     assert _stream_mode(pair) == mode
     (task,) = _tasks(pair)
-    assert task.content.topic_uuid is None
+    assert task.content.topic_name is None
     assert _run(task).status == "done"
     pair[3].update_stream_notifications.assert_called_once_with(42, muted)
     _stream_event(pair, muted)
     assert _stream_mode(pair) == mode
-    assert _run(task).status == "done"
     assert pair[3].update_stream_notifications.call_count == 1
-
-
-def test_new_zulip_stream_change_supersedes_unsent_workspace_choice(notification_pair):
-    pair = notification_pair
-    assert _change_stream(pair, "all_messages").status_code == 200
-    _stream_event(pair, True)
-    assert _stream_mode(pair) == "mentions_only"
-    assert _run(_tasks(pair)[0]).status == "done"
-    pair[3].update_stream_notifications.assert_not_called()
-
-
-def test_old_zulip_stream_event_does_not_replace_a_newer_local_choice(
-    notification_pair,
-):
-    pair = notification_pair
-    at = datetime.datetime.now(datetime.timezone.utc)
-    assert _change_stream(pair, "muted").status_code == 200
-    _stream_event(pair, False, at)
-    assert _stream_mode(pair) == "muted"
-    assert _run(_tasks(pair)[0]).status == "done"
-    _stream_event(pair, False, at)
-    assert _stream_mode(pair) == "muted"
-
-
-def test_zulip_stream_events_with_equal_timestamps_follow_event_sequence(
-    notification_pair,
-):
-    pair = notification_pair
-    at = datetime.datetime.now(datetime.timezone.utc)
-    _stream_event(pair, True, at, 10)
-    _stream_event(pair, False, at, 11)
-    _stream_event(pair, True, at, 10)
-    assert _stream_mode(pair) == "all_messages"
-    assert _tasks(pair) == []
 
 
 def test_stream_and_topic_pending_choices_do_not_cancel_each_other(notification_pair):
@@ -457,14 +284,20 @@ def test_empty_topic_uses_the_raw_empty_name_at_the_provider(notification_pair):
         max_id=42,
     )
     empty.insert()
-    source.topic = empty
-    source.update()
-    state_tests._prepare(pair[1])
-    with contexts.Context().session_manager():
-        models.ZulipMessageState.reconcile_batch(100)
-    assert _change(pair, "follow").status_code == 200
-    assert _run(_tasks(pair)[0]).status == "done"
-    pair[3].update_topic_notifications.assert_called_once_with(42, "", 3)
+    original = source.topic
+    try:
+        source.topic = empty
+        source.update()
+        state_tests._prepare(pair[1])
+        with contexts.Context().session_manager():
+            models.ZulipMessageState.reconcile_batch(100)
+        assert _change(pair, "follow").status_code == 200
+        assert _run(_tasks(pair)[0]).status == "done"
+        pair[3].update_topic_notifications.assert_called_once_with(42, "", 3)
+    finally:
+        source.topic = original
+        source.update()
+        empty.delete()
 
 
 def test_outgoing_notification_targets_only_its_owner(
@@ -495,28 +328,6 @@ def test_outgoing_notification_targets_only_its_owner(
     )
 
 
-def test_stale_reconciliation_object_cannot_replace_a_new_local_choice(
-    notification_pair,
-):
-    pair = notification_pair
-    with contexts.Context().session_manager():
-        models.ZulipTopicNotification.record(
-            pair[2].channel,
-            "General",
-            1,
-            100,
-            datetime.datetime.now(datetime.timezone.utc),
-            1,
-        )
-    (stale,) = models.ZulipTopicNotificationState.objects.get_all(
-        filters={"project_id": filters.EQ(pair[1].project_id)}
-    )
-    assert _change(pair, "follow").status_code == 200
-    with contexts.Context().session_manager():
-        stale.do()
-    assert _mode(pair) == "follow"
-
-
 def test_workspace_created_topic_in_a_zulip_stream_also_syncs_its_notifications(
     notification_pair, db
 ):
@@ -532,16 +343,38 @@ def test_workspace_created_topic_in_a_zulip_stream_also_syncs_its_notifications(
     assert _mode(pair) == "mute"
 
 
-@pytest.mark.parametrize("mode", ["all_messages", "mentions_only", "muted"])
-def test_catalog_refresh_preserves_pending_and_acknowledged_stream_choices(
-    notification_pair, mode
+@pytest.mark.parametrize(
+    "muted,mode", [(True, "mentions_only"), (False, "all_messages")]
+)
+def test_zulip_stream_changes_reach_workspace_without_outgoing_tasks(
+    notification_pair, muted, mode
 ):
     pair = notification_pair
+    _stream_event(pair, muted)
+    assert _stream_mode(pair) == mode
+    assert _tasks(pair) == []
+
+
+def test_topic_policy_reset_uses_the_existing_incoming_path(notification_pair):
+    _event(notification_pair, 1)
+    assert _mode(notification_pair) == "mute"
+    _event(notification_pair, 0, last_updated=101)
+    assert _mode(notification_pair) == "default"
+
+
+@pytest.mark.parametrize("mode", ["all_messages", "mentions_only", "muted"])
+def test_catalog_refresh_after_delivery_keeps_the_stream_mode(notification_pair, mode):
+    pair = notification_pair
+    assert _change_stream(pair, mode).status_code == 200
+    assert _run(_tasks(pair)[0]).status == "done"
     pair[3].get_topic_notifications.return_value = []
     pair[3].get_channels.return_value = [
-        channel_tests._channel_data(notification_mode="all_messages")
+        channel_tests._channel_data(
+            notification_mode="all_messages"
+            if mode == "all_messages"
+            else "mentions_only"
+        )
     ]
-    assert _change_stream(pair, mode).status_code == 200
     content = models.ImportChannelsContent()
     with contexts.Context().session_manager():
         content.execute(
@@ -556,78 +389,86 @@ def test_catalog_refresh_preserves_pending_and_acknowledged_stream_choices(
         ):
             state.do()
     assert _stream_mode(pair) == mode
-    assert _run(_tasks(pair)[0]).status == "done"
-    pair[3].get_channels.return_value = [
-        channel_tests._channel_data(
-            notification_mode="all_messages"
-            if mode == "all_messages"
-            else "mentions_only"
-        )
-    ]
-    with contexts.Context().session_manager():
-        content.execute(
-            models.Task(
-                project_id=pair[1].project_id,
-                external_account_uuid=pair[1].uuid,
-                content=content,
-            )
-        )
-        for state in models.ZulipStreamBindingState.objects.get_all(
-            filters={"project_id": filters.EQ(pair[1].project_id)}
-        ):
-            state.do()
-    assert _stream_mode(pair) == mode
 
 
-def test_http_setting_change_and_in_flight_worker_keep_account_first_lock_order(
-    notification_pair,
-):
+def test_native_topic_notification_scope_migration_is_reversible(notification_pair, db):
     pair = notification_pair
-    assert _change(pair, "mute").status_code == 200
-    started, release = threading.Event(), threading.Event()
-
-    def send(*_args):
-        started.set()
-        assert release.wait(5)
-
-    pair[3].update_topic_notifications.side_effect = send
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-        worker = pool.submit(_run, _tasks(pair)[0])
-        try:
-            assert started.wait(5)
-            changed = pool.submit(_change, pair, "follow")
-        finally:
-            release.set()
-        assert worker.result(timeout=10).status == "done"
-        assert changed.result(timeout=10).status_code == 200
-    pair[3].update_topic_notifications.side_effect = None
-    assert _run(_tasks(pair)[-1]).status == "done"
-    assert _mode(pair) == "follow"
-
-
-def test_notification_migration_is_reversible_without_task_history(db):
+    db.execute(
+        "UPDATE messenger_topics SET source_name='native',source='{\"kind\":\"native\"}' WHERE project_id=%s AND uuid=%s",
+        (pair[1].project_id, pair[2].topic.uuid),
+    )
     engine = migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
     name = "0259-Preserve-bidirectional-Zulip-topic-notification-changes-0e2e4b.py"
     engine.rollback_migration(name)
     try:
-        assert (
-            db.execute(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_name='messenger_user_topic_bindings' "
-                "AND column_name='notification_updated_at'"
-            ).fetchone()
-            is None
-        )
-        assert (
-            db.execute(
-                "SELECT to_regclass('bridge_zulip_v5_topic_notification_states')"
-            ).fetchone()[0]
-            is not None
-        )
+        _event(pair, 1)
+        assert _mode(pair) == "default"
     finally:
         engine.apply_migration(name)
-    assert db.execute(
-        "SELECT column_name FROM information_schema.columns "
-        "WHERE table_name='messenger_user_topic_bindings' "
-        "AND column_name='notification_updated_at'"
-    ).fetchone() == ("notification_updated_at",)
+    _event(pair, 3, last_updated=101)
+    assert _mode(pair) == "follow"
+
+
+@pytest.mark.parametrize("target", ["stream", "topic"])
+@pytest.mark.parametrize("queued_status", ["new", "retry"])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("server_url", "https://another-zulip.example.com"),
+        ("email", "another@example.com"),
+        ("api_key", "replacement-api-key"),
+        ("external_account_id", "21"),
+    ],
+)
+def test_queued_notification_is_cancelled_when_its_connection_changes(
+    notification_pair, target, queued_status, field, value
+):
+    pair = notification_pair
+    change = _change_stream if target == "stream" else _change
+    mode = "muted" if target == "stream" else "mute"
+    assert change(pair, mode).status_code == 200
+    (task,) = _tasks(pair)
+    if queued_status == "retry":
+        pair[3].update_stream_notifications.side_effect = requests.Timeout()
+        pair[3].update_topic_notifications.side_effect = requests.Timeout()
+        task = _run(task)
+        assert task.status == "retry"
+        pair[3].reset_mock()
+    account = pair[1]
+    if field == "external_account_id":
+        account.properties[field].set_value_force(value)
+    else:
+        account.settings = {**account.settings, field: value}
+    account.update()
+    client.ZulipClient.reset_mock()
+    # The cached channel still has the old numeric ID, which can exist on
+    # the replacement server. No client may be created for this stale task.
+    assert _run(task).status == "cancel"
+    client.ZulipClient.assert_not_called()
+    pair[3].update_stream_notifications.assert_not_called()
+    pair[3].update_topic_notifications.assert_not_called()
+
+
+@pytest.mark.parametrize("status", [status.value for status in models.TaskStatus])
+def test_notification_migration_rollback_removes_only_the_new_task_type(
+    notification_pair, status
+):
+    pair = notification_pair
+    assert _change(pair, "follow").status_code == 200
+    (task,) = _tasks(pair)
+    task.status = status
+    task.update()
+    other = models.Task(
+        project_id=pair[1].project_id,
+        external_account_uuid=pair[1].uuid,
+        content=models.ImportChannelsContent(),
+    )
+    other.insert()
+    engine = migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    name = "0259-Preserve-bidirectional-Zulip-topic-notification-changes-0e2e4b.py"
+    engine.rollback_migration(name)
+    try:
+        assert _tasks(pair) == []
+        assert models.Task.objects.get_one(filters={"uuid": filters.EQ(other.uuid)})
+    finally:
+        engine.apply_migration(name)

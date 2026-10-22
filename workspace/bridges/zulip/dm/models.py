@@ -415,10 +415,6 @@ class ZulipStreamBindingState(
         types.Enum(["create", "update", "delete"]), required=True, read_only=True
     )
 
-    observed_at = properties.property(
-        types.AllowNone(types.UTCDateTimeZ()), default=None, read_only=True
-    )
-
     @classmethod
     def get_id_property(cls) -> dict[str, typing.Any]:
         return cls.id_properties.copy()
@@ -427,12 +423,11 @@ class ZulipStreamBindingState(
         return self.project_id, self.stream_uuid, self.user_uuid
 
     def do(self) -> None:
-        actions: dict[str, typing.Callable[[], None]] = {
+        {
             "create": self.create_workspace_binding,
             "update": self.update_workspace_binding,
             "delete": self.delete_workspace_binding,
-        }
-        actions[self.action]()
+        }[self.action]()
 
     def create_workspace_binding(self) -> None:
         messenger_helpers.get_or_create_workspace_stream_bindings(
@@ -447,37 +442,27 @@ class ZulipStreamBindingState(
             defer_folder_events=True,
         )
         if self.notification_mode is not None:
-            self.update_workspace_binding(initial=True)
+            self.update_workspace_binding()
 
-    def update_workspace_binding(self, initial: bool = False) -> None:
+    def update_workspace_binding(self) -> None:
         session = contexts.Context().get_session()
         messenger_helpers._lock_workspace_project_event_writes(self.project_id, session)
         messenger_helpers._lock_workspace_stream_binding(
             self.project_id, self.binding_uuid, session
         )
-        current = (
-            self
-            if initial
-            else ZulipStreamBindingState.objects.get_one_or_none(
-                filters={
-                    "project_id": filters.EQ(self.project_id),
-                    "stream_uuid": filters.EQ(self.stream_uuid),
-                    "user_uuid": filters.EQ(self.user_uuid),
-                }
-            )
+        binding = v2_models.WorkspaceStreamBinding.objects.get_one(
+            filters={
+                "project_id": filters.EQ(self.project_id),
+                "uuid": filters.EQ(self.binding_uuid),
+            }
         )
-        if current is None:
+        if binding.notification_mode == self.notification_mode:
             return
         session.execute(
             "UPDATE messenger_stream_bindings SET notification_mode=%s, "
-            "notification_updated_at=%s, updated_at=NOW() "
+            "notification_updated_at=NOW(), updated_at=NOW() "
             "WHERE project_id=%s AND uuid=%s AND active",
-            (
-                current.notification_mode,
-                current.observed_at,
-                self.project_id,
-                self.binding_uuid,
-            ),
+            (self.notification_mode, self.project_id, self.binding_uuid),
         )
         topic_uuids = [
             topic.uuid
@@ -697,10 +682,6 @@ class ZulipTopicNotificationState(models.ModelWithID, orm.SQLStorableMixin):
         read_only=True,
     )
 
-    observed_at = properties.property(
-        types.UTCDateTimeZ(), required=True, read_only=True
-    )
-
     @classmethod
     def get_id_property(cls) -> dict[str, typing.Any]:
         return cls.id_properties.copy()
@@ -712,30 +693,9 @@ class ZulipTopicNotificationState(models.ModelWithID, orm.SQLStorableMixin):
         session = contexts.Context().get_session()
         messenger_helpers._lock_workspace_project_event_writes(self.project_id, session)
         session.execute(
-            "SELECT uuid FROM messenger_user_topic_bindings "
-            "WHERE project_id=%s AND user_uuid=%s AND topic_uuid=%s FOR UPDATE",
-            (self.project_id, self.user_uuid, self.topic_uuid),
-        ).fetchone()
-        current = ZulipTopicNotificationState.objects.get_one_or_none(
-            filters={
-                "project_id": filters.EQ(self.project_id),
-                "user_uuid": filters.EQ(self.user_uuid),
-                "topic_uuid": filters.EQ(self.topic_uuid),
-            }
-        )
-        if current is None:
-            return
-        session.execute(
-            "UPDATE messenger_user_topic_bindings SET notification_mode=%s, "
-            "notification_updated_at=%s, updated_at=NOW() "
+            "UPDATE messenger_user_topic_bindings SET notification_mode=%s, updated_at=NOW() "
             "WHERE project_id=%s AND user_uuid=%s AND topic_uuid=%s",
-            (
-                current.notification_mode,
-                current.observed_at.replace(tzinfo=None),
-                self.project_id,
-                self.user_uuid,
-                self.topic_uuid,
-            ),
+            (self.notification_mode, self.project_id, self.user_uuid, self.topic_uuid),
         )
         ZulipMessageCounterChange.mark_many(
             {(self.project_id, self.user_uuid, self.stream_uuid, self.topic_uuid)}
@@ -1575,16 +1535,6 @@ class ZulipChannel(
     __tablename__ = "bridge_zulip_v5_channels"
 
     topic_notifications_synced = properties.property(types.Boolean(), default=False)
-    topic_notifications_observed_at = properties.property(
-        types.UTCDateTimeZ(),
-        default=datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc),
-    )
-
-    notification_observed_at = properties.property(
-        types.UTCDateTimeZ(),
-        default=datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc),
-    )
-    notification_event_id = properties.property(types.Integer(min_value=-1), default=-1)
 
     notification_mode = properties.property(
         types.AllowNone(
@@ -1672,56 +1622,8 @@ class ZulipTopicNotification(models.ModelWithUUID, orm.SQLStorableMixin):
     )
     last_updated = properties.property(types.Integer(min_value=0), required=True)
 
-    observed_at = properties.property(
-        types.UTCDateTimeZ(),
-        default=datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc),
-    )
-    event_id = properties.property(types.Integer(min_value=-1), default=-1)
-
     @classmethod
-    def record(
-        cls,
-        channel: "ZulipChannel",
-        name: str,
-        policy: int,
-        last_updated: int,
-        observed_at: datetime.datetime,
-        event_id: int = -1,
-    ) -> None:
-        name = name.lower()
-        row = cls.objects.get_one_or_none(
-            filters={
-                "channel_uuid": filters.EQ(channel.uuid),
-                "topic_name": filters.EQ(name),
-            }
-        )
-        if row is not None and (row.observed_at, row.event_id) >= (
-            observed_at,
-            event_id,
-        ):
-            return
-        if row is not None and last_updated < row.last_updated:
-            return
-        fields = dict(
-            visibility_policy=policy,
-            last_updated=last_updated,
-            observed_at=observed_at,
-            event_id=event_id,
-        )
-        if row is None:
-            cls(channel_uuid=channel.uuid, topic_name=name, **fields).insert()
-        else:
-            row.update_dm(values=fields)
-            row.update()
-
-    @classmethod
-    def import_snapshot(
-        cls,
-        channel: "ZulipChannel",
-        values: list[dict],
-        observed_at: datetime.datetime | None = None,
-    ) -> None:
-        observed_at = observed_at or datetime.datetime.now(datetime.timezone.utc)
+    def import_snapshot(cls, channel: "ZulipChannel", values: list[dict]) -> None:
         previous = {
             row.topic_name: row
             for row in cls.objects.get_all(
@@ -1730,20 +1632,20 @@ class ZulipTopicNotification(models.ModelWithUUID, orm.SQLStorableMixin):
         }
         for data in values:
             name = data["topic_name"].lower()
-            previous.pop(name, None)
-            cls.record(
-                channel,
-                name,
-                data["visibility_policy"],
-                data["last_updated"],
-                observed_at,
-            )
+            row = previous.pop(name, None)
+            fields = {
+                "visibility_policy": data["visibility_policy"],
+                "last_updated": data["last_updated"],
+            }
+            if row is None:
+                cls(channel_uuid=channel.uuid, topic_name=name, **fields).insert()
+            else:
+                row.update_dm(values=fields)
+                row.update()
         for row in previous.values():
-            cls.record(channel, row.topic_name, 0, row.last_updated, observed_at)
-        if observed_at >= channel.topic_notifications_observed_at:
-            channel.topic_notifications_synced = True
-            channel.topic_notifications_observed_at = observed_at
-            channel.update()
+            row.delete()
+        channel.topic_notifications_synced = True
+        channel.update()
 
 
 class ZulipTopic(
@@ -2375,11 +2277,6 @@ class ImportChannelsContent(AbstractZulipTaskContent):
     periodic = properties.property(types.Boolean(), default=False)
     event = properties.property(types.AllowNone(types.Dict()), default=None)
 
-    observed_at = properties.property(
-        types.AllowNone(types.UTCDateTimeZ()), default=None
-    )
-    event_id = properties.property(types.Integer(min_value=-1), default=-1)
-
     def apply_event(self, account: external_models.ExternalAccount) -> bool:
         if self.event is None:
             return False
@@ -2392,14 +2289,30 @@ class ImportChannelsContent(AbstractZulipTaskContent):
             )
             if channel is None:
                 return False
-            ZulipTopicNotification.record(
-                channel,
-                self.event["topic_name"],
-                self.event["visibility_policy"],
-                self.event["last_updated"],
-                self.observed_at or datetime.datetime.now(datetime.timezone.utc),
-                self.event_id if self.event_id >= 0 else self.event.get("id", 0),
+            name = self.event["topic_name"].lower()
+            row = ZulipTopicNotification.objects.get_one_or_none(
+                filters={
+                    "channel_uuid": filters.EQ(channel.uuid),
+                    "topic_name": filters.EQ(name),
+                }
             )
+            if row is not None and row.last_updated >= self.event["last_updated"]:
+                return True
+            if self.event["visibility_policy"] == 0:
+                if row is not None:
+                    row.delete()
+            else:
+                values = {
+                    key: self.event[key]
+                    for key in ("visibility_policy", "last_updated")
+                }
+                if row is None:
+                    ZulipTopicNotification(
+                        channel_uuid=channel.uuid, topic_name=name, **values
+                    ).insert()
+                else:
+                    row.update_dm(values=values)
+                    row.update()
             return True
         if self.event["op"] != "update":
             return False
@@ -2415,28 +2328,14 @@ class ImportChannelsContent(AbstractZulipTaskContent):
                 return False
             name = change["property"]
             if name == "is_muted":
-                observed_at = self.observed_at or datetime.datetime.now(
-                    datetime.timezone.utc
-                )
-                event_id = (
-                    self.event_id if self.event_id >= 0 else self.event.get("id", 0)
-                )
-                if (
-                    channel.notification_observed_at,
-                    channel.notification_event_id,
-                ) >= (observed_at, event_id):
-                    continue
                 values = {
                     "notification_mode": (
                         "muted"
                         if channel.notification_mode == "muted"
-                        and channel.notification_observed_at.timestamp() > 0
                         else "mentions_only"
                     )
                     if change["value"]
-                    else "all_messages",
-                    "notification_observed_at": observed_at,
-                    "notification_event_id": event_id,
+                    else "all_messages"
                 }
             elif name in (
                 "name",
@@ -2466,22 +2365,10 @@ class ImportChannelsContent(AbstractZulipTaskContent):
                 "project_id": filters.EQ(task.project_id),
             },
         )
-        if self.event is not None and self.observed_at is None:
-            # Tasks queued by an older worker must retain their original ingress
-            # time when they are retried after the upgrade.
-            self.observed_at = task.created_at
-            source_uuid = task.realtime_event_uuid or task.backfill_uuid
-            if source_uuid is not None:
-                source = RealtimeEvent.objects.get_one(
-                    filters={"uuid": filters.EQ(source_uuid)}
-                )
-                self.observed_at = source.created_at
-                self.event_id = source.event_id
         if self.apply_event(account):
             return
         hostname = account.get_host()
         server_namespace = sys_uuid.uuid5(sys_uuid.NAMESPACE_DNS, hostname)
-        observed_at = datetime.datetime.now(datetime.timezone.utc)
         zulip = client.ZulipClient(account)
         try:
             topic_notifications: dict[int, list[dict[str, typing.Any]]] = {}
@@ -2517,24 +2404,6 @@ class ImportChannelsContent(AbstractZulipTaskContent):
                         "stream_id": filters.EQ(values["stream_id"]),
                     },
                 )
-                values["notification_observed_at"] = observed_at
-                values["notification_event_id"] = -1
-                if channel is not None:
-                    if channel.notification_observed_at > observed_at:
-                        for field in (
-                            "notification_mode",
-                            "notification_observed_at",
-                            "notification_event_id",
-                        ):
-                            values.pop(field)
-                    elif (
-                        values["notification_mode"] == "mentions_only"
-                        and channel.notification_mode == "muted"
-                        and channel.notification_observed_at.timestamp() > 0
-                    ):
-                        # Zulip has one muted flag. Keep the stricter local choice
-                        # until the provider actually switches that flag off.
-                        values["notification_mode"] = "muted"
                 if channel is None:
                     channel = ZulipChannel(
                         external_account_uuid=account.uuid,
@@ -2542,12 +2411,15 @@ class ImportChannelsContent(AbstractZulipTaskContent):
                     )
                     channel.insert()
                 else:
+                    if (
+                        values["notification_mode"] == "mentions_only"
+                        and channel.notification_mode == "muted"
+                    ):
+                        values["notification_mode"] = "muted"
                     channel.update_dm(values=values)
                     channel.update()
                 ZulipTopicNotification.import_snapshot(
-                    channel,
-                    topic_notifications.get(values["stream_id"], []),
-                    observed_at,
+                    channel, topic_notifications.get(values["stream_id"], [])
                 )
                 stream_ids.add(values["stream_id"])
             for channel in ZulipChannel.objects.get_all(
@@ -3251,8 +3123,8 @@ class UpdateNotificationsContent(AbstractZulipTaskContent):
     KIND = "update_notifications"
 
     channel_uuid = properties.property(types.UUID(), required=True, read_only=True)
-    topic_uuid = properties.property(
-        types.AllowNone(types.UUID()), default=None, read_only=True
+    topic_name = properties.property(
+        types.AllowNone(types.String()), default=None, read_only=True
     )
     notification_mode = properties.property(
         types.Enum(
@@ -3262,12 +3134,42 @@ class UpdateNotificationsContent(AbstractZulipTaskContent):
         required=True,
         read_only=True,
     )
-    changed_at = properties.property(
-        types.UTCDateTimeZ(), required=True, read_only=True
-    )
+
     account_revision = properties.property(
         types.String(), required=True, read_only=True
     )
+
+    def remember(self, channel: "ZulipChannel") -> None:
+        # Reconciliation reads this same cache. Remember the local choice in
+        # the API transaction so the unchanged cache does not immediately undo it.
+        if self.topic_name is None:
+            channel.notification_mode = self.notification_mode
+            channel.update()
+            return
+        name = self.topic_name.lower()
+        row = ZulipTopicNotification.objects.get_one_or_none(
+            filters={
+                "channel_uuid": filters.EQ(channel.uuid),
+                "topic_name": filters.EQ(name),
+            }
+        )
+        policy = {"default": 0, "mute": 1, "unmute": 2, "follow": 3}[
+            self.notification_mode
+        ]
+        if policy == 0:
+            if row is not None:
+                row.delete()
+        elif row is None:
+            ZulipTopicNotification(
+                channel_uuid=channel.uuid,
+                topic_name=name,
+                visibility_policy=policy,
+                last_updated=0,
+            ).insert()
+        else:
+            row.visibility_policy = policy
+            row.last_updated = 0
+            row.update()
 
     def execute(self, task: "Task") -> None:
         account = external_models.ExternalAccount.objects.get_one(
@@ -3276,13 +3178,11 @@ class UpdateNotificationsContent(AbstractZulipTaskContent):
                 "project_id": filters.EQ(task.project_id),
             }
         )
-        account = RealtimeSubscription.lock_account(account)
         if (
             not account.can_stream()
-            or account.subscription_revision() != self.account_revision
+            or account.realtime_revision() != self.account_revision
         ):
             raise SubscriptionChangedError()
-        session = contexts.Context().get_session()
         channel = ZulipChannel.objects.get_one_or_none(
             filters={
                 "uuid": filters.EQ(self.channel_uuid),
@@ -3292,106 +3192,23 @@ class UpdateNotificationsContent(AbstractZulipTaskContent):
         )
         if channel is None:
             return
-        if self.topic_uuid is None:
-            self.update_stream(task, account, channel, session)
-            return
-        current = session.execute(
-            "SELECT binding.notification_mode, binding.notification_updated_at, topic.name, topic.stream_uuid "
-            "FROM messenger_user_topic_bindings AS binding JOIN messenger_topics AS topic "
-            "ON topic.project_id=binding.project_id AND topic.uuid=binding.topic_uuid "
-            "JOIN messenger_stream_bindings AS membership ON membership.project_id=binding.project_id "
-            "AND membership.stream_uuid=topic.stream_uuid AND membership.user_uuid=binding.user_uuid AND membership.active "
-            "JOIN messenger_streams AS stream ON stream.project_id=topic.project_id AND stream.uuid=topic.stream_uuid "
-            "AND stream.source_name='zulip' AND stream.deleted_at IS NULL "
-            "WHERE binding.project_id=%s AND binding.topic_uuid=%s AND binding.user_uuid=%s "
-            "AND topic.deleted_at IS NULL FOR UPDATE OF binding",
-            (task.project_id, self.topic_uuid, account.owner_user_uuid),
-        ).fetchone()
-        if (
-            current is None
-            or current["notification_updated_at"]
-            != self.changed_at.replace(tzinfo=None)
-            or current["notification_mode"] != self.notification_mode
-        ):
-            return
-        channel = ZulipChannel.objects.get_one_or_none(
-            filters={
-                "uuid": filters.EQ(self.channel_uuid),
-                "external_account_uuid": filters.EQ(account.uuid),
-                "stream_uuid": filters.EQ(current["stream_uuid"]),
-                "channel_type": filters.EQ("channel"),
-            }
-        )
-        if channel is None:
-            return
-        name = (
-            ""
-            if self.topic_uuid == sys_uuid.uuid5(channel.stream_uuid, "")
-            else current["name"]
-        )
-        policy = {"default": 0, "mute": 1, "unmute": 2, "follow": 3}[
-            self.notification_mode
-        ]
-        previous = ZulipTopicNotification.objects.get_one_or_none(
-            filters={
-                "channel_uuid": filters.EQ(channel.uuid),
-                "topic_name": filters.EQ(name.lower()),
-            }
-        )
-        if (
-            previous is not None
-            and previous.visibility_policy == policy
-            and previous.observed_at >= self.changed_at
-        ):
-            return
-        observed_at = datetime.datetime.now(datetime.timezone.utc)
         zulip = client.ZulipClient(account)
         try:
-            zulip.update_topic_notifications(channel.stream_id, name, policy)
+            if self.topic_name is None:
+                zulip.update_stream_notifications(
+                    channel.stream_id, self.notification_mode != "all_messages"
+                )
+            else:
+                zulip.update_topic_notifications(
+                    channel.stream_id,
+                    self.topic_name,
+                    {"default": 0, "mute": 1, "unmute": 2, "follow": 3}[
+                        self.notification_mode
+                    ],
+                )
         finally:
             zulip.close()
-        ZulipTopicNotification.record(
-            channel, name, policy, previous.last_updated if previous else 0, observed_at
-        )
-
-    def update_stream(
-        self,
-        task: "Task",
-        account: external_models.ExternalAccount,
-        channel: "ZulipChannel",
-        session: sessions.PgSQLSession,
-    ) -> None:
-        current = session.execute(
-            "SELECT binding.notification_mode,binding.notification_updated_at AT TIME ZONE 'UTC' AS notification_updated_at FROM messenger_stream_bindings AS binding "
-            "JOIN messenger_streams AS stream ON stream.project_id=binding.project_id AND stream.uuid=binding.stream_uuid "
-            "WHERE binding.project_id=%s AND binding.stream_uuid=%s AND binding.user_uuid=%s AND binding.active "
-            "AND stream.source_name='zulip' AND stream.deleted_at IS NULL FOR UPDATE OF binding",
-            (task.project_id, channel.stream_uuid, account.owner_user_uuid),
-        ).fetchone()
-        if (
-            current is None
-            or current["notification_updated_at"]
-            != self.changed_at.replace(tzinfo=None)
-            or current["notification_mode"] != self.notification_mode
-        ):
-            return
-        if (
-            channel.notification_mode == self.notification_mode
-            and channel.notification_observed_at >= self.changed_at
-        ):
-            return
-        observed_at = datetime.datetime.now(datetime.timezone.utc)
-        zulip = client.ZulipClient(account)
-        try:
-            zulip.update_stream_notifications(
-                channel.stream_id, self.notification_mode != "all_messages"
-            )
-        finally:
-            zulip.close()
-        channel.notification_mode = self.notification_mode
-        channel.notification_observed_at = observed_at
-        channel.notification_event_id = -1
-        channel.update()
+        self.remember(channel)
 
     def on_error(self, task: "Task", error: Exception) -> None:
         if isinstance(error, SubscriptionChangedError):
@@ -4859,13 +4676,7 @@ class RealtimeEvent(
             contents = [ImportUsersContent(event=self.payload)]
             priority = TASK_PRIORITY_IMPORT_USERS
         elif kind in ("subscription", "stream", "user_topic"):
-            contents = [
-                ImportChannelsContent(
-                    event=self.payload,
-                    observed_at=self.created_at,
-                    event_id=self.event_id,
-                )
-            ]
+            contents = [ImportChannelsContent(event=self.payload)]
             priority = TASK_PRIORITY_IMPORT_CHANNELS
         for index, content in enumerate(contents):
             Task(
@@ -5482,64 +5293,46 @@ class WorkspaceEvent(
         return True
 
 
-def lock_notification_accounts(
-    project_id: sys_uuid.UUID,
-    user_uuid: sys_uuid.UUID,
-    stream_uuid: sys_uuid.UUID,
-    session: sessions.PgSQLSession,
-) -> None:
-    # Workers and account rebinds lock the account before personal bindings.
-    # Keep the API in that order before inserting its account-referencing task.
-    session.execute(
-        "SELECT account.uuid FROM m_external_accounts_v2 AS account "
-        "WHERE account.project_id=%s AND account.owner_user_uuid=%s AND account.provider='zulip' "
-        "AND EXISTS (SELECT 1 FROM bridge_zulip_v5_channels AS channel "
-        "JOIN messenger_streams AS stream ON stream.project_id=account.project_id AND stream.uuid=channel.stream_uuid "
-        "WHERE channel.external_account_uuid=account.uuid AND channel.stream_uuid=%s "
-        "AND channel.channel_type='channel' AND stream.source_name='zulip') "
-        "ORDER BY account.uuid FOR UPDATE OF account",
-        (project_id, user_uuid, stream_uuid),
-    ).fetchall()
-
-
 def enqueue_notifications(
     project_id: sys_uuid.UUID,
     user_uuid: sys_uuid.UUID,
     stream_uuid: sys_uuid.UUID,
     topic_uuid: sys_uuid.UUID | None,
     notification_mode: str,
-    changed_at: datetime.datetime,
     session: sessions.PgSQLSession,
 ) -> None:
     targets = session.execute(
-        "SELECT channel.uuid, account.uuid AS account_uuid FROM bridge_zulip_v5_channels AS channel "
+        "SELECT channel.uuid, account.uuid AS account_uuid, topic.name FROM bridge_zulip_v5_channels AS channel "
         "JOIN m_external_accounts_v2 AS account ON account.uuid=channel.external_account_uuid "
         "JOIN messenger_streams AS stream ON stream.project_id=account.project_id AND stream.uuid=channel.stream_uuid "
         "LEFT JOIN messenger_topics AS topic ON topic.project_id=stream.project_id AND topic.stream_uuid=stream.uuid AND topic.uuid=%s "
         "WHERE account.project_id=%s AND account.owner_user_uuid=%s AND account.provider='zulip' "
-        "AND stream.uuid=%s AND stream.source_name='zulip' AND channel.channel_type='channel' "
-        "AND (%s::uuid IS NULL OR (topic.uuid IS NOT NULL AND topic.deleted_at IS NULL))",
-        (topic_uuid, project_id, user_uuid, stream_uuid, topic_uuid),
+        "AND stream.uuid=%s AND stream.source_name='zulip' AND channel.channel_type='channel'",
+        (topic_uuid, project_id, user_uuid, stream_uuid),
     ).fetchall()
     for target in targets:
         account = external_models.ExternalAccount.objects.get_one(
-            filters={"uuid": filters.EQ(target["account_uuid"])}
+            filters={"uuid": filters.EQ(target["account_uuid"])}, session=session
         )
         if not account.can_stream():
             continue
+        channel = ZulipChannel.objects.get_one(
+            filters={"uuid": filters.EQ(target["uuid"])}, session=session
+        )
+        content = UpdateNotificationsContent(
+            channel_uuid=channel.uuid,
+            account_revision=account.realtime_revision(),
+            topic_name=(
+                "" if topic_uuid == sys_uuid.uuid5(stream_uuid, "") else target["name"]
+            )
+            if topic_uuid is not None
+            else None,
+            notification_mode=notification_mode,
+        )
+        content.remember(channel)
         Task(
             project_id=project_id,
             external_account_uuid=account.uuid,
             priority=TASK_PRIORITY_REALTIME_FLAGS,
-            content=UpdateNotificationsContent(
-                channel_uuid=target["uuid"],
-                topic_uuid=topic_uuid,
-                notification_mode=notification_mode,
-                changed_at=(
-                    changed_at.replace(tzinfo=datetime.timezone.utc)
-                    if changed_at.tzinfo is None
-                    else changed_at.astimezone(datetime.timezone.utc)
-                ),
-                account_revision=account.subscription_revision(),
-            ),
+            content=content,
         ).insert(session=session)

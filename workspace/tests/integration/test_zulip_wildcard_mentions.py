@@ -152,9 +152,6 @@ def test_channel_preferences_keep_other_observers_mention_state(message_sources)
     _reconcile()
     for mode, expected in [("mentions_only", False), ("all_messages", True)]:
         source.channel.notification_mode = mode
-        source.channel.notification_observed_at = datetime.datetime.now(
-            datetime.timezone.utc
-        )
         source.channel.update()
         message_states._prepare(account)
         _reconcile()

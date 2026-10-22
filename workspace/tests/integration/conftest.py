@@ -314,26 +314,6 @@ def _database():
     engines.engine_factory.destroy_all_engines()
 
 
-def _current_notification_metadata(connection):
-    # Keep current ORM metadata usable while preserving historical view logic.
-    connection.execute("""ALTER TABLE IF EXISTS bridge_zulip_v5_channels
-        ADD COLUMN IF NOT EXISTS notification_observed_at TIMESTAMP NOT NULL DEFAULT 'epoch',
-        ADD COLUMN IF NOT EXISTS notification_event_id BIGINT NOT NULL DEFAULT -1,
-        ADD COLUMN IF NOT EXISTS topic_notifications_observed_at TIMESTAMP NOT NULL DEFAULT 'epoch'""")
-    name = "bridge_zulip_v5_stream_binding_states"
-    definition = connection.execute(
-        "SELECT pg_get_viewdef(oid) FROM pg_class WHERE oid=to_regclass(%s) "
-        "AND NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid=oid AND attname='observed_at')",
-        (name,),
-    ).fetchone()
-    if definition is not None:
-        connection.execute(
-            sql.SQL(
-                "CREATE OR REPLACE VIEW {} AS SELECT historical.*, NULL::timestamp AS observed_at FROM ({}) AS historical"
-            ).format(sql.Identifier(name), sql.SQL(definition[0].rstrip().rstrip(";")))
-        )
-
-
 @contextlib.contextmanager
 def isolated_migration_database(migration, *, current_models=False):
     """Own a disposable database for tests of a published schema revision."""
@@ -381,7 +361,6 @@ def isolated_migration_database(migration, *, current_models=False):
                         ADD COLUMN IF NOT EXISTS read_updated_at TIMESTAMP WITHOUT TIME ZONE,
                         ADD COLUMN IF NOT EXISTS starred_updated_at TIMESTAMP WITHOUT TIME ZONE;
                 """)
-                _current_notification_metadata(connection)
         yield database_url
     finally:
         engines.engine_factory.destroy_all_engines()
@@ -534,7 +513,6 @@ def _test_database_url(_database, request, monkeypatch):
                 connection.execute(
                     f"ALTER TABLE IF EXISTS {table} ADD COLUMN IF NOT EXISTS message_created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT 'epoch', ADD COLUMN IF NOT EXISTS message_sequence BIGINT NOT NULL DEFAULT 0"
                 )
-            _current_notification_metadata(connection)
         return result
 
     if hasattr(request.module, "_historical_database"):
