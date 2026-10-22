@@ -31,6 +31,11 @@ from workspace.messenger_api import events
 
 
 ROUTE_MANIFEST = {
+    "message_mutations": (
+        routes.WorkspaceMutationStatusRoute,
+        controllers.WorkspaceMutationStatusController,
+        {ra_routes.GET},
+    ),
     "folders": (
         routes.FolderRoute,
         controllers.FolderController,

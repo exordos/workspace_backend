@@ -27,6 +27,8 @@ from restalchemy.api import resources as ra_resources
 from restalchemy.common import exceptions as ra_exc
 from restalchemy.common import contexts
 from restalchemy.dm import filters as dm_filters
+from workspace.common import mutation_journal_opts
+from workspace.messenger_api import publication
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.dm import event_payloads
 from workspace.messenger_api.dm import message_payloads
@@ -410,6 +412,16 @@ def _create_workspace_event(
     payload: typing.Any,
     session: typing.Any = None,
 ) -> typing.Any:
+    if mutation_journal_opts.enabled():
+        pending = publication.enqueue(
+            session or contexts.Context().get_session(),
+            project_id,
+            payload.get("uuid", user_uuid),
+            [user_uuid],
+            kind,
+            payload,
+        )
+        return pending[0]
     object_type, action = _event_metadata_for_kind(kind)
     event = models.WorkspaceEvent(
         schema_version=models.WORKSPACE_EVENT_SCHEMA_VERSION,
@@ -672,15 +684,28 @@ def create_broadcast_event(
     event_uuid: object = None,
     created_at: typing.Any = None,
     wait_for_project_lock: bool = True,
+    owned_publication: bool = False,
 ) -> typing.Any:
     if not recipients:
         return []
     session = session or contexts.Context().get_session()
     recipients = sorted({sys_uuid.UUID(str(value)) for value in recipients}, key=str)
+    if mutation_journal_opts.enabled() and not owned_publication:
+        return publication.enqueue(
+            session,
+            project_id,
+            entity_uuid,
+            recipients,
+            kind,
+            payload,
+            recipient_payloads,
+        )
     # WebSocket cursors assume that lower epoch versions become visible before
     # higher versions. Serialize broadcast and direct event writers with the
     # same per-project transaction lock so commit order preserves that invariant.
-    if wait_for_project_lock:
+    if owned_publication:
+        pass
+    elif wait_for_project_lock:
         session.execute(
             """
             SELECT pg_advisory_xact_lock(hashtextextended(%s::text, 0))

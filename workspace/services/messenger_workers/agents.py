@@ -17,20 +17,27 @@
 import datetime
 import contextlib
 import logging
+import os
 import time
 import typing
 import uuid as sys_uuid
 
 from restalchemy.common import contexts
+from oslo_config import cfg
 from gcl_looper.services import basic
 
 from workspace.common import topic_summary_opts
+from workspace.common import mutation_journal_opts
 from workspace.messenger_api.dm import helpers as messenger_dm_helpers
 from workspace.messenger_api.dm import schema
 from workspace.messenger_api.api import sql_canonical_store
 from workspace.messenger_api import topic_summarization
 from workspace.services.messenger_workers import projection_wakeup
 from workspace.services.messenger_workers import v2_projection
+
+if typing.TYPE_CHECKING:
+    from workspace.services.messenger_workers import mutation_runtime
+
 
 LOG = logging.getLogger(__name__)
 EVENT_PRUNE_INTERVAL_SECONDS = 5 * 60
@@ -90,7 +97,9 @@ class MessengerWorkerAgent(basic.BasicService):
         self._v2_metrics_started_at = time.monotonic()
         self._v2_idle_sleep_seconds = v2_idle_sleep_seconds
         self._v2_projection_wakeup = (
-            projection_wakeup.ProjectionQueueWakeup(v2_projection_db_url)
+            projection_wakeup.ProjectionQueueWakeup(
+                v2_projection_db_url, mutations=mutation_journal_opts.enabled()
+            )
             if v2_projection_db_url is not None
             else None
         )
@@ -109,6 +118,7 @@ class MessengerWorkerAgent(basic.BasicService):
             summary_endpoint_claim_seconds,
             summary_request_timeout_seconds + topic_summary_opts.CLAIM_GRACE_SECONDS,
         )
+        self._mutation_runtime: mutation_runtime.MutationRuntime | None = None
         self._last_event_prune: float | None = None
 
     def _prune_expired_events(
@@ -167,6 +177,23 @@ class MessengerWorkerAgent(basic.BasicService):
         self._v2_projection_wakeup.wait(self._v2_idle_sleep_seconds)
 
     def _run_v2_projection_tasks(self) -> bool:
+        if mutation_journal_opts.enabled():
+            if self._mutation_runtime is None:
+                if self._v2_projection_wakeup is not None:
+                    self._v2_projection_wakeup.wait(0)
+                from workspace.services.messenger_workers import mutation_runtime
+
+                self._mutation_runtime = mutation_runtime.MutationRuntime(
+                    threads=cfg.CONF[mutation_journal_opts.DOMAIN].threads,
+                    batch_size=cfg.CONF[mutation_journal_opts.DOMAIN].batch_size,
+                    receipt_retention_seconds=(
+                        cfg.CONF[mutation_journal_opts.DOMAIN].receipt_retention_seconds
+                    ),
+                    singleton_directory=os.environ.get(
+                        "WORKSPACE_RUN_DIR", "/run/workspace"
+                    ),
+                )
+            return self._mutation_runtime.tick()
         metrics: dict[str, float] = {}
         processed_any = False
         deferred = False
@@ -204,6 +231,8 @@ class MessengerWorkerAgent(basic.BasicService):
 
     def stop(self) -> None:
         super().stop()
+        if self._mutation_runtime is not None:
+            self._mutation_runtime.close()
         if self._v2_projection_wakeup is not None:
             self._v2_projection_wakeup.close()
 

@@ -611,6 +611,13 @@ def test_flag_migration_preserves_existing_local_changes(imported, db):
     spec = importlib.util.spec_from_file_location("flag_upgrade_data", path)
     migration = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(migration)
+    # The scoped probe returns this view's composite type. Remove its current
+    # definition around the deliberately isolated historical migration, then
+    # restore it against the recreated view.
+    probe = db.execute(
+        "SELECT pg_get_functiondef('bridge_zulip_v5_probe_flag_states(uuid,uuid,uuid,text)'::regprocedure)"
+    ).fetchone()[0]
+    db.execute("DROP FUNCTION bridge_zulip_v5_probe_flag_states(uuid,uuid,uuid,text)")
     migration.migration_step.downgrade(db)
     try:
         db.execute(
@@ -635,6 +642,7 @@ def test_flag_migration_preserves_existing_local_changes(imported, db):
             CREATE INDEX bridge_zulip_v5_flag_changes_newest_idx
                 ON bridge_zulip_v5_flag_changes(message_created_at DESC,message_sequence DESC,revision);
         """)
+        db.execute(probe)
     reconcile()
     current = reload(state)
     assert current.read_at is None and not current.starred

@@ -103,6 +103,16 @@ class ServerSettingsMiddleware(middlewares.Middleware):
         return None
 
 
+class MutationResponseMiddleware(middlewares.Middleware):
+    @webob.dec.wsgify
+    def __call__(self, req: webob.Request) -> webob.Response:
+        response = req.get_response(self.application)
+        mutation_uuid = req.environ.get("workspace.mutation_uuid")
+        if mutation_uuid is not None and response.status_int < 400:
+            response.headers["X-Workspace-Mutation-Id"] = str(mutation_uuid)
+        return response
+
+
 def _is_database_deadlock(error: BaseException) -> bool:
     """Recognize both raw psycopg and RESTAlchemy deadlock exceptions."""
     current: BaseException | None = error

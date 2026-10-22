@@ -26,6 +26,8 @@ from restalchemy.dm import filters as dm_filters
 from restalchemy.storage import exceptions as storage_exc
 from restalchemy.storage.sql import sessions
 
+from workspace.services.messenger_workers import owned_projection
+
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api import exceptions as messenger_exc
 from workspace.messenger_api import file_storage
@@ -66,7 +68,9 @@ def _lock_workspace_project_event_writes(
     project_id: object,
     session: typing.Any,
 ) -> None:
-    """Serialize project event writes before mutating message flags."""
+    """Serialize legacy event writes before mutating message flags."""
+    if owned_projection.CURRENT.get() is not None:
+        return
     execute = getattr(session, "execute", None)
     if not callable(execute):
         return

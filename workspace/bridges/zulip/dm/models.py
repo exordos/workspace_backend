@@ -40,6 +40,9 @@ from restalchemy.storage.sql import orm
 from restalchemy.storage.sql import sessions
 from restalchemy.storage.sql import utils
 
+from workspace.common import mutation_journal_opts
+from workspace.services.messenger_workers import owned_projection
+
 from workspace.bridges.zulip import client
 from workspace.bridges.zulip import content_conversion
 from workspace.bridges.zulip import message_conversion
@@ -87,6 +90,26 @@ class ExternalAccountAlreadyConnectedError(Exception):
 
 class SubscriptionChangedError(Exception):
     pass
+
+
+def validate_outgoing_account(account: external_models.ExternalAccount) -> None:
+    """Authorize this send with a fresh account snapshot, then close the DB hop.
+
+    Revocation after this check cannot cancel an HTTP request already authorized.
+    The completion hop checks the revision again before recording its ACK.
+    """
+    with contexts.Context().session_manager():
+        current = external_models.ExternalAccount.objects.get_one(
+            filters={
+                "uuid": filters.EQ(account.uuid),
+                "project_id": filters.EQ(account.project_id),
+            }
+        )
+        if (
+            not current.can_stream()
+            or current.realtime_revision() != account.realtime_revision()
+        ):
+            raise SubscriptionChangedError()
 
 
 class MessageContent(
@@ -768,6 +791,11 @@ class ZulipMessageCounterChange(
             tuple[sys_uuid.UUID, sys_uuid.UUID, sys_uuid.UUID, sys_uuid.UUID | None]
         ],
     ) -> None:
+        changes = owned_projection.CURRENT.get()
+        if changes is not None:
+            for project, user, stream, topic in scopes:
+                changes.topic(project, stream, topic, [user])
+            return
         if not scopes:
             return
         rows = {
@@ -896,6 +924,8 @@ class ZulipMessageState(
         project_id: sys_uuid.UUID | None = None,
         message_uuids: list[sys_uuid.UUID] | None = None,
     ) -> int:
+        if mutation_journal_opts.enabled() and owned_projection.CURRENT.get() is None:
+            return 0
         changes: dict[
             tuple[sys_uuid.UUID, sys_uuid.UUID],
             list[ZulipMessageChange | v2_models.WorkspaceMessageChange],
@@ -965,7 +995,13 @@ class ZulipMessageState(
                     rank = {
                         message: index for index, message in enumerate(message_uuids)
                     }
-                    states.sort(key=lambda state: rank[state.message_uuid])
+                    if (
+                        model is ZulipUserMessageState
+                        and owned_projection.CURRENT.get() is not None
+                    ):
+                        states.sort(key=lambda state: state.state_uuid.int)
+                    else:
+                        states.sort(key=lambda state: rank[state.message_uuid])
                     changed_uuids = list({state.message_uuid for state in states})
                     counter_scopes.update(
                         ZulipMessageCounterChange.message_scopes(
@@ -1147,10 +1183,11 @@ class ZulipMessageState(
 
     def update_content(self) -> None:
         session = contexts.Context().get_session()
+        content_lock = "FOR UPDATE" if owned_projection.CURRENT.get() is None else ""
         session.execute(
             "SELECT uuid FROM messenger_messages "
             "WHERE project_id = %s AND uuid = %s AND source_name = 'zulip' "
-            "FOR UPDATE",
+            + content_lock,
             (self.project_id, self.message_uuid),
         )
         message = v2_models.WorkspaceMessage.objects.get_one(
@@ -1188,7 +1225,12 @@ class ZulipMessageState(
             "WHERE message.project_id = %s AND "
             "messenger_uuid_v5(message.project_id, message.message_uuid::text) = %s "
             "AND account.provider = 'zulip' "
-            "ORDER BY content.uuid FOR UPDATE OF content",
+            "ORDER BY content.uuid "
+            + (
+                "FOR UPDATE OF content"
+                if owned_projection.CURRENT.get() is None
+                else ""
+            ),
             (self.project_id, self.message_uuid),
         ).fetchall()
         contents = MessageContent.objects.get_all(
@@ -1385,7 +1427,7 @@ class ZulipUserMessageState(
                 "project_id": filters.EQ(self.project_id),
                 "uuid": filters.EQ(self.state_uuid),
             },
-            locked=True,
+            locked=owned_projection.CURRENT.get() is None,
         )
         if self.action == "delete":
             if binding is not None:
@@ -1413,7 +1455,22 @@ class ZulipUserMessageState(
             binding.relation_role = self.relation_role
             binding.visibility = "visible"
             binding.permissions = permissions
-            binding.update()
+            if owned_projection.CURRENT.get() is None:
+                binding.update()
+            else:
+                binding.validate()
+                contexts.Context().get_session().execute(
+                    """UPDATE messenger_user_message_bindings SET membership_generation=%s,
+                       relation_role=%s,visibility='visible',permissions=%s::jsonb,updated_at=NOW()
+                       WHERE project_id=%s AND uuid=%s""",
+                    (
+                        binding.membership_generation,
+                        binding.relation_role,
+                        json.dumps(binding.permissions),
+                        binding.project_id,
+                        binding.uuid,
+                    ),
+                )
         if state is None:
             v2_models.WorkspaceUserMessageState(
                 uuid=self.state_uuid,
@@ -1444,7 +1501,30 @@ class ZulipUserMessageState(
             state.properties["zulip_flags_updated_at"].set_value_force(
                 self.flags_updated_at
             )
-            state.update()
+            if owned_projection.CURRENT.get() is None:
+                state.update()
+            else:
+                state.validate()
+                contexts.Context().get_session().execute(
+                    """UPDATE messenger_user_message_states SET mentioned=%s,binding_uuid=%s,
+                       membership_generation=%s,zulip_source_uuid=%s,
+                       zulip_flags_updated_at=%s::timestamptz AT TIME ZONE 'UTC',
+                       read_updated_at=%s::timestamptz AT TIME ZONE 'UTC',
+                       starred_updated_at=%s::timestamptz AT TIME ZONE 'UTC',pinned=%s,updated_at=NOW()
+                       WHERE project_id=%s AND uuid=%s""",
+                    (
+                        state.mentioned,
+                        state.binding_uuid,
+                        state.membership_generation,
+                        state.zulip_source_uuid,
+                        state.zulip_flags_updated_at,
+                        state.read_updated_at,
+                        state.starred_updated_at,
+                        state.pinned,
+                        state.project_id,
+                        state.uuid,
+                    ),
+                )
 
 
 class ZulipChannel(
@@ -3045,9 +3125,10 @@ class UpdateMessageFlagsContent(AbstractZulipTaskContent):
     )
 
     def execute(self, task: "Task") -> None:
-        message_flags.lock_state(
-            task.project_id, self.state_uuid, task.external_account_uuid
-        )
+        if not mutation_journal_opts.enabled():
+            message_flags.lock_state(
+                task.project_id, self.state_uuid, task.external_account_uuid
+            )
         account = external_models.ExternalAccount.objects.get_one(
             filters={
                 "uuid": filters.EQ(task.external_account_uuid),

@@ -693,6 +693,8 @@ def claim_summary_work(
                 FROM messenger_topic_messages_v1 AS message
                 LEFT JOIN messenger_topic_messages_v1 AS previous_boundary
                   ON previous_boundary.uuid = topic.summary_last_message_uuid
+                 AND previous_boundary.project_id = topic.project_id
+                 AND previous_boundary.topic_uuid = topic.uuid
                 WHERE message.project_id = topic.project_id
                   AND message.topic_uuid = topic.uuid
                   AND message.payload->>'kind' = 'markdown'

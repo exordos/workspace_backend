@@ -41,6 +41,35 @@ TASK_KINDS = (
 )
 
 
+class WorkspaceMutationRequest(
+    models.ModelWithUUID, models.ModelWithProject, orm.SQLStorableMixin
+):
+    """Owner-scoped progress; applied means state and topic counters committed."""
+
+    __tablename__ = "messenger_mutation_requests"
+    user_uuid = properties.property(types.UUID(), required=True, read_only=True)
+    status = properties.property(
+        types.Enum(["pending", "applied", "rejected"]), required=True, read_only=True
+    )
+    command_count = properties.property(
+        types.Integer(min_value=1), required=True, read_only=True
+    )
+    applied_count = properties.property(
+        types.Integer(min_value=0), required=True, read_only=True
+    )
+    rejected_count = properties.property(
+        types.Integer(min_value=0), required=True, read_only=True
+    )
+    created_at = properties.property(
+        common_types.UTCDateTimeWithOffset(), required=True, read_only=True
+    )
+    finished_at = properties.property(
+        types.AllowNone(common_types.UTCDateTimeWithOffset()),
+        default=None,
+        read_only=True,
+    )
+
+
 class WorkspaceFolder(
     models.ModelWithUUID,
     models.ModelWithProject,

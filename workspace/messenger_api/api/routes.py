@@ -329,3 +329,8 @@ class MeRoute(routes.Route):
 
     __controller__ = controllers.MeController
     __allow_methods__ = [routes.FILTER]
+
+
+class WorkspaceMutationStatusRoute(routes.Route):
+    __controller__ = controllers.WorkspaceMutationStatusController
+    __allow_methods__ = [routes.GET]

@@ -12,6 +12,7 @@ from restalchemy.common import config_opts as ra_config_opts
 
 from workspace.common import config
 from workspace.common import database
+from workspace.common import mutation_journal_opts
 from workspace.common import file_storage_opts
 from workspace.common import log as infra_log
 from workspace.services import zulip_realtime
@@ -31,6 +32,7 @@ zulip_realtime_opts = [
 CONF = cfg.CONF
 CONF.register_cli_opts(zulip_realtime_opts, DOMAIN)
 ra_config_opts.register_posgresql_db_opts(CONF)
+mutation_journal_opts.register_opts(CONF)
 file_storage_opts.register_opts(CONF)
 
 

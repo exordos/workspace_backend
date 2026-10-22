@@ -18,6 +18,7 @@ from workspace.messenger_api.api import resource_projection
 from workspace.messenger_api.api import sql_canonical_store
 from workspace.messenger_api.api import store as api_store
 from workspace.common import emoji
+from workspace.common import mutation_journal_opts
 from workspace.messenger_api.dm import base
 from workspace.messenger_api.dm import helpers
 from workspace.messenger_api.dm import message_payloads
@@ -1733,13 +1734,10 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
     ) -> bool:
         """Check exact unread placements without materializing them in Python."""
         session = contexts.Context().get_session()
-        return (
-            session.execute(
-                f"SELECT 1 FROM ({candidate_sql}) AS candidate LIMIT 1",
-                candidate_values,
-            ).fetchone()
-            is not None
-        )
+        return session.execute(
+            f"SELECT EXISTS ({candidate_sql}) AS present",
+            candidate_values,
+        ).fetchone()["present"]
 
     def perform_action(
         self,
@@ -2356,7 +2354,13 @@ class MessengerV2StoreFactory(sql_canonical_store.SQLCanonicalMessengerStoreFact
         project_uuid: str | sys_uuid.UUID,
         user_uuid: str | sys_uuid.UUID,
     ) -> typing.Iterator[api_store.MessengerStore]:
-        messenger_store = MessengerV2Store(project_uuid, user_uuid)
+        messenger_store: MessengerV2Store
+        if mutation_journal_opts.enabled():
+            from workspace.messenger_api.api import journal_store
+
+            messenger_store = journal_store.JournalStore(project_uuid, user_uuid)
+        else:
+            messenger_store = MessengerV2Store(project_uuid, user_uuid)
         self._sync_request_iam_identity(messenger_store, user_uuid)
         yield typing.cast(
             api_store.MessengerStore,
