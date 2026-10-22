@@ -948,3 +948,65 @@ def test_new_observer_creates_its_own_source_and_personal_flags(
         first.uuid: (True, False),
         second.uuid: (False, True),
     }
+
+
+@pytest.mark.parametrize("stale", [False, True])
+@pytest.mark.parametrize("batch_size", [1, 100])
+def test_stale_snapshot_retry_preserves_history_cutoff(
+    history_account, monkeypatch, stale, batch_size
+):
+    """A fenced batch must not import messages excluded by its original scan."""
+    account = history_account
+    cutoff = datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
+    monkeypatch.setattr(models, "HISTORY_BATCH_SIZE", batch_size)
+    zulip = mock.Mock()
+    zulip.get_history_batch.return_value = {
+        "messages": [
+            message(42, timestamp=1691057200),
+            message(43, timestamp=1735689600),
+        ],
+        "next_id": 0,
+        "history_limited": False,
+    }
+    monkeypatch.setattr(client, "ZulipClient", lambda _account: zulip)
+    task = models.Task(
+        project_id=account.project_id,
+        external_account_uuid=account.uuid,
+        content=models.ScanHistoryContent(last_message_id=1000, since=cutoff),
+    )
+    task.insert()
+    task.execute()
+    assert task.status == "done", task.error_description
+    children = pending(account)
+    assert len(children) == (2 if batch_size == 1 else 1)
+    assert all(child.content.since == cutoff for child in children)
+    session = contexts.Context().get_session()
+    if stale:
+        session.execute(
+            "UPDATE bridge_zulip_v5_history_batches SET revision=revision+1 "
+            "WHERE external_account_uuid=%s",
+            (account.uuid,),
+        )
+    for index, child in enumerate(children):
+        child.execute()
+        assert child.status == "done", child.error_description
+        retries = models.Task.objects.get_all(
+            filters={
+                "external_account_uuid": filters.EQ(account.uuid),
+                "status": filters.EQ("new"),
+                "content": filters.JSONFields({"kind": "scan_history"}),
+            }
+        )
+        assert len(retries) == int(stale and index == len(children) - 1)
+    if stale:
+        (retry,) = retries
+        assert retry.content.since == cutoff
+        retry.execute()
+        assert retry.status == "done", retry.error_description
+        apply(account)
+    ids = session.execute(
+        "SELECT message_id FROM bridge_zulip_v5_messages "
+        "WHERE external_account_uuid=%s ORDER BY message_id",
+        (account.uuid,),
+    ).fetchall()
+    assert [row["message_id"] for row in ids] == [43]
