@@ -6,6 +6,7 @@
 
 import hashlib
 import json
+import typing
 
 from workspace.common import emoji
 
@@ -26,7 +27,7 @@ FLAGS = (
 )
 
 
-def digest(value):
+def digest(value: typing.Any) -> str:
     return hashlib.sha256(
         json.dumps(
             value,
@@ -38,19 +39,19 @@ def digest(value):
     ).hexdigest()
 
 
-def range_start(message_id):
+def range_start(message_id: int) -> int:
     return (message_id - 1) // BATCH_SIZE * BATCH_SIZE + 1
 
 
-def normalized_flags(flags):
+def normalized_flags(flags: typing.Iterable[str]) -> list[str]:
     return sorted(set(flags).intersection(FLAGS))
 
 
-def flags_hash(flags):
+def flags_hash(flags: typing.Iterable[str]) -> str:
     return digest(normalized_flags(flags))
 
 
-def metadata(message):
+def metadata(message: dict[str, typing.Any]) -> dict[str, typing.Any]:
     result = {
         "type": message["type"],
         "sender_id": message["sender_id"],
@@ -69,7 +70,7 @@ def metadata(message):
     return result
 
 
-def reactions_hash(reactions):
+def reactions_hash(reactions: list[dict[str, typing.Any]]) -> str:
     values = set()
     for reaction in reactions:
         kind = reaction["reaction_type"]
@@ -82,7 +83,7 @@ def reactions_hash(reactions):
     return digest(sorted(values))
 
 
-def message_hashes(message):
+def message_hashes(message: dict[str, typing.Any]) -> dict[str, str | None]:
     """A missing component is unknown, distinct from an observed empty value."""
     return {
         "text": hashlib.sha256(message["content"].encode("utf-8")).hexdigest(),
@@ -94,12 +95,16 @@ def message_hashes(message):
     }
 
 
-def batch_hashes(messages, first_id, covered_to):
+def batch_hashes(
+    messages: list[dict[str, typing.Any]], first_id: int, covered_to: int
+) -> dict[str, str | None]:
     entries = sorted((message["id"], message_hashes(message)) for message in messages)
     return batch_hashes_from_entries(entries, first_id, covered_to)
 
 
-def batch_hashes_from_entries(entries, first_id, covered_to):
+def batch_hashes_from_entries(
+    entries: list[tuple[int, dict[str, str | None]]], first_id: int, covered_to: int
+) -> dict[str, str | None]:
     result = {}
     for component in COMPONENTS:
         values = [(message_id, hashes[component]) for message_id, hashes in entries]
@@ -111,7 +116,9 @@ def batch_hashes_from_entries(entries, first_id, covered_to):
     return result
 
 
-def changed_components(current, previous):
+def changed_components(
+    current: dict[str, str | None], previous: dict[str, str | None] | None
+) -> list[str]:
     if previous is None:
         return list(COMPONENTS)
     return [

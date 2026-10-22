@@ -2356,7 +2356,7 @@ class ScanHistoryContent(AbstractZulipTaskContent):
     last_message_id = properties.property(types.Integer(min_value=1), required=True)
     since = properties.property(types.AllowNone(types.UTCDateTimeZ()), default=None)
 
-    def fetch(self, zulip):
+    def fetch(self, zulip: client.ZulipClient) -> dict[str, typing.Any]:
         first_id = history_fingerprints.range_start(self.last_message_id)
         page = zulip.get_history_batch(first_id, self.last_message_id)
         # Production workers prepare HTTP and hashes outside account/task locks.
@@ -2511,7 +2511,7 @@ class ImportHistoryContent(AbstractZulipTaskContent):
         types.AllowNone(types.Integer(min_value=1)), default=None
     )
 
-    def fetch(self, zulip):
+    def fetch(self, zulip: client.ZulipClient) -> list[dict[str, typing.Any]]:
         if self.snapshot is not None:
             return [item["message"] for item in self.snapshot]
         return zulip.get_messages(self.first_message_id, self.last_message_id)
@@ -2538,7 +2538,10 @@ class ImportHistoryContent(AbstractZulipTaskContent):
         if prepared is not None and account.realtime_revision() != prepared[0]:
             raise SubscriptionChangedError()
         if self.snapshot is not None:
-            current = history_snapshots.batch(account, self.batch_first_id)
+            current = typing.cast(
+                dict[str, typing.Any],
+                history_snapshots.batch(account, self.batch_first_id),
+            )
             if current["revision"] != self.batch_revision or current[
                 "source_revision"
             ] != history_snapshots.revision(account):
@@ -2563,15 +2566,20 @@ class ImportHistoryContent(AbstractZulipTaskContent):
                 return
             if account.realtime_revision() != self.account_revision:
                 raise SubscriptionChangedError()
-            self._accepted = {}
+            self._accepted: dict[int, dict[str, typing.Any]] = {}
             self._complete_snapshot = True
             with history_snapshots.applying(account, self.batch_first_id):
                 self._execute_import(task, account, prepared)
         else:
             self._execute_import(task, account, prepared)
 
-    def _execute_import(self, task, account, prepared):
-        hostname = account.get_host()
+    def _execute_import(
+        self,
+        task: "Task",
+        account: external_models.ExternalAccount,
+        prepared: tuple[str, datetime.datetime, list[dict[str, typing.Any]]] | None,
+    ) -> None:
+        hostname = typing.cast(str, account.get_host())
         server_namespace = sys_uuid.uuid5(sys_uuid.NAMESPACE_DNS, hostname)
         zulip = client.ZulipClient(account)
         try:

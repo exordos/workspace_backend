@@ -310,7 +310,12 @@ class HistoryImportService(basic.BasicService):
     def _fetch_import(
         task_uuid: uuid.UUID, owner: uuid.UUID
     ) -> tuple[
-        tuple[str, datetime.datetime, list[dict[str, typing.Any]]] | None,
+        tuple[
+            str,
+            datetime.datetime,
+            list[dict[str, typing.Any]] | dict[str, typing.Any],
+        ]
+        | None,
         Exception | None,
         float,
     ]:

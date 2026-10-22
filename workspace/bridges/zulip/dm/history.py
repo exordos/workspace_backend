@@ -5,7 +5,9 @@
 """Durable source fingerprints, independent of derived message identities."""
 
 import contextlib
+import datetime
 import json
+import typing
 import uuid
 
 from restalchemy.common import contexts
@@ -13,9 +15,10 @@ from restalchemy.storage.sql import utils
 
 from workspace.bridges.zulip import content_conversion
 from workspace.bridges.zulip import history_fingerprints
+from workspace.messenger_api.dm import external_models
 
 
-def revision(account):
+def revision(account: external_models.ExternalAccount) -> str:
     return history_fingerprints.digest(
         [
             account.subscription_revision(),
@@ -25,7 +28,9 @@ def revision(account):
     )
 
 
-def batch(account, first_id):
+def batch(
+    account: external_models.ExternalAccount, first_id: int
+) -> dict[str, typing.Any] | None:
     return (
         contexts.Context()
         .get_session()
@@ -37,7 +42,7 @@ def batch(account, first_id):
     )
 
 
-def next_known_id(account, before):
+def next_known_id(account: external_models.ExternalAccount, before: int) -> int:
     return (
         contexts.Context()
         .get_session()
@@ -55,7 +60,9 @@ def next_known_id(account, before):
     )
 
 
-def retained_upper_bound(account, at):
+def retained_upper_bound(
+    account: external_models.ExternalAccount, at: datetime.datetime
+) -> int:
     """Check a disappeared tail without chasing observations newer than this task."""
     return (
         contexts.Context()
@@ -81,8 +88,14 @@ def retained_upper_bound(account, at):
 
 
 def compare(
-    account, first_id, last_id, messages, observed_at, fingerprints=None, hashes=None
-):
+    account: external_models.ExternalAccount,
+    first_id: int,
+    last_id: int,
+    messages: list[dict[str, typing.Any]],
+    observed_at: datetime.datetime,
+    fingerprints: dict[int, dict[str, str | None]] | None = None,
+    hashes: dict[str, str | None] | None = None,
+) -> tuple[list[dict[str, typing.Any]], int] | None:
     """One batch lookup on a hit; a single bounded leaf lookup on a miss."""
     session = contexts.Context().get_session()
     current = batch(account, first_id)
@@ -128,7 +141,7 @@ def compare(
     # Realtime imports can add an observation without adding a fingerprint, or
     # recreate one whose old fingerprint says absent. Include those records in
     # the same bounded lookup so a missed subsequent deletion is still noticed.
-    namespace = uuid.uuid5(uuid.NAMESPACE_DNS, account.get_host())
+    namespace = uuid.uuid5(uuid.NAMESPACE_DNS, typing.cast(str, account.get_host()))
     previous = {
         row["message_id"]: (
             row["hashes"]
@@ -199,7 +212,9 @@ def compare(
 
 
 @contextlib.contextmanager
-def applying(account, first_id):
+def applying(
+    account: external_models.ExternalAccount, first_id: int
+) -> typing.Iterator[None]:
     session = contexts.Context().get_session()
     # Rollback restores transaction-local settings even when PostgreSQL has
     # aborted the statement. A finally query would mask the original deadlock.
@@ -219,14 +234,14 @@ def applying(account, first_id):
 
 
 def complete(
-    account,
-    first_id,
-    batch_revision,
-    task_uuid,
-    messages,
-    complete_snapshot,
-    missing_ids=(),
-):
+    account: external_models.ExternalAccount,
+    first_id: int,
+    batch_revision: int,
+    task_uuid: uuid.UUID,
+    messages: list[dict[str, typing.Any]],
+    complete_snapshot: bool,
+    missing_ids: typing.Sequence[int] = (),
+) -> None:
     session = contexts.Context().get_session()
     current = batch(account, first_id)
     if current is None or current["revision"] != batch_revision:
@@ -274,7 +289,9 @@ def complete(
     )
 
 
-def barrier(account, message_id):
+def barrier(
+    account: external_models.ExternalAccount, message_id: int
+) -> datetime.datetime | None:
     current = batch(account, history_fingerprints.range_start(message_id))
     return (
         current["observed_at"]
