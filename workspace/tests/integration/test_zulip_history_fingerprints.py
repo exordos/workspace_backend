@@ -2,10 +2,13 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
+import concurrent.futures
 import datetime
 import json
+import threading
 from unittest import mock
 
+import psycopg
 import pytest
 from restalchemy.common import contexts
 from restalchemy.dm import filters
@@ -17,6 +20,7 @@ from workspace.bridges.zulip.dm import flags
 from workspace.bridges.zulip.dm import history
 from workspace.bridges.zulip.dm import models
 from workspace.bridges.zulip.dm import reactions
+from workspace.tests.integration import conftest
 from workspace.tests.integration import test_zulip_messages as messages_tests
 
 
@@ -69,6 +73,116 @@ def apply(account):
         task.execute()
         assert task.status == "done", task.error_description
     return tasks
+
+
+def test_interleaved_observers_finish_their_original_snapshot_children(
+    history_account, direct_peer, monkeypatch
+):
+    """One observer's replay must not cancel another observer's pending batch."""
+    messages_tests._channel(direct_peer)
+    monkeypatch.setattr(models, "HISTORY_BATCH_SIZE", 1)
+    reaction = {
+        "user_id": 7,
+        "emoji_name": "test_tube",
+        "emoji_code": "1f9ea",
+        "reaction_type": "unicode_emoji",
+    }
+    data = [message(message_id, reactions=[reaction]) for message_id in (41, 42)]
+    for account in (history_account, direct_peer):
+        scan(account, data, monkeypatch)
+    first, second = pending(history_account), pending(direct_peer)
+    assert len(first) == len(second) == 2
+    for tasks in zip(first, second):
+        for task in tasks:
+            task.execute()
+            assert task.status == "done", task.error_description
+    for account in (history_account, direct_peer):
+        assert len(messages_tests._messages(account)) == 2
+        assert history.batch(account, 1)["ready"]
+
+
+def test_parallel_snapshot_writers_do_not_cross_lock_observer_batches(
+    history_account, direct_peer, monkeypatch
+):
+    """Reproduce the lock cycle from the full multi-account recovery run."""
+    messages_tests._channel(direct_peer)
+    for account in (history_account, direct_peer):
+        scan(account, [message()], monkeypatch)
+    contexts.Context().get_session().commit()
+    barrier = threading.Barrier(2)
+
+    def invalidate_other(account, other):
+        try:
+            with psycopg.connect(conftest.TEST_DB_URL) as connection:
+                connection.execute("SET LOCAL lock_timeout='3s'")
+                connection.execute(
+                    "SELECT uuid FROM m_external_accounts_v2 WHERE uuid=%s FOR UPDATE",
+                    (account.uuid,),
+                )
+                connection.execute(
+                    "SELECT first_id FROM bridge_zulip_v5_history_batches "
+                    "WHERE external_account_uuid=%s AND first_id=1 FOR UPDATE",
+                    (account.uuid,),
+                )
+                connection.execute(
+                    "SELECT set_config('workspace.zulip_history_batch',%s,true)",
+                    (f"{account.uuid}:1",),
+                )
+                barrier.wait(timeout=5)
+                connection.execute(
+                    "SELECT bridge_zulip_v5_invalidate_history(%s,42,ARRAY['reactions'])",
+                    (other.uuid,),
+                )
+            return None
+        except psycopg.Error as error:
+            return error.sqlstate
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(invalidate_other, history_account, direct_peer),
+            executor.submit(invalidate_other, direct_peer, history_account),
+        ]
+        assert [future.result(timeout=10) for future in futures] == [None, None]
+
+
+def test_shared_history_replay_keeps_other_snapshot_but_fresh_changes_are_detected(
+    history_account, direct_peer, monkeypatch
+):
+    messages_tests._channel(direct_peer)
+    for account in (history_account, direct_peer):
+        scan(account, [message()], monkeypatch)
+        apply(account)
+    scan(history_account, [message()], monkeypatch)
+    previous = history.batch(direct_peer, 1)["hashes"]
+    reaction = {
+        "user_id": 7,
+        "emoji_name": "test_tube",
+        "emoji_code": "1f9ea",
+        "reaction_type": "unicode_emoji",
+    }
+    changed = message(reactions=[reaction])
+    scan(history_account, [changed], monkeypatch)
+    apply(history_account)
+    assert history.batch(direct_peer, 1)["ready"]
+    assert history.batch(direct_peer, 1)["hashes"] == previous
+    scan(direct_peer, [changed], monkeypatch)
+    (task,) = pending(direct_peer)
+    assert task.content.snapshot[0]["components"] == ["reactions"]
+    apply(direct_peer)
+    assert all(
+        history.batch(account, 1)["ready"] for account in (history_account, direct_peer)
+    )
+    # A real event or another out-of-band source mutation still fences both
+    # observers; only application of a known history snapshot is exempt.
+    contexts.Context().get_session().execute(
+        "UPDATE bridge_zulip_v5_reactions SET present=false WHERE reaction_message_uuid IN "
+        "(SELECT uuid FROM bridge_zulip_v5_reaction_messages WHERE project_id=%s)",
+        (history_account.project_id,),
+    )
+    assert all(
+        not history.batch(account, 1)["ready"]
+        for account in (history_account, direct_peer)
+    )
 
 
 def test_unchanged_recovery_creates_no_processing_tasks_or_source_writes(

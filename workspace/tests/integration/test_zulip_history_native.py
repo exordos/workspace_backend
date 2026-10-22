@@ -4,6 +4,7 @@
 
 from unittest import mock
 import datetime
+import uuid
 
 import pytest
 from restalchemy.common import contexts
@@ -14,12 +15,88 @@ from workspace.bridges.zulip.dm import history
 from workspace.bridges.zulip.dm import flags
 from workspace.bridges.zulip.dm import models
 from workspace.messenger_api.dm import v2_models
+from workspace.messenger_api.dm import external_models
+from workspace.tests.integration import conftest
 from workspace.tests.integration import test_zulip_history_fingerprints as history_tests
+from workspace.tests.integration import test_zulip_messages as messages_tests
 from workspace.tests.integration import test_zulip_outgoing as outgoing_tests
 from workspace.tests.integration import test_zulip_flags as flags_tests
 
 
 outgoing = outgoing_tests.outgoing
+
+
+def test_shared_native_observation_updates_canonical_without_invalidating_peer_snapshot(
+    outgoing, monkeypatch, db
+):
+    _api, account, _channel, remote, zulip, _constructor = outgoing
+    outgoing_tests.create(outgoing)
+    owner = uuid.uuid4()
+    conftest.seed_workspace_user(db, owner, f"cassi-history-peer-{owner}")
+    with contexts.Context().session_manager():
+        peer = external_models.ExternalAccount(
+            project_id=account.project_id,
+            owner_user_uuid=owner,
+            provider="zulip",
+            external_account_id="zulip.example.com:8",
+            settings=account.settings,
+        )
+        peer.insert()
+        messages_tests._channel(peer)
+        try:
+            placement = v2_models.WorkspaceMessagePlacement.objects.get_one(
+                filters={"project_id": filters.EQ(account.project_id)}
+            )
+            canonical = v2_models.WorkspaceMessage.objects.get_one(
+                filters={"project_id": filters.EQ(account.project_id)}
+            )
+            delivery = models.MessageDelivery.route(
+                account.project_id, placement, canonical
+            )
+            delivery.zulip_message_id = remote["id"]
+            delivery.update()
+            data = {**remote, "reactions": []}
+            first_id = (remote["id"] - 1) // 1000 * 1000 + 1
+            for observer in (account, peer):
+                history_tests.scan(observer, [data], monkeypatch, last_id=remote["id"])
+                history_tests.apply(observer)
+            changed = {
+                **data,
+                "content": data["content"] + " changed by provider",
+                "last_edit_timestamp": data["timestamp"] + 10,
+            }
+            history_tests.scan(account, [changed], monkeypatch, last_id=remote["id"])
+            history_tests.apply(account)
+            current = v2_models.WorkspaceMessage.objects.get_one(
+                filters={"uuid": filters.EQ(canonical.uuid)}
+            )
+            assert "changed by provider" in current.payload.content
+            assert history.batch(peer, first_id)["ready"]
+            # The peer's unchanged old observation does not undo the newer
+            # shared canonical edit. A genuinely fresh snapshot is detected.
+            history_tests.scan(peer, [data], monkeypatch, last_id=remote["id"])
+            assert history_tests.pending(peer) == []
+            history_tests.scan(peer, [changed], monkeypatch, last_id=remote["id"])
+            assert len(history_tests.pending(peer)) == 1
+            history_tests.apply(peer)
+            delivery = models.MessageDelivery.objects.get_one(
+                filters={"uuid": filters.EQ(delivery.uuid)}
+            )
+            delivery.observe(
+                {
+                    **changed,
+                    "content": changed["content"] + " again",
+                    "last_edit_timestamp": data["timestamp"] + 20,
+                },
+                observer=account,
+                zulip=zulip,
+            )
+            assert all(
+                not history.batch(observer, first_id)["ready"]
+                for observer in (account, peer)
+            )
+        finally:
+            peer.delete()
 
 
 @pytest.mark.parametrize("component", ["flags", "reactions", "metadata"])

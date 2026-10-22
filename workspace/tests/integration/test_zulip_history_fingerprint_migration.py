@@ -9,6 +9,27 @@ import psycopg
 from workspace.tests.integration import conftest
 
 
+def test_shared_snapshot_invalidation_migration_restores_previous_guard(_database):
+    with conftest.isolated_migration_database(
+        "0251-Add-Zulip-history-snapshot-fingerprints-fc9065.py"
+    ) as url:
+        path = next(conftest.MIGRATIONS_DIR.glob("0252-Scope-shared-history-*.py"))
+        spec = importlib.util.spec_from_file_location("shared_snapshot_migration", path)
+        migration = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(migration)
+        query = "SELECT pg_get_functiondef('bridge_zulip_v5_invalidate_history(uuid,bigint,text[])'::regprocedure)"
+        with psycopg.connect(url, autocommit=True) as connection:
+            before = connection.execute(query).fetchone()[0]
+            migration.migration_step.upgrade(connection)
+            assert (
+                "COALESCE(current_setting('workspace.zulip_history_batch',true),'')<>''"
+                in connection.execute(query).fetchone()[0]
+            )
+            migration.migration_step.downgrade(connection)
+            assert connection.execute(query).fetchone()[0] == before
+            migration.migration_step.upgrade(connection)
+
+
 def test_hash_migration_round_trip_handles_recreated_flags_and_archived_tasks(
     _database,
 ):

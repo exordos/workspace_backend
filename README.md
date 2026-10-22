@@ -119,6 +119,12 @@ snapshots advance the batch observation barrier without rewriting message, flag
 or reaction state. Newer observations, including same-value events, fence slow
 snapshots; the barrier is separate from user flag/reaction change timestamps.
 Relevant realtime, delivery and local mutations invalidate the affected ranges.
+Migration 0252 excludes application of a known history snapshot from that fan-out:
+another observer's replay does not change what this observer previously read.
+Each observer still compares its next fresh provider snapshot independently.
+This prevents shared reaction/content writes from cancelling sibling snapshot
+children or taking another observer's account/cache locks. Changes outside the
+transaction-scoped history replay marker retain the ordinary invalidation fences.
 An absent source ID withdraws that imported observer, not the shared canonical
 message. Pending native deliveries retain their existing duplicate-send guards.
 The bounded lookup also includes imported observations not yet represented in

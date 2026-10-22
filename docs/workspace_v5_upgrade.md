@@ -32,6 +32,9 @@ Migration 0251 introduces the message-recovery fingerprint cache. It does not
 rehash retained history inside the migration: the next bounded recovery scan
 populates the cache as its processing tasks succeed. Existing import task
 payloads remain supported. Keep the separate realtime and background workers.
+Migration 0252 preserves independent observer checkpoints during shared history
+replay; apply it together with the fingerprint implementation. Its downgrade
+restores the previous invalidation function without changing retained data.
 For a schema rollback, stop the new workers and use the migration's downgrade
 before starting the older image. The downgrade turns pending scans back into
 legacy full-backfill work, removes the snapshot-only task fields, restores the
