@@ -10,10 +10,12 @@ import threading
 from unittest import mock
 import uuid
 
+from psycopg import sql
 import pytest
 import requests
 from restalchemy.common import contexts
 from restalchemy.dm import filters
+from restalchemy.storage.sql import engines
 
 from workspace.bridges.zulip import client
 from workspace.bridges.zulip.dm import models
@@ -25,7 +27,29 @@ message_sources = state_tests.message_sources
 
 
 @pytest.fixture
-def notification_pair(message_sources, api, monkeypatch):
+def database_timezone(db, request, _test_database_url):
+    # The bridge's timestamp columns and timestamptz settings must also agree
+    # when new HTTP/worker connections use a non-UTC database timezone.
+    original = db.execute("SHOW TimeZone").fetchone()[0]
+    statement = sql.SQL("ALTER DATABASE {} SET timezone TO {}").format
+    db.execute(
+        statement(
+            sql.Identifier(db.info.dbname),
+            sql.Literal(getattr(request, "param", "UTC")),
+        )
+    )
+    engines.engine_factory.destroy_all_engines()
+    engines.engine_factory.configure_factory(db_url=_test_database_url)
+    try:
+        yield
+    finally:
+        db.execute(statement(sql.Identifier(db.info.dbname), sql.Literal(original)))
+        engines.engine_factory.destroy_all_engines()
+        engines.engine_factory.configure_factory(db_url=_test_database_url)
+
+
+@pytest.fixture
+def notification_pair(database_timezone, message_sources, api, monkeypatch):
     account, source = message_sources()
     account.status = "active"
     account.settings = {
@@ -148,6 +172,7 @@ def test_zulip_notification_reaches_workspace_without_an_outgoing_echo(
     pair[3].update_topic_notifications.assert_not_called()
 
 
+@pytest.mark.parametrize("database_timezone", ["UTC", "Europe/Moscow"], indirect=True)
 def test_pending_local_choice_is_not_reverted_by_a_later_catalog_snapshot(
     notification_pair,
 ):
@@ -330,6 +355,7 @@ def _stream_event(pair, muted, observed_at=None, event_id=1):
             state.do()
 
 
+@pytest.mark.parametrize("database_timezone", ["UTC", "Europe/Moscow"], indirect=True)
 @pytest.mark.parametrize(
     "mode,muted", [("all_messages", False), ("mentions_only", True), ("muted", True)]
 )

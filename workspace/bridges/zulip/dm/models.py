@@ -474,7 +474,7 @@ class ZulipStreamBindingState(
             "WHERE project_id=%s AND uuid=%s AND active",
             (
                 current.notification_mode,
-                current.observed_at.replace(tzinfo=None),
+                current.observed_at,
                 self.project_id,
                 self.binding_uuid,
             ),
@@ -3362,7 +3362,7 @@ class UpdateNotificationsContent(AbstractZulipTaskContent):
         session: sessions.PgSQLSession,
     ) -> None:
         current = session.execute(
-            "SELECT binding.notification_mode,binding.notification_updated_at FROM messenger_stream_bindings AS binding "
+            "SELECT binding.notification_mode,binding.notification_updated_at AT TIME ZONE 'UTC' AS notification_updated_at FROM messenger_stream_bindings AS binding "
             "JOIN messenger_streams AS stream ON stream.project_id=binding.project_id AND stream.uuid=binding.stream_uuid "
             "WHERE binding.project_id=%s AND binding.stream_uuid=%s AND binding.user_uuid=%s AND binding.active "
             "AND stream.source_name='zulip' AND stream.deleted_at IS NULL FOR UPDATE OF binding",
@@ -5535,7 +5535,11 @@ def enqueue_notifications(
                 channel_uuid=target["uuid"],
                 topic_uuid=topic_uuid,
                 notification_mode=notification_mode,
-                changed_at=changed_at.replace(tzinfo=datetime.timezone.utc),
+                changed_at=(
+                    changed_at.replace(tzinfo=datetime.timezone.utc)
+                    if changed_at.tzinfo is None
+                    else changed_at.astimezone(datetime.timezone.utc)
+                ),
                 account_revision=account.subscription_revision(),
             ),
         ).insert(session=session)

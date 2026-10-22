@@ -2152,7 +2152,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 """
                 UPDATE messenger_stream_bindings
                 SET notification_mode = %s,
-                    notification_updated_at = clock_timestamp() AT TIME ZONE 'UTC', updated_at = NOW()
+                    notification_updated_at = clock_timestamp(), updated_at = NOW()
                 WHERE project_id = %s AND stream_uuid = %s AND user_uuid = %s
                   AND active
                 """,

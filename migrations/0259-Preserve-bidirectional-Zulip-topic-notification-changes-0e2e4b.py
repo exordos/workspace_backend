@@ -81,7 +81,8 @@ WITH zulip_bindings AS (
     WHERE account.provider = 'zulip' AND stream.source_name = 'zulip' AND stream.deleted_at IS NULL
 ), workspace_bindings AS (
     SELECT binding.project_id, binding.stream_uuid, binding.user_uuid,
-           binding.uuid, binding.active, binding.notification_mode, binding.notification_updated_at
+           binding.uuid, binding.active, binding.notification_mode,
+           binding.notification_updated_at AT TIME ZONE 'UTC' AS notification_updated_at
     FROM messenger_stream_bindings AS binding
     JOIN messenger_streams AS stream
       ON stream.project_id = binding.project_id AND stream.uuid = binding.stream_uuid
@@ -108,7 +109,7 @@ WHERE (zulip.user_uuid IS NOT NULL AND (workspace.uuid IS NULL OR NOT workspace.
                  AND task.content->>'kind'='update_notifications' AND task.content->>'topic_uuid' IS NULL
                  AND task.content->>'channel_uuid'=zulip.channel_uuid::text
                  AND task.status IN ('new','waiting','retry')
-                 AND (task.content->>'changed_at')::timestamptz AT TIME ZONE 'UTC'=workspace.notification_updated_at
+                 AND (task.content->>'changed_at')::timestamp=workspace.notification_updated_at
            )))))
    OR (zulip.user_uuid IS NULL AND workspace.active);
 
@@ -193,7 +194,7 @@ WHERE binding.notification_mode IS DISTINCT FROM
         AND task.content->>'kind'='update_notifications'
         AND task.content->>'topic_uuid'=topic.uuid::text
         AND task.status IN ('new', 'waiting', 'retry')
-        AND (task.content->>'changed_at')::timestamptz AT TIME ZONE 'UTC'=binding.notification_updated_at
+        AND (task.content->>'changed_at')::timestamp=binding.notification_updated_at
   ));
 """
 
