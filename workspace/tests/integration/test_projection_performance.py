@@ -4,6 +4,7 @@
 # not use this file except in compliance with the License.
 
 import concurrent.futures
+import importlib.util
 import itertools
 import json
 import threading
@@ -13,8 +14,10 @@ import uuid as sys_uuid
 
 import psycopg
 import pytest
+from oslo_config import cfg
 from restalchemy.common import contexts
 
+from workspace.common import messenger_reaction_opts
 from workspace.tests.integration import legacy_store
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.api import store_factory
@@ -297,6 +300,204 @@ def test_old_scope_preview_preserves_visibility_dates_and_uuid_ties(
                 "WHERE project_id=%s AND placement_uuid=%s",
                 (api.project_id, expected),
             )
+
+
+@pytest.mark.parametrize("limit", [0, 2, 5])
+def test_native_reaction_snapshot_switches_complete_lists_at_configured_limit(
+    api, db, limit
+):
+    response = api.post(
+        STREAMS,
+        json={
+            "name": "bounded-native-reactions",
+            "description": "",
+            "source_name": "native",
+            "source": {"kind": "native"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    stream = response.json()
+    users = [str(api.user_uuid)] + [str(sys_uuid.uuid4()) for _index in range(5)]
+    for user_uuid in users[1:]:
+        conftest.seed_user_stream_binding(db, api.project_id, stream["uuid"], user_uuid)
+    _drain()
+    response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream["uuid"],
+            "topic_uuid": stream["default_topic_uuid"],
+            "payload": {"kind": "markdown", "content": "bounded reactions"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    message = response.json()
+    _drain()
+    cfg.CONF.set_override(
+        "user_list_limit", limit, group=messenger_reaction_opts.DOMAIN
+    )
+    try:
+        reactions = []
+        response = api.post(
+            MESSAGE_REACTIONS,
+            json={"message_uuid": message["uuid"], "emoji_name": "eyes"},
+        )
+        assert response.status_code == 201, response.text
+        _drain()
+
+        def check_snapshot(count):
+            expected_users = {"eyes": users[:1]} if limit > 0 else {}
+            if 0 < count <= limit:
+                expected_users["heart"] = users[:count]
+            expected_counts = {"eyes": 1}
+            if count:
+                expected_counts["heart"] = count
+            response = api.get(f"{MESSAGES}{message['uuid']}")
+            assert response.status_code == 200, response.text
+            assert response.json()["reactions"] == expected_counts
+            assert response.json()["reaction_users"] == expected_users
+            page = api.get(MESSAGES, params={"stream_uuid": stream["uuid"]})
+            assert page.status_code == 200, page.text
+            row = next(row for row in page.json() if row["uuid"] == message["uuid"])
+            assert row["reaction_users"] == expected_users
+            with db.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT message.reactions, message.reaction_users
+                    FROM messenger_messages AS message
+                    JOIN messenger_message_placements AS placement
+                      ON placement.project_id = message.project_id
+                     AND placement.message_uuid = message.uuid
+                    WHERE placement.project_id = %s AND placement.uuid = %s
+                    """,
+                    (api.project_id, message["uuid"]),
+                )
+                assert cursor.fetchone() == (expected_counts, expected_users)
+                cursor.execute(
+                    """
+                    SELECT payload
+                    FROM m_workspace_visible_events
+                    WHERE project_id = %s AND user_uuid = %s
+                      AND object_type = 'message' AND action = 'updated'
+                      AND payload->>'uuid' = %s
+                    ORDER BY epoch_version DESC LIMIT 1
+                    """,
+                    (api.project_id, api.user_uuid, message["uuid"]),
+                )
+                payload = cursor.fetchone()[0]
+                assert payload["reactions"] == expected_counts
+                assert payload["reaction_users"] == expected_users
+
+        for count, user_uuid in enumerate(users, 1):
+            response = api.post(
+                MESSAGE_REACTIONS,
+                user=user_uuid,
+                json={"message_uuid": message["uuid"], "emoji_name": "heart"},
+            )
+            assert response.status_code == 201, response.text
+            reactions.append(response.json()["uuid"])
+            _drain()
+            check_snapshot(count)
+        for index in range(len(users) - 1, -1, -1):
+            response = api.delete(
+                f"{MESSAGE_REACTIONS}{reactions[index]}", user=users[index]
+            )
+            assert response.status_code == 204, response.text
+            _drain()
+            check_snapshot(index)
+    finally:
+        cfg.CONF.clear_override("user_list_limit", group=messenger_reaction_opts.DOMAIN)
+
+
+def test_migration_rebuilds_existing_reactions_without_a_new_reaction(api, db):
+    _stream, message = _create_message(api, "existing-reaction-users")
+    _stream, empty_message = _create_message(api, "existing-no-reactions")
+    users = [str(api.user_uuid)] + [str(sys_uuid.uuid4()) for _index in range(5)]
+    for user_uuid in users[1:]:
+        conftest.seed_workspace_user(db, user_uuid, f"reactor-{user_uuid}")
+        db.execute(
+            "SELECT messenger_v2_register_project_user(%s, %s)",
+            (api.project_id, user_uuid),
+        )
+    canonical_uuid = db.execute(
+        "SELECT message_uuid FROM messenger_message_placements "
+        "WHERE project_id=%s AND uuid=%s",
+        (api.project_id, message["uuid"]),
+    ).fetchone()[0]
+    with db.cursor() as cursor:
+        cursor.executemany(
+            """
+            INSERT INTO messenger_message_reaction_facts
+                (uuid, project_id, canonical_message_uuid, placement_uuid,
+                 user_uuid, emoji_name)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            """,
+            [
+                (
+                    sys_uuid.uuid4(),
+                    api.project_id,
+                    canonical_uuid,
+                    message["uuid"],
+                    user_uuid,
+                    emoji_name,
+                )
+                for emoji_name, reactors in (("heart", users), ("eyes", users[:2]))
+                for user_uuid in reactors
+            ],
+        )
+        cursor.execute(
+            """
+            UPDATE messenger_messages
+            SET reactions = '{"heart":6,"eyes":2,"ghost":3}',
+                reaction_users = %s::jsonb,
+                created_at = NOW() - INTERVAL '30 days'
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (
+                json.dumps({"heart": users, "ghost": users[:3]}),
+                api.project_id,
+                canonical_uuid,
+            ),
+        )
+    path = next(
+        conftest.MIGRATIONS_DIR.glob(
+            "*-Rebuild-bounded-reaction-users-for-existing-messages-*.py"
+        )
+    )
+    spec = importlib.util.spec_from_file_location("rebuild_reaction_users", path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    with contexts.Context().session_manager() as session:
+        migration.migration_step.upgrade(session)
+        migration.migration_step.upgrade(session)
+    tasks = db.execute(
+        """
+        SELECT payload->>'placement_uuid'
+        FROM messenger_domain_outbox_events
+        WHERE project_id = %s AND payload->>'source_kind' = 'reaction_users.rebuild'
+        """,
+        (api.project_id,),
+    ).fetchall()
+    assert tasks == [(message["uuid"],)]
+    _drain()
+    response = api.get(f"{MESSAGES}{message['uuid']}")
+    assert response.status_code == 200, response.text
+    assert response.json()["reactions"] == {"heart": 6, "eyes": 2}
+    assert sorted(response.json()["reaction_users"]["eyes"]) == sorted(users[:2])
+    assert set(response.json()["reaction_users"]) == {"eyes"}
+    page = api.get(MESSAGES, params={"stream_uuid": message["stream_uuid"]})
+    assert page.status_code == 200, page.text
+    assert (
+        next(row for row in page.json() if row["uuid"] == message["uuid"])[
+            "reaction_users"
+        ]
+        == response.json()["reaction_users"]
+    )
+    assert db.execute(
+        "SELECT count(*) FROM messenger_message_reaction_facts "
+        "WHERE project_id=%s AND canonical_message_uuid=%s",
+        (api.project_id, canonical_uuid),
+    ).fetchone() == (8,)
+    assert api.get(f"{MESSAGES}{empty_message['uuid']}").json()["reaction_users"] == {}
 
 
 def test_reaction_snapshot_uses_message_scoped_covering_index(api, db):

@@ -139,7 +139,7 @@ def test_reaction_user_lists_have_bounded_runtime_defaults():
     ):
         config = _read(config_path)
         assert "[messenger_reactions]" in config
-        assert "user_list_limit = 4" in config
+        assert "user_list_limit = 5" in config
         assert "user_list_max_entries_per_message" not in config
 
 

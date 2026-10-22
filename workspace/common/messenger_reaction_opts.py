@@ -7,7 +7,7 @@ from oslo_config import cfg
 
 
 DOMAIN = "messenger_reactions"
-DEFAULT_USER_LIST_LIMIT = 4
+DEFAULT_USER_LIST_LIMIT = 5
 
 messenger_reaction_opts = [
     cfg.IntOpt(

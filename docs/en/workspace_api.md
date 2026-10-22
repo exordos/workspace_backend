@@ -1663,7 +1663,7 @@ The `reactions` field on message views is an aggregate map:
 ```
 
 The `reaction_users` field exposes complete UUID lists only for small groups
-selected by server configuration. The default per-group threshold is four
+selected by server configuration. The default per-group threshold is five
 users (`[messenger_reactions] user_list_limit`). The client does not send or
 infer the limit:
 
@@ -1683,14 +1683,24 @@ infer the limit:
 }
 ```
 
-Presence of an emoji key guarantees that the list was complete when the
-reaction group was last mutated. If the current count exceeds the configured
-limit, the write removes that key instead of storing a prefix. Historical
-messages are not backfilled and therefore return `reaction_users: {}` until a
-reaction mutation materializes an affected key. Changing the configured limit
-does not rewrite existing snapshots; the next mutation of a group applies the
-new limit. Clients replace the whole map on every REST or realtime message
-snapshot; they must not merge it with a previous value.
+Presence of an emoji key guarantees a complete list. With the default limit,
+groups of one through five users have avatars; groups of six or more expose
+only their count. A zero limit disables all user lists. The reaction projection
+counts every fact but loads user UUIDs only for groups within the limit, using
+the message-scoped covering index. Native writes, imported Zulip snapshots and
+Zulip realtime reactions use this same projection.
+
+Reaction projections replace the stored `reactions` and `reaction_users` maps
+atomically. Recent messages emit the same snapshot in `message.updated`,
+following the existing realtime age window. Groups above the
+limit have no user-list key; lists are never truncated. Existing messages are
+rebuilt once by migration 0260 through the durable reaction projection queue,
+including missing or previously unbounded user lists. The worker rebuilds
+them without another user reaction and without changing reaction facts.
+Subsequent configuration changes apply on the next reaction projection for a
+message. Clients replace the whole map
+on every REST or realtime message snapshot; they must not merge it with a
+previous value or fetch per-message lists to fill absent keys.
 
 Reaction realtime payloads include `uuid`, `project_id`, `message_uuid`,
 `user_uuid`, `emoji_name`, `source_name`, `source`, `provider`, and `delivery`.
