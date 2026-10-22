@@ -39,7 +39,8 @@ _INLINE = (
 )
 _QUOTE_HEADER = re.compile(
     r"@_?\*\*(?P<name>[^|\n]+)\|\d+\*\* "
-    r"\[[^\]\n]+\]\((?P<url>[^\n]+)\):\r?\n"
+    r"\[[^\]\n]+\]\((?P<url>\S+?)\)"
+    r"(?: to @_?\*\*[^\n]+\*\*| in \[[^\n]+\]\([^\n]+\))?:\r?\n"
 )
 _FENCE = re.compile(r" {0,3}(?P<marker>`{3,}|~{3,})(?P<info>[^\n]*)\n")
 _REFERENCE_URN = re.compile(

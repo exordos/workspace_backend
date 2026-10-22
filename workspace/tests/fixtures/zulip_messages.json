@@ -2473,5 +2473,420 @@
     "unsupported_features": [],
     "expected_zulip_content": "@_**Zoë Example|13** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1059):\n`````quote\n@_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1001):\n```quote\nThe deployment finished successfully.\n```\n\nFirst comment.\n\n@_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1002):\n```quote\nFirst line.\nSecond line.  \nThird line.\n\nA separate paragraph.\n\nFinal paragraph.\n```\nImmediate second comment.\nAnother comment line.\n\n@_**Bob Example|12** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1056):\n````quote\n@_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1001):\n```quote\ndeployment finished successfully.\n```\n\nThe quoted fragment is enough.\n````\n\nThird comment.\n\nLater source update.\n`````\n\nReply outside all quotes.",
     "expected_quote_count": 5
+  },
+  {
+    "name": "direct_quote_source",
+    "description": "Synthetic private message used by recipient-context quote examples.",
+    "message": {
+      "id": 1062,
+      "type": "private",
+      "display_recipient": [
+        {
+          "id": 9,
+          "full_name": "Alice Example",
+          "email": "alice@example.test"
+        },
+        {
+          "id": 12,
+          "full_name": "Bob Example",
+          "email": "bob@example.test"
+        }
+      ],
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000061,
+      "content_type": "text/x-markdown",
+      "content": "The backup is complete.\nThe mirror is healthy.",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1062",
+      "message_uuids": {
+        "1001": "38c6b1e8-3017-53c6-b963-1694633751bb",
+        "1062": "c74da236-3079-51d4-ac50-65d5ae50f349",
+        "1063": "99959fd9-6da4-51df-afef-9af626347178",
+        "1064": "0da5eb14-ecbe-57e3-b142-57b93cc183aa",
+        "1065": "587cbb07-e724-519a-82d8-88df48808605",
+        "1066": "0ac6a271-3757-51c1-9101-38cb927be8cd",
+        "1067": "5a10c171-c56d-5e8d-98d6-aacf8dc14465",
+        "1068": "8599f535-1753-54bb-941e-973b6889e9c8",
+        "1069": "c7e72c75-b5d9-5c34-9d77-b46484d7913a"
+      },
+      "mention_uuids": {}
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "The backup is complete.\nThe mirror is healthy."
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "The backup is complete.\nThe mirror is healthy."
+  },
+  {
+    "name": "direct_message_context_quote",
+    "description": "A Zulip private-message quote keeps its author and source when the header includes a recipient.",
+    "message": {
+      "id": 1063,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 12,
+      "sender_full_name": "Bob Example",
+      "sender_email": "bob@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000062,
+      "content_type": "text/x-markdown",
+      "content": "@_**Alice Example|9** [said](https://zulip.example.test/#narrow/dm/9,12-dm/near/1062) to @_**Bob Example**:\n```quote\nThe backup is complete.\nThe mirror is healthy.\n```\n\nDirect reply.",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1063",
+      "message_uuids": {
+        "1001": "38c6b1e8-3017-53c6-b963-1694633751bb",
+        "1062": "c74da236-3079-51d4-ac50-65d5ae50f349",
+        "1063": "99959fd9-6da4-51df-afef-9af626347178",
+        "1064": "0da5eb14-ecbe-57e3-b142-57b93cc183aa",
+        "1065": "587cbb07-e724-519a-82d8-88df48808605",
+        "1066": "0ac6a271-3757-51c1-9101-38cb927be8cd",
+        "1067": "5a10c171-c56d-5e8d-98d6-aacf8dc14465",
+        "1068": "8599f535-1753-54bb-941e-973b6889e9c8",
+        "1069": "c7e72c75-b5d9-5c34-9d77-b46484d7913a"
+      },
+      "mention_uuids": {}
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "[Alice Example](urn:quote:c74da236-3079-51d4-ac50-65d5ae50f349)\n\nDirect reply."
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "@_**Alice Example|9** [said](https://zulip.example.test/#narrow/near/1062):\n```quote\nThe backup is complete.\nThe mirror is healthy.\n```\n\nDirect reply.",
+    "expected_quote_count": 1
+  },
+  {
+    "name": "group_direct_quote_source",
+    "description": "Synthetic group direct message used by the multiple-recipient quote.",
+    "message": {
+      "id": 1064,
+      "type": "private",
+      "display_recipient": [
+        {
+          "id": 9,
+          "full_name": "Alice Example",
+          "email": "alice@example.test"
+        },
+        {
+          "id": 12,
+          "full_name": "Bob Example",
+          "email": "bob@example.test"
+        },
+        {
+          "id": 13,
+          "full_name": "Zoë Example",
+          "email": "zoe@example.test"
+        }
+      ],
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000063,
+      "content_type": "text/x-markdown",
+      "content": "The team review is complete.",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1064",
+      "message_uuids": {
+        "1001": "38c6b1e8-3017-53c6-b963-1694633751bb",
+        "1062": "c74da236-3079-51d4-ac50-65d5ae50f349",
+        "1063": "99959fd9-6da4-51df-afef-9af626347178",
+        "1064": "0da5eb14-ecbe-57e3-b142-57b93cc183aa",
+        "1065": "587cbb07-e724-519a-82d8-88df48808605",
+        "1066": "0ac6a271-3757-51c1-9101-38cb927be8cd",
+        "1067": "5a10c171-c56d-5e8d-98d6-aacf8dc14465",
+        "1068": "8599f535-1753-54bb-941e-973b6889e9c8",
+        "1069": "c7e72c75-b5d9-5c34-9d77-b46484d7913a"
+      },
+      "mention_uuids": {}
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "The team review is complete."
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "The team review is complete."
+  },
+  {
+    "name": "group_direct_context_quote",
+    "description": "A group direct quote ignores recipient-only context without generating unsupported silent mentions.",
+    "message": {
+      "id": 1065,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 12,
+      "sender_full_name": "Bob Example",
+      "sender_email": "bob@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000064,
+      "content_type": "text/x-markdown",
+      "content": "@_**Alice Example|9** [said](https://zulip.example.test/#narrow/near/1064) to @_**Bob Example** and @_**Zoë Example|13**:\n```quote\nThe team review is complete.\n```",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1065",
+      "message_uuids": {
+        "1001": "38c6b1e8-3017-53c6-b963-1694633751bb",
+        "1062": "c74da236-3079-51d4-ac50-65d5ae50f349",
+        "1063": "99959fd9-6da4-51df-afef-9af626347178",
+        "1064": "0da5eb14-ecbe-57e3-b142-57b93cc183aa",
+        "1065": "587cbb07-e724-519a-82d8-88df48808605",
+        "1066": "0ac6a271-3757-51c1-9101-38cb927be8cd",
+        "1067": "5a10c171-c56d-5e8d-98d6-aacf8dc14465",
+        "1068": "8599f535-1753-54bb-941e-973b6889e9c8",
+        "1069": "c7e72c75-b5d9-5c34-9d77-b46484d7913a"
+      },
+      "mention_uuids": {}
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "[Alice Example](urn:quote:0da5eb14-ecbe-57e3-b142-57b93cc183aa)"
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "@_**Alice Example|9** [said](https://zulip.example.test/#narrow/near/1064):\n```quote\nThe team review is complete.\n```",
+    "expected_quote_count": 1
+  },
+  {
+    "name": "channel_topic_context_quote",
+    "description": "Channel/topic context has its own link; the quote still resolves the first message URL.",
+    "message": {
+      "id": 1066,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 12,
+      "sender_full_name": "Bob Example",
+      "sender_email": "bob@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000065,
+      "content_type": "text/x-markdown",
+      "content": "@_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1001) in [#**general>Formatting examples**](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1002):\n```quote\nThe deployment finished successfully.\n```",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1066",
+      "message_uuids": {
+        "1001": "38c6b1e8-3017-53c6-b963-1694633751bb",
+        "1062": "c74da236-3079-51d4-ac50-65d5ae50f349",
+        "1063": "99959fd9-6da4-51df-afef-9af626347178",
+        "1064": "0da5eb14-ecbe-57e3-b142-57b93cc183aa",
+        "1065": "587cbb07-e724-519a-82d8-88df48808605",
+        "1066": "0ac6a271-3757-51c1-9101-38cb927be8cd",
+        "1067": "5a10c171-c56d-5e8d-98d6-aacf8dc14465",
+        "1068": "8599f535-1753-54bb-941e-973b6889e9c8",
+        "1069": "c7e72c75-b5d9-5c34-9d77-b46484d7913a"
+      },
+      "mention_uuids": {}
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "[Alice Example](urn:quote:38c6b1e8-3017-53c6-b963-1694633751bb)"
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "@_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1001):\n```quote\nThe deployment finished successfully.\n```",
+    "expected_quote_count": 1
+  },
+  {
+    "name": "nested_direct_context_quote",
+    "description": "A full nested private-message quote retains two quote cards and the outside reply.",
+    "message": {
+      "id": 1067,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000066,
+      "content_type": "text/x-markdown",
+      "content": "@_**Bob Example|12** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1063):\n````quote\n@_**Alice Example|9** [said](https://zulip.example.test/#narrow/dm/9,12-dm/near/1062) to @_**Bob Example**:\n```quote\nThe backup is complete.\nThe mirror is healthy.\n```\n\nDirect reply.\n````\n\nOutside reply.",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1067",
+      "message_uuids": {
+        "1001": "38c6b1e8-3017-53c6-b963-1694633751bb",
+        "1062": "c74da236-3079-51d4-ac50-65d5ae50f349",
+        "1063": "99959fd9-6da4-51df-afef-9af626347178",
+        "1064": "0da5eb14-ecbe-57e3-b142-57b93cc183aa",
+        "1065": "587cbb07-e724-519a-82d8-88df48808605",
+        "1066": "0ac6a271-3757-51c1-9101-38cb927be8cd",
+        "1067": "5a10c171-c56d-5e8d-98d6-aacf8dc14465",
+        "1068": "8599f535-1753-54bb-941e-973b6889e9c8",
+        "1069": "c7e72c75-b5d9-5c34-9d77-b46484d7913a"
+      },
+      "mention_uuids": {}
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "[Bob Example](urn:quote:99959fd9-6da4-51df-afef-9af626347178)\n\nOutside reply."
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "@_**Bob Example|12** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1063):\n````quote\n@_**Alice Example|9** [said](https://zulip.example.test/#narrow/dm/9,12-dm/near/1062) to @_**Bob Example**:\n```quote\nThe backup is complete.\nThe mirror is healthy.\n```\n\nDirect reply.\n````\n\nOutside reply.",
+    "expected_quote_count": 2
+  },
+  {
+    "name": "partial_nested_direct_context_quote",
+    "description": "The reported shape: a four-backtick outer quote contains a recipient-context direct quote; a selected excerpt keeps two cards.",
+    "message": {
+      "id": 1068,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000067,
+      "content_type": "text/x-markdown",
+      "content": "@_**Bob Example|12** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1063):\n````quote\n@_**Alice Example|9** [said](https://zulip.example.test/#narrow/dm/9,12-dm/near/1062) to @_**Bob Example**:\n```quote\nThe backup is complete.\nThe mirror is healthy.\n```\n````\n\nOutside reply.",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1068",
+      "message_uuids": {
+        "1001": "38c6b1e8-3017-53c6-b963-1694633751bb",
+        "1062": "c74da236-3079-51d4-ac50-65d5ae50f349",
+        "1063": "99959fd9-6da4-51df-afef-9af626347178",
+        "1064": "0da5eb14-ecbe-57e3-b142-57b93cc183aa",
+        "1065": "587cbb07-e724-519a-82d8-88df48808605",
+        "1066": "0ac6a271-3757-51c1-9101-38cb927be8cd",
+        "1067": "5a10c171-c56d-5e8d-98d6-aacf8dc14465",
+        "1068": "8599f535-1753-54bb-941e-973b6889e9c8",
+        "1069": "c7e72c75-b5d9-5c34-9d77-b46484d7913a"
+      },
+      "mention_uuids": {}
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "[Bob Example](urn:forward:99959fd9-6da4-51df-afef-9af626347178?snapshot=W0FsaWNlIEV4YW1wbGVdKHVybjpxdW90ZTpjNzRkYTIzNi0zMDc5LTUxZDQtYWM1MC02NWQ1YWU1MGYzNDkp)\n\nOutside reply."
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "@_**Bob Example|12** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1063):\n````quote\n@_**Alice Example|9** [said](https://zulip.example.test/#narrow/near/1062):\n```quote\nThe backup is complete.\nThe mirror is healthy.\n```\n````\n\nOutside reply.",
+    "expected_quote_count": 2
+  },
+  {
+    "name": "partial_direct_context_quote",
+    "description": "A recipient-context quote of selected text uses the original source UUID and a text fragment.",
+    "message": {
+      "id": 1069,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 12,
+      "sender_full_name": "Bob Example",
+      "sender_email": "bob@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000068,
+      "content_type": "text/x-markdown",
+      "content": "@_**Alice Example|9** [said](https://zulip.example.test/#narrow/dm/9,12-dm/near/1062) to @_**Bob Example**:\n```quote\nThe backup is complete.\n```",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1069",
+      "message_uuids": {
+        "1001": "38c6b1e8-3017-53c6-b963-1694633751bb",
+        "1062": "c74da236-3079-51d4-ac50-65d5ae50f349",
+        "1063": "99959fd9-6da4-51df-afef-9af626347178",
+        "1064": "0da5eb14-ecbe-57e3-b142-57b93cc183aa",
+        "1065": "587cbb07-e724-519a-82d8-88df48808605",
+        "1066": "0ac6a271-3757-51c1-9101-38cb927be8cd",
+        "1067": "5a10c171-c56d-5e8d-98d6-aacf8dc14465",
+        "1068": "8599f535-1753-54bb-941e-973b6889e9c8",
+        "1069": "c7e72c75-b5d9-5c34-9d77-b46484d7913a"
+      },
+      "mention_uuids": {}
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "[Alice Example](urn:quote:c74da236-3079-51d4-ac50-65d5ae50f349?text=The%20backup%20is%20complete.)"
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "@_**Alice Example|9** [said](https://zulip.example.test/#narrow/near/1062):\n```quote\nThe backup is complete.\n```",
+    "expected_quote_count": 1
   }
 ]

@@ -226,7 +226,13 @@ Externally hosted media retain their original URLs.
 Attachments returning HTTP 404 or 410 are replaced with their caption or filename
 followed by `(file deleted)`; HTTP 403 uses `(access denied)` instead. Other content
 and available attachments still import. Other download failures remain retryable.
-Full and partial quotes use persisted message identities; outgoing quotes require
+Full and partial quotes use persisted message identities, including Zulip headers
+with direct-message recipients (`to …`) or channel/topic context (`in …`).
+Migration 0261 queues bounded reconversion only for stored messages containing
+these contextual headers; source edit times and newer Workspace edits are preserved.
+The [format comparison page](docs/zulip_messages_preview.html) includes direct,
+group, channel, nested, and selected-text quote examples.
+Outgoing quotes require
 the sender's access to the referenced message. Missing incoming targets retain a
 provider URL or quoted snapshot instead of an invented internal identity. Features
 that Workspace cannot represent retain an explicit notice and a link to the

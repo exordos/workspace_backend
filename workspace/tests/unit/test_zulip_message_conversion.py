@@ -813,3 +813,37 @@ def test_full_quote_preserves_source_whitespace(content):
         message_conversion.zulip_to_workspace({"id": 2, "content": quoted}, context)
         == payload
     )
+
+
+@pytest.mark.parametrize("original_available", [True, False])
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        " to @_**Bob**",
+        " to @_**Bob|12** and @_**Zoë|13**",
+        " in [#**general>topic**](https://zulip.example.test/#narrow/near/999)",
+    ],
+)
+def test_contextual_quote_keeps_the_first_message_identity(suffix, original_available):
+    identifier = "11111111-1111-4111-8111-111111111111"
+    context = {
+        "server_url": "https://zulip.example.test",
+        "original_url": "https://zulip.example.test/#narrow/near/2",
+        "strict_identities": True,
+        "message_uuids": {"1": identifier},
+        "messages": {"1": {"content": "Original leaf."}} if original_available else {},
+    }
+    message = {
+        "id": 2,
+        "content": (
+            "@_**Alice|9** [said](https://zulip.example.test/#narrow/near/1)"
+            f"{suffix}:\n```quote\nOriginal leaf.\n```\nImmediate reply."
+        ),
+    }
+    target = f"urn:quote:{identifier}"
+    if not original_available:
+        target += "?text=Original%20leaf."
+    assert message_conversion.zulip_to_workspace(message, context) == {
+        "kind": "markdown",
+        "content": f"[Alice]({target})\n\nImmediate reply.",
+    }
