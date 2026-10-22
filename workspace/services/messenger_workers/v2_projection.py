@@ -33,6 +33,7 @@ from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api.api import resource_projection
 from workspace.messenger_api.dm import message_payloads
 from workspace.messenger_api.dm import v2_models
+from workspace.services.messenger_workers import owned_projection
 
 
 LOG = logging.getLogger(__name__)
@@ -1080,6 +1081,8 @@ def _try_lock_projection_partition(
 
 def _try_lock_project_event_tail(session: typing.Any, project_id: object) -> None:
     """Acquire cursor ordering only after user projection writes are ready."""
+    if owned_projection.CURRENT.get() is not None:
+        return
     locked = session.execute(
         """
         SELECT pg_try_advisory_xact_lock(
@@ -1208,7 +1211,11 @@ def _refresh_recipient_counters(
         (project_id, stream_uuid),
     ).fetchone()
     pending = False
-    if stream is not None and stream["source_name"] == "zulip":
+    if (
+        owned_projection.CURRENT.get() is None
+        and stream is not None
+        and stream["source_name"] == "zulip"
+    ):
         for user_uuid in recipients:
             more = v2_models.WorkspaceMessageCounterChange.reconcile_batch(
                 project_id, user_uuid, stream_uuid, COUNTER_DELTA_BATCH_SIZE
@@ -1455,6 +1462,13 @@ def _enqueue_counter_outbox_events(
     placement_uuid: object | None = None,
     include_topic: bool = True,
 ) -> None:
+    changes = owned_projection.CURRENT.get()
+    if changes is not None:
+        if include_topic and topic_uuid is not None:
+            changes.topic(project_id, stream_uuid, topic_uuid, [user_uuid])
+        else:
+            changes.stream(project_id, stream_uuid, [user_uuid])
+        return
     common_payload = {
         "source_kind": source_kind,
         "user_uuid": user_uuid,
@@ -1584,8 +1598,9 @@ def _process_fanout(
         (root_uuid, project_id, task["outbox_event_uuid"], placement_uuid),
     ).fetchone()
     cursor = root["next_user_uuid"]
+    membership_lock = "FOR UPDATE" if owned_projection.CURRENT.get() is None else ""
     recipients = session.execute(
-        """
+        f"""
         SELECT user_uuid, membership_generation
         FROM messenger_stream_bindings
         WHERE project_id = %s AND stream_uuid = %s AND active
@@ -1593,7 +1608,7 @@ def _process_fanout(
           AND (%s::uuid IS NULL OR user_uuid > %s::uuid)
         ORDER BY user_uuid
         LIMIT %s
-        FOR UPDATE
+        {membership_lock}
         """,
         (
             project_id,
@@ -1876,8 +1891,11 @@ def _process_reaction_snapshot(
     message = _message_namespace(session, task["project_id"], placement_uuid)
     if message is None:
         return
+    sibling_lock = (
+        "FOR UPDATE SKIP LOCKED" if owned_projection.CURRENT.get() is None else ""
+    )
     siblings = session.execute(
-        """
+        f"""
         SELECT sibling.uuid, sibling.project_id, sibling.outbox_event_uuid,
                sibling.task_kind, sibling.scope_kind, sibling.scope_key,
                sibling.ordering_key, sibling.ordering_created_at,
@@ -1906,7 +1924,7 @@ def _process_reaction_snapshot(
               )
         ORDER BY event.created_at, event.uuid
         LIMIT %s
-        FOR UPDATE SKIP LOCKED
+        {sibling_lock}
         """,
         (
             task["project_id"],
@@ -2129,7 +2147,9 @@ def _process_read_counters(
             task["scope_kind"],
         )
         return
-    if not payload.get("emit_message_read", False):
+    if owned_projection.CURRENT.get() is None and not payload.get(
+        "emit_message_read", False
+    ):
         # Counter tasks are authoritative snapshots.  One claimed snapshot can
         # absorb every idle snapshot-only sibling for the same user scope;
         # tasks that must emit a per-message read event remain independent.
@@ -2230,7 +2250,10 @@ def _process_folder_projection(
     user_uuid = _uuid(payload["user_uuid"])
     source_kind = payload["source_kind"]
     stream_uuid = payload.get("stream_uuid")
-    if source_kind in LEGACY_FOLDER_SNAPSHOT_SOURCE_KINDS:
+    if (
+        owned_projection.CURRENT.get() is None
+        and source_kind in LEGACY_FOLDER_SNAPSHOT_SOURCE_KINDS
+    ):
         # Legacy flag repair can enqueue the same authoritative folder rebuild
         # once per message.  The claimed rebuild absorbs every idle sibling for
         # this scope because none of them carries a historical snapshot.
@@ -2277,12 +2300,13 @@ def _process_folder_projection(
             control_effect=True,
         )
         return
+    binding_lock = "FOR UPDATE" if owned_projection.CURRENT.get() is None else ""
     binding = session.execute(
-        """
+        f"""
         SELECT rule
         FROM messenger_user_folder_bindings
         WHERE project_id = %s AND user_uuid = %s AND folder_uuid = %s
-        FOR UPDATE
+        {binding_lock}
         """,
         (project_id, user_uuid, folder_uuid),
     ).fetchone()

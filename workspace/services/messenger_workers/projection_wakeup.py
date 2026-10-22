@@ -18,13 +18,16 @@ CHANNEL = "workspace_projection_tasks"
 class ProjectionQueueWakeup:
     """Wake a projection worker while retaining timeout-based retry polling."""
 
-    def __init__(self, db_url: str) -> None:
+    def __init__(self, db_url: str, *, mutations: bool = False) -> None:
         self._db_url = db_url
+        self._mutations = mutations
         self._connection: typing.Any | None = None
 
     def _connect(self) -> typing.Any:
         connection = psycopg.connect(self._db_url, autocommit=True)
         connection.execute(f"LISTEN {CHANNEL}")
+        if self._mutations:
+            connection.execute("LISTEN workspace_mutation_commands")
         return connection
 
     def wait(self, timeout: float) -> bool:

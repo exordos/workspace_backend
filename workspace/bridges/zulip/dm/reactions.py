@@ -18,6 +18,9 @@ from restalchemy.dm import types
 from restalchemy.storage.sql import orm
 from restalchemy.storage.sql import sessions
 
+from workspace.common import mutation_journal_opts
+from workspace.services.messenger_workers import owned_projection
+
 from workspace.bridges.zulip import client
 from workspace.common import emoji
 from workspace.messenger_api.dm import external_models
@@ -402,19 +405,20 @@ def _schedule(
 
 def reconcile(project_id: uuid.UUID, canonical_uuid: uuid.UUID) -> bool:
     # Keep the same account-before-message lock order as outgoing HTTP tasks.
+    row_lock = "FOR UPDATE" if owned_projection.CURRENT.get() is None else ""
     _session().execute(
-        """SELECT uuid FROM m_external_accounts_v2 WHERE project_id=%s AND provider='zulip'
+        f"""SELECT uuid FROM m_external_accounts_v2 WHERE project_id=%s AND provider='zulip'
            AND (owner_user_uuid IN (SELECT user_uuid FROM bridge_zulip_v5_reaction_intents
                    WHERE project_id=%s AND canonical_message_uuid=%s)
                 OR uuid IN (SELECT observer_account_uuid FROM bridge_zulip_v5_reaction_messages
                    WHERE project_id=%s AND canonical_message_uuid=%s))
-           ORDER BY uuid FOR UPDATE""",
+           ORDER BY uuid {row_lock}""",
         (project_id, project_id, canonical_uuid, project_id, canonical_uuid),
     )
     messages = (
         _session()
         .execute(
-            "SELECT * FROM bridge_zulip_v5_reaction_messages WHERE project_id=%s AND canonical_message_uuid=%s ORDER BY uuid FOR UPDATE",
+            f"SELECT * FROM bridge_zulip_v5_reaction_messages WHERE project_id=%s AND canonical_message_uuid=%s ORDER BY uuid {row_lock}",
             (project_id, canonical_uuid),
         )
         .fetchall()
@@ -540,13 +544,18 @@ def reconcile(project_id: uuid.UUID, canonical_uuid: uuid.UUID) -> bool:
     return deferred
 
 
-def send(
-    content: "zulip_models.UpdateReactionContent", task: "zulip_models.Task"
-) -> None:
+def prepare_outgoing(
+    task: "zulip_models.Task",
+) -> (
+    tuple[external_models.ExternalAccount, typing.Any, "ReactionIntent", str, str, int]
+    | None
+):
+    content = task.content
     from workspace.bridges.zulip.dm import models as zulip_models
 
+    row_lock = "" if mutation_journal_opts.enabled() else "FOR UPDATE"
     _session().execute(
-        "SELECT uuid FROM m_external_accounts_v2 WHERE project_id=%s AND uuid=%s FOR UPDATE",
+        f"SELECT uuid FROM m_external_accounts_v2 WHERE project_id=%s AND uuid=%s {row_lock}",
         (task.project_id, task.external_account_uuid),
     )
     account = external_models.ExternalAccount.objects.get_one(
@@ -563,7 +572,7 @@ def send(
     message = (
         _session()
         .execute(
-            "SELECT * FROM bridge_zulip_v5_reaction_messages WHERE uuid=%s AND project_id=%s FOR UPDATE",
+            f"SELECT * FROM bridge_zulip_v5_reaction_messages WHERE uuid=%s AND project_id=%s {row_lock}",
             (content.reaction_message_uuid, task.project_id),
         )
         .fetchone()
@@ -575,7 +584,7 @@ def send(
         }
     )
     if intent.changed_at != content.changed_at or intent.present != content.present:
-        return
+        return None
     if (
         account.owner_user_uuid != intent.user_uuid
         or message["hostname"] != account.get_host()
@@ -607,9 +616,21 @@ def send(
     user_id = int(account.external_account_id.rsplit(":", 1)[1])
     value, at, name = remote_state(message, user_id, code)
     if value == intent.present or (at is not None and at >= _naive(intent.changed_at)):
-        return
+        return None
+    return account, message, intent, code, name or observed_name, user_id
+
+
+def send_prepared(
+    prepared: tuple[
+        external_models.ExternalAccount, typing.Any, "ReactionIntent", str, str, int
+    ],
+) -> None:
+    account, message, intent, code, name, user_id = prepared
+    if mutation_journal_opts.enabled():
+        from workspace.bridges.zulip.dm import models as zulip_models
+
+        zulip_models.validate_outgoing_account(account)
     zulip = client.ZulipClient(account)
-    name = name or observed_name
     try:
         try:
             zulip.update_reaction(
@@ -637,19 +658,36 @@ def send(
             )
             if code_error != expected:
                 raise
-        _record(
-            message,
-            {
-                "user_id": user_id,
-                "emoji_code": code,
-                "emoji_name": name,
-                "reaction_type": "unicode_emoji",
-            },
-            intent.present,
-            intent.changed_at,
-        )
     finally:
         zulip.close()
+
+
+def confirm_prepared(
+    prepared: tuple[
+        external_models.ExternalAccount, typing.Any, "ReactionIntent", str, str, int
+    ],
+) -> None:
+    account, message, intent, code, name, user_id = prepared
+    _record(
+        message,
+        {
+            "user_id": user_id,
+            "emoji_code": code,
+            "emoji_name": name,
+            "reaction_type": "unicode_emoji",
+        },
+        intent.present,
+        intent.changed_at,
+    )
+
+
+def send(
+    content: "zulip_models.UpdateReactionContent", task: "zulip_models.Task"
+) -> None:
+    prepared = prepare_outgoing(task)
+    if prepared is not None:
+        send_prepared(prepared)
+        confirm_prepared(prepared)
 
 
 class ReactionIntent(
@@ -713,6 +751,8 @@ class ReactionChange(models.ModelWithID, models.ModelWithProject, orm.SQLStorabl
             .fetchall()
         ):
             bind(message)
+        if mutation_journal_opts.enabled() and owned_projection.CURRENT.get() is None:
+            return 0
         now = datetime.datetime.now(datetime.timezone.utc)
         changes = cls.objects.get_all(
             filters=filters.OR(

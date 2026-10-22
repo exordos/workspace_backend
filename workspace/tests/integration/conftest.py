@@ -199,6 +199,7 @@ def build_test_wsgi_application():
         [
             middlewares.configure_middleware(MockedIamAuthMiddleware),
             app_middlewares.ServerSettingsMiddleware,
+            app_middlewares.MutationResponseMiddleware,
             app_middlewares.DatabaseDeadlockRetryMiddleware,
             app_middlewares.ErrorsHandlerMiddleware,
             logging_mw.LoggingMiddleware,
@@ -430,6 +431,13 @@ def pytest_configure(config):
 def _test_database_url(_database, request, monkeypatch):
     if request.node.get_closest_marker("pre_retirement_schema") is None:
         with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
+            # Permanent tombstones intentionally survive membership cleanup.
+            # Do not carry one scenario's deletion history into unrelated tests
+            # that roll the entire schema back to a historical revision.
+            if connection.execute(
+                "SELECT to_regclass('messenger_message_delete_tombstones')"
+            ).fetchone()[0]:
+                connection.execute("DELETE FROM messenger_message_delete_tombstones")
             if connection.execute(
                 "SELECT to_regclass('messenger_domain_outbox_events')"
             ).fetchone()[0]:

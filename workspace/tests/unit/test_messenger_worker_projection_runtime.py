@@ -9,8 +9,11 @@ import logging
 import types
 import uuid as sys_uuid
 
+import pytest
+
 from workspace.cmd import messenger_worker
 from workspace.common import messenger_worker_opts
+from workspace.common import mutation_journal_opts
 from workspace.services.messenger_workers import agents
 from workspace.services.messenger_workers import projection_wakeup
 from workspace.services.messenger_workers import v2_projection
@@ -137,6 +140,30 @@ def test_projection_only_worker_sleeps_only_after_an_empty_cycle(monkeypatch):
     assert sleeps == [0.5]
 
 
+def test_owned_dispatcher_cannot_run_slow_summary_or_presence_maintenance(monkeypatch):
+    messenger_worker.CONF.set_override(
+        "enabled", True, group=mutation_journal_opts.DOMAIN
+    )
+    try:
+        services = messenger_worker.build_worker_services()
+        dispatcher, maintenance = services
+        assert dispatcher._v2_projection_enabled and dispatcher._projection_only
+        assert (
+            not maintenance._v2_projection_enabled and not maintenance._projection_only
+        )
+        monkeypatch.setattr(dispatcher, "_run_v2_projection_tasks", lambda: True)
+
+        def forbidden():
+            raise AssertionError("Coordinator must not run a blocking summary request")
+
+        monkeypatch.setattr(dispatcher, "_summarize_one_topic", forbidden)
+        dispatcher._iteration()
+    finally:
+        messenger_worker.CONF.clear_override(
+            "enabled", group=mutation_journal_opts.DOMAIN
+        )
+
+
 def test_projection_worker_waits_for_database_notification(monkeypatch):
     waits = []
     wakeup = types.SimpleNamespace(
@@ -157,7 +184,8 @@ def test_projection_worker_waits_for_database_notification(monkeypatch):
     assert waits == [0.5]
 
 
-def test_projection_queue_wakeup_reuses_listener_connection(monkeypatch):
+@pytest.mark.parametrize("mutations", [False, True])
+def test_projection_queue_wakeup_reuses_listener_connection(monkeypatch, mutations):
     executed = []
     closed = []
     delivered = []
@@ -184,14 +212,18 @@ def test_projection_queue_wakeup_reuses_listener_connection(monkeypatch):
         return connection
 
     monkeypatch.setattr(projection_wakeup.psycopg, "connect", connect)
-    wakeup = projection_wakeup.ProjectionQueueWakeup("postgresql://test")
+    wakeup = projection_wakeup.ProjectionQueueWakeup(
+        "postgresql://test", mutations=mutations
+    )
 
     assert wakeup.wait(0.5) is True
     assert wakeup.wait(0.5) is True
     wakeup.close()
 
     assert connections == [("postgresql://test", True)]
-    assert executed == [f"LISTEN {projection_wakeup.CHANNEL}"]
+    assert executed == [f"LISTEN {projection_wakeup.CHANNEL}"] + (
+        ["LISTEN workspace_mutation_commands"] if mutations else []
+    )
     assert delivered == ["1", "1", "4", "1", "1", "4"]
     assert closed == [True]
 

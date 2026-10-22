@@ -24,6 +24,7 @@ from restalchemy.common import config_opts as ra_config_opts
 
 from workspace.common import config
 from workspace.common import database
+from workspace.common import mutation_journal_opts
 from workspace.common import file_storage_opts
 from workspace.common import log as infra_log
 from workspace.common import messenger_worker_opts
@@ -38,38 +39,55 @@ TOPIC_SUMMARY_DOMAIN = topic_summary_opts.DOMAIN
 
 CONF = cfg.CONF
 ra_config_opts.register_posgresql_db_opts(CONF)
+mutation_journal_opts.register_opts(CONF)
 file_storage_opts.register_opts(CONF)
 messenger_worker_opts.register_opts(CONF)
 topic_summary_opts.register_opts(CONF)
+
+
+def configure_worker_database() -> None:
+    if mutation_journal_opts.enabled():
+        CONF.set_override(
+            "connection_pool_max_size",
+            CONF[mutation_journal_opts.DOMAIN].threads + 2,
+            group="db",
+        )
+    database.configure_postgresql("workspace-messenger-worker", conf=CONF)
 
 
 def build_worker_services() -> tuple[agents.MessengerWorkerAgent, ...]:
     worker_count = (
         CONF[DOMAIN].v2_projection_workers if CONF[DOMAIN].v2_projection_enabled else 1
     )
+    owned = mutation_journal_opts.enabled()
+    if owned:
+        worker_count = 2
     services = []
     for worker_index in range(worker_count):
+        projection_enabled = CONF[DOMAIN].v2_projection_enabled and (
+            not owned or worker_index == 0
+        )
         service = agents.MessengerWorkerAgent(
-            iter_min_period=0 if CONF[DOMAIN].v2_projection_enabled else 3,
-            iter_pause=0 if CONF[DOMAIN].v2_projection_enabled else 0.1,
+            iter_min_period=0 if projection_enabled else 3,
+            iter_pause=0 if projection_enabled else 0.1,
             event_retention=datetime.timedelta(
                 seconds=CONF[DOMAIN].event_retention_seconds,
             ),
             event_prune_interval_seconds=(CONF[DOMAIN].event_prune_interval_seconds),
             event_prune_batch_size=CONF[DOMAIN].event_prune_batch_size,
-            v2_projection_enabled=CONF[DOMAIN].v2_projection_enabled,
+            v2_projection_enabled=projection_enabled,
             v2_projection_max_tasks_per_iteration=(
                 CONF[DOMAIN].v2_projection_max_tasks_per_iteration
             ),
             v2_idle_sleep_seconds=(CONF[DOMAIN].v2_projection_idle_sleep_seconds),
             v2_projection_db_url=(
-                CONF.db.connection_url if CONF[DOMAIN].v2_projection_enabled else None
+                CONF.db.connection_url if projection_enabled else None
             ),
             v2_fanout_batch_size=CONF[DOMAIN].v2_fanout_batch_size,
             v2_metrics_log_interval_seconds=(
                 CONF[DOMAIN].v2_metrics_log_interval_seconds
             ),
-            projection_only=worker_index > 0,
+            projection_only=(worker_index == 0 if owned else worker_index > 0),
             summary_secret_key=CONF[TOPIC_SUMMARY_DOMAIN].secret_encryption_key,
             summary_connect_timeout_seconds=(
                 CONF[TOPIC_SUMMARY_DOMAIN].connect_timeout_seconds
@@ -84,11 +102,7 @@ def build_worker_services() -> tuple[agents.MessengerWorkerAgent, ...]:
                 CONF[TOPIC_SUMMARY_DOMAIN].endpoint_claim_seconds
             ),
         )
-        service.add_setup(
-            lambda: database.configure_postgresql(
-                "workspace-messenger-worker", conf=CONF
-            )
-        )
+        service.add_setup(configure_worker_database)
         services.append(service)
     return tuple(services)
 

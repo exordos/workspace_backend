@@ -37,6 +37,7 @@ from workspace.messenger_api.dm import models
 from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.dm import helpers
 from workspace.messenger_api.dm import push_devices
+from workspace.messenger_api.dm import v2_models
 
 
 LOG = logging.getLogger(__name__)
@@ -1004,6 +1005,23 @@ class WorkspaceDraftController(StoreResourceController):
                 typing.cast(sys_uuid.UUID, uuid),
                 expected_revision,
             )
+
+
+class WorkspaceMutationStatusController(StoreResourceController):
+    __resource__ = ra_resources.ResourceByRAModel(
+        model_class=v2_models.WorkspaceMutationRequest, convert_underscore=False
+    )
+
+    def get(
+        self, uuid: object, **kwargs: typing.Any
+    ) -> v2_models.WorkspaceMutationRequest:
+        return v2_models.WorkspaceMutationRequest.objects.get_one(
+            filters={
+                "uuid": dm_filters.EQ(uuid),
+                "project_id": dm_filters.EQ(self._get_project_id()),
+                "user_uuid": dm_filters.EQ(self._get_user_uuid()),
+            }
+        )
 
 
 class WorkspaceMessageReactionController(StoreResourceController):

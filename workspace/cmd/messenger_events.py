@@ -24,6 +24,8 @@ from oslo_config import cfg
 from restalchemy.common import config_opts as ra_config_opts
 from restalchemy.storage.sql import engines
 
+from workspace.common import mutation_journal_opts
+
 from workspace.common import config
 from workspace.common import database
 from workspace.common import log as infra_log
@@ -87,6 +89,7 @@ DOMAIN = "messenger_events"
 CONF = cfg.CONF
 CONF.register_cli_opts(events_cli_opts, DOMAIN)
 ra_config_opts.register_posgresql_db_opts(CONF)
+mutation_journal_opts.register_opts(CONF)
 iam_opts.register_iam_cli_opts(CONF)
 
 

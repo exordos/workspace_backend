@@ -18,6 +18,11 @@ from restalchemy.common import exceptions as ra_exc
 import typing
 
 
+class MutationQueueFullError(ra_exc.RestAlchemyException):
+    message = "Too many pending message mutations. Retry after processing completes."
+    code = 429
+
+
 class OnlyOneAllFolderPerUserError(ra_exc.ValidationErrorException):
     message = "Only one 'all' folder is allowed per user"
     code = 400001001
