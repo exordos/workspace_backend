@@ -142,6 +142,43 @@ def test_realtime_events_in_one_poll_keep_order_and_do_not_echo(imported):
     assert pending(account) == []
 
 
+def test_imported_reaction_groups_switch_at_five_and_restore_after_removal(
+    imported, message_sources, api
+):
+    account, _source, state, _subscription, zulip, _constructor = imported
+    users = [str(account.owner_user_uuid)]
+    remote_users = list(range(7, 13))
+    for remote_user in remote_users[1:]:
+        actor, _copy = message_sources(
+            project_id=account.project_id, sender_id=remote_user
+        )
+        source_tests._prepare(actor)
+        users.append(str(actor.owner_user_uuid))
+    api.project_id, api.user_uuid = account.project_id, account.owner_user_uuid
+
+    def check_snapshot(count):
+        messenger_tests._drain()
+        response = api.get(f"{MESSAGES}{state.placement_uuid}")
+        assert response.status_code == 200, response.text
+        assert response.json()["reactions"] == ({"thumbs_up": count} if count else {})
+        expected_users = {"thumbs_up": users[:count]} if 0 < count <= 5 else {}
+        actual_users = response.json()["reaction_users"]
+        assert actual_users.keys() == expected_users.keys()
+        for emoji_name, expected in expected_users.items():
+            assert sorted(actual_users[emoji_name]) == sorted(expected)
+        assert pending(account) == []
+        zulip.update_reaction.assert_not_called()
+
+    snapshot(imported, [reaction(user_id=user_id) for user_id in remote_users[:5]])
+    check_snapshot(5)
+    receive(imported, event_id=1, data=reaction(user_id=remote_users[-1]))
+    check_snapshot(6)
+    receive(imported, "remove", event_id=2, data=reaction(user_id=remote_users[-1]))
+    check_snapshot(5)
+    snapshot(imported, [])
+    check_snapshot(0)
+
+
 def test_snapshot_removal_and_its_barrier_reject_an_old_unknown_add(imported):
     account, *_rest = imported
     old = datetime.datetime.now(datetime.timezone.utc)

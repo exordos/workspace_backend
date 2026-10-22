@@ -33,6 +33,7 @@ def test_all_messenger_entrypoints_use_the_canonical_factory():
 def test_all_message_snapshot_writers_register_reaction_options():
     for module in (
         "workspace.cmd.workspace_api",
+        "workspace.cmd.messenger_worker",
     ):
         result = subprocess.run(
             [
@@ -42,7 +43,7 @@ def test_all_message_snapshot_writers_register_reaction_options():
                     "from oslo_config import cfg; "
                     f"import {module}; "
                     "options = cfg.CONF['messenger_reactions']; "
-                    "assert options.user_list_limit == 4"
+                    "assert options.user_list_limit == 5"
                 ),
             ],
             check=False,

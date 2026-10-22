@@ -6881,7 +6881,7 @@ def test_message_reaction_users_are_complete_at_limit_and_omit_large_groups(
     db,
 ):
     users = [sys_uuid.UUID(str(api.user_uuid))] + [
-        sys_uuid.uuid4() for _index in range(4)
+        sys_uuid.uuid4() for _index in range(5)
     ]
     stream_uuid = conftest.seed_user_stream(
         db,
@@ -6921,7 +6921,7 @@ def test_message_reaction_users_are_complete_at_limit_and_omit_large_groups(
         sys_uuid.uuid5(sys_uuid.UUID(topic_uuid), message_uuid.lower())
     )
 
-    for user_uuid in users[:4]:
+    for user_uuid in users[:5]:
         response = api.post(
             MESSAGE_REACTIONS,
             user=user_uuid,
@@ -6943,11 +6943,11 @@ def test_message_reaction_users_are_complete_at_limit_and_omit_large_groups(
         assert response.status_code == 201, response.text
 
     expected_reaction_users = {
-        "heart": sorted(str(user_uuid) for user_uuid in users[:4]),
+        "heart": sorted(str(user_uuid) for user_uuid in users[:5]),
     }
     response = api.get(f"{MESSAGES}{message_uuid}")
     assert response.status_code == 200, response.text
-    assert response.json()["reactions"] == {"eyes": 5, "heart": 4}
+    assert response.json()["reactions"] == {"eyes": 6, "heart": 5}
     assert response.json()["reaction_users"] == expected_reaction_users
 
     page_response = api.get(MESSAGES, params={"stream_uuid": str(stream_uuid)})
@@ -7006,7 +7006,7 @@ def test_message_reaction_users_are_complete_at_limit_and_omit_large_groups(
         )
         read_event_payload = cursor.fetchone()[0]
     assert stored_reaction_users == expected_reaction_users
-    assert event_payload["reactions"] == {"eyes": 5, "heart": 4}
+    assert event_payload["reactions"] == {"eyes": 6, "heart": 5}
     assert event_payload["reaction_users"] == expected_reaction_users
     assert read_event_payload["reaction_users"] == expected_reaction_users
 

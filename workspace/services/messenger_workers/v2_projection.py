@@ -26,9 +26,11 @@ import types
 import typing
 import uuid as sys_uuid
 
+from oslo_config import cfg
 from restalchemy.common import contexts
 from restalchemy.dm import filters as dm_filters
 
+from workspace.common import messenger_reaction_opts
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api.api import resource_projection
 from workspace.messenger_api.dm import message_payloads
@@ -1985,6 +1987,7 @@ def _process_reaction_snapshot(
         task["_execution_stats"]["reaction_placement_count"] = len(
             event_placement_uuids
         )
+    user_list_limit = cfg.CONF[messenger_reaction_opts.DOMAIN].user_list_limit
     changed = session.execute(
         """
         UPDATE messenger_messages AS message
@@ -1995,15 +1998,29 @@ def _process_reaction_snapshot(
                    jsonb_object_agg(grouped.emoji_name, grouped.reaction_count)
                        FILTER (WHERE grouped.emoji_name IS NOT NULL) AS reactions,
                    jsonb_object_agg(grouped.emoji_name, grouped.users)
-                       FILTER (WHERE grouped.emoji_name IS NOT NULL) AS reaction_users
+                       FILTER (WHERE grouped.users IS NOT NULL) AS reaction_users
             FROM messenger_messages AS target
             LEFT JOIN (
-                SELECT canonical_message_uuid, emoji_name,
+                SELECT fact.canonical_message_uuid, fact.emoji_name,
                        count(*) AS reaction_count,
-                       jsonb_agg(user_uuid::text ORDER BY created_at, uuid) AS users
-                FROM messenger_message_reaction_facts
-                WHERE project_id = %s AND canonical_message_uuid = %s
-                GROUP BY canonical_message_uuid, emoji_name
+                       CASE WHEN count(*) <= %s THEN (
+                           SELECT jsonb_agg(
+                               bounded.user_uuid::text
+                               ORDER BY bounded.created_at, bounded.uuid
+                           )
+                           FROM (
+                               SELECT user_uuid, created_at, uuid
+                               FROM messenger_message_reaction_facts
+                               WHERE project_id = %s
+                                 AND canonical_message_uuid = fact.canonical_message_uuid
+                                 AND emoji_name = fact.emoji_name
+                               ORDER BY created_at, uuid
+                               LIMIT %s
+                           ) AS bounded
+                       ) END AS users
+                FROM messenger_message_reaction_facts AS fact
+                WHERE fact.project_id = %s AND fact.canonical_message_uuid = %s
+                GROUP BY fact.canonical_message_uuid, fact.emoji_name
             ) AS grouped ON grouped.canonical_message_uuid = target.uuid
             WHERE target.project_id = %s AND target.uuid = (
                 SELECT message_uuid FROM messenger_message_placements
@@ -2018,6 +2035,9 @@ def _process_reaction_snapshot(
         RETURNING message.uuid
         """,
         (
+            user_list_limit,
+            task["project_id"],
+            user_list_limit,
             task["project_id"],
             message.canonical_message_uuid,
             task["project_id"],
