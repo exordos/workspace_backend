@@ -232,6 +232,16 @@ Migration 0261 queues bounded reconversion only for stored messages containing
 these contextual headers; source edit times and newer Workspace edits are preserved.
 The [format comparison page](docs/zulip_messages_preview.html) includes direct,
 group, channel, nested, and selected-text quote examples.
+Silent individual mentions remain clickable user references, represented as
+`[Name](urn:user:UUID "silent")`. The standard Markdown title preserves silent
+notification semantics without changing the user URN. Reverse conversion keeps
+the Zulip `@_**Name|ID**` form. Selected rich snippets use quote snapshots to keep
+their clickable content. Name-only and ID-only references resolve against the
+persisted user catalog. Mentions inside quote snapshots are silent; mention syntax
+inside code remains literal. Zulip user groups and wildcard scopes remain explicitly
+unsupported, including their silent spellings, with a link to the original message.
+Migration 0262 queues bounded reconversion of all stored mention-bearing Zulip
+messages, including snapshots and conversions that had lost their source notice.
 Outgoing quotes require
 the sender's access to the referenced message. Missing incoming targets retain a
 provider URL or quoted snapshot instead of an invented internal identity. Features

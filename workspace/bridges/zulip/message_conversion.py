@@ -29,7 +29,8 @@ from workspace.common import emoji
 _INLINE = (
     r"(?P<escape>\\[^\n])"
     r"|(?P<user>@_?\*\*[^*\n]+\*\*)"
-    r"|(?P<group>@\*[^*\n]+\*)"
+    r"|(?P<group>@_?\*[^*\n]+\*)"
+    r"|(?P<code>`+)"
     r"|(?P<channel>\#\*\*[^*\n]+\*\*)"
     r"|(?P<link>!?\[)"
     r"|(?P<url><?(?:https?://|/user_uploads/)[^\s<>`]+>?)"
@@ -48,6 +49,7 @@ _REFERENCE_URN = re.compile(
     r"([\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12})(?:\?(.*))?",
     re.IGNORECASE,
 )
+_SILENT_USER_LINK = re.compile(r'\]\(urn:user:[\da-f-]{36} "silent"\)', re.IGNORECASE)
 
 
 def _escape_label(value: str) -> str:
@@ -404,7 +406,7 @@ class _ZulipToWorkspace:
                     return f"urn:stream:{self.context['stream_uuids'][channel]}"
         return f"urn:url:{absolute}"
 
-    def inline(self, text: str) -> str:
+    def inline(self, text: str, *, quoted: bool = False, literal: bool = False) -> str:
         output = []
         position = 0
         while match := self.tokens.search(text, position):
@@ -412,7 +414,17 @@ class _ZulipToWorkspace:
             position = match.end()
             token = match[0]
             kind = match.lastgroup
-            if kind == "link":
+            if kind == "code" and not literal:
+                closing = re.search(rf"(?<!`){re.escape(token)}(?!`)", text[position:])
+                if closing is None:
+                    output.append(token)
+                else:
+                    end = position + closing.end()
+                    output.append(self.inline(text[match.start() : end], literal=True))
+                    position = end
+            elif kind in ("user", "group") and literal:
+                output.append(token)
+            elif kind == "link":
                 link = _link(text, match.start())
                 if link is None:
                     output.append(token)
@@ -455,12 +467,12 @@ class _ZulipToWorkspace:
                     _markdown_link(label, urn, image=urn.startswith("urn:image:"))
                 )
             elif kind == "user":
-                silent = token.startswith("@_")
-                value = token[4 if silent else 3 : -2]
+                silent = quoted or token.startswith("@_")
+                value = token[4 if token.startswith("@_") else 3 : -2]
                 name, separator, user_id = value.rpartition("|")
                 if not separator:
                     name = value
-                if name in ("all", "everyone", "topic"):
+                if not separator and name in ("all", "everyone", "channel", "topic"):
                     scope = "topic" if name == "topic" else "channel"
                     output.append(self.notice(f"{scope}-wide mention"))
                     continue
@@ -468,14 +480,22 @@ class _ZulipToWorkspace:
                 mapped = self.context.get("mention_uuids", {}).get(key)
                 if mapped is None:
                     output.append(self.notice(f"unresolved user {name}"))
-                elif silent:
-                    output.append(self.notice(f"silent mention of {name}"))
                 else:
+                    if not name:
+                        identity = self.context.get("user_ids", {}).get(mapped)
+                        if identity is None:
+                            output.append(self.notice(f"unresolved user {value}"))
+                            continue
+                        name = identity[1]
                     output.append(
-                        _markdown_link(_escape_label(name), f"urn:user:{mapped}")
+                        _markdown_link(
+                            _escape_label(name),
+                            f"urn:user:{mapped}",
+                            ' "silent"' if silent else "",
+                        )
                     )
             elif kind == "group":
-                name = token[2:-1]
+                name = token[3 if token.startswith("@_") else 2 : -1]
                 description = (
                     "mention of user group"
                     if name in self.context.get("user_group_ids", {})
@@ -528,7 +548,7 @@ class _ZulipToWorkspace:
         output.append(text[position:])
         return "".join(output)
 
-    def body(self, text: str) -> str:
+    def body(self, text: str, *, quoted: bool = False) -> str:
         command = re.match(r"^/(me|poll|todo)(?:\s|$)", text)
         if command:
             return self.block_notice(
@@ -576,24 +596,33 @@ class _ZulipToWorkspace:
                             # Fragment URNs hold plain text; nested blocks need a snapshot.
                             output.append(
                                 self.snapshot(
-                                    self.body(content), header["name"], message_id
+                                    self.body(content, quoted=True),
+                                    header["name"],
+                                    message_id,
                                 )
                             )
                         else:
+                            selected = content
                             if partial:
-                                selected = (
-                                    self.inline(content)
-                                    if self.context.get("strict_identities")
-                                    else content
+                                selected = self.inline(content, quoted=True)
+                            if partial and _SILENT_USER_LINK.search(selected):
+                                # Text fragments are plain text in clients; a
+                                # snapshot keeps the clickable user reference.
+                                output.append(
+                                    self.snapshot(selected, header["name"], message_id)
                                 )
-                                target += "?text=" + urllib.parse.quote(
-                                    selected, safe=""
+                            else:
+                                if partial:
+                                    target += "?text=" + urllib.parse.quote(
+                                        selected, safe=""
+                                    )
+                                output.append(
+                                    _markdown_link(
+                                        _escape_label(header["name"]), target
+                                    )
                                 )
-                            output.append(
-                                _markdown_link(_escape_label(header["name"]), target)
-                            )
                     else:
-                        output.append(self.snapshot(self.inline(content)))
+                        output.append(self.snapshot(self.inline(content, quoted=True)))
                         if header is not None and self.context.get("strict_identities"):
                             source = self.target(header["url"])
                             output.append(
@@ -609,7 +638,7 @@ class _ZulipToWorkspace:
                 elif info == "math":
                     output.append(self.block_notice("LaTeX block", text[position:end]))
                 else:
-                    output.append(self.inline(text[position:end]))
+                    output.append(self.inline(text[position:end], literal=True))
                     position = end
                     continue
                 if text[end - 1] == "\n":
@@ -626,11 +655,13 @@ class _ZulipToWorkspace:
                     position = line_end
                     line_end = text.find("\n", position) + 1 or len(text)
                 content = "".join(lines)
-                output.append(self.snapshot(self.inline(content.removesuffix("\n"))))
+                output.append(
+                    self.snapshot(self.inline(content.removesuffix("\n"), quoted=True))
+                )
                 if content.endswith("\n"):
                     output.append("\n")
             else:
-                output.append(self.inline(text[position:line_end]))
+                output.append(self.inline(text[position:line_end], quoted=quoted))
                 position = line_end
         return "".join(output)
 
@@ -694,16 +725,23 @@ def workspace_to_zulip(payload: dict, context: dict) -> str:
             return None
         kind, identifier, query = reference
         if kind == "user":
+            prefix = (
+                "@_" if title.strip() in ('"silent"', "'silent'", "(silent)") else "@"
+            )
             if context.get("strict_identities"):
                 if identifier not in context["user_ids"]:
                     raise ValueError(
                         f"No unambiguous Zulip user mapping for {identifier}"
                     )
                 user_id, name = context["user_ids"][identifier]
-                return f"@**{name}|{user_id}**"
+                return f"{prefix}**{name}|{user_id}**"
             key = _reverse_lookup(context, "mention_uuids", identifier)
             name = _unescape(label)
-            return f"@**{name}|{key[3:]}**" if key.startswith("id:") else f"@**{name}**"
+            return (
+                f"{prefix}**{name}|{key[3:]}**"
+                if key.startswith("id:")
+                else f"{prefix}**{name}**"
+            )
         if kind in ("stream", "topic"):
             urls = context.get("stream_urls" if kind == "stream" else "topic_urls", {})
             if identifier in urls:
@@ -753,9 +791,12 @@ def workspace_to_zulip(payload: dict, context: dict) -> str:
             if (
                 source is not None
                 and label != "unknown"
-                and any(
-                    kind in ("quote", "forward")
-                    for kind, _identifier, _query in workspace_references(snapshot)
+                and (
+                    _SILENT_USER_LINK.search(snapshot)
+                    or any(
+                        kind in ("quote", "forward")
+                        for kind, _identifier, _query in workspace_references(snapshot)
+                    )
                 )
             ):
                 return _message_quote(

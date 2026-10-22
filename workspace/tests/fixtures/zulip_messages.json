@@ -645,7 +645,7 @@
     },
     "expected_payload": {
       "kind": "markdown",
-      "content": "Run `python -m pytest`.\nKeep `[Bob Example](urn:user:7af731c9-ccd4-5318-9a12-bab962ee4679)` literal.\nA backtick inside a code span: ``value = `literal` ``."
+      "content": "Run `python -m pytest`.\nKeep `@**Bob Example|12**` literal.\nA backtick inside a code span: ``value = `literal` ``."
     },
     "unsupported_features": [],
     "expected_zulip_content": "Run `python -m pytest`.\nKeep `@**Bob Example|12**` literal.\nA backtick inside a code span: ``value = `literal` ``."
@@ -688,7 +688,7 @@
   },
   {
     "name": "fenced_literal_markup",
-    "description": "Zulip references are converted inside fenced code; unsupported math is marked as plain text, with one original-message link at the end.",
+    "description": "Literal mentions remain unchanged inside code while file references retain their mappings; unsupported math is marked with an original-message link.",
     "message": {
       "id": 1016,
       "type": "stream",
@@ -732,7 +732,7 @@
     },
     "expected_payload": {
       "kind": "markdown",
-      "content": "```text\n[Bob Example](urn:user:7af731c9-ccd4-5318-9a12-bab962ee4679)\n[#general > Roadmap](urn:topic:40000000-0000-4000-8000-000000000042)\n[file](urn:file:60000000-0000-4000-8000-000000000002?name=report.pdf&content_type=application%2Fpdf)\n:smile: (Not supported in Workspace: inline LaTeX)\n```\n\nOutside code: [Bob Example](urn:user:7af731c9-ccd4-5318-9a12-bab962ee4679).\n\n[Original message](urn:url:https://zulip.example.test/#narrow/near/1016)"
+      "content": "```text\n@**Bob Example|12**\n[#general > Roadmap](urn:topic:40000000-0000-4000-8000-000000000042)\n[file](urn:file:60000000-0000-4000-8000-000000000002?name=report.pdf&content_type=application%2Fpdf)\n:smile: (Not supported in Workspace: inline LaTeX)\n```\n\nOutside code: [Bob Example](urn:user:7af731c9-ccd4-5318-9a12-bab962ee4679).\n\n[Original message](urn:url:https://zulip.example.test/#narrow/near/1016)"
     },
     "unsupported_features": ["inline_latex"],
     "expected_zulip_content": "```text\n@**Bob Example|12**\n#**general>Roadmap**\n[file](/user_uploads/1/abc123/report.pdf)\n:smile: (Not supported in Workspace: inline LaTeX)\n```\n\nOutside code: @**Bob Example|12**.\n\n[Original message](https://zulip.example.test/#narrow/near/1016)"
@@ -1039,7 +1039,7 @@
   },
   {
     "name": "silent_user_mention",
-    "description": "A silent mention refers to the user without triggering a notification.",
+    "description": "A silent mention remains a clickable user reference without triggering a notification.",
     "message": {
       "id": 1025,
       "type": "stream",
@@ -1071,10 +1071,10 @@
     },
     "expected_payload": {
       "kind": "markdown",
-      "content": "Following (Not supported in Workspace: silent mention of Bob Example)'s suggestion.\n\n[Original message](urn:url:https://zulip.example.test/#narrow/near/1025)"
+      "content": "Following [Bob Example](urn:user:7af731c9-ccd4-5318-9a12-bab962ee4679 \"silent\")'s suggestion."
     },
-    "unsupported_features": ["silent_user_mention"],
-    "expected_zulip_content": "Following (Not supported in Workspace: silent mention of Bob Example)'s suggestion.\n\n[Original message](https://zulip.example.test/#narrow/near/1025)"
+    "unsupported_features": [],
+    "expected_zulip_content": "Following @_**Bob Example|12**'s suggestion."
   },
   {
     "name": "user_group_mention",
@@ -2337,7 +2337,7 @@
     },
     "expected_payload": {
       "kind": "markdown",
-      "content": "[Bob Example](urn:user:7af731c9-ccd4-5318-9a12-bab962ee4679), here is the **release summary** for [#general > Roadmap](urn:topic:40000000-0000-4000-8000-000000000042).\n\n1. Read [the report](urn:file:60000000-0000-4000-8000-000000000002?name=report.pdf&content_type=application%2Fpdf).\n2. Check the formula (Not supported in Workspace: inline LaTeX).\n\n```python\n# This is literal: [Zoë Example](urn:user:0b596ff7-0956-5783-9ad4-0660396b0543) :smile:\nprint(\"ready\")\n```\n\n```spoiler Internal notes\n> Preserve the original link: [https://docs.example.test/runbook](urn:url:https://docs.example.test/runbook)\n\nRestart the worker at (Not supported in Workspace: global time 2026-10-18T18:00:00+03:00).\n```\n\n![Deployment diagram](urn:image:60000000-0000-4000-8000-000000000005?name=architecture.png&content_type=image%2Fpng&w=480&h=240)\n\nThanks! :+1:\n\n[Original message](urn:url:https://zulip.example.test/#narrow/near/1055)"
+      "content": "[Bob Example](urn:user:7af731c9-ccd4-5318-9a12-bab962ee4679), here is the **release summary** for [#general > Roadmap](urn:topic:40000000-0000-4000-8000-000000000042).\n\n1. Read [the report](urn:file:60000000-0000-4000-8000-000000000002?name=report.pdf&content_type=application%2Fpdf).\n2. Check the formula (Not supported in Workspace: inline LaTeX).\n\n```python\n# This is literal: @**Zoë Example|13** :smile:\nprint(\"ready\")\n```\n\n```spoiler Internal notes\n> Preserve the original link: [https://docs.example.test/runbook](urn:url:https://docs.example.test/runbook)\n\nRestart the worker at (Not supported in Workspace: global time 2026-10-18T18:00:00+03:00).\n```\n\n![Deployment diagram](urn:image:60000000-0000-4000-8000-000000000005?name=architecture.png&content_type=image%2Fpng&w=480&h=240)\n\nThanks! :+1:\n\n[Original message](urn:url:https://zulip.example.test/#narrow/near/1055)"
     },
     "unsupported_features": ["inline_latex", "global_time"],
     "expected_zulip_content": "@**Bob Example|12**, here is the **release summary** for #**general>Roadmap**.\n\n1. Read [the report](/user_uploads/1/abc123/report.pdf).\n2. Check the formula (Not supported in Workspace: inline LaTeX).\n\n```python\n# This is literal: @**Zoë Example|13** :smile:\nprint(\"ready\")\n```\n\n```spoiler Internal notes\n> Preserve the original link: [https://docs.example.test/runbook](https://docs.example.test/runbook)\n\nRestart the worker at (Not supported in Workspace: global time 2026-10-18T18:00:00+03:00).\n```\n\n![Deployment diagram](/user_uploads/1/img123/architecture.png)\n\nThanks! :+1:\n\n[Original message](https://zulip.example.test/#narrow/near/1055)"
@@ -2888,5 +2888,489 @@
     "unsupported_features": [],
     "expected_zulip_content": "@_**Alice Example|9** [said](https://zulip.example.test/#narrow/near/1062):\n```quote\nThe backup is complete.\n```",
     "expected_quote_count": 1
+  },
+  {
+    "name": "notification_bot_silent_mention",
+    "description": "A synthetic bot notification preserves the silent clickable user reference.",
+    "message": {
+      "id": 1070,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 6,
+      "sender_full_name": "Notification Bot",
+      "sender_email": "notification@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000069,
+      "content_type": "text/x-markdown",
+      "content": "@_**Bob Example|12** marked this topic as unresolved.",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1070",
+      "mention_uuids": {
+        "id:12": "7af731c9-ccd4-5318-9a12-bab962ee4679"
+      },
+      "message_uuids": {
+        "1070": "a53ef2e8-9ce5-5810-9440-400c6cb23b74"
+      },
+      "strict_identities": true,
+      "user_ids": {
+        "7af731c9-ccd4-5318-9a12-bab962ee4679": [
+          "12",
+          "Bob Example"
+        ]
+      }
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "[Bob Example](urn:user:7af731c9-ccd4-5318-9a12-bab962ee4679 \"silent\") marked this topic as unresolved."
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "@_**Bob Example|12** marked this topic as unresolved.",
+    "expected_quote_count": 0
+  },
+  {
+    "name": "quoted_notification_bot_silent_mention",
+    "description": "A quote of a bot notification resolves its source; the rendered body contains no unsupported notice.",
+    "message": {
+      "id": 1071,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000070,
+      "content_type": "text/x-markdown",
+      "content": "@_**Notification Bot|6** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1070):\n```quote\n@_**Bob Example|12** marked this topic as unresolved.\n```",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1071",
+      "mention_uuids": {
+        "id:12": "7af731c9-ccd4-5318-9a12-bab962ee4679"
+      },
+      "message_uuids": {
+        "1070": "a53ef2e8-9ce5-5810-9440-400c6cb23b74"
+      },
+      "strict_identities": true,
+      "user_ids": {
+        "7af731c9-ccd4-5318-9a12-bab962ee4679": [
+          "12",
+          "Bob Example"
+        ]
+      }
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "[Notification Bot](urn:quote:a53ef2e8-9ce5-5810-9440-400c6cb23b74)"
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "@_**Notification Bot|6** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1070):\n```quote\n@_**Bob Example|12** marked this topic as unresolved.\n```",
+    "expected_quote_count": 1
+  },
+  {
+    "name": "selected_notification_silent_mention",
+    "description": "A selected silent user reference retains its clickable identity in a structured snapshot.",
+    "message": {
+      "id": 1072,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000071,
+      "content_type": "text/x-markdown",
+      "content": "@_**Notification Bot|6** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1070):\n```quote\n@_**Bob Example|12**\n```",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1072",
+      "mention_uuids": {
+        "id:12": "7af731c9-ccd4-5318-9a12-bab962ee4679"
+      },
+      "message_uuids": {
+        "1070": "a53ef2e8-9ce5-5810-9440-400c6cb23b74"
+      },
+      "strict_identities": true,
+      "user_ids": {
+        "7af731c9-ccd4-5318-9a12-bab962ee4679": [
+          "12",
+          "Bob Example"
+        ]
+      }
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "[Notification Bot](urn:forward:a53ef2e8-9ce5-5810-9440-400c6cb23b74?snapshot=W0JvYiBFeGFtcGxlXSh1cm46dXNlcjo3YWY3MzFjOS1jY2Q0LTUzMTgtOWExMi1iYWI5NjJlZTQ2NzkgInNpbGVudCIp)"
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "@_**Notification Bot|6** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1070):\n```quote\n@_**Bob Example|12**\n```",
+    "expected_quote_count": 1
+  },
+  {
+    "name": "silent_user_mention_by_name",
+    "description": "A name-only silent mention resolves the same mapped profile.",
+    "message": {
+      "id": 1073,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000024,
+      "content_type": "text/x-markdown",
+      "content": "@_**Bob Example**",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1073",
+      "mention_uuids": {
+        "id:12": "7af731c9-ccd4-5318-9a12-bab962ee4679",
+        "name:Bob Example": "7af731c9-ccd4-5318-9a12-bab962ee4679"
+      },
+      "user_ids": {
+        "7af731c9-ccd4-5318-9a12-bab962ee4679": [
+          "12",
+          "Bob Example"
+        ]
+      }
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "[Bob Example](urn:user:7af731c9-ccd4-5318-9a12-bab962ee4679 \"silent\")"
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "@_**Bob Example|12**"
+  },
+  {
+    "name": "silent_user_mention_by_id",
+    "description": "An ID-only silent mention uses the persisted display name.",
+    "message": {
+      "id": 1074,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000024,
+      "content_type": "text/x-markdown",
+      "content": "@_**|12**",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1074",
+      "mention_uuids": {
+        "id:12": "7af731c9-ccd4-5318-9a12-bab962ee4679",
+        "name:Bob Example": "7af731c9-ccd4-5318-9a12-bab962ee4679"
+      },
+      "user_ids": {
+        "7af731c9-ccd4-5318-9a12-bab962ee4679": [
+          "12",
+          "Bob Example"
+        ]
+      }
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "[Bob Example](urn:user:7af731c9-ccd4-5318-9a12-bab962ee4679 \"silent\")"
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "@_**Bob Example|12**"
+  },
+  {
+    "name": "mixed_silent_and_active_mentions",
+    "description": "Silent references stay silent beside an ordinary active mention.",
+    "message": {
+      "id": 1075,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000024,
+      "content_type": "text/x-markdown",
+      "content": "@_**Bob Example|12** and @**Bob Example|12**",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1075",
+      "mention_uuids": {
+        "id:12": "7af731c9-ccd4-5318-9a12-bab962ee4679",
+        "name:Bob Example": "7af731c9-ccd4-5318-9a12-bab962ee4679"
+      },
+      "user_ids": {
+        "7af731c9-ccd4-5318-9a12-bab962ee4679": [
+          "12",
+          "Bob Example"
+        ]
+      }
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "[Bob Example](urn:user:7af731c9-ccd4-5318-9a12-bab962ee4679 \"silent\") and [Bob Example](urn:user:7af731c9-ccd4-5318-9a12-bab962ee4679)"
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "@_**Bob Example|12** and @**Bob Example|12**"
+  },
+  {
+    "name": "quoted_active_user_mention",
+    "description": "Zulip makes ordinary user mentions inside quotes silent.",
+    "message": {
+      "id": 1076,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000024,
+      "content_type": "text/x-markdown",
+      "content": "> @**Bob Example|12**",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1076",
+      "mention_uuids": {
+        "id:12": "7af731c9-ccd4-5318-9a12-bab962ee4679",
+        "name:Bob Example": "7af731c9-ccd4-5318-9a12-bab962ee4679"
+      },
+      "user_ids": {
+        "7af731c9-ccd4-5318-9a12-bab962ee4679": [
+          "12",
+          "Bob Example"
+        ]
+      },
+      "strict_identities": true,
+      "current_message_uuid": "b86acf74-3b26-5e4b-8a62-509ed24a8e54",
+      "message_uuids": {
+        "1076": "b86acf74-3b26-5e4b-8a62-509ed24a8e54"
+      }
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "[unknown](urn:forward:b86acf74-3b26-5e4b-8a62-509ed24a8e54?snapshot=W0JvYiBFeGFtcGxlXSh1cm46dXNlcjo3YWY3MzFjOS1jY2Q0LTUzMTgtOWExMi1iYWI5NjJlZTQ2NzkgInNpbGVudCIp)"
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "```quote\n@_**Bob Example|12**\n```"
+  },
+  {
+    "name": "literal_silent_user_mentions",
+    "description": "Mention examples inside inline and fenced code stay literal.",
+    "message": {
+      "id": 1077,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000024,
+      "content_type": "text/x-markdown",
+      "content": "`@_**Bob Example|12**`\n\n```text\n@_**Bob Example|12**\n```",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1077",
+      "mention_uuids": {
+        "id:12": "7af731c9-ccd4-5318-9a12-bab962ee4679",
+        "name:Bob Example": "7af731c9-ccd4-5318-9a12-bab962ee4679"
+      },
+      "user_ids": {
+        "7af731c9-ccd4-5318-9a12-bab962ee4679": [
+          "12",
+          "Bob Example"
+        ]
+      }
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "`@_**Bob Example|12**`\n\n```text\n@_**Bob Example|12**\n```"
+    },
+    "unsupported_features": [],
+    "expected_zulip_content": "`@_**Bob Example|12**`\n\n```text\n@_**Bob Example|12**\n```"
+  },
+  {
+    "name": "silent_user_group_mention",
+    "description": "Unsupported silent groups keep an explicit notice and the original source.",
+    "message": {
+      "id": 1078,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000024,
+      "content_type": "text/x-markdown",
+      "content": "@_*Engineering*",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1078",
+      "mention_uuids": {
+        "id:12": "7af731c9-ccd4-5318-9a12-bab962ee4679",
+        "name:Bob Example": "7af731c9-ccd4-5318-9a12-bab962ee4679"
+      },
+      "user_ids": {
+        "7af731c9-ccd4-5318-9a12-bab962ee4679": [
+          "12",
+          "Bob Example"
+        ]
+      },
+      "user_group_ids": {
+        "Engineering": 101
+      }
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "(Not supported in Workspace: mention of user group Engineering)\n\n[Original message](urn:url:https://zulip.example.test/#narrow/near/1078)"
+    },
+    "unsupported_features": [
+      "silent_user_group_mention"
+    ],
+    "expected_zulip_content": "(Not supported in Workspace: mention of user group Engineering)\n\n[Original message](https://zulip.example.test/#narrow/near/1078)"
+  },
+  {
+    "name": "silent_wildcard_mentions",
+    "description": "Unsupported wildcard scopes never become active user mentions.",
+    "message": {
+      "id": 1079,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "general",
+      "recipient_id": 142,
+      "subject": "Formatting examples",
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "sender_email": "alice@example.test",
+      "sender_realm_str": "example",
+      "avatar_url": null,
+      "client": "website",
+      "timestamp": 1788000024,
+      "content_type": "text/x-markdown",
+      "content": "@_**all** @_**everyone** @_**channel** @_**topic**",
+      "is_me_message": false,
+      "flags": [],
+      "reactions": [],
+      "submessages": [],
+      "topic_links": []
+    },
+    "conversion_context": {
+      "server_url": "https://zulip.example.test",
+      "original_url": "https://zulip.example.test/#narrow/near/1079",
+      "mention_uuids": {
+        "id:12": "7af731c9-ccd4-5318-9a12-bab962ee4679",
+        "name:Bob Example": "7af731c9-ccd4-5318-9a12-bab962ee4679"
+      },
+      "user_ids": {
+        "7af731c9-ccd4-5318-9a12-bab962ee4679": [
+          "12",
+          "Bob Example"
+        ]
+      }
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "(Not supported in Workspace: channel-wide mention) (Not supported in Workspace: channel-wide mention) (Not supported in Workspace: channel-wide mention) (Not supported in Workspace: topic-wide mention)\n\n[Original message](urn:url:https://zulip.example.test/#narrow/near/1079)"
+    },
+    "unsupported_features": [
+      "wildcard_mention"
+    ],
+    "expected_zulip_content": "(Not supported in Workspace: channel-wide mention) (Not supported in Workspace: channel-wide mention) (Not supported in Workspace: channel-wide mention) (Not supported in Workspace: topic-wide mention)\n\n[Original message](https://zulip.example.test/#narrow/near/1079)"
   }
 ]
