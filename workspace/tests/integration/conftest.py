@@ -30,6 +30,7 @@ below the auth layer, including the composite-primary-key controllers.
 import contextlib
 import datetime
 import gc
+import hashlib
 import json
 import os
 import pathlib
@@ -224,6 +225,7 @@ class ApiClient:
         self.user_uuid = str(user_uuid)
         self.project_id = str(project_id)
         self._user_seeder = user_seeder
+        self._seeded_users = set()
 
     def _headers(self, user=None, project=None, permissions=()):
         headers = {
@@ -243,8 +245,10 @@ class ApiClient:
         permissions=(),
         **kwargs,
     ):
-        if self._user_seeder is not None:
-            self._user_seeder(str(user or self.user_uuid))
+        user_uuid = str(user or self.user_uuid)
+        if self._user_seeder is not None and user_uuid not in self._seeded_users:
+            self._user_seeder(user_uuid)
+            self._seeded_users.add(user_uuid)
         headers = self._headers(user, project, permissions)
         headers.update(kwargs.pop("headers", {}))
         return requests.request(
@@ -423,15 +427,52 @@ def workspace_api(http_server, db):
     )
 
 
+def pytest_addoption(parser):
+    parser.addoption(
+        "--integration-shard",
+        nargs=2,
+        type=int,
+        metavar=("INDEX", "COUNT"),
+        help="Run one zero-based integration shard with its own database.",
+    )
+
+
 def pytest_configure(config):
+    shard = config.getoption("integration_shard")
+    if shard is not None and not 0 <= shard[0] < shard[1]:
+        raise pytest.UsageError("--integration-shard requires 0 <= INDEX < COUNT")
     config.addinivalue_line(
         "markers",
         "pre_retirement_schema: verify a published migration before compatibility retirement",
     )
+    config.addinivalue_line(
+        "markers",
+        "isolated_schema: keep destructive migration tests off the shared schema",
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    shard = config.getoption("integration_shard")
+    if shard is None:
+        return
+    index, count = shard
+    selected, deselected = [], []
+    for item in items:
+        # Keep module-scoped migration fixtures and their test order intact.
+        module = item.nodeid.split("::", 1)[0]
+        assigned = int.from_bytes(hashlib.sha256(module.encode()).digest(), "big")
+        (selected if assigned % count == index else deselected).append(item)
+    items[:] = selected
+    config.hook.pytest_deselected(items=deselected)
 
 
 @pytest.fixture(autouse=True)
 def _test_database_url(_database, request, monkeypatch):
+    if request.node.get_closest_marker("isolated_schema") is not None:
+        engine = ra_migrations.MigrationEngine(migrations_path=str(MIGRATIONS_DIR))
+        with isolated_migration_database(engine.get_latest_migration()) as database_url:
+            yield database_url
+        return
     if request.node.get_closest_marker("pre_retirement_schema") is None:
         with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
             # Permanent tombstones intentionally survive membership cleanup.

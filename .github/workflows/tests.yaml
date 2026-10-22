@@ -2,7 +2,13 @@ name: tests
 
 on:
   push:
+    branches: [master]
+    tags: ["**"]
   pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -63,15 +69,20 @@ jobs:
         run: uv tool install tox --with tox-uv
       - name: Unit tests
         run: |
-          tox -e ${{ matrix.python-version }}
+          tox -e ${{ matrix.python-version }}-nocoverage
       - name: Functional tests
         env:
           DATABASE_URI: "postgresql://workspace:pass@localhost:5432/workspace"
         run: |
-          tox -e ${{ matrix.python-version }}-functional
-  Integration:
+          tox -e ${{ matrix.python-version }}-functional-nocoverage
+  IntegrationShard:
+    name: Integration shard (${{ matrix.shard }})
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     services:
       postgresql:
         image: postgres:18
@@ -102,7 +113,7 @@ jobs:
           WORKSPACE_TEST_DB_URL: "postgresql://workspace:pass@localhost:5432/workspace_test"
           WORKSPACE_REQUIRE_INTEGRATION_TESTS: "1"
           WORKSPACE_PRIVILEGED_NAMESPACE_TEST: "1"
-        run: tox -e 3.12-integration -- --junitxml=integration-results.xml -ra
+        run: tox -e 3.12-integration-nocoverage -- --integration-shard ${{ matrix.shard }} 4 --junitxml=integration-results.xml -ra
       - name: Verify namespace restriction after tests
         if: always()
         run: test "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns)" -eq 1
@@ -110,9 +121,19 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: integration-results
+          name: integration-results-${{ matrix.shard }}
           path: integration-results.xml
           if-no-files-found: warn
+  # Preserve the existing required check and fail it if any shard fails or is skipped.
+  Integration:
+    runs-on: ubuntu-24.04
+    needs: IntegrationShard
+    if: always()
+    steps:
+      - name: Require every integration shard
+        env:
+          RESULT: ${{ needs.IntegrationShard.result }}
+        run: test "$RESULT" = success
   Coverage:
     runs-on: ubuntu-24.04
     strategy:
