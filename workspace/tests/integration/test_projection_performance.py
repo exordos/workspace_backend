@@ -388,7 +388,10 @@ def test_reaction_snapshot_uses_message_scoped_covering_index(api, db):
     assert scoped_plan["Plan"]["Total Cost"] * 20 < project_plan["Plan"]["Total Cost"]
 
 
-def test_reaction_burst_coalesces_and_preserves_realtime_events(api, db, monkeypatch):
+@pytest.mark.parametrize("delete_reaction", [False, True])
+def test_reaction_burst_coalesces_and_preserves_realtime_events(
+    api, db, monkeypatch, delete_reaction
+):
     _stream, message = _create_message(api, "reaction-coalescing")
     monkeypatch.setattr(
         v2_projection,
@@ -412,8 +415,9 @@ def test_reaction_burst_coalesces_and_preserves_realtime_events(api, db, monkeyp
         json={"emoji_name": "heart"},
     )
     assert updated.status_code == 200, updated.text
-    deleted = api.delete(f"{MESSAGE_REACTIONS}{reaction_uuid}")
-    assert deleted.status_code in (200, 204), deleted.text
+    if delete_reaction:
+        deleted = api.delete(f"{MESSAGE_REACTIONS}{reaction_uuid}")
+        assert deleted.status_code in (200, 204), deleted.text
 
     with contexts.Context().session_manager() as session:
         processed = v2_projection.process_one_projection_task(
@@ -447,18 +451,19 @@ def test_reaction_burst_coalesces_and_preserves_realtime_events(api, db, monkeyp
         )
         events = cursor.fetchall()
 
-    assert completed == 3
+    expected_events = 3 if delete_reaction else 2
+    assert completed == expected_events
     assert actually_claimed == 1
     claimed_stats = [stats for stats in execution_stats if stats.get("claim_count")]
     coalesced_stats = [
         stats for stats in execution_stats if stats.get("last_outcome") == "coalesced"
     ]
     assert len(claimed_stats) == 1
-    assert len(coalesced_stats) == 2
+    assert len(coalesced_stats) == expected_events - 1
     assert claimed_stats[0]["last_outcome"] == "completed"
-    assert claimed_stats[0]["coalesced_task_count"] == 2
-    assert claimed_stats[0]["reaction_fact_count"] == 0
-    assert claimed_stats[0]["reaction_event_count"] == 3
+    assert claimed_stats[0]["coalesced_task_count"] == expected_events - 1
+    assert claimed_stats[0]["reaction_fact_count"] == int(not delete_reaction)
+    assert claimed_stats[0]["reaction_event_count"] == expected_events
     assert claimed_stats[0]["queue_wait_ms"] >= 0
     assert claimed_stats[0]["outbox_wait_ms"] >= claimed_stats[0]["queue_wait_ms"]
     assert claimed_stats[0]["derivation_delay_ms"] >= 0
@@ -468,11 +473,20 @@ def test_reaction_burst_coalesces_and_preserves_realtime_events(api, db, monkeyp
     reaction_actions = [
         action for kind, action, _payload in events if kind == "message_reaction"
     ]
-    assert reaction_actions == ["created", "updated", "deleted"]
+    assert reaction_actions == ["created", "updated"] + (
+        ["deleted"] if delete_reaction else []
+    )
     message_events = [payload for kind, _action, payload in events if kind == "message"]
-    assert len(message_events) == 1
-    assert message_events[0]["reactions"] == {}
-    assert api.get(f"{MESSAGES}{message['uuid']}").json()["reactions"] == {}
+    # A net-empty burst leaves the initial empty snapshot unchanged. All
+    # individual reaction events still have to reach the realtime audience.
+    assert len(message_events) == int(not delete_reaction)
+    expected_reactions = {} if delete_reaction else {"heart": 1}
+    if message_events:
+        assert message_events[0]["reactions"] == expected_reactions
+    assert (
+        api.get(f"{MESSAGES}{message['uuid']}").json()["reactions"]
+        == expected_reactions
+    )
 
 
 def test_reaction_coalescing_locks_a_bounded_sibling_batch(api, db, monkeypatch):

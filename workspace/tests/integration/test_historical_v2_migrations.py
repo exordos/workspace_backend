@@ -15,6 +15,7 @@ from restalchemy.storage.sql import migrations as ra_migrations
 
 from workspace.tests.integration import legacy_store
 from workspace.messenger_api.api import store as api_store
+from workspace.tests.integration.legacy_messenger import helpers as legacy_helpers
 from workspace.tests.integration.legacy_messenger import store_factory
 from workspace.services.messenger_workers import v2_projection
 from workspace.tests.integration import conftest
@@ -82,8 +83,89 @@ LEGACY_BACKFILL_COUNTER_MIGRATION = "0174-suppress-legacy-backfill-counters-a2cd
 
 
 @pytest.fixture(autouse=True)
-def _historical_database(_database):
-    # Schema 0165 is the original baseline for the published cutover tests.
+def _historical_database(_database, monkeypatch):
+    # The frozen API fixtures include profile/encryption fields introduced
+    # after these migration scenarios. Supply only unrelated model metadata,
+    # without applying later messenger data migrations under test.
+    views = ("m_workspace_user_streams", "messenger_api_user_streams_v1")
+
+    def restore_model_views():
+        with contexts.Context().session_manager() as session:
+            for view in views:
+                base = "test_historical_" + view
+                if session.execute(
+                    "SELECT to_regclass(%s) AS name", (base,)
+                ).fetchone()["name"]:
+                    session.execute(f"DROP VIEW {view}")
+                    session.execute(f"ALTER VIEW {base} RENAME TO {view}")
+
+    def add_model_metadata():
+        with contexts.Context().session_manager() as session:
+            session.execute(
+                "ALTER TABLE m_workspace_users ADD COLUMN IF NOT EXISTS "
+                "disabled BOOLEAN NOT NULL DEFAULT FALSE"
+            )
+            if session.execute(
+                "SELECT to_regclass('messenger_streams') AS name"
+            ).fetchone()["name"]:
+                session.execute(
+                    "ALTER TABLE messenger_streams "
+                    "ADD COLUMN IF NOT EXISTS encryption BOOLEAN NOT NULL DEFAULT FALSE, "
+                    "ADD COLUMN IF NOT EXISTS current_encryption_key_uuid UUID"
+                )
+            for view in views:
+                row = session.execute(
+                    "SELECT to_regclass(%s) AS name, "
+                    "EXISTS(SELECT 1 FROM information_schema.columns "
+                    "WHERE table_name=%s AND column_name='encryption') AS encrypted",
+                    (view, view),
+                ).fetchone()
+                if row["name"] is not None and not row["encrypted"]:
+                    base = "test_historical_" + view
+                    session.execute(f"ALTER VIEW {view} RENAME TO {base}")
+                    session.execute(
+                        f"CREATE VIEW {view} AS SELECT historical.*, "
+                        "false AS encryption, NULL::uuid AS current_encryption_key_uuid "
+                        f"FROM {base} AS historical"
+                    )
+
+    def with_model_metadata(operation):
+        def run(engine, *args, **kwargs):
+            # Published migrations must see their original view shape. Keep
+            # the additional API columns in a removable fixture-only wrapper.
+            restore_model_views()
+            try:
+                return operation(engine, *args, **kwargs)
+            finally:
+                add_model_metadata()
+
+        return run
+
+    for method in ("apply_migration", "rollback_migration"):
+        monkeypatch.setattr(
+            ra_migrations.MigrationEngine,
+            method,
+            with_model_metadata(getattr(ra_migrations.MigrationEngine, method)),
+        )
+    # Legacy read-counter snapshots must also run before the canonical tables
+    # exist. Encryption is outside these published cutover scenarios.
+    monkeypatch.setattr(
+        legacy_helpers,
+        "_READ_STATE_USER_STREAM_SNAPSHOTS_SQL",
+        legacy_helpers._READ_STATE_USER_STREAM_SNAPSHOTS_SQL.replace(
+            "canonical.encryption,", "false AS encryption,"
+        )
+        .replace(
+            "canonical.current_encryption_key_uuid,",
+            "NULL::uuid AS current_encryption_key_uuid,",
+        )
+        .replace(
+            "    JOIN messenger_streams AS canonical\n"
+            "      ON canonical.project_id = stream.project_id\n"
+            "     AND canonical.uuid = stream.uuid\n",
+            "",
+        ),
+    )
     with conftest.isolated_migration_database(
         "0165-repair-provider-participant-message-state-73514c.py"
     ) as database_url:

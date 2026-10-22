@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   Lint:
     runs-on: ubuntu-24.04
@@ -66,6 +69,50 @@ jobs:
           DATABASE_URI: "postgresql://workspace:pass@localhost:5432/workspace"
         run: |
           tox -e ${{ matrix.python-version }}-functional
+  Integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgresql:
+        image: postgres:18
+        env:
+          POSTGRES_DB: workspace_test
+          POSTGRES_USER: workspace
+          POSTGRES_PASSWORD: pass
+        options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+        ports:
+          - 5432:5432
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install system requirements
+        run: sudo apt update && sudo apt install --yes libev-dev libvirt-dev postgresql-client util-linux
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+      - name: Install tox-uv
+        run: uv tool install tox --with tox-uv
+      - name: Verify namespace restriction before tests
+        run: test "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns)" -eq 1
+      - name: Full integration suite
+        env:
+          WORKSPACE_TEST_DB_URL: "postgresql://workspace:pass@localhost:5432/workspace_test"
+          WORKSPACE_REQUIRE_INTEGRATION_TESTS: "1"
+          WORKSPACE_PRIVILEGED_NAMESPACE_TEST: "1"
+        run: tox -e 3.12-integration -- --junitxml=integration-results.xml -ra
+      - name: Verify namespace restriction after tests
+        if: always()
+        run: test "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns)" -eq 1
+      - name: Upload integration results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-results
+          path: integration-results.xml
+          if-no-files-found: warn
   Coverage:
     runs-on: ubuntu-24.04
     strategy:
