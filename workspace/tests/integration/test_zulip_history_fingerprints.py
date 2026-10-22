@@ -185,6 +185,68 @@ def test_shared_history_replay_keeps_other_snapshot_but_fresh_changes_are_detect
     )
 
 
+def test_reaction_projection_keeps_pending_and_ready_history_checkpoints(
+    history_account, monkeypatch
+):
+    """The real projector links native facts without changing provider input."""
+    account = history_account
+    monkeypatch.setattr(models, "HISTORY_BATCH_SIZE", 1)
+    reaction = {
+        "user_id": 7,
+        "emoji_name": "test_tube",
+        "emoji_code": "1f9ea",
+        "reaction_type": "unicode_emoji",
+    }
+    data = [message(message_id, reactions=[reaction]) for message_id in (41, 42)]
+    scan(account, data, monkeypatch)
+    first, second = pending(account)
+    original_revision = history.batch(account, 1)["revision"]
+    first.execute()
+    assert first.status == "done", first.error_description
+    for model in (
+        models.ZulipProjectUserState,
+        models.ZulipStreamState,
+        models.ZulipStreamBindingState,
+    ):
+        for state in model.objects.get_all():
+            state.do()
+    models.ZulipTopicState.reconcile_batch(100)
+    models.ZulipMessageState.reconcile_batch(100)
+    # The first observation precedes canonical creation. Make the real
+    # projector's deferred bind due now instead of sleeping for its retry.
+    session = contexts.Context().get_session()
+    session.execute(
+        "UPDATE bridge_zulip_v5_reaction_messages SET next_retry_at=NULL WHERE project_id=%s",
+        (account.project_id,),
+    )
+    reactions.ReactionChange.reconcile_batch(100)
+    assert session.execute(
+        "SELECT count(*) AS n FROM bridge_zulip_v5_reactions WHERE fact_uuid IS NOT NULL"
+    ).fetchone()["n"]
+    assert history.batch(account, 1)["revision"] == original_revision
+    second.execute()
+    assert second.status == "done", second.error_description
+    models.ZulipMessageState.reconcile_batch(100)
+    session.execute(
+        "UPDATE bridge_zulip_v5_reaction_messages SET next_retry_at=NULL WHERE project_id=%s",
+        (account.project_id,),
+    )
+    reactions.ReactionChange.reconcile_batch(100)
+    assert history.batch(account, 1)["ready"]
+    scan(account, data, monkeypatch)
+    assert pending(account) == []
+    session.execute(
+        "UPDATE bridge_zulip_v5_reactions SET fact_uuid=fact_uuid WHERE user_id=7"
+    )
+    assert history.batch(account, 1)["ready"]
+    # A newer provider observation must still fence an older in-flight scan,
+    # even when the reaction value itself did not change.
+    session.execute(
+        "UPDATE bridge_zulip_v5_reactions SET observed_at=observed_at+interval '1 second' WHERE user_id=7"
+    )
+    assert not history.batch(account, 1)["ready"]
+
+
 def test_unchanged_recovery_creates_no_processing_tasks_or_source_writes(
     history_account, monkeypatch, db
 ):

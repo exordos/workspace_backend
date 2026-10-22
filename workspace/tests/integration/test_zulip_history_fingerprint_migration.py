@@ -5,8 +5,34 @@
 import importlib.util
 
 import psycopg
+from psycopg import rows
 
 from workspace.tests.integration import conftest
+
+
+def test_reaction_fact_guard_migration_restores_previous_trigger(_database):
+    with conftest.isolated_migration_database(
+        "0252-Scope-shared-history-snapshot-invalidation-04417c.py"
+    ) as url:
+        path = next(conftest.MIGRATIONS_DIR.glob("0253-Keep-history-checkpoints-*.py"))
+        spec = importlib.util.spec_from_file_location("reaction_fact_guard", path)
+        migration = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(migration)
+        with psycopg.connect(
+            url, autocommit=True, row_factory=rows.dict_row
+        ) as connection:
+            before = connection.execute(migration.FUNCTION_SQL).fetchone()["definition"]
+            migration.migration_step.upgrade(connection)
+            assert (
+                migration.PROJECTED_FACT_GUARD
+                in connection.execute(migration.FUNCTION_SQL).fetchone()["definition"]
+            )
+            migration.migration_step.downgrade(connection)
+            assert (
+                connection.execute(migration.FUNCTION_SQL).fetchone()["definition"]
+                == before
+            )
+            migration.migration_step.upgrade(connection)
 
 
 def test_shared_snapshot_invalidation_migration_restores_previous_guard(_database):

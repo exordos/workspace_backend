@@ -125,6 +125,10 @@ Each observer still compares its next fresh provider snapshot independently.
 This prevents shared reaction/content writes from cancelling sibling snapshot
 children or taking another observer's account/cache locks. Changes outside the
 transaction-scoped history replay marker retain the ordinary invalidation fences.
+Migration 0253 also excludes writes to the derived reaction `fact_uuid` link.
+Reaction projection can fill or rewrite that link while sibling history tasks
+are pending; it does not change the provider snapshot. Newer observation times
+and real reaction changes still invalidate the affected checkpoints.
 An absent source ID withdraws that imported observer, not the shared canonical
 message. Pending native deliveries retain their existing duplicate-send guards.
 The bounded lookup also includes imported observations not yet represented in
