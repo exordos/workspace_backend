@@ -285,10 +285,13 @@ def _database():
         with psycopg.connect(TEST_DB_URL, connect_timeout=3):
             pass
     except Exception as exc:  # pragma: no cover - environment guard
-        pytest.skip(
-            "Test database is not reachable at %s (%s). Create it with: "
-            "CREATE DATABASE workspace_test OWNER workspace;" % (TEST_DB_URL, exc)
+        reason = (
+            "Test database is not reachable (%s). Create a dedicated workspace_test database."
+            % exc
         )
+        if os.environ.get("WORKSPACE_REQUIRE_INTEGRATION_TESTS") == "1":
+            pytest.fail(reason)
+        pytest.skip(reason)
 
     with psycopg.connect(TEST_DB_URL, autocommit=True) as conn:
         with conn.cursor() as cur:

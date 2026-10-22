@@ -232,78 +232,71 @@ def test_backfill_starts_only_after_realtime_queue_registration(
             "status": filters.EQ("new"),
         }
     )
-    assert len(pending) == 103
+    assert len(pending) == 3
     assert all(child.project_id == task.project_id for child in pending)
     (user_sync,) = [
         child
         for child in pending
         if isinstance(child.content, models.ImportUsersContent)
     ]
-    assert user_sync.priority == models.TASK_PRIORITY_IMPORT_USERS
-    service._iteration()
-    assert _stored(user_sync).status == "done"
-    next_user_sync = models.Task.objects.get_all(
-        filters={
-            "external_account_uuid": filters.EQ(account.uuid),
-            "priority": filters.EQ(models.TASK_PRIORITY_IMPORT_USERS),
-            "status": filters.EQ("waiting"),
-        }
-    )
-    assert next_user_sync == []
-    (first_sync,) = [
+    (channel_sync,) = [
         child
         for child in pending
         if isinstance(child.content, models.ImportChannelsContent)
     ]
-    history = sorted(
-        [
-            child
-            for child in pending
-            if isinstance(child.content, models.ImportHistoryContent)
-        ],
-        key=lambda child: child.created_at,
+    (history_scan,) = [
+        child
+        for child in pending
+        if isinstance(child.content, models.ScanHistoryContent)
+    ]
+    assert (
+        user_sync.priority == channel_sync.priority == models.TASK_PRIORITY_IMPORT_USERS
     )
-    assert [
-        (child.content.first_message_id, child.content.last_message_id)
-        for child in history
-    ] == [(10001, 10005), *[(first, first + 99) for first in range(9901, 0, -100)]]
-    assert all(
-        newer.created_at < older.created_at
-        for newer, older in zip(history, history[1:])
-    )
-    assert [child.priority for child in history] == list(range(10_000, 9_899, -1))
-    assert first_sync.project_id == account.project_id
-    assert first_sync.priority == models.TASK_PRIORITY_IMPORT_USERS == 500_000
-    assert first_sync.not_before_at is None
-    assert isinstance(first_sync.content, models.ImportChannelsContent)
-
+    assert history_scan.priority == models.TASK_PRIORITY_IMPORT_HISTORY
+    assert history_scan.content.first_message_id == 1
+    assert history_scan.content.last_message_id == 10005
+    assert history_scan.backfill_uuid == full_backfill.backfill_uuid
+    assert channel_sync.not_before_at is None
+    # The scan reads fixed provider ranges lazily, rather than eagerly queuing
+    # one import task per 100 IDs during realtime registration.
+    zulip.get_history_batch.side_effect = [
+        {"messages": [], "next_id": 9999, "history_limited": False},
+        {"messages": [], "next_id": 0, "history_limited": False},
+    ]
     service._iteration()
-    assert _stored(first_sync).status == "done"
-    pending = models.Task.objects.get_all(
-        filters={
-            "external_account_uuid": filters.EQ(account.uuid),
-            "status": filters.In(["new", "waiting"]),
-        }
-    )
-    assert {child.uuid for child in pending} == {child.uuid for child in history}
-
+    assert _stored(user_sync).status == "done"
     service._iteration()
-
-    assert _stored(history[0]).status == "done"
-    zulip.get_messages.assert_called_once_with(10001, 10005)
-    for child in history[1:]:
-        service._iteration()
-
-    assert all(_stored(child).status == "done" for child in history)
+    assert _stored(channel_sync).status == "done"
+    service._iteration()
+    assert _stored(history_scan).status == "done"
+    (continuation,) = models.Task.objects.get_all(
+        filters={"external_account_uuid": account.uuid, "status": "new"}
+    )
+    assert isinstance(continuation.content, models.ScanHistoryContent)
+    assert continuation.content.first_message_id == 1
+    assert continuation.content.last_message_id == 9999
+    assert continuation.backfill_uuid == full_backfill.backfill_uuid
+    service._iteration()
+    assert _stored(continuation).status == "done"
+    assert (
+        models.Task.objects.get_all(
+            filters={
+                "external_account_uuid": account.uuid,
+                "status": filters.In(["new", "waiting"]),
+            }
+        )
+        == []
+    )
     zulip.check_connection.assert_called_once_with()
     zulip.get_last_message_id.assert_not_called()
     zulip.get_channels.assert_called_once_with()
     zulip.get_users.assert_called_once_with()
-    assert zulip.get_messages.call_args_list == [
+    zulip.get_messages.assert_not_called()
+    assert zulip.get_history_batch.call_args_list == [
         mock.call(10001, 10005),
-        *[mock.call(first, first + 99) for first in range(9901, 0, -100)],
+        mock.call(9001, 9999),
     ]
-    assert zulip.close.call_count == len(history) + 3
+    assert zulip.close.call_count == 5
     assert (
         external_models.ExternalAccount.objects.get_one(
             filters={"uuid": account.uuid}
@@ -321,7 +314,7 @@ def test_failed_full_backfill_does_not_leave_partial_child_tasks(
         project_id=initial.project_id,
         external_account_uuid=initial.external_account_uuid,
         priority=models.TASK_PRIORITY_FULL_BACKFILL,
-        content=models.ActualizeBackfillContent(
+        content=models.FullBackfillContent(
             last_message_id=10005,
             since=datetime.datetime.now(datetime.timezone.utc)
             - datetime.timedelta(days=30),

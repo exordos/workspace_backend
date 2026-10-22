@@ -99,12 +99,17 @@ import urllib.parse
 config = configparser.ConfigParser(interpolation=None)
 config.read(sys.argv[1])
 url = urllib.parse.urlsplit(config["db"]["connection_url"])
+# libpq URL query parameters override authority/path values, including
+# Unix-socket hosts and non-default ports used by isolated installations.
+parameters = dict(urllib.parse.parse_qsl(
+    url.query.replace("+", "%2B"), keep_blank_values=True
+))
 values = {
-    "WORKSPACE_PG_ENDPOINT": url.hostname or "localhost",
-    "WORKSPACE_PG_PORT": str(url.port or 5432),
-    "WORKSPACE_PG_USER": urllib.parse.unquote(url.username or "workspace"),
-    "WORKSPACE_PG_PASS": urllib.parse.unquote(url.password or ""),
-    "WORKSPACE_PG_DB": urllib.parse.unquote(url.path.lstrip("/") or "workspace"),
+    "WORKSPACE_PG_ENDPOINT": parameters.get("host", url.hostname or "localhost"),
+    "WORKSPACE_PG_PORT": parameters.get("port", str(url.port or 5432)),
+    "WORKSPACE_PG_USER": parameters.get("user", urllib.parse.unquote(url.username or "workspace")),
+    "WORKSPACE_PG_PASS": parameters.get("password", urllib.parse.unquote(url.password or "")),
+    "WORKSPACE_PG_DB": parameters.get("dbname", urllib.parse.unquote(url.path.lstrip("/") or "workspace")),
 }
 for key, value in values.items():
     print(f"{key}={shlex.quote(value)}")

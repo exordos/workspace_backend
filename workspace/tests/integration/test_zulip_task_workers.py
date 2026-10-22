@@ -888,7 +888,7 @@ def test_file_send_retries_when_account_is_locked_after_preparation(
         [(task_uuid, owner)] = service._claim_tasks(1)
     original = service._locked_task
     calls = 0
-    blocker = psycopg.connect(db.info.dsn)
+    blocker = psycopg.connect(conftest.TEST_DB_URL)
 
     def lock_after_prepare(claimed_uuid, claimed_owner):
         nonlocal calls
