@@ -34,6 +34,7 @@ from workspace.common import messenger_reaction_opts
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api.api import resource_projection
 from workspace.messenger_api.dm import message_payloads
+from workspace.messenger_api.dm import synchronization
 from workspace.messenger_api.dm import v2_models
 from workspace.services.messenger_workers import owned_projection
 
@@ -1148,7 +1149,7 @@ def _message_namespace(
                message.author_uuid AS user_uuid, message.payload,
                message.created_at, message.updated_at, message.source_name,
                message.provider_uuid,
-               message.provider_identity, message.reaction_users
+               message.provider_identity, message.status, message.reaction_users
         FROM messenger_message_placements AS placement
         JOIN messenger_messages AS message
           ON message.project_id = placement.project_id
@@ -3400,6 +3401,7 @@ def process_one_projection_task(
             metrics[outcome_key] = metrics.get(outcome_key, 0.0) + 1
     except Exception as error:
         session.execute("ROLLBACK TO SAVEPOINT messenger_v2_projection_task", ())
+        synchronization.record_error(error, session=session)
         attempts = int(task["attempts"])
         status = "dead_letter" if attempts >= max_attempts else "failed"
         outcome = status

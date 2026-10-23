@@ -121,6 +121,7 @@ def test_snapshot_projects_reactions_and_updates_public_counts_without_echo(
     (fact,) = facts(account)
     assert fact.user_uuid == account.owner_user_uuid and fact.emoji_name == "thumbs_up"
     assert fact.source_name == "zulip"
+    assert fact.status == "active"
     assert fact.provider_uuid == account.provider_uuid
     assert fact.provider_identity == "42:7:thumbs_up"
     snapshot(imported, [reaction()])

@@ -706,6 +706,7 @@ def test_realtime_message_is_converted_with_attachments_before_workspace_creatio
         api.get(f"/v1/messenger/files/{file_uuid}/actions/download").content == b"photo"
     )
     zulip.download_file.assert_called_once_with(path)
+    assert api.get(f"/v1/messenger/files/{file_uuid}").json()["status"] == "active"
     assert db.execute(
         "SELECT source_name,provider_uuid,provider_identity FROM m_workspace_files WHERE uuid=%s",
         (file_uuid,),

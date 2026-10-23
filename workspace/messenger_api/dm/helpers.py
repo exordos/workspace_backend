@@ -52,7 +52,7 @@ WORKSPACE_USER_PRESENCE_EVENT_FIELDS = (
 )
 DIRECT_STREAM_NAMESPACE = sys_uuid.UUID("26f42131-4503-5f59-8aa6-32b20f551751")
 STREAM_SOURCE_IDENTITY_FIELDS = frozenset(
-    {"source_name", "provider_uuid", "provider_identity"}
+    {"source_name", "provider_uuid", "provider_identity", "status"}
 )
 DIRECT_STREAM_IDENTITY_FIELDS = frozenset(
     {"direct_user_uuid", "private_index", "private"}

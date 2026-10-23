@@ -481,6 +481,7 @@ def create_message_events(
         "starred": False,
         "reactions": {},
         "source_name": message.source_name,
+        "status": message.status,
         "provider_uuid": message.provider_uuid,
         "provider_identity": message.provider_identity,
         "reaction_users": getattr(message, "reaction_users", {}) or {},

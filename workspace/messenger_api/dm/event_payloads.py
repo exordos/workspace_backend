@@ -43,7 +43,15 @@ class MessageEventTimestampType(types.UTCDateTimeZ):
 MESSAGE_EVENT_TIMESTAMP_TYPE = MessageEventTimestampType()
 
 
+class WorkspaceEntityEventSnapshot(models.Model):
+    def __init__(self, **kwargs: typing.Any) -> None:
+        # Historical event snapshots predate the operational status field.
+        kwargs.setdefault("status", "active")
+        super().__init__(**kwargs)
+
+
 class MessageEventPayloadBase(
+    WorkspaceEntityEventSnapshot,
     types_dynamic.AbstractKindModel,
     base.WorkspaceUserMessageBase,
 ):
@@ -193,6 +201,7 @@ class FolderUpdatedEventPayload(FolderEventPayloadBase):
 
 
 class StreamEventPayloadBase(
+    WorkspaceEntityEventSnapshot,
     types_dynamic.AbstractKindModel,
     base.WorkspaceUserStreamBase,
 ):
@@ -221,6 +230,7 @@ class StreamReadEventPayload(StreamEventPayloadBase):
 
 
 class TopicEventPayloadBase(
+    WorkspaceEntityEventSnapshot,
     types_dynamic.AbstractKindModel,
     base.UserScopedModelWithUUID,
     models.ModelWithProject,

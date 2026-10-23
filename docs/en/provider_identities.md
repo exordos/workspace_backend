@@ -47,3 +47,24 @@ restores the previous source representation and hostname-prefixed account IDs.
 Downgrading after creating multiple same-type accounts for one owner requires
 resolving those accounts first because the old schema cannot represent them.
 Provider deletion uses cascading foreign keys for provider-owned rows.
+
+
+## Synchronization status
+
+All eight provider-aware domain models expose a read-only `status` with values
+`new`, `syncing`, `active`, and `error`. Native entities start and remain
+`active`. A newly constructed provider entity starts as `new`; an import that
+creates an already complete entity persists it directly as `active`.
+Existing records are backfilled as `active` by migration 0264.
+
+Provider reconciliation transitions an existing entity to `syncing`, then to
+`active` after successful processing. A failed worker records `error` for its
+specific persisted entity after rolling back the failed data writes. A retry
+can return it to `active`. Existing data remains readable in every status.
+Account connectivity errors do not mark all imported objects as failed.
+
+These transitions use the existing worker transaction. Intermediate `syncing`
+changes are not separately committed or broadcast. Status-only updates do not
+change domain timestamps, counters, or enqueue new reconciliation work.
+Archive, completion, read, starred and pinned fields remain independent.
+Native message exports retain `active`; remote delivery uses its own state.

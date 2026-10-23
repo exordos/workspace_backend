@@ -561,6 +561,7 @@ class ConversionContext:
                     description="",
                     stream_uuid=stream_uuid,
                     source_name="zulip",
+                    status="active",
                     provider_uuid=self.account.provider_uuid,
                     provider_identity=str(uuid.uuid5(self.account.provider_uuid, path)),
                     content_type=content_type,

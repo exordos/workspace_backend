@@ -2175,6 +2175,10 @@ def test_fair_scheduler_bounds_fanout_under_large_read_backlog(api, monkeypatch)
                     json.dumps(payload),
                 ),
             )
+        # Plan bulk fixture alignment against its current size, not earlier tests.
+        session.execute(
+            "ANALYZE messenger_projection_tasks, messenger_domain_outbox_events", ()
+        )
         session.execute(
             """
             UPDATE messenger_projection_tasks AS task

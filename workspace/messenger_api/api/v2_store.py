@@ -1282,6 +1282,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 "source_name",
                 "provider_uuid",
                 "provider_identity",
+                "status",
                 "direct_user_uuid",
                 "private_index",
                 "private",

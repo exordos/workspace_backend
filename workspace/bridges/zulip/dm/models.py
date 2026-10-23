@@ -58,6 +58,7 @@ from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.dm import helpers as messenger_helpers
 from workspace.messenger_api.dm import message_payloads
 from workspace.messenger_api.dm import models as messenger_models
+from workspace.messenger_api.dm import synchronization
 from workspace.messenger_api.dm import v2_models
 
 
@@ -233,6 +234,7 @@ class ZulipStreamState(
     def get_id(self) -> tuple[sys_uuid.UUID, sys_uuid.UUID]:
         return self.project_id, self.stream_uuid
 
+    @synchronization.track_entity(v2_models.WorkspaceStream, uuid="stream_uuid")
     def do(self) -> None:
         {
             "create": self.create_workspace_stream,
@@ -419,6 +421,7 @@ class ZulipStreamBindingState(
     def get_id(self) -> tuple[sys_uuid.UUID, sys_uuid.UUID, sys_uuid.UUID]:
         return self.project_id, self.stream_uuid, self.user_uuid
 
+    @synchronization.track_entity(v2_models.WorkspaceStreamBinding, uuid="binding_uuid")
     def do(self) -> None:
         {
             "create": self.create_workspace_binding,
@@ -589,6 +592,7 @@ class ZulipTopicState(
             ZulipTopicChange.acknowledge_many(changes)
         return len(changes)
 
+    @synchronization.track_entity(v2_models.WorkspaceStreamTopic, uuid="topic_uuid")
     def do(self) -> None:
         {
             "create": self.create_workspace_topic,
@@ -685,6 +689,11 @@ class ZulipTopicNotificationState(models.ModelWithID, orm.SQLStorableMixin):
     def get_id(self) -> tuple[sys_uuid.UUID, sys_uuid.UUID, sys_uuid.UUID]:
         return self.project_id, self.user_uuid, self.topic_uuid
 
+    @synchronization.track_entity(
+        v2_models.WorkspaceUserTopicBinding,
+        topic_uuid="topic_uuid",
+        user_uuid="user_uuid",
+    )
     def do(self) -> None:
         session = contexts.Context().get_session()
         messenger_helpers._lock_workspace_project_event_writes(self.project_id, session)
@@ -1116,6 +1125,7 @@ class ZulipMessageState(
                 project_id, messages, session=session, compact=True
             )
 
+    @synchronization.track_entity(v2_models.WorkspaceMessage, uuid="message_uuid")
     def do(self) -> None:
         {
             "create": self.create_workspace_message,
@@ -1165,6 +1175,7 @@ class ZulipMessageState(
                     content=source.content.workspace_content,
                 ),
                 source_name=messenger_base.SourceName.ZULIP.value,
+                status="active",
                 provider_uuid=account.provider_uuid,
                 provider_identity=str(source.message_id),
                 ingest_sequence=sequence,
@@ -1411,6 +1422,9 @@ class ZulipUserMessageState(
     def get_id(self) -> tuple[sys_uuid.UUID, sys_uuid.UUID, sys_uuid.UUID]:
         return self.project_id, self.message_uuid, self.user_uuid
 
+    @synchronization.track_entity(
+        v2_models.WorkspaceUserMessageState, uuid="state_uuid"
+    )
     def do(self) -> None:
         binding = v2_models.WorkspaceUserMessageBinding.objects.get_one_or_none(
             filters={
@@ -4224,6 +4238,7 @@ class Task(
             self.on_done()
 
     def on_error(self, error: Exception) -> None:
+        synchronization.record_error(error)
         self.status = TaskStatus.ERROR.value
         self.error_description = str(error)
         self.next_retry_at = None
@@ -4709,6 +4724,7 @@ class RealtimeEvent(
             with utils.savepoint():
                 event.dispatch()
         except Exception as error:
+            synchronization.record_error(error)
             LOG.exception("Failed to dispatch Zulip event %s", event.uuid)
             event.attempts += 1
             event.error_description = str(error)

@@ -22,6 +22,7 @@ from workspace.bridges.zulip.dm import flags as message_flags
 from workspace.bridges.zulip.dm import reactions as message_reactions
 from workspace.bridges.zulip.dm import models
 from workspace.messenger_api.dm import external_models
+from workspace.messenger_api.dm import synchronization
 
 
 LOG = logging.getLogger(__name__)
@@ -46,8 +47,14 @@ class ZulipRealtimeService:
 
     @staticmethod
     def _transaction(callback: typing.Callable, args: tuple) -> typing.Any:
-        with contexts.Context().session_manager():
-            return callback(*args)
+        try:
+            with contexts.Context().session_manager():
+                return callback(*args)
+        except Exception as error:
+            if getattr(error, "workspace_sync_scopes", ()):
+                with contexts.Context().session_manager() as session:
+                    synchronization.record_error(error, session=session)
+            raise
 
     async def _database(
         self, callback: typing.Callable, *args: typing.Any

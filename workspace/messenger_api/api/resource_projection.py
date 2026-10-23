@@ -75,6 +75,7 @@ def as_dict(
         "message_reactions",
         "files",
     }:
+        result.setdefault("status", "active")
         result.setdefault("provider_uuid", None)
         result.setdefault("provider_identity", None)
     if resource == "streams":

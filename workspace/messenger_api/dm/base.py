@@ -73,7 +73,29 @@ class TopicSourceName(str, enum.Enum):
     ZULIP = "zulip"
 
 
-class WorkspaceProviderBase(models.Model):
+class WorkspaceSyncStatus(str, enum.Enum):
+    NEW = "new"
+    SYNCING = "syncing"
+    ACTIVE = "active"
+    ERROR = "error"
+
+
+class WorkspaceSyncStatusBase(models.Model):
+    status = properties.property(
+        types.Enum([status.value for status in WorkspaceSyncStatus]),
+        default=WorkspaceSyncStatus.ACTIVE.value,
+        read_only=True,
+    )
+
+    def __init__(self, **kwargs: typing.Any) -> None:
+        kwargs.setdefault(
+            "status",
+            "active" if kwargs.get("source_name", "native") == "native" else "new",
+        )
+        super().__init__(**kwargs)
+
+
+class WorkspaceProviderBase(WorkspaceSyncStatusBase):
     source_name = properties.property(
         types.Enum([source.value for source in SourceName]),
         default=SourceName.NATIVE.value,
@@ -89,6 +111,8 @@ class WorkspaceProviderBase(models.Model):
             raise ra_exc.ValidationErrorException()
         if self.source_name == "native" and self.provider_uuid is not None:
             raise ra_exc.ValidationErrorException()
+        if self.source_name == "native" and self.status != "active":
+            raise ra_exc.ValidationErrorException()
 
     @staticmethod
     def validate_native_creation(values: dict[str, typing.Any]) -> None:
@@ -96,12 +120,15 @@ class WorkspaceProviderBase(models.Model):
             values.get("source_name", "native") != "native"
             or values.get("provider_uuid") is not None
             or values.get("provider_identity") is not None
+            or values.get("status", "active") != "active"
         ):
             raise ra_exc.ValidationErrorException()
 
     @staticmethod
     def validate_provider_update(values: dict[str, typing.Any]) -> None:
-        if {"source_name", "provider_uuid", "provider_identity"}.intersection(values):
+        if {"source_name", "provider_uuid", "provider_identity", "status"}.intersection(
+            values
+        ):
             raise ra_exc.ValidationErrorException()
 
 
@@ -254,6 +281,7 @@ class WorkspaceTopicNotificationMode(str, enum.Enum):
 
 
 class WorkspaceStreamBase(
+    WorkspaceSyncStatusBase,
     models.ModelWithUUID,
     models.ModelWithProject,
     common_models.ModelWithRequiredNameDesc,
@@ -335,6 +363,7 @@ class WorkspaceStreamEncryptionCreation(models.Model):
 
 
 class WorkspaceUserStreamBase(
+    WorkspaceSyncStatusBase,
     UserScopedModelWithUUID,
     common_models.ModelWithRequiredNameDesc,
     models.ModelWithProject,

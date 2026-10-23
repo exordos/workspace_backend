@@ -411,6 +411,16 @@ components:
     WorkspaceFile_Get:
       type: object
       properties:
+        status:
+          type: string
+          enum:
+          - active
+          - error
+          - new
+          - syncing
+          example: new
+          readOnly: true
+          default: active
         source_name:
           type: string
           enum:
@@ -702,6 +712,16 @@ components:
     WorkspaceMessageReactions_Get:
       type: object
       properties:
+        status:
+          type: string
+          enum:
+          - active
+          - error
+          - new
+          - syncing
+          example: new
+          readOnly: true
+          default: active
         source_name:
           type: string
           enum:
@@ -798,6 +818,16 @@ components:
           format: date-time
           readOnly: true
           default: '2006-01-02T15:04:05.000576Z'
+        status:
+          type: string
+          enum:
+          - active
+          - error
+          - new
+          - syncing
+          example: new
+          readOnly: true
+          default: active
         source_name:
           type: string
           enum:
@@ -1044,6 +1074,16 @@ components:
     WorkspaceStreamBinding_Get:
       type: object
       properties:
+        status:
+          type: string
+          enum:
+          - active
+          - error
+          - new
+          - syncing
+          example: new
+          readOnly: true
+          default: active
         source_name:
           type: string
           enum:
@@ -1162,6 +1202,16 @@ components:
           format: date-time
           readOnly: true
           default: '2006-01-02T15:04:05.000576Z'
+        status:
+          type: string
+          enum:
+          - active
+          - error
+          - new
+          - syncing
+          example: new
+          readOnly: true
+          default: active
         source_name:
           type: string
           enum:
@@ -1287,6 +1337,16 @@ components:
     WorkspaceUserStream_Get:
       type: object
       properties:
+        status:
+          type: string
+          enum:
+          - active
+          - error
+          - new
+          - syncing
+          example: new
+          readOnly: true
+          default: active
         uuid:
           type: string
           example: 00000000-0000-0000-0000-000000000000
@@ -2486,6 +2546,19 @@ components:
         type: string
         example: any_string
         nullable: true
+    WorkspaceFile_status:
+      name: status
+      in: query
+      schema:
+        type: string
+        enum:
+        - active
+        - error
+        - new
+        - syncing
+        example: new
+        readOnly: true
+        default: active
     WorkspaceFile_source_name:
       name: source_name
       in: query
@@ -2968,6 +3041,19 @@ components:
         format: date-time
         readOnly: true
         nullable: true
+    WorkspaceMessageReactions_status:
+      name: status
+      in: query
+      schema:
+        type: string
+        enum:
+        - active
+        - error
+        - new
+        - syncing
+        example: new
+        readOnly: true
+        default: active
     WorkspaceMessageReactions_source_name:
       name: source_name
       in: query
@@ -3121,6 +3207,19 @@ components:
         format: date-time
         readOnly: true
         default: '2006-01-02T15:04:05.000576Z'
+    WorkspaceUserMessage_status:
+      name: status
+      in: query
+      schema:
+        type: string
+        enum:
+        - active
+        - error
+        - new
+        - syncing
+        example: new
+        readOnly: true
+        default: active
     WorkspaceUserMessage_source_name:
       name: source_name
       in: query
@@ -3366,6 +3465,19 @@ components:
           key: value
         readOnly: true
         default: {}
+    WorkspaceStreamBinding_status:
+      name: status
+      in: query
+      schema:
+        type: string
+        enum:
+        - active
+        - error
+        - new
+        - syncing
+        example: new
+        readOnly: true
+        default: active
     WorkspaceStreamBinding_source_name:
       name: source_name
       in: query
@@ -3552,6 +3664,19 @@ components:
         format: date-time
         readOnly: true
         default: '2006-01-02T15:04:05.000576Z'
+    WorkspaceUserTopic_status:
+      name: status
+      in: query
+      schema:
+        type: string
+        enum:
+        - active
+        - error
+        - new
+        - syncing
+        example: new
+        readOnly: true
+        default: active
     WorkspaceUserTopic_source_name:
       name: source_name
       in: query
@@ -3718,6 +3843,19 @@ components:
         example: 'off'
         readOnly: true
         nullable: true
+    WorkspaceUserStream_status:
+      name: status
+      in: query
+      schema:
+        type: string
+        enum:
+        - active
+        - error
+        - new
+        - syncing
+        example: new
+        readOnly: true
+        default: active
     WorkspaceUserStream_uuid:
       name: uuid
       in: query
@@ -5355,6 +5493,7 @@ paths:
         - provider_uuid
         - size_bytes
         - source_name
+        - status
         - storage_id
         - storage_object_id
         - storage_type
@@ -5362,6 +5501,7 @@ paths:
         - updated_at
         - user_uuid
         - uuid
+      - $ref: '#/components/parameters/WorkspaceFile_status'
       - $ref: '#/components/parameters/WorkspaceFile_source_name'
       - $ref: '#/components/parameters/WorkspaceFile_provider_uuid'
       - $ref: '#/components/parameters/WorkspaceFile_provider_identity'
@@ -5999,9 +6139,11 @@ paths:
         - provider_identity
         - provider_uuid
         - source_name
+        - status
         - updated_at
         - user_uuid
         - uuid
+      - $ref: '#/components/parameters/WorkspaceMessageReactions_status'
       - $ref: '#/components/parameters/WorkspaceMessageReactions_source_name'
       - $ref: '#/components/parameters/WorkspaceMessageReactions_provider_uuid'
       - $ref: '#/components/parameters/WorkspaceMessageReactions_provider_identity'
@@ -6166,6 +6308,7 @@ paths:
         - read
         - source_name
         - starred
+        - status
         - stream_uuid
         - topic_uuid
         - updated_at
@@ -6176,6 +6319,7 @@ paths:
       - $ref: '#/components/parameters/WorkspaceUserMessage_project_id'
       - $ref: '#/components/parameters/WorkspaceUserMessage_created_at'
       - $ref: '#/components/parameters/WorkspaceUserMessage_updated_at'
+      - $ref: '#/components/parameters/WorkspaceUserMessage_status'
       - $ref: '#/components/parameters/WorkspaceUserMessage_source_name'
       - $ref: '#/components/parameters/WorkspaceUserMessage_provider_uuid'
       - $ref: '#/components/parameters/WorkspaceUserMessage_provider_identity'
@@ -6793,11 +6937,13 @@ paths:
         - provider_uuid
         - role
         - source_name
+        - status
         - stream_uuid
         - updated_at
         - user_uuid
         - uuid
         - who_uuid
+      - $ref: '#/components/parameters/WorkspaceStreamBinding_status'
       - $ref: '#/components/parameters/WorkspaceStreamBinding_source_name'
       - $ref: '#/components/parameters/WorkspaceStreamBinding_provider_uuid'
       - $ref: '#/components/parameters/WorkspaceStreamBinding_provider_identity'
@@ -6940,6 +7086,7 @@ paths:
         - provider_identity
         - provider_uuid
         - source_name
+        - status
         - stream_uuid
         - summary
         - summary_enabled
@@ -6956,6 +7103,7 @@ paths:
       - $ref: '#/components/parameters/WorkspaceUserTopic_project_id'
       - $ref: '#/components/parameters/WorkspaceUserTopic_created_at'
       - $ref: '#/components/parameters/WorkspaceUserTopic_updated_at'
+      - $ref: '#/components/parameters/WorkspaceUserTopic_status'
       - $ref: '#/components/parameters/WorkspaceUserTopic_source_name'
       - $ref: '#/components/parameters/WorkspaceUserTopic_provider_uuid'
       - $ref: '#/components/parameters/WorkspaceUserTopic_provider_identity'
@@ -7323,10 +7471,12 @@ paths:
         - provider_uuid
         - role
         - source_name
+        - status
         - unread_count
         - updated_at
         - user_uuid
         - uuid
+      - $ref: '#/components/parameters/WorkspaceUserStream_status'
       - $ref: '#/components/parameters/WorkspaceUserStream_uuid'
       - $ref: '#/components/parameters/WorkspaceUserStream_user_uuid'
       - $ref: '#/components/parameters/WorkspaceUserStream_name'

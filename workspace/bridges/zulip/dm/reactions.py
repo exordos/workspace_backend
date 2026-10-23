@@ -24,6 +24,7 @@ from workspace.services.messenger_workers import owned_projection
 from workspace.bridges.zulip import client
 from workspace.common import emoji
 from workspace.messenger_api.dm import external_models
+from workspace.messenger_api.dm import synchronization
 from workspace.messenger_api.dm import v2_models
 
 
@@ -420,6 +421,19 @@ def reconcile(project_id: uuid.UUID, canonical_uuid: uuid.UUID) -> bool:
         )
         .fetchall()
     )
+    with synchronization.synchronize(
+        v2_models.WorkspaceMessageReactionFact,
+        project_id,
+        canonical_message_uuid=canonical_uuid,
+    ):
+        return _reconcile_observations(project_id, canonical_uuid, messages)
+
+
+def _reconcile_observations(
+    project_id: uuid.UUID,
+    canonical_uuid: uuid.UUID,
+    messages: list[dict[str, typing.Any]],
+) -> bool:
     observations = (
         _session()
         .execute(
@@ -523,6 +537,7 @@ def reconcile(project_id: uuid.UUID, canonical_uuid: uuid.UUID) -> bool:
                 user_uuid=key[0],
                 emoji_name=key[1],
                 source_name="zulip" if rows else "native",
+                status="active",
                 provider_uuid=rows[0]["provider_uuid"] if rows else None,
                 provider_identity=f"{rows[0]['message_id']}:{rows[0]['user_id']}:{key[1]}"
                 if rows

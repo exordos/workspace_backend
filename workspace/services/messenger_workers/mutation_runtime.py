@@ -29,6 +29,7 @@ from workspace.bridges.zulip.dm import reactions
 from workspace.messenger_api import events
 from workspace.messenger_api.api import v2_store
 from workspace.messenger_api.dm import message_payloads
+from workspace.messenger_api.dm import synchronization
 from workspace.messenger_api.dm import v2_models
 from workspace.services.messenger_workers import keyed_dispatcher
 from workspace.services.messenger_workers import owned_projection
@@ -825,6 +826,17 @@ class MutationRuntime:
                 )
 
     def _execute(self, work: keyed_dispatcher.Work) -> owned_projection.Changes:
+        try:
+            return self._execute_transaction(work)
+        except Exception as error:
+            if getattr(error, "workspace_sync_scopes", ()):
+                with contexts.Context().session_manager() as session:
+                    synchronization.record_error(error, session=session)
+            raise
+
+    def _execute_transaction(
+        self, work: keyed_dispatcher.Work
+    ) -> owned_projection.Changes:
         with contexts.Context().session_manager() as session:
             session.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", ())
             with owned_projection.capture() as changes:
