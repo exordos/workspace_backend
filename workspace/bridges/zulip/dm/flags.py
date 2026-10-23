@@ -125,12 +125,15 @@ def record(
     observed_at: datetime.datetime,
     event_id: int = -1,
 ) -> None:
+    # Zulip coalesces consecutive flag events and may repeat message IDs.
+    message_ids = sorted(set(message_ids))
     if mutation_journal_opts.enabled():
         _record_owned(
             account,
-            [(message_id, flag, value) for message_id in message_ids],
-            observed_at,
-            event_id,
+            [
+                (message_id, flag, value, observed_at, event_id)
+                for message_id in message_ids
+            ],
         )
         return
     session = contexts.Context().get_session()
@@ -179,9 +182,7 @@ def record(
 
 def _record_owned(
     account: external_models.ExternalAccount,
-    observations: list[tuple[int, str, bool]],
-    observed_at: datetime.datetime,
-    event_id: int = -1,
+    observations: list[tuple[int, str, bool, datetime.datetime, int]],
 ) -> None:
     if not observations:
         return
@@ -194,17 +195,18 @@ def _record_owned(
         "SELECT set_config('workspace.owned_mutations','on',true), "
         "set_config('workspace.batch_flags','on',true)"
     )
-    message_ids, names, values = map(list, zip(*observations))
+    message_ids, names, values, times, event_ids = map(list, zip(*observations))
     changed = session.execute(
         """INSERT INTO bridge_zulip_v5_message_flags
              (project_id,external_account_uuid,message_id,flag,value,updated_at,event_id)
-           SELECT %s,%s,input.message_id,input.flag,input.value,%s,%s
-           FROM unnest(%s::bigint[],%s::text[],%s::boolean[]) AS input(message_id,flag,value)
-           WHERE %s < 0 OR input.message_id=0 OR NOT EXISTS (
+           SELECT %s,%s,input.message_id,input.flag,input.value,input.observed_at,input.event_id
+           FROM unnest(%s::bigint[],%s::text[],%s::boolean[],%s::timestamp[],%s::bigint[])
+               AS input(message_id,flag,value,observed_at,event_id)
+           WHERE input.event_id < 0 OR input.message_id=0 OR NOT EXISTS (
              SELECT 1 FROM bridge_zulip_v5_history_batches AS batch
              WHERE batch.external_account_uuid=%s
                AND batch.first_id=(input.message_id-1)/1000*1000+1
-               AND input.message_id<=batch.covered_to AND batch.observed_at >= %s)
+               AND input.message_id<=batch.covered_to AND batch.observed_at >= input.observed_at)
            ORDER BY input.message_id,input.flag
            ON CONFLICT (external_account_uuid,message_id,flag) DO UPDATE
              SET value=EXCLUDED.value,updated_at=EXCLUDED.updated_at,event_id=EXCLUDED.event_id
@@ -214,14 +216,12 @@ def _record_owned(
         (
             account.project_id,
             account.uuid,
-            observed_at.replace(tzinfo=None),
-            event_id,
             message_ids,
             names,
             values,
-            event_id,
+            [at.replace(tzinfo=None) for at in times],
+            event_ids,
             account.uuid,
-            observed_at.replace(tzinfo=None),
         ),
     ).fetchall()
     mirrored = session.execute(
@@ -286,6 +286,29 @@ def _record_owned(
     )
 
 
+def record_message_events(
+    account: external_models.ExternalAccount, events: list["zulip_models.RealtimeEvent"]
+) -> None:
+    observations: dict[
+        tuple[int, str], tuple[int, str, bool, datetime.datetime, int]
+    ] = {}
+    for event in events:
+        if event.payload["type"] != "message" or "flags" not in event.payload:
+            continue
+        for flag in FLAGS:
+            row = (
+                event.payload["message"]["id"],
+                flag,
+                flag in event.payload["flags"],
+                event.created_at,
+                event.event_id,
+            )
+            key = row[:2]
+            if key not in observations or observations[key][3:] < row[3:]:
+                observations[key] = row
+    _record_owned(account, list(observations.values()))
+
+
 def observe_snapshot(
     account: external_models.ExternalAccount,
     messages: list[dict],
@@ -297,11 +320,10 @@ def observe_snapshot(
         _record_owned(
             account,
             [
-                (data["id"], flag, flag in data["flags"])
+                (data["id"], flag, flag in data["flags"], observed_at, -1)
                 for data in messages
                 for flag in FLAGS
             ],
-            observed_at,
         )
     else:
         for flag in FLAGS:

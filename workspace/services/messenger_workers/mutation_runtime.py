@@ -261,6 +261,7 @@ class MutationRuntime:
                 ("command", row["scope_key"]),
                 [row["uuid"]],
                 self._topic_reservations(row["project_id"], row["payload"]["topics"]),
+                priority=1 if row["operation"] in {"edit", "delete"} else 0,
             )
         tasks = session.execute(
             """SELECT * FROM messenger_projection_tasks
@@ -310,7 +311,7 @@ class MutationRuntime:
             "SELECT DISTINCT project_id FROM messenger_publication_outbox LIMIT 128",
             (),
         ).fetchall():
-            self._dispatcher.trigger(("publish", row["project_id"]))
+            self._dispatcher.trigger(("publish", row["project_id"]), priority=3)
 
     def _scan_provider_inputs(self, session: sessions.PgSQLSession) -> None:
         # Provider observations already have durable revisioned input journals.
@@ -321,23 +322,22 @@ class MutationRuntime:
                LIMIT 128""",
             (),
         ).fetchall():
-            topics = session.execute(
-                """SELECT topic_uuid FROM messenger_message_placements
-                   WHERE project_id=%s AND message_uuid=%s
-                   UNION
-                   SELECT observed.topic AS topic_uuid FROM bridge_zulip_v5_messages AS observed
-                   WHERE observed.project_id=%s
-                     AND messenger_uuid_v5(observed.project_id,observed.message_uuid::text)=%s""",
-                (
-                    row["project_id"],
-                    row["message_uuid"],
-                    row["project_id"],
-                    row["message_uuid"],
-                ),
-            ).fetchall()
+            topics = self._provider_topics(
+                session, row["project_id"], row["message_uuid"]
+            )
+            # The provider task creates streams and topics first. A new
+            # message journal entry can become visible before that task runs.
+            if any(not topic["ready"] for topic in topics):
+                continue
             self._dispatcher.trigger(
-                ("provider_message", row["project_id"], row["message_uuid"]),
+                (
+                    "provider_message",
+                    row["project_id"],
+                    tuple(sorted(topic["topic_uuid"] for topic in topics)),
+                ),
+                [row["message_uuid"]],
                 reservations=self._topic_reservations(row["project_id"], topics),
+                priority=2,
             )
         for row in session.execute(
             """SELECT change.project_id,change.state_uuid,placement.topic_uuid
@@ -379,9 +379,12 @@ class MutationRuntime:
         for work, changes, error in completed:
             if error is not None:
                 if isinstance(error, ScopeChanged):
-                    self._dispatcher.trigger(work.key, work.values, error.reservations)
+                    self._dispatcher.trigger(
+                        work.key, work.values, error.reservations, work.priority
+                    )
                     continue
-                if getattr(error, "sqlstate", None) in {"40001", "40P01"}:
+                database_error = getattr(error, "caused", error)
+                if getattr(database_error, "sqlstate", None) in {"40001", "40P01"}:
                     # PostgreSQL confirmed rollback. The original input is
                     # still durable; retrying it cannot lose a committed
                     # counter invalidation. Do not flood live work with a
@@ -858,11 +861,19 @@ class MutationRuntime:
                 elif kind == "command":
                     self._commands(session, work)
                 elif kind == "provider_message":
-                    if self._deleted_canonical(session, *work.key[1:]):
-                        self._ack_deleted_observations(session, *work.key[1:])
-                    else:
+                    messages = []
+                    for message_uuid in sorted(work.values)[: self._batch_size]:
+                        if self._deleted_canonical(session, work.key[1], message_uuid):
+                            self._ack_deleted_observations(
+                                session, work.key[1], message_uuid
+                            )
+                        else:
+                            messages.append(message_uuid)
+                    if messages:
                         zulip_models.ZulipMessageState.reconcile_batch(
-                            1, project_id=work.key[1], message_uuids=[work.key[2]]
+                            len(messages),
+                            project_id=work.key[1],
+                            message_uuids=messages,
                         )
                 elif kind == "provider_flags":
                     flags.FlagChange.reconcile_batch(
@@ -949,14 +960,29 @@ class MutationRuntime:
                         "user-topic",
                     )
                     changes.stream(project_id, stream_uuid, users)
+        # A concurrent account observation can advance an input revision while
+        # the repeatable-read projection commits. Acknowledge that revision in
+        # a fresh snapshot so a newer input cannot roll back visible messages.
+        if changes.message_acknowledgements:
+            try:
+                with contexts.Context().session_manager():
+                    for model, inputs in changes.message_acknowledgements.items():
+                        model.acknowledge_many(inputs)
+            except Exception:
+                # The projection committed and its counter invalidations must
+                # reach the dispatcher even when this optional cleanup fails.
+                # Durable inputs remain replayable until a later successful ACK.
+                LOG.exception("Failed to acknowledge committed Messenger inputs")
         return changes
 
     def _check_reservations(
         self, session: sessions.PgSQLSession, work: keyed_dispatcher.Work
     ) -> None:
         kind = work.key[0]
-        pairs = []
-        if kind in {"provider_message", "provider_reactions"}:
+        pairs: list[tuple[uuid.UUID, uuid.UUID]] = []
+        if kind == "provider_message":
+            pairs.extend((work.key[1], message_uuid) for message_uuid in work.values)
+        elif kind == "provider_reactions":
             pairs.append(work.key[1:])
         elif kind == "command" and ":message:" in work.key[1]:
             project_id, _kind, message_uuid = work.key[1].split(":")
@@ -1014,15 +1040,26 @@ class MutationRuntime:
                     pairs.append((project_id, row["message_uuid"]))
         required = set()
         for project_id, canonical_uuid in pairs:
-            topics = session.execute(
-                """SELECT topic_uuid FROM messenger_message_placements WHERE project_id=%s AND message_uuid=%s
-                   UNION SELECT topic AS topic_uuid FROM bridge_zulip_v5_messages
-                   WHERE project_id=%s AND messenger_uuid_v5(project_id,message_uuid::text)=%s""",
-                (project_id, canonical_uuid, project_id, canonical_uuid),
-            ).fetchall()
+            topics = self._provider_topics(session, project_id, canonical_uuid)
             required.update(self._topic_reservations(project_id, topics))
         if not required.issubset(work.reservations):
             raise ScopeChanged(required)
+
+    @staticmethod
+    def _provider_topics(
+        session: sessions.PgSQLSession, project_id: uuid.UUID, canonical_uuid: uuid.UUID
+    ) -> list[dict[str, typing.Any]]:
+        return session.execute(
+            """SELECT scope.topic_uuid, EXISTS (
+                   SELECT 1 FROM messenger_topics WHERE project_id=%s AND uuid=scope.topic_uuid
+               ) AS ready FROM (
+                   SELECT topic_uuid FROM messenger_message_placements WHERE project_id=%s AND message_uuid=%s
+                   UNION SELECT bridge_zulip_v5_workspace_topic_uuid(topic) AS topic_uuid
+                   FROM bridge_zulip_v5_messages
+                   WHERE project_id=%s AND messenger_uuid_v5(project_id,message_uuid::text)=%s
+               ) AS scope""",
+            (project_id, project_id, canonical_uuid, project_id, canonical_uuid),
+        ).fetchall()
 
     def close(self) -> None:
         self._dispatcher.close()

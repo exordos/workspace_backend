@@ -3,6 +3,8 @@
 # you may not use this file except in compliance with the License.
 
 import psycopg
+import pytest
+from restalchemy.storage import exceptions as storage_exceptions
 from restalchemy.storage.sql import sessions
 
 from workspace.services.messenger_workers import mutation_runtime
@@ -167,8 +169,9 @@ def test_healthy_runtime_does_not_start_full_catalog_repair_after_five_minutes(
         runtime.close()
 
 
+@pytest.mark.parametrize("wrapped", [False, True])
 def test_known_transaction_rollback_retries_without_full_catalog_repair(
-    api, db, conversation, monkeypatch
+    api, db, conversation, monkeypatch, wrapped
 ):
     _stream, messages, peer = conversation
     runtime = mutation_runtime.MutationRuntime()
@@ -183,9 +186,12 @@ def test_known_transaction_rollback_retries_without_full_catalog_repair(
                 "UPDATE messenger_mutation_commands SET status="
             ):
                 failed = True
-                raise psycopg.errors.SerializationFailure(
+                error = psycopg.errors.SerializationFailure(
                     "Injected guaranteed rollback"
                 )
+                if wrapped:
+                    error = storage_exceptions.UnknownStorageException(caused=error)
+                raise error
             return original(session, statement, *args, **kwargs)
 
         def forbidden(*args, **kwargs):

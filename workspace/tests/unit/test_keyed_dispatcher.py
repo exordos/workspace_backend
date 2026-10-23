@@ -21,6 +21,36 @@ def drain(dispatcher):
     return completions
 
 
+def test_message_work_overtakes_pending_flags_without_overlapping_its_topic():
+    calls = []
+    dispatcher = keyed_dispatcher.KeyedDispatcher(
+        lambda work: calls.append(work.key), workers=1
+    )
+    topic = ("topic", 1)
+    try:
+        dispatcher.trigger(("flags", 1), reservations=[topic], priority=0)
+        dispatcher.trigger(("message", 1), reservations=[topic], priority=2)
+        drain(dispatcher)
+        assert calls == [("message", 1), ("flags", 1)]
+    finally:
+        dispatcher.close()
+
+
+def test_priority_still_allows_old_background_work_to_make_progress():
+    calls = []
+    dispatcher = keyed_dispatcher.KeyedDispatcher(
+        lambda work: calls.append(work.key), workers=1
+    )
+    try:
+        dispatcher.trigger(("flags", 1), priority=0)
+        dispatcher._pending[("flags", 1)].created_at = time.monotonic() - 10
+        dispatcher.trigger(("message", 1), priority=2)
+        drain(dispatcher)
+        assert calls == [("flags", 1), ("message", 1)]
+    finally:
+        dispatcher.close()
+
+
 def test_running_scope_coalesces_one_rerun_without_blocking_other_topics():
     started, release, other = threading.Event(), threading.Event(), threading.Event()
     calls = []

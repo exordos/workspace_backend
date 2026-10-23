@@ -18,6 +18,87 @@ from workspace.bridges.zulip import history_fingerprints
 from workspace.messenger_api.dm import external_models
 
 
+def lock_observation_rows(
+    account: external_models.ExternalAccount,
+    observations: list[dict[str, typing.Any]],
+    *,
+    replay: bool | None = None,
+) -> None:
+    """Cache rows precede deliveries, then affected history batches in key order.
+
+    Callers prepare shared reaction cache rows before entering this fence.
+    A delivery or reaction can invalidate several observers' existing batches.
+    """
+    identifiers = {row["id"] for row in observations if isinstance(row.get("id"), int)}
+    if not identifiers:
+        return
+    session = contexts.Context().get_session()
+    deliveries = [
+        row["_delivery_uuid"] for row in observations if row.get("_delivery_uuid")
+    ]
+    shared = {
+        row["id"]
+        for row in observations
+        if row.get("reactions") or row.get("_delivery_uuid")
+    }
+    for row in session.execute(
+        """SELECT uuid,zulip_message_id FROM bridge_zulip_v5_deliveries
+           WHERE project_id=%s AND hostname=%s
+             AND (zulip_message_id=ANY(%s::bigint[]) OR uuid=ANY(%s::uuid[]))
+           ORDER BY uuid FOR NO KEY UPDATE""",
+        (account.project_id, account.get_host(), list(identifiers), deliveries),
+    ).fetchall():
+        if row["zulip_message_id"] is not None:
+            shared.add(row["zulip_message_id"])
+    if replay is None:
+        replay = bool(
+            session.execute(
+                "SELECT current_setting('workspace.zulip_history_batch',true) AS batch"
+            ).fetchone()["batch"]
+        )
+    if replay:
+        return
+    reaction_ids = [row["id"] for row in observations if "reactions" in row]
+    if reaction_ids:
+        shared.update(
+            row["message_id"]
+            for row in session.execute(
+                """SELECT cache.message_id FROM bridge_zulip_v5_reaction_messages AS cache
+               WHERE cache.project_id=%s AND cache.hostname=%s AND cache.message_id=ANY(%s::bigint[])
+                 AND EXISTS (SELECT 1 FROM bridge_zulip_v5_reactions AS fact
+                             WHERE fact.reaction_message_uuid=cache.uuid)""",
+                (account.project_id, account.get_host(), reaction_ids),
+            ).fetchall()
+        )
+    session.execute(
+        """SELECT external_account_uuid,first_id FROM bridge_zulip_v5_history_batches
+           WHERE project_id=%s AND hostname=%s AND (
+               (external_account_uuid=%s AND (%s OR first_id=ANY(%s::bigint[])))
+               OR first_id=ANY(%s::bigint[]))
+           ORDER BY external_account_uuid,first_id FOR NO KEY UPDATE""",
+        (
+            account.project_id,
+            account.get_host(),
+            account.uuid,
+            0 in identifiers,
+            sorted(
+                {
+                    (identifier - 1) // 1000 * 1000 + 1
+                    for identifier in identifiers
+                    if identifier > 0
+                }
+            ),
+            sorted(
+                {
+                    (identifier - 1) // 1000 * 1000 + 1
+                    for identifier in shared
+                    if identifier > 0
+                }
+            ),
+        ),
+    ).fetchall()
+
+
 def revision(account: external_models.ExternalAccount) -> str:
     return history_fingerprints.digest(
         [

@@ -27,7 +27,9 @@ history_import_opts = [
         choices=["background", "realtime"],
         help="Durable task queue consumed by this process",
     ),
-    cfg.IntOpt("workers", default=4, min=1, help="Maximum concurrent background tasks"),
+    cfg.IntOpt(
+        "workers", default=4, min=1, help="Maximum concurrent Zulip tasks per queue"
+    ),
     cfg.FloatOpt(
         "step-interval",
         default=3,
@@ -54,7 +56,7 @@ def main(queue: str | None = None) -> None:
     log = logging.getLogger(__name__)
 
     queue = queue or CONF[DOMAIN].queue
-    workers = 1 if queue == "realtime" else CONF[DOMAIN].workers
+    workers = CONF[DOMAIN].workers
     service = history_import.HistoryImportService(
         queue=queue,
         workers=workers,

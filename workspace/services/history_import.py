@@ -160,24 +160,46 @@ class HistoryImportService(basic.BasicService):
             "background": "AND task.queue='background'",
             "realtime": "AND task.queue='realtime'",
         }[self.queue]
+        first_send = "(task.content->>'kind'='send_message' AND NOT delivery.sending AND delivery.zulip_message_id IS NULL)"
         claimed = []
         for _index in range(limit):
             owner = uuid.uuid4()
             row = session.execute(
                 f"""WITH candidate AS (
                     SELECT task.uuid FROM bridge_zulip_v5_tasks AS task
+                    LEFT JOIN bridge_zulip_v5_deliveries AS delivery ON delivery.uuid=task.delivery_uuid
                     WHERE task.status IN ('new','waiting','retry')
                       {queue_filter}
                       AND (task.not_before_at IS NULL OR task.not_before_at<=now() AT TIME ZONE 'UTC')
                       AND (task.next_retry_at IS NULL OR task.next_retry_at<=now() AT TIME ZONE 'UTC')
                       AND (task.lease_expires_at IS NULL OR task.lease_expires_at<=now() AT TIME ZONE 'UTC')
+                      AND (task.queue<>'realtime' OR {first_send}
+                           OR %s=1 OR (
+                               SELECT count(*) FROM bridge_zulip_v5_tasks AS running
+                               LEFT JOIN bridge_zulip_v5_deliveries AS sent ON sent.uuid=running.delivery_uuid
+                               WHERE running.queue='realtime' AND running.status IN ('new','waiting','retry')
+                                 AND (running.content->>'kind'<>'send_message' OR sent.sending
+                                      OR sent.zulip_message_id IS NOT NULL)
+                                 AND running.lease_owner IS NOT NULL
+                                 AND running.lease_expires_at>now() AT TIME ZONE 'UTC'
+                           )<%s-1)
                       AND NOT EXISTS (
                           SELECT 1 FROM bridge_zulip_v5_tasks AS active
                           WHERE active.queue=task.queue AND active.concurrency_key=task.concurrency_key
                             AND active.status IN ('new','waiting','retry') AND active.lease_owner IS NOT NULL
                             AND active.lease_expires_at>now() AT TIME ZONE 'UTC'
+                            AND NOT (%s AND {first_send} AND active.content->>'kind'
+                                     IN ('update_message_flags','update_reaction'))
                       )
-                    ORDER BY task.priority DESC,task.message_created_at DESC,task.message_sequence DESC,
+                    ORDER BY CASE WHEN task.queue='realtime' THEN CASE
+                               WHEN {first_send} THEN 3
+                               WHEN task.content->>'kind'='send_message' THEN 2
+                               WHEN task.content->>'kind' IN ('import_history','reconcile_realtime',
+                                    'initialize_connection','import_users','import_channels') THEN 2
+                               WHEN task.content->>'kind' IN ('update_message_flags','update_reaction',
+                                    'update_notifications','refresh_message_flags') THEN 0
+                               ELSE 1 END ELSE 0 END DESC,
+                             task.priority DESC,task.message_created_at DESC,task.message_sequence DESC,
                              task.created_at,task.uuid
                     LIMIT 1 FOR UPDATE OF task SKIP LOCKED
                 )
@@ -188,7 +210,7 @@ class HistoryImportService(basic.BasicService):
                             not_before_at,next_retry_at,lease_expires_at)))),
                     lease_owner=%s,lease_expires_at=(now() AT TIME ZONE 'UTC')+interval '2 minutes'
                 FROM candidate WHERE task.uuid=candidate.uuid RETURNING task.uuid""",
-                (owner,),
+                (self.workers, self.workers, mutation_journal_opts.enabled(), owner),
             ).fetchone()
             if row is None:
                 break
@@ -203,7 +225,7 @@ class HistoryImportService(basic.BasicService):
         if task.external_account_uuid is not None:
             account = session.execute(
                 "SELECT uuid,status,settings ? 'api_key' AS has_credentials "
-                "FROM m_external_accounts_v2 WHERE project_id=%s AND uuid=%s FOR UPDATE SKIP LOCKED",
+                "FROM m_external_accounts_v2 WHERE project_id=%s AND uuid=%s FOR NO KEY UPDATE SKIP LOCKED",
                 (task.project_id, task.external_account_uuid),
             ).fetchone()
             if account is None:
