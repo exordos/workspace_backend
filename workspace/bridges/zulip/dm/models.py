@@ -557,7 +557,7 @@ class ZulipTopicState(
     )
     stream_uuid = properties.property(types.UUID(), required=True, read_only=True)
     action = properties.property(
-        types.Enum(["create", "delete"]), required=True, read_only=True
+        types.Enum(["create", "update", "delete"]), required=True, read_only=True
     )
 
     @classmethod
@@ -595,33 +595,48 @@ class ZulipTopicState(
     def do(self) -> None:
         {
             "create": self.create_workspace_topic,
+            "update": self.update_workspace_topic,
             "delete": self.delete_workspace_topic,
         }[self.action]()
 
     def create_workspace_topic(self) -> None:
-        topic = ZulipTopic.objects.get_one(
-            filters={"uuid": filters.EQ(self.topic_uuid)},
+        session = contexts.Context().get_session()
+        topic = ZulipTopic.objects.get_one_or_none(
+            filters={"uuid": filters.EQ(self.topic_uuid)}
         )
+        if topic is None:
+            source = session.execute(
+                "SELECT uuid FROM bridge_zulip_v5_topics WHERE workspace_topic_uuid=%s ORDER BY uuid LIMIT 1",
+                (self.topic_uuid,),
+            ).fetchone()
+            topic = ZulipTopic.objects.get_one(
+                filters={"uuid": filters.EQ(source["uuid"])}
+            )
+        # Older reconciliation projections expose only identity/action columns.
+        state = session.execute(
+            "SELECT to_jsonb(state) AS data FROM bridge_zulip_v5_topic_states AS state WHERE project_id=%s AND topic_uuid=%s",
+            (self.project_id, self.topic_uuid),
+        ).fetchone()["data"]
         workspace_topic = v2_models.WorkspaceStreamTopic(
             uuid=self.topic_uuid,
             project_id=self.project_id,
             stream_uuid=self.stream_uuid,
-            name=topic.name,
+            name=state.get("name", topic.name),
             source_name=messenger_models.TopicSourceName.ZULIP.value,
             source=messenger_models.ZulipSource(),
             created_at=topic.created_at,
         )
-        session = contexts.Context().get_session()
         restored = session.execute(
-            "INSERT INTO messenger_topics (uuid,project_id,stream_uuid,name,color,source_name,source,created_at,updated_at) "
-            "VALUES (%s,%s,%s,%s,%s,'zulip','{\"kind\":\"zulip\"}'::jsonb,%s,%s) "
-            "ON CONFLICT (project_id,uuid) DO UPDATE SET name=EXCLUDED.name,color=EXCLUDED.color,source_name=EXCLUDED.source_name,source=EXCLUDED.source,deleted_at=NULL,updated_at=EXCLUDED.updated_at WHERE messenger_topics.deleted_at IS NOT NULL RETURNING uuid",
+            "INSERT INTO messenger_topics (uuid,project_id,stream_uuid,name,color,is_done,source_name,source,created_at,updated_at) "
+            "VALUES (%s,%s,%s,%s,%s,%s,'zulip','{\"kind\":\"zulip\"}'::jsonb,%s,%s) "
+            "ON CONFLICT (project_id,uuid) DO UPDATE SET name=EXCLUDED.name,color=EXCLUDED.color,source_name=EXCLUDED.source_name,source=EXCLUDED.source,is_done=EXCLUDED.is_done,deleted_at=NULL,updated_at=EXCLUDED.updated_at WHERE messenger_topics.deleted_at IS NOT NULL RETURNING uuid",
             (
                 workspace_topic.uuid,
                 workspace_topic.project_id,
                 workspace_topic.stream_uuid,
                 workspace_topic.name,
                 workspace_topic.color,
+                state.get("is_done", False),
                 messenger_helpers._database_timestamp(workspace_topic.created_at),
                 messenger_helpers._database_timestamp(workspace_topic.updated_at),
             ),
@@ -646,6 +661,25 @@ class ZulipTopicState(
                 "source_kind": "topic.created",
                 "topic_uuid": str(self.topic_uuid),
                 "emit_public_event": False,
+            },
+        ).insert(session=session)
+
+    def update_workspace_topic(self) -> None:
+        session = contexts.Context().get_session()
+        session.execute(
+            "UPDATE messenger_topics AS topic SET name=state.name,is_done=state.is_done,version=version+1,updated_at=NOW() "
+            "FROM bridge_zulip_v5_topic_states AS state WHERE topic.project_id=%s AND topic.uuid=%s "
+            "AND state.project_id=topic.project_id AND state.topic_uuid=topic.uuid",
+            (self.project_id, self.topic_uuid),
+        )
+        v2_models.WorkspaceDomainOutboxEvent(
+            project_id=self.project_id,
+            event_kind="topic_state_projection",
+            scope_kind="topic",
+            scope_key=f"{self.project_id}:{self.topic_uuid}",
+            payload={
+                "source_kind": "topic.updated",
+                "topic_uuid": str(self.topic_uuid),
             },
         ).insert(session=session)
 
@@ -1655,6 +1689,27 @@ class ZulipTopic(
 ):
     __tablename__ = "bridge_zulip_v5_topics"
 
+    @property
+    def workspace_topic_uuid(self) -> sys_uuid.UUID | None:
+        value = self._identity()["workspace_topic_uuid"]
+        return sys_uuid.UUID(value) if value is not None else None
+
+    @property
+    def base_name(self) -> str | None:
+        return self._identity()["base_name"]
+
+    def _identity(self) -> dict:
+        return (
+            contexts.Context()
+            .get_session()
+            .execute(
+                "SELECT jsonb_build_object('workspace_topic_uuid',to_jsonb(topic)->'workspace_topic_uuid',"
+                "'base_name',to_jsonb(topic)->'base_name') AS data FROM bridge_zulip_v5_topics AS topic WHERE uuid=%s",
+                (self.uuid,),
+            )
+            .fetchone()["data"]
+        )
+
     stream_id = properties.property(
         types.AllowNone(types.Integer(min_value=1)),
         default=None,
@@ -1670,20 +1725,27 @@ class ZulipTopic(
 
     @classmethod
     def observe(cls, **values: typing.Any) -> "ZulipTopic":
+        workspace_topic_uuid = values.pop("workspace_topic_uuid", None)
+        base_name = values.pop("base_name", None)
         topic = cls(**values)
         contexts.Context().get_session().execute(
-            """INSERT INTO bridge_zulip_v5_topics (uuid,stream_id,name,max_id,created_at,updated_at)
-               VALUES (%s,%s,%s,%s,%s,%s)
+            """INSERT INTO bridge_zulip_v5_topics (uuid,stream_id,name,max_id,workspace_topic_uuid,base_name,created_at,updated_at)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
                ON CONFLICT (uuid) DO UPDATE SET name=EXCLUDED.name,
+                   workspace_topic_uuid=COALESCE(bridge_zulip_v5_topics.workspace_topic_uuid,EXCLUDED.workspace_topic_uuid),
+                   base_name=COALESCE(bridge_zulip_v5_topics.base_name,EXCLUDED.base_name),
                    max_id=GREATEST(bridge_zulip_v5_topics.max_id,EXCLUDED.max_id),
                    updated_at=EXCLUDED.updated_at
                WHERE bridge_zulip_v5_topics.name IS DISTINCT FROM EXCLUDED.name
-                  OR bridge_zulip_v5_topics.max_id<EXCLUDED.max_id""",
+                  OR bridge_zulip_v5_topics.max_id<EXCLUDED.max_id
+                  OR bridge_zulip_v5_topics.workspace_topic_uuid IS NULL""",
             (
                 topic.uuid,
                 topic.stream_id,
                 topic.name,
                 topic.max_id,
+                workspace_topic_uuid,
+                base_name,
                 messenger_helpers._database_timestamp(topic.created_at),
                 messenger_helpers._database_timestamp(topic.updated_at),
             ),
@@ -2902,6 +2964,17 @@ class ImportHistoryContent(AbstractZulipTaskContent):
                         stream_id=channel.stream_id,
                         name=topic_name,
                         max_id=data["id"],
+                        workspace_topic_uuid=sys_uuid.uuid5(
+                            channel.stream_uuid,
+                            data["subject"].removeprefix("✔ ")
+                            if channel.channel_type == "channel"
+                            else data["subject"],
+                        ),
+                        base_name=(
+                            data["subject"].removeprefix("✔ ")
+                            if channel.channel_type == "channel"
+                            else "Zulip"
+                        ),
                     )
                 topic = topics[topic_uuid]
                 message = ZulipMessage.objects.get_one_or_none(
@@ -3117,6 +3190,160 @@ class ImportHistoryContent(AbstractZulipTaskContent):
 
 class DeliveryPendingError(Exception):
     pass
+
+
+class TopicPlacementChangedError(Exception):
+    pass
+
+
+class UpdateTopicContent(AbstractZulipTaskContent):
+    """Change the provider first; rekey or merge local topic data after success."""
+
+    KIND = "update_topic"
+    topic_uuid = properties.property(types.UUID(), required=True)
+    new_topic_uuid = properties.property(types.UUID(), required=True)
+    channel_uuid = properties.property(types.UUID(), required=True)
+    name = properties.property(types.String(), required=True)
+    is_done = properties.property(types.Boolean(), required=True)
+    provider_name = properties.property(types.String(), required=True)
+    origins = properties.property(types.TypedList(types.Dict()), required=True)
+    account_revision = properties.property(types.String(), required=True)
+    previous_name = properties.property(types.String(), required=True)
+    previous_done = properties.property(types.Boolean(), required=True)
+    topic_version = properties.property(types.Integer(min_value=1), required=True)
+
+    def execute(self, task: "Task") -> None:
+        account = external_models.ExternalAccount.objects.get_one(
+            filters={
+                "uuid": filters.EQ(task.external_account_uuid),
+                "project_id": filters.EQ(task.project_id),
+            }
+        )
+        if (
+            not account.can_stream()
+            or account.realtime_revision() != self.account_revision
+        ):
+            raise SubscriptionChangedError()
+        session = contexts.Context().get_session()
+        topic = v2_models.WorkspaceStreamTopic.objects.get_one(
+            filters={
+                "project_id": filters.EQ(task.project_id),
+                "uuid": filters.EQ(self.topic_uuid),
+            }
+        )
+        channel = ZulipChannel.objects.get_one(
+            filters={
+                "uuid": filters.EQ(self.channel_uuid),
+                "external_account_uuid": filters.EQ(account.uuid),
+            }
+        )
+        if channel.stream_uuid != topic.stream_uuid:
+            raise SubscriptionChangedError()
+        zulip = client.ZulipClient(account)
+        try:
+            for origin in self.origins:
+                messages = zulip.get_messages(
+                    origin["message_id"], origin["message_id"]
+                )
+                if not messages:
+                    raise TopicPlacementChangedError()
+                current = messages[0]
+                if current["stream_id"] != channel.stream_id:
+                    raise TopicPlacementChangedError()
+                if (
+                    current["subject"] != origin["name"]
+                    and current["subject"] != self.provider_name
+                ):
+                    mapped = session.execute(
+                        "SELECT COALESCE(CASE WHEN root.deleted_at IS NOT NULL THEN root.redirect_topic_uuid END,raw.workspace_topic_uuid,raw.uuid) AS uuid "
+                        "FROM bridge_zulip_v5_topics AS raw LEFT JOIN messenger_topics AS root ON root.project_id=%s "
+                        "AND root.uuid=COALESCE(raw.workspace_topic_uuid,raw.uuid) WHERE raw.uuid=%s",
+                        (
+                            task.project_id,
+                            sys_uuid.uuid5(channel.stream_uuid, current["subject"]),
+                        ),
+                    ).fetchone()
+                    if mapped is None or mapped["uuid"] != self.topic_uuid:
+                        raise TopicPlacementChangedError()
+                if current["subject"] != self.provider_name:
+                    zulip.move_topic(origin["message_id"], self.provider_name)
+        finally:
+            zulip.close()
+        raw = None
+        if self.origins:
+            raw = ZulipTopic.observe(
+                uuid=sys_uuid.uuid5(channel.stream_uuid, self.provider_name),
+                stream_id=channel.stream_id,
+                name=self.provider_name or "General Topic",
+                max_id=max(origin["message_id"] for origin in self.origins),
+                workspace_topic_uuid=self.new_topic_uuid,
+                base_name=""
+                if self.new_topic_uuid == sys_uuid.uuid5(channel.stream_uuid, "")
+                else self.name,
+            )
+            session.execute(
+                "UPDATE bridge_zulip_v5_messages AS observed SET topic=%s FROM bridge_zulip_v5_topics AS original "
+                "WHERE observed.topic=original.uuid AND observed.project_id=%s AND observed.external_account_uuid=%s "
+                "AND COALESCE(original.workspace_topic_uuid,original.uuid)=%s",
+                (raw.uuid, task.project_id, account.uuid, self.topic_uuid),
+            )
+        if self.new_topic_uuid != self.topic_uuid:
+            move_workspace_topic(
+                session,
+                task.project_id,
+                self.topic_uuid,
+                self.new_topic_uuid,
+                topic.stream_uuid,
+                self.name,
+                self.is_done,
+            )
+            RewriteTopicReferencesContent(
+                old_topic_uuid=self.topic_uuid, new_topic_uuid=self.new_topic_uuid
+            ).execute(task)
+        session.execute(
+            "UPDATE bridge_zulip_v5_deliveries AS delivery SET topic_name=%s FROM messenger_message_placements AS placement "
+            "WHERE delivery.project_id=%s AND placement.project_id=delivery.project_id AND placement.message_uuid=delivery.message_uuid "
+            "AND placement.topic_uuid=%s AND delivery.stream_uuid=placement.stream_uuid AND delivery.hostname=%s AND NOT delivery.sending",
+            (
+                self.provider_name,
+                task.project_id,
+                self.new_topic_uuid,
+                account.get_host(),
+            ),
+        )
+
+    def on_error(self, task: "Task", error: Exception) -> None:
+        super().on_error(task, error)
+        if isinstance(error, (SubscriptionChangedError, TopicPlacementChangedError)):
+            task.status = TaskStatus.CANCEL.value
+        if task.status in (TaskStatus.ERROR.value, TaskStatus.CANCEL.value):
+            session = contexts.Context().get_session()
+            restored = session.execute(
+                "UPDATE messenger_topics SET name=%s,is_done=%s,version=version+1,updated_at=NOW() "
+                "WHERE project_id=%s AND uuid=%s AND version=%s",
+                (
+                    self.previous_name,
+                    self.previous_done,
+                    task.project_id,
+                    self.topic_uuid,
+                    self.topic_version,
+                ),
+            ).rowcount
+            if restored:
+                v2_models.WorkspaceDomainOutboxEvent(
+                    project_id=task.project_id,
+                    event_kind="topic_state_projection",
+                    scope_kind="topic",
+                    scope_key=f"{task.project_id}:{self.topic_uuid}",
+                    payload={
+                        "source_kind": "topic.updated",
+                        "topic_uuid": str(self.topic_uuid),
+                    },
+                ).insert(session=session)
+            session.execute(
+                "SELECT bridge_zulip_v5_mark_topic_changed(%s,%s)",
+                (task.project_id, self.topic_uuid),
+            )
 
 
 class UpdateNotificationsContent(AbstractZulipTaskContent):
@@ -3843,6 +4070,507 @@ class ConvertMessageContent(AbstractTaskContent):
         ) + datetime.timedelta(seconds=10)
 
 
+def move_workspace_topic(
+    session: sessions.PgSQLSession,
+    project_id: sys_uuid.UUID,
+    old_uuid: sys_uuid.UUID,
+    new_uuid: sys_uuid.UUID,
+    stream_uuid: sys_uuid.UUID,
+    name: str,
+    is_done: bool,
+) -> None:
+    """Move the topic FK graph and publish the existing delete/create contract."""
+    messenger_helpers._lock_workspace_project_event_writes(project_id, session)
+    previous = v2_models.WorkspaceUserTopic.objects.get_all(
+        filters={
+            "project_id": filters.EQ(project_id),
+            "uuid": filters.EQ(old_uuid),
+        }
+    )
+    existed = session.execute(
+        "SELECT 1 FROM messenger_topics WHERE project_id=%s AND uuid=%s AND deleted_at IS NULL",
+        (project_id, new_uuid),
+    ).fetchone()
+    moved_messages = [
+        row["message_uuid"]
+        for row in session.execute(
+            "SELECT message_uuid FROM messenger_message_placements "
+            "WHERE project_id=%s AND topic_uuid=%s",
+            (project_id, old_uuid),
+        ).fetchall()
+    ]
+    session.execute(
+        "SELECT messenger_move_topic(%s,%s,%s,%s,%s,%s)",
+        (project_id, old_uuid, new_uuid, stream_uuid, name, is_done),
+    )
+    if previous:
+        first = previous[0]
+        messenger_events.create_broadcast_event(
+            project_id,
+            old_uuid,
+            [topic.user_uuid for topic in previous],
+            messenger_events.TOPIC_DELETED_EVENT,
+            {
+                "uuid": str(old_uuid),
+                "stream_uuid": str(first.stream_uuid),
+                "source_name": first.source_name,
+                "source": messenger_events._event_payload_value("source", first.source),
+            },
+            session=session,
+        )
+    current = v2_models.WorkspaceUserTopic.objects.get_all(
+        filters={
+            "project_id": filters.EQ(project_id),
+            "uuid": filters.EQ(new_uuid),
+        }
+    )
+    publish = (
+        messenger_events.create_topic_updated_events
+        if existed
+        else messenger_events.create_topic_events
+    )
+    publish(project_id, current, session=session, compact=True)
+    # Topic deletion evicts its messages from clients. Recreate only the moved
+    # placements so an already loaded merge destination receives them as well.
+    by_placement: dict[sys_uuid.UUID, list] = {}
+    if moved_messages:
+        for message in v2_models.WorkspaceUserMessage.objects.get_all(
+            filters={
+                "project_id": filters.EQ(project_id),
+                "canonical_message_uuid": filters.In(moved_messages),
+                "topic_uuid": filters.EQ(new_uuid),
+                "visible": filters.EQ(True),
+            },
+            session=session,
+        ):
+            by_placement.setdefault(message.uuid, []).append(message)
+    for recipients in by_placement.values():
+        messenger_events.create_compact_message_events(
+            project_id, recipients, session=session
+        )
+
+
+class RewriteTopicReferencesContent(AbstractTaskContent):
+    """Rewrite only indexed messages which refer to the replaced topic."""
+
+    KIND = "rewrite_topic_references"
+    old_topic_uuid = properties.property(types.UUID(), required=True)
+    new_topic_uuid = properties.property(types.UUID(), required=True)
+    after_uuid = properties.property(types.AllowNone(types.UUID()), default=None)
+    before_at = properties.property(types.AllowNone(types.UTCDateTimeZ()), default=None)
+
+    def execute(self, task: "Task") -> None:
+        session = contexts.Context().get_session()
+        target = session.execute(
+            "SELECT (to_jsonb(topic)->>'redirect_topic_uuid')::uuid AS link_target_uuid "
+            "FROM messenger_topics AS topic WHERE project_id=%s AND uuid=%s AND deleted_at IS NOT NULL",
+            (task.project_id, self.new_topic_uuid),
+        ).fetchone()
+        destination = (
+            target["link_target_uuid"]
+            if target and target["link_target_uuid"]
+            else self.new_topic_uuid
+        )
+        old = f"urn:topic:{self.old_topic_uuid}"
+        if self.before_at is None:
+            self.before_at = (
+                session.execute("SELECT clock_timestamp() AT TIME ZONE 'UTC' AS now")
+                .fetchone()["now"]
+                .replace(tzinfo=datetime.timezone.utc)
+            )
+        rows = session.execute(
+            "SELECT uuid,payload,content_updated_at FROM messenger_messages "
+            "WHERE project_id=%s AND deleted_at IS NULL AND (%s::uuid IS NULL OR uuid>%s) "
+            "AND updated_at<=%s "
+            "AND messenger_message_references(payload) @> %s::text[] ORDER BY uuid LIMIT 101 FOR UPDATE",
+            (task.project_id, self.after_uuid, self.after_uuid, self.before_at, [old]),
+        ).fetchall()
+        for row in rows[:100]:
+            rewritten = message_conversion.rewrite_workspace_references(
+                row["payload"]["content"], {old: f"urn:topic:{destination}"}
+            )
+            if rewritten == row["payload"]["content"]:
+                continue
+            with content_conversion.preserve_source_edit_time(
+                session, task.project_id, row["uuid"]
+            ):
+                session.execute(
+                    "UPDATE messenger_messages SET payload=jsonb_set(payload,'{content}',to_jsonb(%s::text)),updated_at=NOW() "
+                    "WHERE project_id=%s AND uuid=%s",
+                    (rewritten, task.project_id, row["uuid"]),
+                )
+            sources = session.execute(
+                "SELECT DISTINCT content.uuid,content.workspace_content FROM bridge_zulip_v5_message_contents AS content "
+                "JOIN bridge_zulip_v5_messages AS observed ON observed.content=content.uuid "
+                "WHERE observed.project_id=%s AND messenger_uuid_v5(observed.project_id,observed.message_uuid::text)=%s",
+                (task.project_id, row["uuid"]),
+            ).fetchall()
+            for source in sources:
+                converted = message_conversion.rewrite_workspace_references(
+                    source["workspace_content"], {old: f"urn:topic:{destination}"}
+                )
+                if converted != source["workspace_content"]:
+                    session.execute(
+                        "UPDATE bridge_zulip_v5_message_contents SET workspace_content=%s,workspace_content_hash=%s WHERE uuid=%s",
+                        (
+                            converted,
+                            hashlib.sha256(converted.encode()).hexdigest(),
+                            source["uuid"],
+                        ),
+                    )
+            messages = v2_models.WorkspaceUserMessage.objects.get_all(
+                filters={
+                    "project_id": filters.EQ(task.project_id),
+                    "canonical_message_uuid": filters.EQ(row["uuid"]),
+                    "visible": filters.EQ(True),
+                }
+            )
+            by_placement: dict[sys_uuid.UUID, list] = {}
+            for message in messages:
+                by_placement.setdefault(message.uuid, []).append(message)
+            for recipients in by_placement.values():
+                messenger_events.create_message_updated_events(
+                    task.project_id, recipients, session=session, compact=True
+                )
+        if len(rows) > 100:
+            Task(
+                project_id=task.project_id,
+                external_account_uuid=task.external_account_uuid,
+                realtime_event_uuid=task.realtime_event_uuid,
+                priority=task.priority,
+                content=RewriteTopicReferencesContent(
+                    old_topic_uuid=self.old_topic_uuid,
+                    new_topic_uuid=destination,
+                    after_uuid=rows[99]["uuid"],
+                    before_at=self.before_at,
+                ),
+            ).insert()
+
+
+class ApplyTopicEventContent(AbstractTaskContent):
+    """Apply one authoritative provider move without fetching unchanged messages."""
+
+    KIND = "apply_topic_event"
+
+    @staticmethod
+    def has_provider_messages(
+        session: sessions.PgSQLSession,
+        project_id: sys_uuid.UUID,
+        topic_uuid: sys_uuid.UUID,
+    ) -> bool:
+        return (
+            session.execute(
+                "SELECT 1 FROM bridge_zulip_v5_messages AS observed "
+                "JOIN bridge_zulip_v5_topics AS raw ON raw.uuid=observed.topic "
+                "WHERE observed.project_id=%s AND COALESCE(raw.workspace_topic_uuid,raw.uuid)=%s "
+                "AND NOT EXISTS (SELECT 1 FROM bridge_zulip_v5_messages AS newer "
+                "WHERE newer.project_id=observed.project_id AND newer.message_uuid=observed.message_uuid "
+                "AND (newer.placement_updated_at,newer.placement_event_uuid IS NOT NULL,newer.uuid) "
+                "> (observed.placement_updated_at,observed.placement_event_uuid IS NOT NULL,observed.uuid)) "
+                "UNION ALL SELECT 1 FROM bridge_zulip_v5_deliveries AS delivery "
+                "JOIN messenger_message_placements AS placement ON placement.project_id=delivery.project_id AND placement.message_uuid=delivery.message_uuid "
+                "LEFT JOIN bridge_zulip_v5_topics AS raw ON raw.uuid=messenger_uuid_v5(delivery.stream_uuid,delivery.topic_name) "
+                "WHERE delivery.project_id=%s AND placement.topic_uuid=%s AND delivery.zulip_message_id IS NOT NULL "
+                "AND COALESCE(raw.workspace_topic_uuid,messenger_uuid_v5(delivery.stream_uuid,bridge_zulip_v5_topic_base_name(delivery.topic_name)))=%s LIMIT 1",
+                (project_id, topic_uuid, project_id, topic_uuid, topic_uuid),
+            ).fetchone()
+            is not None
+        )
+
+    def apply_deliveries(
+        self,
+        task: "Task",
+        event: "RealtimeEvent",
+        channel: "ZulipChannel",
+        old_channel: "ZulipChannel",
+        canonical: sys_uuid.UUID,
+        name: str,
+        base_name: str,
+        toggled: bool,
+    ) -> None:
+        """Native sends have delivery identities instead of imported observations."""
+        session = contexts.Context().get_session()
+        account = external_models.ExternalAccount.objects.get_one(
+            filters={"uuid": filters.EQ(task.external_account_uuid)}
+        )
+        payload = event.payload
+        moved = session.execute(
+            "UPDATE bridge_zulip_v5_deliveries AS delivery SET topic_name=%s,stream_uuid=%s,recipient=%s,placement_event_uuid=%s,placement_updated_at=%s "
+            "FROM messenger_message_placements AS placement JOIN messenger_messages AS message "
+            "ON message.project_id=placement.project_id AND message.uuid=placement.message_uuid "
+            "WHERE delivery.project_id=%s AND delivery.hostname=%s AND delivery.zulip_message_id=ANY(%s) "
+            "AND placement.project_id=delivery.project_id AND placement.message_uuid=delivery.message_uuid "
+            "AND placement.stream_uuid=delivery.stream_uuid AND delivery.stream_uuid=%s AND message.source_name='native' "
+            "AND delivery.placement_updated_at<=%s "
+            "AND (delivery.placement_event_uuid IS NULL OR EXISTS (SELECT 1 FROM bridge_zulip_v5_events AS previous "
+            "WHERE previous.uuid=delivery.placement_event_uuid AND (previous.generation<>%s OR previous.event_id<%s))) "
+            "RETURNING placement.uuid,placement.message_uuid,placement.topic_uuid",
+            (
+                name,
+                channel.stream_uuid,
+                json.dumps({"to": channel.stream_id}),
+                event.uuid,
+                datetime.datetime.fromtimestamp(
+                    payload["edit_timestamp"], datetime.timezone.utc
+                ),
+                task.project_id,
+                account.get_host(),
+                payload["message_ids"],
+                old_channel.stream_uuid,
+                datetime.datetime.fromtimestamp(
+                    payload["edit_timestamp"], datetime.timezone.utc
+                ),
+                event.generation,
+                event.event_id,
+            ),
+        ).fetchall()
+        before = (
+            ZulipMessageState._workspace_messages(
+                task.project_id, [row["message_uuid"] for row in moved]
+            )
+            if moved and not toggled
+            else {}
+        )
+        for old in {row["topic_uuid"] for row in moved}:
+            destination = (
+                old
+                if toggled and channel.stream_uuid == old_channel.stream_uuid
+                else canonical
+            )
+            if destination != old:
+                if payload[
+                    "propagate_mode"
+                ] == "change_all" and not self.has_provider_messages(
+                    session, task.project_id, old
+                ):
+                    move_workspace_topic(
+                        session,
+                        task.project_id,
+                        old,
+                        destination,
+                        channel.stream_uuid,
+                        base_name or "General Topic",
+                        name.startswith("✔ "),
+                    )
+                    RewriteTopicReferencesContent(
+                        old_topic_uuid=old, new_topic_uuid=destination
+                    ).execute(task)
+                else:
+                    session.execute(
+                        "INSERT INTO messenger_topics SELECT (jsonb_populate_record(NULL::messenger_topics,to_jsonb(original)||"
+                        "jsonb_build_object('uuid',%s::uuid,'stream_uuid',%s::uuid,'name',%s::text,'is_done',%s::boolean))).* "
+                        "FROM messenger_topics AS original WHERE project_id=%s AND uuid=%s ON CONFLICT (project_id,uuid) DO NOTHING",
+                        (
+                            destination,
+                            channel.stream_uuid,
+                            base_name or "General Topic",
+                            name.startswith("✔ "),
+                            task.project_id,
+                            old,
+                        ),
+                    )
+                    session.execute(
+                        "INSERT INTO messenger_user_topic_bindings(uuid,project_id,user_uuid,topic_uuid) "
+                        "SELECT messenger_uuid_v5(%s,user_uuid::text),project_id,user_uuid,%s FROM messenger_stream_bindings "
+                        "WHERE project_id=%s AND stream_uuid=%s AND active ON CONFLICT (project_id,user_uuid,topic_uuid) DO NOTHING",
+                        (
+                            destination,
+                            destination,
+                            task.project_id,
+                            channel.stream_uuid,
+                        ),
+                    )
+                    session.execute(
+                        "UPDATE messenger_message_placements SET topic_uuid=%s,stream_uuid=%s,updated_at=NOW() "
+                        "WHERE project_id=%s AND uuid=ANY(%s)",
+                        (
+                            destination,
+                            channel.stream_uuid,
+                            task.project_id,
+                            [row["uuid"] for row in moved if row["topic_uuid"] == old],
+                        ),
+                    )
+            session.execute(
+                "SELECT bridge_zulip_v5_mark_topic_changed(%s,%s)",
+                (task.project_id, destination),
+            )
+            for state in ZulipTopicState.objects.get_all(
+                filters={
+                    "project_id": filters.EQ(task.project_id),
+                    "topic_uuid": filters.EQ(destination),
+                }
+            ):
+                state.do()
+            if destination != old:
+                v2_models.WorkspaceDomainOutboxEvent(
+                    project_id=task.project_id,
+                    event_kind="topic_state_projection",
+                    scope_kind="topic",
+                    scope_key=f"{task.project_id}:{destination}",
+                    payload={
+                        "source_kind": "topic.updated",
+                        "topic_uuid": str(destination),
+                    },
+                ).insert(session=session)
+        if not toggled:
+            ZulipMessageState._publish_message_events(
+                task.project_id,
+                before,
+                ZulipMessageState._workspace_messages(
+                    task.project_id, [row["message_uuid"] for row in moved]
+                ),
+                session,
+            )
+
+    def execute(self, task: "Task") -> None:
+        event = RealtimeEvent.objects.get_one(
+            filters={"uuid": filters.EQ(task.realtime_event_uuid)}
+        )
+        if event.current_subscription() is None:
+            return
+        payload = event.payload
+        session = contexts.Context().get_session()
+        stream_id = payload.get("new_stream_id", payload["stream_id"])
+        channel = ZulipChannel.objects.get_one(
+            filters={
+                "external_account_uuid": filters.EQ(task.external_account_uuid),
+                "stream_id": filters.EQ(stream_id),
+            }
+        )
+        old_name = payload["orig_subject"]
+        name = payload.get("subject", old_name)
+        base_name = name.removeprefix("✔ ")
+        old_base = old_name.removeprefix("✔ ")
+        old_channel = ZulipChannel.objects.get_one(
+            filters={
+                "external_account_uuid": filters.EQ(task.external_account_uuid),
+                "stream_id": filters.EQ(payload["stream_id"]),
+            }
+        )
+        old_uuid = sys_uuid.uuid5(old_channel.stream_uuid, old_name)
+        previous = ZulipTopic.objects.get_one_or_none(
+            filters={"uuid": filters.EQ(old_uuid)}
+        )
+        toggled = name.startswith("✔ ") != old_name.startswith("✔ ") and (
+            base_name == old_base
+            or (
+                name.startswith("✔ ")
+                and len(name) == len(old_name)
+                and old_base.startswith(base_name)
+            )
+        )
+        toggled = toggled and channel.stream_uuid == old_channel.stream_uuid
+        canonical = sys_uuid.uuid5(channel.stream_uuid, base_name)
+        if (
+            toggled
+            and channel.stream_uuid == old_channel.stream_uuid
+            and previous is not None
+        ):
+            canonical = previous.workspace_topic_uuid or previous.uuid
+            base_name = (
+                previous.base_name if previous.base_name is not None else old_base
+            )
+        topic = ZulipTopic.observe(
+            uuid=sys_uuid.uuid5(channel.stream_uuid, name),
+            stream_id=stream_id,
+            name=name or "General Topic",
+            max_id=max(payload["message_ids"]),
+            workspace_topic_uuid=canonical,
+            base_name=base_name,
+        )
+        old_canonical = (
+            previous.workspace_topic_uuid or previous.uuid
+            if previous is not None
+            else sys_uuid.uuid5(old_channel.stream_uuid, old_base)
+        )
+        applied = session.execute(
+            "UPDATE bridge_zulip_v5_messages AS observed SET channel=%s,topic=%s,placement_updated_at=%s,placement_event_uuid=%s "
+            "WHERE project_id=%s AND external_account_uuid=%s AND message_id=ANY(%s) "
+            "AND date_trunc('second',placement_updated_at)<=%s AND (placement_event_uuid IS NULL OR EXISTS ("
+            "SELECT 1 FROM bridge_zulip_v5_events AS previous WHERE previous.uuid=observed.placement_event_uuid "
+            "AND (previous.generation<>%s OR previous.event_id<%s)))",
+            (
+                channel.uuid,
+                topic.uuid,
+                datetime.datetime.fromtimestamp(
+                    payload["edit_timestamp"], datetime.timezone.utc
+                ),
+                event.uuid,
+                task.project_id,
+                task.external_account_uuid,
+                payload["message_ids"],
+                datetime.datetime.fromtimestamp(
+                    payload["edit_timestamp"], datetime.timezone.utc
+                ),
+                event.generation,
+                event.event_id,
+            ),
+        ).rowcount
+        self.apply_deliveries(
+            task, event, channel, old_channel, canonical, name, base_name, toggled
+        )
+        if not applied:
+            return
+        full_move = payload[
+            "propagate_mode"
+        ] == "change_all" and not self.has_provider_messages(
+            session, task.project_id, old_canonical
+        )
+        if (
+            full_move
+            and old_canonical != canonical
+            and session.execute(
+                "SELECT 1 FROM messenger_topics WHERE project_id=%s AND uuid=%s",
+                (task.project_id, old_canonical),
+            ).fetchone()
+        ):
+            for model in (ZulipStreamState, ZulipStreamBindingState):
+                for state in model.objects.get_all(
+                    filters={
+                        "project_id": filters.EQ(task.project_id),
+                        "stream_uuid": filters.EQ(channel.stream_uuid),
+                    }
+                ):
+                    state.do()
+            state = session.execute(
+                "SELECT name,is_done FROM bridge_zulip_v5_topic_states WHERE project_id=%s AND topic_uuid=%s",
+                (task.project_id, canonical),
+            ).fetchone()
+            if state is None:
+                state = session.execute(
+                    "SELECT name,is_done FROM messenger_topics WHERE project_id=%s AND uuid=%s",
+                    (task.project_id, canonical),
+                ).fetchone()
+            if state is None:
+                state = {
+                    "name": base_name or "General Topic",
+                    "is_done": name.startswith("✔ "),
+                }
+            move_workspace_topic(
+                session,
+                task.project_id,
+                old_canonical,
+                canonical,
+                channel.stream_uuid,
+                state["name"],
+                state["is_done"],
+            )
+        for state in ZulipTopicState.objects.get_all(
+            filters={
+                "project_id": filters.EQ(task.project_id),
+                "topic_uuid": filters.EQ(canonical),
+            }
+        ):
+            state.do()
+        if not toggled or channel.stream_uuid != old_channel.stream_uuid:
+            ReconcileRealtimeContent(message_ids=payload["message_ids"]).execute(task)
+            if full_move:
+                if old_canonical != canonical:
+                    RewriteTopicReferencesContent(
+                        old_topic_uuid=old_canonical, new_topic_uuid=canonical
+                    ).execute(task)
+
+
 class ReconcileRealtimeContent(AbstractTaskContent):
     """Publish only the messages touched by a realtime import, in bounded steps."""
 
@@ -3855,7 +4583,7 @@ class ReconcileRealtimeContent(AbstractTaskContent):
         session = contexts.Context().get_session()
         rows = session.execute(
             """SELECT messenger_uuid_v5(observed.project_id,observed.message_uuid::text) AS message_uuid,
-                      channel.stream_uuid,observed.topic AS topic_uuid
+                      channel.stream_uuid,bridge_zulip_v5_workspace_topic_uuid(observed.topic) AS topic_uuid
                FROM bridge_zulip_v5_messages AS observed
                JOIN bridge_zulip_v5_channels AS channel ON channel.uuid=observed.channel
                WHERE observed.project_id=%s AND observed.external_account_uuid=%s
@@ -3984,6 +4712,9 @@ class ReconciliationContent(AbstractTaskContent):
 
 
 TASK_CONTENT_TYPE = types_dynamic.KindModelSelectorType(
+    types_dynamic.KindModelType(UpdateTopicContent),
+    types_dynamic.KindModelType(RewriteTopicReferencesContent),
+    types_dynamic.KindModelType(ApplyTopicEventContent),
     types_dynamic.KindModelType(ScanHistoryContent),
     types_dynamic.KindModelType(ReconcileRealtimeContent),
     types_dynamic.KindModelType(ConvertMessageContent),
@@ -4083,9 +4814,12 @@ class Task(
             "delete_message",
             "update_message_flags",
             "update_notifications",
+            "update_topic",
             "update_reaction",
             "initialize_connection",
             "reconcile_realtime",
+            "apply_topic_event",
+            "rewrite_topic_references",
         ):
             kwargs["queue"] = "realtime"
         if "concurrency_key" not in kwargs:
@@ -4556,12 +5290,19 @@ class RealtimeEvent(
                 message_ids = [self.payload["message_id"]]
             if kind == "update_message":
                 priority = TASK_PRIORITY_REALTIME_EDIT
-            contents = [
-                ImportHistoryContent(
-                    first_message_id=message_id, last_message_id=message_id
+            if kind == "update_message" and "orig_subject" in self.payload:
+                contents = [ApplyTopicEventContent()]
+                message_ids = (
+                    [self.payload["message_id"]] if "content" in self.payload else []
                 )
-                for message_id in sorted(set(message_ids), reverse=True)
-            ]
+            contents.extend(
+                [
+                    ImportHistoryContent(
+                        first_message_id=message_id, last_message_id=message_id
+                    )
+                    for message_id in sorted(set(message_ids), reverse=True)
+                ]
+            )
         elif kind == "delete_message":
             account = external_models.ExternalAccount.objects.get_one(
                 filters={
@@ -4950,6 +5691,8 @@ class MessageDelivery(
                 if topic.uuid == sys_uuid.uuid5(channel.stream_uuid, "")
                 else topic.name
             )
+            if topic.is_done:
+                topic_name = ("✔ " + topic_name)[:60]
         else:
             topic_name = None
             if channel.channel_type == ZulipChannelType.PRIVATE.value:
@@ -5293,6 +6036,89 @@ class WorkspaceEvent(
         return True
 
 
+def enqueue_topic_update(
+    project_id: sys_uuid.UUID,
+    user_uuid: sys_uuid.UUID,
+    topic: typing.Any,
+    name: str,
+    is_done: bool,
+    session: sessions.PgSQLSession,
+) -> None:
+    target = session.execute(
+        "SELECT channel.uuid,channel.stream_id,account.uuid AS account_uuid FROM bridge_zulip_v5_channels AS channel "
+        "JOIN m_external_accounts_v2 AS account ON account.uuid=channel.external_account_uuid "
+        "WHERE account.project_id=%s AND account.owner_user_uuid=%s AND account.provider='zulip' "
+        "AND channel.stream_uuid=%s AND channel.channel_type='channel'",
+        (project_id, user_uuid, topic.stream_uuid),
+    ).fetchone()
+    if target is None:
+        raise exceptions.ValidationErrorException()
+    account = external_models.ExternalAccount.objects.get_one(
+        filters={"uuid": filters.EQ(target["account_uuid"])}, session=session
+    )
+    if not account.can_stream():
+        raise exceptions.ValidationErrorException()
+    origins = session.execute(
+        "SELECT name,max(message_id) AS message_id FROM ("
+        "SELECT raw.name,observed.message_id FROM bridge_zulip_v5_messages AS observed "
+        "JOIN bridge_zulip_v5_topics AS raw ON raw.uuid=observed.topic "
+        "WHERE observed.project_id=%s AND observed.external_account_uuid=%s AND observed.channel=%s "
+        "AND COALESCE(raw.workspace_topic_uuid,raw.uuid)=%s "
+        "UNION ALL SELECT delivery.topic_name,delivery.zulip_message_id FROM bridge_zulip_v5_deliveries AS delivery "
+        "JOIN messenger_message_placements AS placement ON placement.project_id=delivery.project_id AND placement.message_uuid=delivery.message_uuid "
+        "WHERE delivery.project_id=%s AND delivery.hostname=%s AND delivery.stream_uuid=%s "
+        "AND placement.topic_uuid=%s AND delivery.zulip_message_id IS NOT NULL AND delivery.topic_name IS NOT NULL"
+        ") AS routes GROUP BY name ORDER BY max(message_id) DESC",
+        (
+            project_id,
+            account.uuid,
+            target["uuid"],
+            topic.uuid,
+            project_id,
+            account.get_host(),
+            topic.stream_uuid,
+            topic.uuid,
+        ),
+    ).fetchall()
+    empty = topic.uuid == sys_uuid.uuid5(topic.stream_uuid, "") and name == topic.name
+    base = "" if empty else name
+    new_uuid = (
+        sys_uuid.uuid5(topic.stream_uuid, base) if name != topic.name else topic.uuid
+    )
+    if name == topic.name and origins:
+        preferred = next(
+            (
+                origin["name"]
+                for origin in origins
+                if origin["name"].startswith("✔ ") == is_done
+            ),
+            origins[0]["name"],
+        )
+        base = preferred.removeprefix("✔ ")
+    provider_name = ("✔ " + base)[:60] if is_done else base
+    Task(
+        project_id=project_id,
+        external_account_uuid=account.uuid,
+        priority=TASK_PRIORITY_REALTIME_EDIT,
+        content=UpdateTopicContent(
+            topic_uuid=topic.uuid,
+            new_topic_uuid=new_uuid,
+            channel_uuid=target["uuid"],
+            name=name,
+            is_done=is_done,
+            provider_name=provider_name,
+            origins=[dict(origin) for origin in origins],
+            account_revision=account.realtime_revision(),
+            previous_name=topic.name,
+            previous_done=topic.is_done,
+            topic_version=session.execute(
+                "SELECT version+1 AS version FROM messenger_topics WHERE project_id=%s AND uuid=%s",
+                (project_id, topic.uuid),
+            ).fetchone()["version"],
+        ),
+    ).insert(session=session)
+
+
 def enqueue_notifications(
     project_id: sys_uuid.UUID,
     user_uuid: sys_uuid.UUID,
@@ -5302,7 +6128,7 @@ def enqueue_notifications(
     session: sessions.PgSQLSession,
 ) -> None:
     targets = session.execute(
-        "SELECT channel.uuid, account.uuid AS account_uuid, topic.name FROM bridge_zulip_v5_channels AS channel "
+        "SELECT channel.uuid, account.uuid AS account_uuid, topic.name,topic.is_done FROM bridge_zulip_v5_channels AS channel "
         "JOIN m_external_accounts_v2 AS account ON account.uuid=channel.external_account_uuid "
         "JOIN messenger_streams AS stream ON stream.project_id=account.project_id AND stream.uuid=channel.stream_uuid "
         "LEFT JOIN messenger_topics AS topic ON topic.project_id=stream.project_id AND topic.stream_uuid=stream.uuid AND topic.uuid=%s "
@@ -5329,6 +6155,10 @@ def enqueue_notifications(
             else None,
             notification_mode=notification_mode,
         )
+        if topic_uuid is not None and target["is_done"]:
+            content.properties["topic_name"].set_value_force(
+                ("✔ " + content.topic_name)[:60]
+            )
         content.remember(channel)
         Task(
             project_id=project_id,

@@ -1039,6 +1039,35 @@ Die Herkunft bleibt durch eine Umbenennung unverändert.
 `POST /api/workspace/v1/messenger/stream_topics/{topic_uuid}/actions/toggle_done/invoke` Flips
 `is_done` für alle Themabenutzer und gibt die aktualisierte Themaansicht des aktuellen Benutzers zurück.
 
+Bei einem Zulip-Kanal ergibt sich die Themen-ID als UUIDv5 aus der Stream-UUID
+und dem Basisnamen ohne das Dienstpräfix `✔ `. Erledigen ändert `is_done`,
+während Name und UUID erhalten bleiben, auch bei gekürzten Namen in Zulip-Ereignissen.
+Existieren beide Varianten, hält die offene Variante das gemeinsame Thema offen.
+
+Umbenennen und Erledigen stellen einen dauerhaften Auftrag über die Verbindung
+des handelnden Benutzers ein. Die API liefert den vorläufigen lokalen Zustand;
+eine endgültige Ablehnung stellt ihn wieder her, sofern keine neuere Änderung vorliegt.
+Nach einer erfolgreichen Umbenennung oder vollständigen Kanalverschiebung erhält
+das Thema die kanonische Ziel-ID oder wird mit dem vorhandenen Ziel vereinigt.
+Teilverschiebungen betreffen nur die vom Anbieter aufgeführten Nachrichten.
+Vollständige Verschiebungen erhalten Entwürfe, Zusammenfassungen und Einstellungen
+und aktualisieren indizierte Verweise in begrenzten Stapeln.
+Gewöhnliche Workspace-Streams behalten ihr lokales Verhalten.
+
+Das alte Thema sendet `topic.deleted`, das Ziel `topic.created` oder
+`topic.updated`. Danach senden die verschobenen Platzierungen `message.created`
+mit ihren bisherigen Nachrichten-UUIDs, auch für historische Nachrichten. So
+können Clients das bereits geladene Ziel nach dem Entfernen des alten Themas
+aktualisieren. Reine Done-Änderungen verwenden diesen Ablauf nicht.
+
+`GET /stream_topics/{old_uuid}` liefert das aktuelle Thema nach Prüfung der
+Zugriffsrechte auf das Ziel. Clients verwenden die zurückgegebenen Themen- und
+Stream-UUIDs, auch bei gespeicherten Links und nach dem Löschereignis für das
+ausgewählte Thema. Wird der alte Basisname erneut angelegt, bezeichnet die
+berechnete UUID das neue Thema; ausstehende Stapel ändern keine Nachrichten,
+die erst nach der ursprünglichen Verschiebung erstellt wurden.
+
+
 `POST /api/workspace/v1/messenger/stream_topics/{topic_uuid}/actions/set_default/invoke` setzt die
 Thema als Standard-Stream und gibt das aktualisierte Thema des aktuellen Benutzers zurück
 Die Operation ist idempotent. Eine veränderte Standardfunktion gibt `stream.updated` aus

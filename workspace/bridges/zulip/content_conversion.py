@@ -216,19 +216,35 @@ class ConversionContext:
         streams = [uuid.UUID(stream) for stream, _name in references]
         names = [name or "General Topic" for _stream, name in references]
         topics = self.session.execute(
-            """SELECT topic.uuid, topic.stream_uuid, topic.name, channel.name AS channel_name,
+            """SELECT topic.uuid, original.uuid AS reference_uuid, topic.stream_uuid, topic.name,
+                      topic.is_done, CASE WHEN original.uuid=messenger_uuid_v5(original.stream_uuid,'') THEN ''
+                          ELSE original.name END AS reference_name, channel.name AS channel_name,
                       channel.stream_id, 0 AS source_order
-               FROM messenger_topics AS topic
+               FROM messenger_topics AS original
+               JOIN messenger_topics AS topic ON topic.project_id=original.project_id
+                 AND topic.uuid=COALESCE(CASE WHEN original.deleted_at IS NOT NULL
+                     THEN (to_jsonb(original)->>'redirect_topic_uuid')::uuid END,original.uuid)
                JOIN bridge_zulip_v5_channels AS channel ON channel.stream_uuid = topic.stream_uuid
                WHERE topic.project_id = %s AND topic.deleted_at IS NULL
                  AND channel.external_account_uuid = ANY(%s)
-                 AND (topic.uuid=ANY(%s) OR (topic.stream_uuid=ANY(%s) AND topic.name=ANY(%s)))
+                 AND (original.uuid=ANY(%s) OR (original.stream_uuid=ANY(%s) AND original.name=ANY(%s)))
                UNION ALL
-               SELECT topic.uuid, channel.stream_uuid, topic.name, channel.name, channel.stream_id, 1
+               SELECT COALESCE(destination.uuid,(to_jsonb(topic)->>'workspace_topic_uuid')::uuid,topic.uuid),
+                      topic.uuid, channel.stream_uuid,
+                      COALESCE(destination.name,to_jsonb(topic)->>'base_name',topic.name),
+                      COALESCE(destination.is_done,topic.name LIKE '✔ %%'),
+                      CASE WHEN topic.uuid=messenger_uuid_v5(channel.stream_uuid,'') THEN '' ELSE topic.name END,
+                      channel.name, channel.stream_id, 1
                FROM bridge_zulip_v5_topics AS topic
                JOIN bridge_zulip_v5_channels AS channel ON channel.stream_id=topic.stream_id
                 AND topic.uuid IN (messenger_uuid_v5(channel.stream_uuid, topic.name),
                     messenger_uuid_v5(channel.stream_uuid, ''))
+               LEFT JOIN messenger_topics AS original ON original.project_id=%s
+                 AND original.uuid=COALESCE((to_jsonb(topic)->>'workspace_topic_uuid')::uuid,topic.uuid)
+               LEFT JOIN messenger_topics AS destination ON destination.project_id=original.project_id
+                 AND destination.uuid=COALESCE(CASE WHEN original.deleted_at IS NOT NULL
+                       THEN (to_jsonb(original)->>'redirect_topic_uuid')::uuid END,original.uuid)
+                 AND destination.deleted_at IS NULL
                WHERE topic.uuid=ANY(%s) AND channel.external_account_uuid=ANY(%s)
                ORDER BY source_order""",
             (
@@ -237,6 +253,7 @@ class ConversionContext:
                 candidates,
                 streams,
                 names,
+                self.account.project_id,
                 candidates,
                 self.account_ids,
             ),
@@ -250,13 +267,18 @@ class ConversionContext:
             name = (
                 "" if row["uuid"] == uuid.uuid5(row["stream_uuid"], "") else row["name"]
             )
-            self.context["topic_uuids"][f"{row['channel_name']}>{name}"] = str(
-                row["uuid"]
+            reference_name = row["reference_name"]
+            self.context["topic_uuids"].setdefault(
+                f"{row['channel_name']}>{reference_name}", str(row["uuid"])
             )
-            self.context["topic_urls"][str(row["uuid"])] = (
+            if row["is_done"]:
+                name = ("✔ " + name)[:60]
+            url = (
                 f"{self.server_url}/#narrow/channel/{row['stream_id']}/topic/"
                 + message_conversion.encode_hash(name)
             )
+            self.context["topic_urls"].setdefault(str(row["uuid"]), url)
+            self.context["topic_urls"].setdefault(str(row["reference_uuid"]), url)
 
     def prefetch(self, messages: list[dict[str, typing.Any]]) -> None:
         """Resolve identities and deliveries once for the whole ordered batch."""

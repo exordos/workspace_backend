@@ -351,6 +351,9 @@ def isolated_migration_database(migration, *, current_models=False):
                         ADD COLUMN IF NOT EXISTS conversion_version INTEGER NOT NULL DEFAULT 0,
                         ADD COLUMN IF NOT EXISTS source_timestamp BIGINT NOT NULL DEFAULT 0,
                         ADD COLUMN IF NOT EXISTS source_message_id BIGINT NOT NULL DEFAULT 0;
+                    ALTER TABLE bridge_zulip_v5_topics
+                        ADD COLUMN IF NOT EXISTS workspace_topic_uuid UUID,
+                        ADD COLUMN IF NOT EXISTS base_name TEXT;
                     ALTER TABLE IF EXISTS messenger_message_changes ADD COLUMN IF NOT EXISTS
                         message_created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT 'epoch',
                         ADD COLUMN IF NOT EXISTS message_sequence BIGINT NOT NULL DEFAULT 0;

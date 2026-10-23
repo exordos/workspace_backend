@@ -116,6 +116,30 @@ def test_edit_preserves_content_and_uses_the_remote_id():
     )
 
 
+def test_topic_move_uses_all_messages_without_resending_content_or_stream_id():
+    account = mock.Mock(
+        settings={
+            "server_url": "https://zulip.example.com",
+            "email": "sender@example.com",
+            "api_key": "sender-key",
+        }
+    )
+    session = mock.Mock()
+    session.request.return_value.json.return_value = {"result": "success"}
+    with mock.patch.object(client.requests, "Session", return_value=session):
+        zulip = client.ZulipClient(account)
+        try:
+            zulip.move_topic(123, "✔ General")
+        finally:
+            zulip.close()
+    session.request.assert_called_once_with(
+        "PATCH",
+        "https://zulip.example.com/api/v1/messages/123",
+        timeout=(5, 30),
+        data={"topic": "✔ General", "propagate_mode": "change_all"},
+    )
+
+
 def test_attachment_upload_uses_the_authenticated_api():
     account = mock.Mock(
         settings={

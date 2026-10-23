@@ -5,6 +5,7 @@
 import base64
 import datetime
 import hashlib
+import importlib.util
 import re
 from unittest import mock
 import uuid
@@ -1091,8 +1092,12 @@ def test_content_repair_restores_saved_content_without_an_edit(
         if repair_kind == "contextual_quote"
         else "0262-Reconvert-stored-Zulip-silent-user-mentions-80e205.py"
     )
-    engine = migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
-    engine.rollback_migration(target)
+    # Exercise this data repair without rolling back unrelated later schema.
+    spec = importlib.util.spec_from_file_location(
+        "content_repair", conftest.MIGRATIONS_DIR / target
+    )
+    repair = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(repair)
     task = None
     try:
         zulip = mock.Mock()
@@ -1184,7 +1189,8 @@ def test_content_repair_restores_saved_content_without_an_edit(
         existing_tasks = set(
             row[0] for row in db.execute("SELECT uuid FROM bridge_zulip_v5_tasks")
         )
-        engine.apply_migration(target)
+        with contexts.Context().session_manager() as session:
+            repair.migration_step.upgrade(session)
         assert db.execute(
             "SELECT conversion_version FROM bridge_zulip_v5_message_contents WHERE uuid=%s",
             (leaf.content.uuid,),
@@ -1215,7 +1221,6 @@ def test_content_repair_restores_saved_content_without_an_edit(
             (canonical,),
         ).fetchone() == (before,)
     finally:
-        engine.apply_migration(engine.get_latest_migration())
         if task is not None:
             task.delete()
 

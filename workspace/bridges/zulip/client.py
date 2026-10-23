@@ -73,6 +73,13 @@ class ZulipClient:
     def edit_message(self, message_id: int, content: str) -> None:
         self._request("PATCH", f"/messages/{message_id}", data={"content": content})
 
+    def move_topic(self, message_id: int, topic: str) -> None:
+        self._request(
+            "PATCH",
+            f"/messages/{message_id}",
+            data={"topic": topic, "propagate_mode": "change_all"},
+        )
+
     def delete_message(self, message_id: int) -> None:
         try:
             self._request("DELETE", f"/messages/{message_id}")

@@ -2474,6 +2474,19 @@ def _process_folder_projection(
     )
     if not payload.get("emit_public_event", True):
         return
+    # Provider-only users may have legacy folder state without a membership.
+    # Keep their snapshot current without publishing an unfenced stream event.
+    if (
+        source_kind in LEGACY_FOLDER_SNAPSHOT_SOURCE_KINDS
+        and stream_uuid is not None
+        and session.execute(
+            "SELECT 1 FROM messenger_stream_bindings "
+            "WHERE project_id=%s AND user_uuid=%s AND stream_uuid=%s",
+            (project_id, user_uuid, stream_uuid),
+        ).fetchone()
+        is None
+    ):
+        return
     _try_lock_project_event_tail(session, project_id)
     folders = v2_models.WorkspaceUserFolder.objects.get_all(
         filters={
@@ -3245,6 +3258,7 @@ def _purge_completed_tombstone(
             """
             DELETE FROM messenger_topics
             WHERE project_id = %s AND uuid = %s AND deleted_at IS NOT NULL
+              AND to_jsonb(messenger_topics)->>'redirect_topic_uuid' IS NULL
             """,
             (project_id, _uuid(payload["topic_uuid"])),
         )

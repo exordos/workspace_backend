@@ -1036,6 +1036,26 @@ Content-Type: application/json
 `POST /api/workspace/v1/messenger/stream_topics/{topic_uuid}/actions/toggle_done/invoke` 翻转
 `is_done` 对于所有主题用户,并返回当前用户的更新主题视图.
 
+Zulip 频道的主题标识是由流 UUID 和去掉服务前缀 `✔ ` 的基本名称计算出的 UUIDv5。
+标记完成只改变 `is_done`，公开名称和 UUID 保持不变；处理关闭和重新打开事件时，
+即使 Zulip 截短了名称也保留原标识。若两种名称同时存在，开放的版本使逻辑主题保持开放。
+
+重命名和完成操作通过当前用户自己的连接排入一个持久任务。API 先返回本地预期状态；
+若服务端最终拒绝操作且没有更新的本地修改，则恢复原状态。成功重命名或完整移动到
+另一频道后，主题使用目标的规范 UUID，或与已有目标合并。部分移动仅影响服务端列出的消息。
+完整移动保留草稿、摘要和用户设置，并分批更新索引中的主题引用。
+普通 Workspace 流中的原生主题继续使用本地行为。
+
+旧主题发送 `topic.deleted`，目标主题发送 `topic.created` 或 `topic.updated`。
+随后，移动的消息位置使用原消息 UUID 发送 `message.created`，也包括历史消息，
+使客户端在移除旧主题缓存后能够更新已加载的合并目标。单纯更改 done 状态不走此流程。
+
+`GET /stream_topics/{old_uuid}` 在检查目标访问权限后返回当前主题。
+客户端应使用响应中的主题 UUID 和流 UUID，包括打开旧链接以及收到所选主题的删除事件时。
+重新创建旧基本名称会赋予该确定性 UUID 新的含义；待处理的引用修复批次不会改写
+原移动之后创建的消息。
+
+
 `POST /api/workspace/v1/messenger/stream_topics/{topic_uuid}/actions/set_default/invoke` 设置
 主题为其流的默认,并返回当前用户的更新主题
 操作是无源的. 已改变的默认发出`stream.updated`

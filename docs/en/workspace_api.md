@@ -1040,6 +1040,33 @@ realtime side effects atomically. Provenance remains unchanged by a rename.
 `POST /api/workspace/v1/messenger/stream_topics/{topic_uuid}/actions/toggle_done/invoke` flips
 `is_done` for all topic users and returns the current user's updated topic view.
 
+For a Zulip channel, topic identity is UUIDv5 of the stream UUID and the base
+subject without the leading service marker `✔ `. Resolution changes `is_done`,
+while the public name and UUID remain stable, including provider truncation
+observed in resolve/reopen events. If both provider variants exist, the open
+variant keeps the logical topic open.
+
+Rename and done actions queue one durable provider operation under the acting
+user's own connection. The API returns optimistic local state; a terminal
+provider rejection restores it unless a newer local change has superseded it.
+After a successful rename, or a complete incoming move to another channel,
+the topic is rekeyed or merged with its canonical destination. Partial moves
+move only the provider-specified messages. A complete move transfers drafts,
+summaries and user settings, and updates indexed topic references in bounded
+batches. Native topics in ordinary Workspace streams retain their local behavior.
+
+The old topic emits `topic.deleted`; the destination emits `topic.created` or
+`topic.updated`. Moved placements then emit `message.created` with their existing
+message UUIDs, including historical messages, so clients can repopulate a loaded
+merge destination after evicting the old topic. Pure done changes do not use this path.
+
+`GET /stream_topics/{old_uuid}` resolves a replaced topic to the current topic
+DTO after checking the destination's normal access rules. Clients should use
+the returned UUID and stream UUID, including when following a stored link or
+receiving a deletion event for the selected topic. Recreating the old base
+name gives that deterministic UUID its new meaning; pending reference batches
+do not rewrite messages created after the original move.
+
 `POST /api/workspace/v1/messenger/stream_topics/{topic_uuid}/actions/set_default/invoke` sets the
 topic as its stream's default and returns the current user's updated topic
 view. The operation is idempotent. A changed default emits `stream.updated`

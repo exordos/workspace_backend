@@ -218,6 +218,16 @@ the destination server's identifiers. References to messages awaiting delivery
 retry until their Zulip IDs are known; unsupported outgoing identities fail
 before a send attempt is marked. Zulip messages use `read_by_sender=true`.
 
+Channel topics separate the canonical base name and UUID from the provider's
+resolve marker. A topic-only event applies its authoritative placement IDs in
+one task without fetching unchanged message text, flags or reactions. Full
+renames/moves preserve the topic's dependent data and redirect old IDs under
+the destination's ACL; partial moves preserve the original topic references.
+An expression GIN index over canonical message payloads finds entity URNs,
+including references in quote selections and forwarded snapshots. Link repair
+uses bounded batches and does not require an index-maintenance queue or a
+full-history rebuild for every topic change.
+
 Uploaded Zulip attachments are copied into Workspace file storage with the
 destination stream's access rules. Workspace attachments are uploaded to Zulip
 once per destination stream, with persisted file mappings for retries and echoes.
