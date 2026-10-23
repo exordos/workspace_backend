@@ -4138,6 +4138,7 @@ def move_workspace_topic(
             filters={
                 "project_id": filters.EQ(project_id),
                 "canonical_message_uuid": filters.In(moved_messages),
+                "topic_uuid": filters.EQ(new_uuid),
                 "visible": filters.EQ(True),
             },
             session=session,
