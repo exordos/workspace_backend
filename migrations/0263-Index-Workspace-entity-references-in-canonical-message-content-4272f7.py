@@ -42,8 +42,10 @@ EXCEPTION WHEN data_exception THEN
 END;
 $$;
 
+-- CREATE INDEX restricts search_path. Retain the installation schema so that
+-- existing quote/forward payloads can resolve the decoding helper at backfill.
 CREATE FUNCTION messenger_message_references(payload jsonb)
-RETURNS text[] LANGUAGE plpgsql IMMUTABLE STRICT AS $$
+RETURNS text[] LANGUAGE plpgsql IMMUTABLE STRICT SET search_path FROM CURRENT AS $$
 DECLARE
     pending text[] := ARRAY[payload->>'content'];
     targets text[] := ARRAY[]::text[];

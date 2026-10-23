@@ -162,8 +162,10 @@ def test_reference_index_tracks_http_create_edit_and_delete(api, db):
 
 
 @pytest.mark.isolated_schema
+@pytest.mark.parametrize("envelope", ["plain", "quote", "forward"])
 def test_reference_index_migration_indexes_existing_content_and_is_reversible(
     _database,
+    envelope,
 ):
     previous = (
         "0261-Reconvert-Zulip-quotes-with-recipient-and-channel-context-1adfa4.py"
@@ -184,15 +186,21 @@ def test_reference_index_migration_indexes_existing_content_and_is_reversible(
                 "SELECT messenger_v2_register_project_user(%s,%s)", (project, user)
             )
             target = f"urn:topic:{uuid.uuid4()}"
+            content = f"[history]({target})"
+            if envelope == "quote":
+                content = f"[selection](urn:quote:{uuid.uuid4()}?text={urllib.parse.quote(content)})"
+            elif envelope == "forward":
+                snapshot = (
+                    base64.urlsafe_b64encode(content.encode()).decode().rstrip("=")
+                )
+                content = f"[forward](urn:forward:{uuid.uuid4()}?snapshot={snapshot})"
             connection.execute(
                 "INSERT INTO messenger_messages(uuid,project_id,author_uuid,payload) VALUES(%s,%s,%s,%s)",
                 (
                     message,
                     project,
                     user,
-                    psycopg.types.json.Jsonb(
-                        {"kind": "markdown", "content": f"[history]({target})"}
-                    ),
+                    psycopg.types.json.Jsonb({"kind": "markdown", "content": content}),
                 ),
             )
             before = connection.execute(
@@ -200,6 +208,7 @@ def test_reference_index_migration_indexes_existing_content_and_is_reversible(
                 (message,),
             ).fetchone()
             engine.apply_migration(migration)
+            connection.execute("REINDEX INDEX messenger_messages_entity_references_idx")
             assert connection.execute(
                 "SELECT uuid FROM messenger_messages WHERE project_id=%s AND deleted_at IS NULL "
                 "AND messenger_message_references(payload) @> %s::text[]",
