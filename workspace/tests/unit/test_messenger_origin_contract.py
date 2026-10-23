@@ -284,6 +284,7 @@ def test_server_settings_origin_path_and_fields_are_preserved():
         "msg",
         "authentication_methods",
         "push_notifications_enabled",
+        "organization_uuid",
         "email_auth_enabled",
         "require_email_format_usernames",
         "realm_url",

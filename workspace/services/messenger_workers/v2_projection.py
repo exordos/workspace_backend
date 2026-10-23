@@ -32,6 +32,7 @@ from restalchemy.dm import filters as dm_filters
 
 from workspace.common import messenger_reaction_opts
 from workspace.messenger_api import events as messenger_events
+from workspace.messenger_api import push_outbox
 from workspace.messenger_api.api import resource_projection
 from workspace.messenger_api.dm import message_payloads
 from workspace.messenger_api.dm import v2_models
@@ -1741,6 +1742,10 @@ def _process_fanout(
                 if _uuid(recipient["user_uuid"]) in set(recipient_uuids)
             },
         )
+    if task["payload"].get("emit_public_event", True):
+        push_outbox.enqueue_message(
+            session, task["outbox_event_uuid"], project_id, message, recipient_uuids
+        )
     for user_uuid in recipient_uuids:
         _enqueue_counter_outbox_events(
             session,
@@ -2233,6 +2238,9 @@ def _process_read_counters(
         )
     _try_lock_project_event_tail(session, task["project_id"])
     if payload.get("placement_uuid") and payload.get("emit_message_read"):
+        push_outbox.enqueue_read_state(
+            session, task["project_id"], user_uuid, topic_uuid
+        )
         messages = _v2_rows(
             v2_models.WorkspaceUserMessage,
             task["project_id"],

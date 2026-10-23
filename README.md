@@ -427,3 +427,98 @@ The Python 3.10–3.14 unit and functional jobs use the `nocoverage` tox factor.
 Coverage is still collected and reported separately with `tox -e begin,3.12,end`;
 other tox environments retain coverage by default. CI runs for every PR, pushes
 to `master`, and tags. A newer PR revision cancels that PR's obsolete run.
+
+## Native encrypted Android push
+
+The push migration joins the current native provider schema through a new migration
+head. Existing installations that applied the earlier push migration retain their
+push snapshots. Push HPKE is independent of the retired external-bridge runtime.
+Migration 0263 joins the push chain with the current Workspace schema without
+rewriting applied migrations. Read cancellation also runs when the optional
+`[messenger_mutations]` journal is enabled; message, topic and stream reads use
+the same retained notification routes in either mode.
+
+The existing `PUT/DELETE /api/workspace/v1/push_devices/{device_uuid}` API
+registers a device's FCM token and raw X25519 public key under the authenticated
+user/project. Private keys stay on the phone. The registration UUID stays stable
+when a token changes; there are no registration revisions.
+
+When `[mobile_push]` is configured, native message fanout writes an encrypted
+per-user event snapshot into `messenger_push_outbox` in the same transaction.
+The delivery deadline remains one hour. This bounds undelivered transport work,
+not the lifetime of an unread notification on Android. Once delivery is terminal,
+the outbox removes device tokens and encrypted preview snapshots and retains the
+minimal event/owner/chat/message route. An unread route has no age deadline;
+reading or deleting the message can still enqueue cancellation weeks later.
+After cancellation, routine cleanup may discard that closed route.
+Message reads and read-up-to cancel the retained routes even when the messages
+are older than the public-event history window. Read-up-to preserves newer
+unread alerts in the same topic.
+Before handoff, the worker drops targets whose registration was deleted or whose
+token/key changed. Device row locks serialize that check with registration
+changes. Notifications already handed to an upstream service or FCM can be in
+flight; logout also removes the device's local decryption key.
+
+The existing primary Messenger worker forwards it to the local Notification
+v1 API and polls that event UUID. Per-device HPKE uses RFC 9180
+X25519/HKDF-SHA256/AES-256-GCM. The action, server/project/chat/message route,
+recipient, device and key UUID are authenticated as associated data.
+Device registration rejects low-order X25519 public keys. A bad legacy key is
+skipped per device so it cannot interrupt native message fanout.
+
+The two kinds are `workspace_message_create` and
+`workspace_message_cancelled`. Reading a message, topic or stream, or deleting a
+message, enqueues a separate cancellation with the same public message placement UUID. Existing
+mute, mention, topic-override, membership and unread rules determine recipients.
+The author, protocol-only key messages and history import do not produce alerts.
+Ordinary preview text is bounded before encryption. End-to-end encrypted chat
+payloads remain opaque and produce a generic encrypted-message preview.
+
+The worker retries the same event UUID/ciphertext after timeouts or restart,
+retains the initial one-hour deadline, and propagates inactive-token errors.
+It deletes a device registration only if its current token still equals the
+rejected snapshot. Temporary errors keep the outbox retryable. Notification
+transport choice remains in its owner-scoped binding API; Workspace preference
+proxy endpoints and Android transport-preference screens are deferred. Android
+presentation limits are separate: the client groups a saved connection's unread
+messages by stream/topic, preserves local dismissal/read/delete decisions, and
+uses the existing authenticated message-list API in batches to repair missed
+updates at startup and reconnection. A successful filtered response may omit
+deleted or inaccessible messages; HTTP/auth failures must preserve pending routes.
+
+Configuration keys are `mobile_push.organization_uuid`,
+`mobile_push.notification_endpoint` and `mobile_push.notification_auth_file`.
+The managed backend node UUID supplies the stable installation identity.
+The feature is disabled until the endpoint and private credential file are set.
+The [optional site manifest](exordos/manifests/mobile_push.yaml.j2) connects the
+existing worker to the local Notification and provisions a protected Event
+proxy through the existing Workspace gateway. Services read drop-ins from
+`/etc/workspace/workspace.conf.d`. Firebase sender credentials belong only on
+the upstream Notification, never in Workspace or customer installations.
+
+The complete event, encryption, relay and deployment contract is documented in
+`exordos_notification/docs/mobile-push.md`. Android integration is documented in
+`workspace_android/docs/mobile-push.md`.
+
+Tests include public HPKE vectors and a shared Python/Android event fixture,
+plus real PostgreSQL/HTTP integration of create, message/topic/stream read
+cancellation, retry and stale-token cleanup. Run the latter against a dedicated
+empty test database only:
+
+```bash
+WORKSPACE_TEST_DB_URL='<DEDICATED_TEST_POSTGRES_URL>' \
+  .tox/develop/bin/python -m pytest workspace/tests/integration/test_mobile_push.py
+```
+
+Its fixture recreates the test database's public schema. Use immutable
+`exordos build`/`exordos deploy` artifacts for runtime updates and preserve a
+Workspace database backup before applying migrations. A queued event or an
+`ACTIVE` transport status does not prove display on a real phone.
+
+
+The native push producer refuses HTTP redirects and redacts request/response
+bodies at every log level. The same client handles Core IAM login and refresh;
+passwords, issued tokens and encrypted device snapshots are omitted from HTTP
+diagnostics. API diagnostic request/response bodies are also redacted, including
+registration requests and private messages. Methods, URLs and response statuses
+remain available.

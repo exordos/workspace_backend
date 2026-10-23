@@ -49,7 +49,6 @@ from gcl_iam import middlewares as iam_mw
 from restalchemy.api import applications
 from restalchemy.api import middlewares
 from restalchemy.api.middlewares import contexts as contexts_mw
-from restalchemy.api.middlewares import logging as logging_mw
 from restalchemy.storage.sql import engines
 from restalchemy.storage.sql import migrations as ra_migrations
 from oslo_config import cfg
@@ -203,7 +202,7 @@ def build_test_wsgi_application():
             app_middlewares.MutationResponseMiddleware,
             app_middlewares.DatabaseDeadlockRetryMiddleware,
             app_middlewares.ErrorsHandlerMiddleware,
-            logging_mw.LoggingMiddleware,
+            workspace_app.MetadataOnlyLoggingMiddleware,
         ],
     )
 
