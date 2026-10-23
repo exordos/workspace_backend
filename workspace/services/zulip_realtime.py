@@ -31,6 +31,7 @@ INBOX_WORKERS = 4
 # Inbox transactions may wait on shared cache rows. Keep capacity for polling
 # cursors and dispatching a newly submitted Workspace message.
 DATABASE_WORKERS = INBOX_WORKERS + 2
+EVENT_PROBE_INTERVAL = 0.5
 
 
 class ZulipRealtimeService:
@@ -249,11 +250,7 @@ class ZulipRealtimeService:
                             registration,
                             started_at,
                         )
-                    events = await zulip.get_events(
-                        subscription.queue_id,
-                        subscription.last_event_id,
-                        subscription.longpoll_timeout,
-                    )
+                    events = await self._receive_events(zulip, subscription)
                     received_at = datetime.datetime.now(datetime.timezone.utc)
                     subscription.last_event_id = await self._database(
                         models.RealtimeSubscription.append_events,
@@ -280,3 +277,61 @@ class ZulipRealtimeService:
                     delay = min(delay * 2, 60)
         finally:
             await zulip.close()
+
+    @staticmethod
+    async def _receive_events(
+        zulip: client.AsyncZulipClient, subscription: models.RealtimeSubscription
+    ) -> list[dict]:
+        # Keep the server-advertised heartbeat timeout. A separate nonblocking
+        # read detects ready events even when the long-poll connection stalls.
+        # Both requests acknowledge only the same already committed cursor.
+        pending = asyncio.create_task(
+            zulip.get_events(
+                subscription.queue_id,
+                subscription.last_event_id,
+                subscription.longpoll_timeout,
+            )
+        )
+        probe: asyncio.Task | None = None
+        try:
+            while True:
+                done, _ = await asyncio.wait((pending,), timeout=EVENT_PROBE_INTERVAL)
+                if done:
+                    return await pending
+                probe = asyncio.create_task(
+                    zulip.get_events(
+                        subscription.queue_id,
+                        subscription.last_event_id,
+                        5,
+                        dont_block=True,
+                    )
+                )
+                done, _ = await asyncio.wait(
+                    (pending, probe), return_when=asyncio.FIRST_COMPLETED
+                )
+                if pending in done:
+                    return await pending
+                try:
+                    events = probe.result()
+                except Exception as error:
+                    if (
+                        isinstance(error, client.ZulipApiError)
+                        and error.code == "BAD_EVENT_QUEUE_ID"
+                    ):
+                        raise
+                    # A failed health check must not discard a healthy poll or
+                    # create a tight retry loop when the provider limits reads.
+                    LOG.warning(
+                        "Zulip event health probe failed (%s); retaining long poll",
+                        type(error).__name__,
+                    )
+                    return await pending
+                if events:
+                    return events
+                probe = None
+        finally:
+            jobs = [pending] + ([probe] if probe is not None else [])
+            for job in jobs:
+                if not job.done():
+                    job.cancel()
+            await asyncio.gather(*jobs, return_exceptions=True)

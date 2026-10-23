@@ -19,6 +19,7 @@ from restalchemy.storage.sql import migrations
 from workspace.bridges.zulip import client
 from workspace.bridges.zulip.dm import models
 from workspace.bridges.zulip.dm import reactions
+from workspace.bridges.zulip.dm import flags
 from workspace.common import mutation_journal_opts
 from workspace.messenger_api.dm import external_models
 from workspace.services import history_import
@@ -33,6 +34,21 @@ from workspace.tests.integration import test_zulip_task_workers as worker_tests
 message_sources = state_tests.message_sources
 history_account = message_tests.history_account
 outgoing = worker_tests.outgoing
+
+
+@pytest.mark.parametrize("owned", [False, True])
+def test_coalesced_provider_flags_can_repeat_a_message_id(
+    history_account, db, monkeypatch, owned
+):
+    monkeypatch.setattr(mutation_journal_opts, "enabled", lambda: owned)
+    at = datetime.datetime.now(datetime.timezone.utc)
+    for event_id, value in [(5, True), (6, False)]:
+        with contexts.Context().session_manager():
+            flags.record(history_account, [42] * 8, "starred", value, at, event_id)
+        assert db.execute(
+            "SELECT value,event_id FROM bridge_zulip_v5_message_flags WHERE external_account_uuid=%s AND message_id=42 AND flag='starred'",
+            (history_account.uuid,),
+        ).fetchone() == (value, event_id)
 
 
 def test_native_observers_do_not_cross_lock_each_others_history_batches(

@@ -368,7 +368,12 @@ class AsyncZulipClient:
         )
 
     async def get_events(
-        self, queue_id: str, last_event_id: int, timeout: int
+        self,
+        queue_id: str,
+        last_event_id: int,
+        timeout: int,
+        *,
+        dont_block: bool = False,
     ) -> list[dict]:
         result = await self._request(
             "GET",
@@ -376,7 +381,7 @@ class AsyncZulipClient:
             params={
                 "queue_id": queue_id,
                 "last_event_id": last_event_id,
-                "dont_block": "false",
+                "dont_block": "true" if dont_block else "false",
             },
             timeout=aiohttp.ClientTimeout(total=timeout, connect=5),
         )

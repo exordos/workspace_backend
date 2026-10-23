@@ -125,6 +125,8 @@ def record(
     observed_at: datetime.datetime,
     event_id: int = -1,
 ) -> None:
+    # Zulip coalesces consecutive flag events and may repeat message IDs.
+    message_ids = sorted(set(message_ids))
     if mutation_journal_opts.enabled():
         _record_owned(
             account,
