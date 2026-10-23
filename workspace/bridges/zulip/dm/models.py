@@ -4091,6 +4091,14 @@ def move_workspace_topic(
         "SELECT 1 FROM messenger_topics WHERE project_id=%s AND uuid=%s AND deleted_at IS NULL",
         (project_id, new_uuid),
     ).fetchone()
+    moved_messages = [
+        row["message_uuid"]
+        for row in session.execute(
+            "SELECT message_uuid FROM messenger_message_placements "
+            "WHERE project_id=%s AND topic_uuid=%s",
+            (project_id, old_uuid),
+        ).fetchall()
+    ]
     session.execute(
         "SELECT messenger_move_topic(%s,%s,%s,%s,%s,%s)",
         (project_id, old_uuid, new_uuid, stream_uuid, name, is_done),
@@ -4122,6 +4130,23 @@ def move_workspace_topic(
         else messenger_events.create_topic_events
     )
     publish(project_id, current, session=session, compact=True)
+    # Topic deletion evicts its messages from clients. Recreate only the moved
+    # placements so an already loaded merge destination receives them as well.
+    by_placement: dict[sys_uuid.UUID, list] = {}
+    if moved_messages:
+        for message in v2_models.WorkspaceUserMessage.objects.get_all(
+            filters={
+                "project_id": filters.EQ(project_id),
+                "canonical_message_uuid": filters.In(moved_messages),
+                "visible": filters.EQ(True),
+            },
+            session=session,
+        ):
+            by_placement.setdefault(message.uuid, []).append(message)
+    for recipients in by_placement.values():
+        messenger_events.create_compact_message_events(
+            project_id, recipients, session=session
+        )
 
 
 class RewriteTopicReferencesContent(AbstractTaskContent):

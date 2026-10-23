@@ -844,3 +844,59 @@ def test_topic_movement_keeps_messages_and_updates_links_only_for_full_moves(
     assert updated.status_code == 200, updated.text
     expected = destination_uuid if mode == "change_all" else source_uuid
     assert updated.json()["payload"]["content"] == f"[Discussion](urn:topic:{expected})"
+
+
+@pytest.mark.parametrize("existing_destination", [False, True])
+def test_full_move_republishes_historical_placements_after_topic_eviction(
+    history_account, monkeypatch, api, db, existing_destination
+):
+    account = history_account
+    messages = [history_tests._message_data(40)]
+    if existing_destination:
+        messages.append(history_tests._message_data(42, subject="Renamed"))
+    _import(account, monkeypatch, *messages)
+    source = next(
+        item for item in history_tests._messages(account) if item.message_id == 40
+    )
+    canonical = uuid.uuid5(account.project_id, str(source.message_uuid))
+    public = db.execute(
+        "SELECT COALESCE(legacy_public_uuid,uuid) FROM messenger_message_placements "
+        "WHERE project_id=%s AND message_uuid=%s",
+        (account.project_id, canonical),
+    ).fetchone()[0]
+    tasks = _topic_event(
+        account,
+        {
+            "id": 1,
+            "type": "update_message",
+            "message_id": 40,
+            "message_ids": [40],
+            "stream_id": 42,
+            "orig_subject": "General",
+            "subject": "Renamed",
+            "propagate_mode": "change_all",
+            "edit_timestamp": int(
+                datetime.datetime.now(datetime.timezone.utc).timestamp()
+            ),
+        },
+    )
+    for task in tasks:
+        with contexts.Context().session_manager():
+            task.execute()
+        assert task.status == "done", task.error_description
+    response = api.get(
+        "/v1/events/",
+        project=account.project_id,
+        user=account.owner_user_uuid,
+        params={"page_limit": 500},
+    )
+    assert response.status_code == 200, response.text
+    payloads = [event["payload"] for event in response.json()]
+    created = [item for item in payloads if item["kind"] == "message.created"]
+    assert [(item["uuid"], item["topic_uuid"]) for item in created] == [
+        (str(public), str(uuid.uuid5(source.channel.stream_uuid, "Renamed")))
+    ]
+    removed_topic = next(
+        index for index, item in enumerate(payloads) if item["kind"] == "topic.deleted"
+    )
+    assert removed_topic < payloads.index(created[0])

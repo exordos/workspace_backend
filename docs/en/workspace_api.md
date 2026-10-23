@@ -1055,6 +1055,11 @@ move only the provider-specified messages. A complete move transfers drafts,
 summaries and user settings, and updates indexed topic references in bounded
 batches. Native topics in ordinary Workspace streams retain their local behavior.
 
+The old topic emits `topic.deleted`; the destination emits `topic.created` or
+`topic.updated`. Moved placements then emit `message.created` with their existing
+message UUIDs, including historical messages, so clients can repopulate a loaded
+merge destination after evicting the old topic. Pure done changes do not use this path.
+
 `GET /stream_topics/{old_uuid}` resolves a replaced topic to the current topic
 DTO after checking the destination's normal access rules. Clients should use
 the returned UUID and stream UUID, including when following a stored link or

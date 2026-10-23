@@ -1054,6 +1054,12 @@ Vollständige Verschiebungen erhalten Entwürfe, Zusammenfassungen und Einstellu
 und aktualisieren indizierte Verweise in begrenzten Stapeln.
 Gewöhnliche Workspace-Streams behalten ihr lokales Verhalten.
 
+Das alte Thema sendet `topic.deleted`, das Ziel `topic.created` oder
+`topic.updated`. Danach senden die verschobenen Platzierungen `message.created`
+mit ihren bisherigen Nachrichten-UUIDs, auch für historische Nachrichten. So
+können Clients das bereits geladene Ziel nach dem Entfernen des alten Themas
+aktualisieren. Reine Done-Änderungen verwenden diesen Ablauf nicht.
+
 `GET /stream_topics/{old_uuid}` liefert das aktuelle Thema nach Prüfung der
 Zugriffsrechte auf das Ziel. Clients verwenden die zurückgegebenen Themen- und
 Stream-UUIDs, auch bei gespeicherten Links und nach dem Löschereignis für das
