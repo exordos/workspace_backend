@@ -22,6 +22,8 @@ class Work:
     values: set = dataclasses.field(default_factory=set)
     reservations: frozenset = frozenset()
     ready_at: float = 0
+    priority: int = 0
+    created_at: float = dataclasses.field(default_factory=time.monotonic)
 
 
 class KeyedDispatcher:
@@ -41,11 +43,13 @@ class KeyedDispatcher:
         key: tuple,
         values: typing.Iterable = (),
         reservations: typing.Iterable[tuple] = (),
+        priority: int = 0,
     ) -> None:
         if self._closed:
             raise RuntimeError("Dispatcher is closed")
         work = self._pending.setdefault(key, Work(key))
         work.values.update(values)
+        work.priority = max(work.priority, priority)
         work.reservations |= frozenset((key, *reservations))
 
     def poll(self) -> list[tuple[Work, object, BaseException | None]]:
@@ -60,7 +64,7 @@ class KeyedDispatcher:
             except Exception as error:
                 # Requeue failed inputs as well as triggers received while
                 # running. Never release a reservation on a timeout alone.
-                self.trigger(work.key, work.values, work.reservations)
+                self.trigger(work.key, work.values, work.reservations, work.priority)
                 self._pending[work.key].ready_at = time.monotonic() + 0.1
                 completed.append((work, None, error))
             else:
@@ -69,7 +73,13 @@ class KeyedDispatcher:
             # already-waiting jobs sharing its reservations run first.
             if work.key in self._pending:
                 self._pending.move_to_end(work.key)
-        for key, work in list(self._pending.items()):
+        # Age waiting jobs so continuous message traffic cannot starve flags.
+        # Equal effective priorities retain FIFO and all reservation fences.
+        now = time.monotonic()
+        for key, work in sorted(
+            self._pending.items(),
+            key=lambda item: -(item[1].priority + int((now - item[1].created_at) / 2)),
+        ):
             if len(self._running) >= self._workers:
                 break
             if work.ready_at > time.monotonic():

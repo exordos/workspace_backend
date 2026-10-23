@@ -16,6 +16,7 @@ class Changes:
     streams: dict = dataclasses.field(default_factory=dict)
     folders: dict = dataclasses.field(default_factory=dict)
     projects: set = dataclasses.field(default_factory=set)
+    message_acknowledgements: dict = dataclasses.field(default_factory=dict)
 
     def topic(
         self,

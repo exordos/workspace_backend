@@ -252,8 +252,8 @@ def test_edit_retries_until_send_then_uses_the_same_account_and_id(outgoing):
     send, edit = tasks(account)
     assert send.content.kind == "send_message" and edit.content.kind == "edit_message"
     assert (
-        models.TASK_PRIORITY_IMPORT_CHANNELS
-        > send.priority
+        send.priority
+        > models.TASK_PRIORITY_IMPORT_CHANNELS
         > edit.priority
         > models.TASK_PRIORITY_IMPORT_HISTORY
     )

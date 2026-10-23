@@ -1237,20 +1237,21 @@ def test_history_reimport_reloads_content_changed_after_the_observation_was_read
     edited_at = datetime.datetime(2025, 1, 1, tzinfo=datetime.timezone.utc)
 
     def load_then_edit(**kwargs):
-        source = collection.get_one_or_none(**kwargs)
+        sources = collection.get_all(**kwargs)
+        (source,) = sources
         db.execute(
             "UPDATE bridge_zulip_v5_message_contents "
             "SET workspace_content = 'A concurrent Workspace edit', "
             "workspace_content_updated_at = %s WHERE uuid = %s",
             (edited_at.replace(tzinfo=None), source.content.uuid),
         )
-        return source
+        return sources
 
     with monkeypatch.context() as patched:
         patched.setattr(
             models.ZulipMessage,
             "objects",
-            mock.Mock(get_one_or_none=load_then_edit, get_one=collection.get_one),
+            mock.Mock(get_all=load_then_edit, get_one=collection.get_one),
         )
         assert _import_history(account).status == "done"
     (stored,) = _messages(account)

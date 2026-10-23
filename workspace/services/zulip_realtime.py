@@ -27,6 +27,10 @@ from workspace.messenger_api.dm import external_models
 LOG = logging.getLogger(__name__)
 EVENTS_CHANNEL = "workspace_zulip_realtime"
 WORKSPACE_EVENTS_CHANNEL = "workspace_projection_tasks"
+INBOX_WORKERS = 4
+# Inbox transactions may wait on shared cache rows. Keep capacity for polling
+# cursors and dispatching a newly submitted Workspace message.
+DATABASE_WORKERS = INBOX_WORKERS + 2
 
 
 class ZulipRealtimeService:
@@ -42,7 +46,9 @@ class ZulipRealtimeService:
         self._pollers: dict[
             tuple[sys_uuid.UUID, sys_uuid.UUID], tuple[str, asyncio.Task[None]]
         ] = {}
-        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=DATABASE_WORKERS
+        )
 
     @staticmethod
     def _transaction(callback: typing.Callable, args: tuple) -> typing.Any:
@@ -144,12 +150,24 @@ class ZulipRealtimeService:
             await self._wait(self._accounts_changed)
 
     async def _consume_events(self) -> None:
+        await asyncio.gather(
+            *(self._consume_event_batches() for _worker in range(INBOX_WORKERS))
+        )
+
+    async def _consume_event_batches(self) -> None:
         while True:
             self._events_ready.clear()
             try:
                 for _index in range(100):
-                    if not await self._database(models.RealtimeEvent.dispatch_one):
+                    processed = await self._database(
+                        models.RealtimeEvent.dispatch_batch, 16
+                    )
+                    if processed == 0:
                         break
+                    if processed < 0:
+                        # A task briefly owns an account with saved input. Its
+                        # commit does not create a new inbox notification.
+                        await asyncio.sleep(0.01)
                 else:
                     await asyncio.sleep(0)
                     continue

@@ -21,6 +21,7 @@ from restalchemy.common import contexts
 from restalchemy.dm import filters
 from restalchemy.storage import exceptions as storage_exceptions
 from restalchemy.storage.sql import migrations
+from restalchemy.storage.sql import sessions
 
 from workspace.bridges.zulip import client
 from workspace.bridges.zulip.dm import models
@@ -319,7 +320,9 @@ def test_different_accounts_run_concurrently_with_separate_sessions(
     monkeypatch.setattr(
         models.InitializeConnectionContent, "on_done", lambda *args: None
     )
-    service = history_import.HistoryImportService(queue="realtime", workers=2)
+    # Two imports can run concurrently while the third slot stays available
+    # for a newly arriving send.
+    service = history_import.HistoryImportService(queue="realtime", workers=3)
     try:
         for value in (account, other):
             task = models.Task(
@@ -544,7 +547,7 @@ def test_history_import_retries_database_deadlock_after_rolling_back_partial_wri
     zulip = mock.Mock()
     zulip.get_messages.return_value = [message_tests._message_data()]
     monkeypatch.setattr(client, "ZulipClient", lambda account: zulip)
-    insert_message = models.ZulipMessage.insert
+    batch_insert = sessions.PgSQLSession.batch_insert
     attempts = []
 
     def fail(message, wrapped):
@@ -561,14 +564,17 @@ def test_history_import_retries_database_deadlock_after_rolling_back_partial_wri
                 )
             raise psycopg.errors.DeadlockDetected(message)
 
-    def insert(message):
-        result = insert_message(message)
-        attempts.append(message.message_id)
+    def insert(session, messages):
+        result = batch_insert(session, messages)
+        if messages and isinstance(messages[0], models.ZulipMessage):
+            attempts.extend(message.message_id for message in messages)
+        else:
+            return result
         if len(attempts) == 1:
             fail(deadlock["message"], deadlock["wrapped"])
         return result
 
-    monkeypatch.setattr(models.ZulipMessage, "insert", insert)
+    monkeypatch.setattr(sessions.PgSQLSession, "batch_insert", insert)
     status_update = mock.Mock(
         side_effect=AssertionError("A database deadlock must not change account status")
     )

@@ -40,17 +40,64 @@ def _naive(value: datetime.datetime) -> datetime.datetime:
 
 
 def _enqueue(project_id: uuid.UUID, message_uuid: uuid.UUID) -> None:
+    _enqueue_many(project_id, [message_uuid])
+
+
+def _enqueue_many(project_id: uuid.UUID, message_uuids: list[uuid.UUID]) -> None:
+    if not message_uuids:
+        return
     _session().execute(
         """INSERT INTO bridge_zulip_v5_reaction_changes(project_id, canonical_message_uuid)
-           SELECT %s,%s WHERE EXISTS (
+           SELECT %s,input.message_uuid FROM unnest(%s::uuid[]) AS input(message_uuid)
+           WHERE EXISTS (
                SELECT 1 FROM bridge_zulip_v5_reactions AS reaction
                JOIN bridge_zulip_v5_reaction_messages AS message ON message.uuid=reaction.reaction_message_uuid
-               WHERE message.project_id=%s AND message.canonical_message_uuid=%s)
+               WHERE message.project_id=%s AND message.canonical_message_uuid=input.message_uuid)
            OR EXISTS (SELECT 1 FROM bridge_zulip_v5_reaction_intents
-               WHERE project_id=%s AND canonical_message_uuid=%s)
+               WHERE project_id=%s AND canonical_message_uuid=input.message_uuid)
+           ORDER BY input.message_uuid
            ON CONFLICT (project_id, canonical_message_uuid) DO UPDATE
                SET revision=EXCLUDED.revision, next_retry_at=NULL""",
-        (project_id, message_uuid, project_id, message_uuid, project_id, message_uuid),
+        (project_id, sorted(set(message_uuids)), project_id, project_id),
+    )
+
+
+def prepare_messages(
+    account: external_models.ExternalAccount, message_ids: typing.Iterable[int]
+) -> list[dict[str, typing.Any]]:
+    """Acquire shared cache rows in the same order as a history import."""
+    identifiers = sorted(set(message_ids), reverse=True)
+    if not identifiers:
+        return []
+    _session().execute(
+        "SELECT uuid FROM m_external_accounts_v2 WHERE project_id=%s AND uuid=%s FOR KEY SHARE",
+        (account.project_id, account.uuid),
+    )
+    hostname = account.get_host()
+    return (
+        _session()
+        .execute(
+            """INSERT INTO bridge_zulip_v5_reaction_messages
+           (uuid,project_id,hostname,message_id,observer_account_uuid)
+           SELECT identifier,%s,%s,message_id,%s
+           FROM unnest(%s::uuid[],%s::bigint[]) AS input(identifier,message_id)
+           ORDER BY message_id DESC
+           ON CONFLICT (project_id,hostname,message_id) DO UPDATE
+               SET observer_account_uuid=EXCLUDED.observer_account_uuid RETURNING *""",
+            (
+                account.project_id,
+                hostname,
+                account.uuid,
+                [
+                    uuid.uuid5(
+                        account.project_id, f"zulip-reactions:{hostname}:{identifier}"
+                    )
+                    for identifier in identifiers
+                ],
+                identifiers,
+            ),
+        )
+        .fetchall()
     )
 
 
@@ -208,14 +255,99 @@ def record_event(
     _record(message, data, data["op"] == "add", observed_at, event_id, queue_id)
 
 
+def _observe_empty_snapshots(
+    account: external_models.ExternalAccount,
+    messages: list[dict[str, typing.Any]],
+    observed_at: datetime.datetime,
+) -> None:
+    cached = prepare_messages(account, [data["id"] for data in messages])
+    missing = [row for row in cached if row["canonical_message_uuid"] is None]
+    bound = []
+    if missing:
+        namespace = uuid.uuid5(uuid.NAMESPACE_DNS, typing.cast(str, account.get_host()))
+        rows = (
+            _session()
+            .execute(
+                """SELECT input.uuid,canonical.uuid AS canonical_uuid
+               FROM unnest(%s::uuid[],%s::bigint[],%s::uuid[]) AS input(uuid,message_id,candidate)
+               LEFT JOIN messenger_messages AS canonical
+                 ON canonical.project_id=%s AND canonical.uuid=COALESCE((
+                     SELECT delivery.message_uuid FROM bridge_zulip_v5_deliveries AS delivery
+                     WHERE delivery.project_id=%s AND delivery.hostname=%s
+                       AND delivery.zulip_message_id=input.message_id),input.candidate)
+                AND canonical.deleted_at IS NULL AND EXISTS (
+                  SELECT 1 FROM messenger_message_placements AS placement
+                  WHERE placement.project_id=canonical.project_id AND placement.message_uuid=canonical.uuid)""",
+                (
+                    [row["uuid"] for row in missing],
+                    [row["message_id"] for row in missing],
+                    [
+                        uuid.uuid5(
+                            account.project_id,
+                            str(uuid.uuid5(namespace, str(row["message_id"]))),
+                        )
+                        for row in missing
+                    ],
+                    account.project_id,
+                    account.project_id,
+                    account.get_host(),
+                ),
+            )
+            .fetchall()
+        )
+        identities = {row["uuid"]: row["canonical_uuid"] for row in rows}
+        _session().execute(
+            """UPDATE bridge_zulip_v5_reaction_messages AS message
+               SET canonical_message_uuid=input.canonical_uuid,
+                   next_retry_at=CASE WHEN input.canonical_uuid IS NULL
+                     THEN (NOW() AT TIME ZONE 'UTC')+INTERVAL '5 seconds' ELSE NULL END
+               FROM unnest(%s::uuid[],%s::uuid[]) AS input(uuid,canonical_uuid)
+               WHERE message.uuid=input.uuid""",
+            (
+                [row["uuid"] for row in missing],
+                [identities[row["uuid"]] for row in missing],
+            ),
+        )
+        for row in missing:
+            row["canonical_message_uuid"] = identities[row["uuid"]]
+            if row["canonical_message_uuid"] is not None:
+                bound.append(row["canonical_message_uuid"])
+    at = _naive(observed_at)
+    fresh = [
+        row for row in cached if row["snapshot_at"] is None or at > row["snapshot_at"]
+    ]
+    if fresh:
+        identifiers = [row["uuid"] for row in fresh]
+        _session().execute(
+            """UPDATE bridge_zulip_v5_reactions SET present=false,observed_at=%s,event_id=-1,queue_id=NULL
+               WHERE reaction_message_uuid=ANY(%s::uuid[]) AND observed_at<=%s""",
+            (at, identifiers, at),
+        )
+        _session().execute(
+            "UPDATE bridge_zulip_v5_reaction_messages SET snapshot_at=%s WHERE uuid=ANY(%s::uuid[])",
+            (at, identifiers),
+        )
+    _enqueue_many(
+        account.project_id,
+        bound
+        + [
+            row["canonical_message_uuid"]
+            for row in fresh
+            if row["canonical_message_uuid"] is not None
+        ],
+    )
+
+
 def observe_snapshot(
     account: external_models.ExternalAccount,
     messages: list[dict[str, typing.Any]],
     observed_at: datetime.datetime,
 ) -> None:
-    for data in messages:
-        if "reactions" not in data:
-            continue
+    snapshots = [data for data in messages if "reactions" in data]
+    if len(snapshots) > 1 and not any(data["reactions"] for data in snapshots):
+        _observe_empty_snapshots(account, snapshots, observed_at)
+        return
+    for data in snapshots:
         message = message_for(account, data["id"])
         at = _naive(observed_at)
         if message["snapshot_at"] is not None and at <= message["snapshot_at"]:
