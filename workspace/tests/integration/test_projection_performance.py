@@ -2772,3 +2772,49 @@ def test_fair_scheduler_filters_blocked_rows_before_candidate_limit(
 
         assert claimed is not None
         assert claimed["scope_key"] == available_scope_key
+
+
+@pytest.mark.parametrize(
+    "source_kind", v2_projection.LEGACY_FOLDER_SNAPSHOT_SOURCE_KINDS
+)
+def test_legacy_folder_snapshot_without_membership_does_not_publish_unfenced_event(
+    api, db, source_kind
+):
+    stream, _message = _create_message(api, "Legacy folder membership")
+    folder_uuid = sys_uuid.UUID(int=0)
+    db.execute(
+        "DELETE FROM messenger_stream_bindings WHERE project_id=%s AND user_uuid=%s AND stream_uuid=%s",
+        (api.project_id, api.user_uuid, stream["uuid"]),
+    )
+    before = db.execute(
+        "SELECT count(*) FROM m_workspace_broadcast_message_events_v1 WHERE project_id=%s AND object_type='folder'",
+        (api.project_id,),
+    ).fetchone()[0]
+    with contexts.Context().session_manager() as session:
+        v2_projection._process_folder_projection(
+            session,
+            {
+                "uuid": sys_uuid.uuid4(),
+                "project_id": api.project_id,
+                "scope_key": f"{api.project_id}:{api.user_uuid}:{folder_uuid}",
+                "payload": {
+                    "source_kind": source_kind,
+                    "stream_uuid": stream["uuid"],
+                    "user_uuid": str(api.user_uuid),
+                    "folder_uuid": str(folder_uuid),
+                },
+            },
+        )
+    snapshot = db.execute(
+        "SELECT unread_count,folder_items_snapshot FROM messenger_user_folder_bindings "
+        "WHERE project_id=%s AND user_uuid=%s AND folder_uuid=%s",
+        (api.project_id, api.user_uuid, folder_uuid),
+    ).fetchone()
+    assert snapshot == (0, [])
+    assert (
+        db.execute(
+            "SELECT count(*) FROM m_workspace_broadcast_message_events_v1 WHERE project_id=%s AND object_type='folder'",
+            (api.project_id,),
+        ).fetchone()[0]
+        == before
+    )
