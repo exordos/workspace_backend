@@ -20,7 +20,6 @@ from workspace.messenger_api.api import store_factory
 from workspace.messenger_api.dm import event_payloads
 from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.dm import message_payloads
-from workspace.messenger_api.dm import models as messenger_models
 from workspace.messenger_api.dm import v2_models
 from workspace.services.messenger_workers import v2_projection
 from workspace.services import history_import
@@ -49,7 +48,7 @@ def message_sources(_database, db):
             project_id=project_id or uuid.uuid4(),
             owner_user_uuid=owner_uuid,
             provider="zulip",
-            external_account_id=f"{host or 'zulip.example.com'}:{sender_id}",
+            external_account_id=str(sender_id),
             settings={"server_url": f"https://{host or 'zulip.example.com'}"},
         )
         account.insert()
@@ -227,7 +226,7 @@ def test_message_state_creates_canonical_content_without_placements(
         "content": source.content.workspace_content,
     }
     assert message.source_name == "zulip"
-    assert message.source == {"kind": "zulip"}
+    assert message.source_name == "zulip"
     assert message.created_at == datetime.datetime.fromtimestamp(
         source.timestamp, tz=datetime.timezone.utc
     )
@@ -239,9 +238,10 @@ def test_message_state_creates_canonical_content_without_placements(
         topic_uuid=source.topic.uuid,
         author_uuid=message.author_uuid,
         source_name="zulip",
-        source=messenger_models.ZulipSource(),
+        provider_uuid=account.provider_uuid,
+        provider_identity="42",
     )
-    assert deleted_event.source.kind == "zulip"
+    assert deleted_event.source_name == "zulip"
     for table in (
         "messenger_message_placements",
         "messenger_user_message_bindings",
@@ -399,7 +399,6 @@ def test_message_states_preserve_native_data_and_filter_other_providers(
             project_id=account.project_id,
             author_uuid=account.owner_user_uuid,
             payload=message_payloads.MarkdownPayload(content="Native message"),
-            source={"kind": "native"},
             ingest_sequence=1,
         ).insert()
     else:
@@ -560,7 +559,6 @@ def test_workspace_changes_track_updates_deletions_and_ignore_native_messages(
         project_id=account.project_id,
         author_uuid=account.owner_user_uuid,
         payload=message_payloads.MarkdownPayload(content="Native body"),
-        source={"kind": "native"},
         ingest_sequence=1,
     )
     native.insert()
@@ -851,19 +849,12 @@ def test_batch_keeps_changes_when_its_writes_leave_another_message_different(
 def test_reconciliation_tracking_migration_is_reversible(message_sources, db):
     account, source = message_sources()
     _prepare(account)
-    engine = migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
     migration = (
         "0236-Avoid-self-generated-Zulip-message-reconciliation-changes-50c353.py"
     )
+    engine = conftest.DataMigration(migration)
     engine.rollback_migration(migration)
     try:
-        db.execute(
-            "ALTER TABLE bridge_zulip_v5_message_contents ADD COLUMN conversion_version INTEGER NOT NULL DEFAULT 0, ADD COLUMN source_timestamp BIGINT NOT NULL DEFAULT 0, ADD COLUMN source_message_id BIGINT NOT NULL DEFAULT 0"
-        )
-        for table in ("messenger_message_changes", "bridge_zulip_v5_message_changes"):
-            db.execute(
-                f"ALTER TABLE {table} ADD COLUMN message_created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT 'epoch', ADD COLUMN message_sequence BIGINT NOT NULL DEFAULT 0"
-            )
         with contexts.Context().session_manager():
             assert models.ZulipMessageState.reconcile_batch(1) == 1
         (pending,) = _changes(v2_models.WorkspaceMessageChange, account)
@@ -2335,11 +2326,11 @@ def test_unread_counters_remain_exact_above_one_thousand_and_recount_after_reads
             FROM unnest(%s::uuid[]) WITH ORDINALITY AS generated(uuid, number)
         ), messages AS (
             INSERT INTO messenger_messages (
-                uuid, project_id, author_uuid, payload, source_name, source,
+                uuid, project_id, author_uuid, payload, source_name,
                 created_at, updated_at, content_updated_at
             )
             SELECT generated.uuid, original.project_id, original.author_uuid,
-                   original.payload, original.source_name, original.source,
+                   original.payload, original.source_name,
                    original.created_at + generated.number * interval '1 second',
                    original.updated_at, original.content_updated_at
             FROM messenger_messages AS original CROSS JOIN generated
@@ -2391,6 +2382,10 @@ def test_unread_counters_remain_exact_above_one_thousand_and_recount_after_reads
             large_active,
             large_active,
         ),
+    )
+    # Plan against the committed bulk fixture rather than statistics from earlier tests.
+    db.execute(
+        "ANALYZE messenger_messages, messenger_message_placements, messenger_user_message_bindings, messenger_user_message_states, messenger_stream_bindings, messenger_topics, messenger_message_counter_changes"
     )
     _refresh_counters()
     for model in (
@@ -3068,7 +3063,7 @@ def test_message_reconciliation_publishes_complete_lifecycle_once(message_source
     assert deleted["uuid"] == str(placement.uuid)
     assert deleted["stream_uuid"] == str(placement.stream_uuid)
     assert deleted["topic_uuid"] == str(placement.topic_uuid)
-    assert deleted["source"] == {"kind": "zulip"}
+    assert deleted["source_name"] == "zulip"
     assert _messages(account) == _placements(account) == []
     messenger_tests._drain()
     assert _message_events(api, account) == [_created, _updated, deleted]

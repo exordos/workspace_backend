@@ -1147,7 +1147,8 @@ def _message_namespace(
                message.uuid AS canonical_message_uuid,
                message.author_uuid AS user_uuid, message.payload,
                message.created_at, message.updated_at, message.source_name,
-               message.source, message.reaction_users
+               message.provider_uuid,
+               message.provider_identity, message.reaction_users
         FROM messenger_message_placements AS placement
         JOIN messenger_messages AS message
           ON message.project_id = placement.project_id
@@ -2069,7 +2070,10 @@ def _process_reaction_snapshot(
             old_message = types.SimpleNamespace(
                 uuid=_uuid(payload["old_message_uuid"]),
                 source_name=payload["old_source_name"],
-                source=payload["old_source"],
+                provider_uuid=_uuid(payload["old_provider_uuid"])
+                if payload["old_provider_uuid"] is not None
+                else None,
+                provider_identity=payload["old_provider_identity"],
             )
             emitted = messenger_events.create_message_reaction_updated_event(
                 reaction,
@@ -2840,7 +2844,8 @@ def _deliver_snapshot_batch(
                         _uuid(recipient),
                         _uuid(payload["stream_uuid"]),
                         payload["source_name"],
-                        payload["source"],
+                        payload["provider_uuid"],
+                        payload["provider_identity"],
                         session=session,
                     )
                 )
@@ -2864,7 +2869,8 @@ def _deliver_snapshot_batch(
                         _uuid(payload["topic_uuid"]),
                         _uuid(payload["stream_uuid"]),
                         payload["source_name"],
-                        payload["source"],
+                        payload["provider_uuid"],
+                        payload["provider_identity"],
                         session=session,
                     )
                 )
@@ -2927,7 +2933,8 @@ def _deliver_snapshot_batch(
                 _uuid(placement["topic_uuid"]),
                 _uuid(payload["author_uuid"]),
                 payload["source_name"],
-                payload["source"],
+                payload["provider_uuid"],
+                payload["provider_identity"],
                 session=session,
                 compact=True,
             )

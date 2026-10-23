@@ -16,7 +16,6 @@ import psycopg.errors
 import pytest
 from restalchemy.common import contexts
 from restalchemy.dm import filters
-from restalchemy.storage.sql import migrations
 
 from workspace.bridges.zulip import client
 from workspace.bridges.zulip.dm import models
@@ -317,8 +316,8 @@ def test_migration_preserves_queue_cursor_and_outgoing_work_but_cancels_polling(
     imported, db
 ):
     account, _source, state, subscription, _zulip, _constructor = imported
-    engine = migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
     migration = next(conftest.MIGRATIONS_DIR.glob("0246-*.py")).name
+    engine = conftest.DataMigration(migration)
     scope = [
         str(account.project_id),
         str(account.owner_user_uuid),
@@ -327,6 +326,14 @@ def test_migration_preserves_queue_cursor_and_outgoing_work_but_cancels_polling(
     ]
     old_revision = hashlib.sha256(
         json.dumps([*scope, account.settings], sort_keys=True).encode()
+    ).hexdigest()
+    legacy_subscription_revision = hashlib.sha256(
+        json.dumps(
+            [*scope, account.settings["server_url"].rstrip("/")], sort_keys=True
+        ).encode()
+    ).hexdigest()
+    legacy_realtime_revision = hashlib.sha256(
+        json.dumps([*scope, account.connection_settings()], sort_keys=True).encode()
     ).hexdigest()
     tasks = []
     try:
@@ -375,12 +382,12 @@ def test_migration_preserves_queue_cursor_and_outgoing_work_but_cancels_polling(
             subscription.generation,
             123,
         )
-        assert current.account_revision == account.subscription_revision()
+        assert current.account_revision == legacy_subscription_revision
         assert (
             models.Task.objects.get_one(
                 filters={"uuid": outgoing.uuid}
             ).content.account_revision
-            == account.realtime_revision()
+            == legacy_realtime_revision
         )
         for task in tasks[1:-1]:
             current = models.Task.objects.get_one(filters={"uuid": task.uuid})
@@ -396,7 +403,7 @@ def test_migration_preserves_queue_cursor_and_outgoing_work_but_cancels_polling(
         engine.apply_migration(migration)
         assert (
             models.RealtimeSubscription.for_account(account).account_revision
-            == account.subscription_revision()
+            == legacy_subscription_revision
         )
         assert (
             models.Task.objects.get_one(filters={"uuid": outgoing.uuid}).status == "new"

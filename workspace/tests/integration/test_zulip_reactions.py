@@ -120,6 +120,9 @@ def test_snapshot_projects_reactions_and_updates_public_counts_without_echo(
     snapshot(imported, [reaction(name="+1")])
     (fact,) = facts(account)
     assert fact.user_uuid == account.owner_user_uuid and fact.emoji_name == "thumbs_up"
+    assert fact.source_name == "zulip"
+    assert fact.provider_uuid == account.provider_uuid
+    assert fact.provider_identity == "42:7:thumbs_up"
     snapshot(imported, [reaction()])
     assert [row.uuid for row in facts(account)] == [fact.uuid]
     messenger_tests._drain()

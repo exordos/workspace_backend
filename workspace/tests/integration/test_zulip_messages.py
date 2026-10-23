@@ -8,7 +8,6 @@ import hashlib
 import json
 from unittest import mock
 import uuid
-import urllib.parse
 
 import psycopg
 import pytest
@@ -57,7 +56,7 @@ def history_account(_database, db):
         project_id=uuid.uuid4(),
         owner_user_uuid=owner_uuid,
         provider="zulip",
-        external_account_id="zulip.example.com:7",
+        external_account_id="7",
         settings={"server_url": "https://zulip.example.com"},
     )
     account.insert()
@@ -164,7 +163,7 @@ def direct_peer(history_account, db):
         project_id=history_account.project_id,
         owner_user_uuid=owner_uuid,
         provider="zulip",
-        external_account_id="zulip.example.com:8",
+        external_account_id="8",
         settings=history_account.settings,
     )
     account.insert()
@@ -493,7 +492,7 @@ def test_topic_state_creates_topics_after_the_stream_and_exposes_zulip_source(
         assert topic.name == (subject or "General Topic")
         assert topic.stream_uuid == stream_uuid
         assert topic.source_name == "zulip"
-        assert topic.source.KIND == "zulip"
+        assert topic.source_name == "zulip"
     for topic_model in (
         messenger_models.WorkspaceUserTopic,
         v2_models.WorkspaceUserTopic,
@@ -501,9 +500,9 @@ def test_topic_state_creates_topics_after_the_stream_and_exposes_zulip_source(
         visible = topic_model.objects.get_one(
             filters={"uuid": filters.EQ(state.topic_uuid)}
         )
-        assert visible.source.KIND == "zulip"
+        assert visible.source_name == "zulip"
         assert (
-            event_payloads.TopicCreatedEventPayload(**dict(visible)).source.KIND
+            event_payloads.TopicCreatedEventPayload(**dict(visible)).source_name
             == "zulip"
         )
     assert (
@@ -511,8 +510,9 @@ def test_topic_state_creates_topics_after_the_stream_and_exposes_zulip_source(
             uuid=state.topic_uuid,
             stream_uuid=stream_uuid,
             source_name="zulip",
-            source=messenger_models.ZulipSource(),
-        ).source.KIND
+            provider_uuid=account.provider_uuid,
+            provider_identity="42",
+        ).source_name
         == "zulip"
     )
     assert _topic_states(account) == []
@@ -590,7 +590,8 @@ def test_topic_states_preserve_native_data_and_filter_other_providers(
             filters={"uuid": filters.EQ(stream_uuid)}
         )
         stream.source_name = "native"
-        stream.source = {"kind": "native"}
+        stream.provider_uuid = None
+        stream.provider_identity = None
         stream.update()
     else:
         account.provider = "other"
@@ -734,10 +735,10 @@ def test_direct_messages_wait_for_a_peer_in_the_same_project_and_host(
             project_id=uuid.uuid4() if peer_scope == "project" else account.project_id,
             owner_user_uuid=owner_uuid,
             provider="zulip",
-            external_account_id=(
-                "other.example.com:8" if peer_scope == "host" else "zulip.example.com:8"
-            ),
-            settings=account.settings,
+            external_account_id="8",
+            settings={**account.settings, "server_url": "https://other.example.com"}
+            if peer_scope == "host"
+            else account.settings,
         )
         other.insert()
     zulip = mock.Mock()
@@ -753,7 +754,7 @@ def test_direct_messages_wait_for_a_peer_in_the_same_project_and_host(
             <= task.next_retry_at
             <= after + models.TASK_RETRY_DELAY
         )
-        assert "zulip.example.com:8" in task.error_description
+        assert "8" in task.error_description
         assert _messages(account) == []
         channels = models.ZulipChannel.objects.get_all(
             filters={"external_account_uuid": filters.EQ(account.uuid)}
@@ -869,7 +870,7 @@ def test_history_import_keeps_accounts_and_projects_separate(
         project_id=uuid.uuid4(),
         owner_user_uuid=account.owner_user_uuid,
         provider="zulip",
-        external_account_id=f"{urllib.parse.urlsplit(server_url).hostname}:7",
+        external_account_id="7",
         settings={"server_url": server_url},
     )
     other.insert()

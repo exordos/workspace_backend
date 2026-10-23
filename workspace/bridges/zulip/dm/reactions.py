@@ -347,17 +347,14 @@ def _schedule(
         account = external_models.ExternalAccount.objects.get_one(
             filters={"uuid": filters.EQ(target["external_account_uuid"])}
         )
-        if (
-            not account.can_stream()
-            or account.external_account_id.rsplit(":", 1)[0] != account.get_host()
-        ):
+        if not account.can_stream():
             verifying_account |= (
                 account.status == external_models.ExternalAccountStatus.NEW.value
                 and bool(account.settings.get("api_key"))
             )
             continue
         message = message_for(account, target["message_id"])
-        user_id = int(account.external_account_id.rsplit(":", 1)[1])
+        user_id = int(account.external_account_id)
         value, at, _remote_name = remote_state(message, user_id, code)
         if value == intent.present or (
             at is not None and at >= _naive(intent.changed_at)
@@ -426,12 +423,14 @@ def reconcile(project_id: uuid.UUID, canonical_uuid: uuid.UUID) -> bool:
     observations = (
         _session()
         .execute(
-            """SELECT reaction.*,actor.owner_user_uuid,message.hostname
+            """SELECT reaction.*,actor.owner_user_uuid,actor.provider_uuid,message.hostname,message.message_id
            FROM bridge_zulip_v5_reactions AS reaction
            JOIN bridge_zulip_v5_reaction_messages AS message ON message.uuid=reaction.reaction_message_uuid
+           JOIN messenger_providers AS provider ON provider.hostname=message.hostname
            LEFT JOIN m_external_accounts_v2 AS actor
              ON actor.project_id=message.project_id AND actor.provider='zulip'
-            AND actor.external_account_id=message.hostname || ':' || reaction.user_id::text
+            AND actor.provider_uuid=provider.uuid
+            AND actor.external_account_id=reaction.user_id::text
            WHERE message.project_id=%s AND message.canonical_message_uuid=%s""",
             (project_id, canonical_uuid),
         )
@@ -523,6 +522,11 @@ def reconcile(project_id: uuid.UUID, canonical_uuid: uuid.UUID) -> bool:
                 placement_uuid=placement[0].uuid,
                 user_uuid=key[0],
                 emoji_name=key[1],
+                source_name="zulip" if rows else "native",
+                provider_uuid=rows[0]["provider_uuid"] if rows else None,
+                provider_identity=f"{rows[0]['message_id']}:{rows[0]['user_id']}:{key[1]}"
+                if rows
+                else None,
             )
             fact.insert()
             _publish(fact, "created")
@@ -530,6 +534,13 @@ def reconcile(project_id: uuid.UUID, canonical_uuid: uuid.UUID) -> bool:
             fact.delete()
             _publish(fact, "deleted")
             fact = None
+        if fact is not None and rows and fact.provider_uuid is None:
+            fact.source_name = "zulip"
+            fact.provider_uuid = rows[0]["provider_uuid"]
+            fact.provider_identity = (
+                f"{rows[0]['message_id']}:{rows[0]['user_id']}:{key[1]}"
+            )
+            fact.update()
         for row in rows:
             _session().execute(
                 "UPDATE bridge_zulip_v5_reactions SET fact_uuid=%s WHERE uuid=%s",
@@ -588,7 +599,6 @@ def prepare_outgoing(
     if (
         account.owner_user_uuid != intent.user_uuid
         or message["hostname"] != account.get_host()
-        or account.external_account_id.rsplit(":", 1)[0] != message["hostname"]
         or message["canonical_message_uuid"] != intent.canonical_message_uuid
     ):
         raise zulip_models.SubscriptionChangedError()
@@ -613,7 +623,7 @@ def prepare_outgoing(
     if identity is None:
         raise ValueError(f"Unsupported Unicode emoji: {intent.emoji_name}")
     code, observed_name = identity
-    user_id = int(account.external_account_id.rsplit(":", 1)[1])
+    user_id = int(account.external_account_id)
     value, at, name = remote_state(message, user_id, code)
     if value == intent.present or (at is not None and at >= _naive(intent.changed_at)):
         return None

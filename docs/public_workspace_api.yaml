@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: Workspace v1 API
-  version: 1.2.5.dev0+g76040871f.d20260929
+  version: 1.3.2.dev28+g33649baf5.d20261019
   description: IAM-authenticated Workspace API
 components:
   responses:
@@ -351,6 +351,27 @@ components:
           example: any_string
           minLength: 1
           maxLength: 64
+        provider_uuid:
+          type: string
+          example: 00000000-0000-0000-0000-000000000000
+          format: uuid
+          nullable: true
+        external_account_id:
+          type: string
+          example: any_string
+          minLength: 1
+          maxLength: 255
+          readOnly: true
+          nullable: true
+        disabled:
+          type: boolean
+          example: true
+          default: false
+        has_completed_backfill:
+          type: boolean
+          example: true
+          readOnly: true
+          default: false
         settings:
           type: object
           additionalProperties:
@@ -390,6 +411,24 @@ components:
     WorkspaceFile_Get:
       type: object
       properties:
+        source_name:
+          type: string
+          enum:
+          - native
+          - zulip
+          example: native
+          default: native
+        provider_uuid:
+          type: string
+          example: 00000000-0000-0000-0000-000000000000
+          format: uuid
+          nullable: true
+        provider_identity:
+          type: string
+          example: any_string
+          minLength: 1
+          maxLength: 255
+          nullable: true
         uuid:
           type: string
           example: 00000000-0000-0000-0000-000000000000
@@ -402,7 +441,7 @@ components:
         description:
           type: string
           example: any_string
-          maxLength: 255
+          maxLength: 10000
           default: ''
         created_at:
           type: string
@@ -598,9 +637,89 @@ components:
       $ref: '#/components/schemas/UserFolder_Get'
     UserFolder_Filter:
       $ref: '#/components/schemas/UserFolder_Get'
+    WorkspaceMutationRequest_Get:
+      type: object
+      properties:
+        uuid:
+          type: string
+          example: 00000000-0000-0000-0000-000000000000
+          format: uuid
+          readOnly: true
+        project_id:
+          type: string
+          example: 00000000-0000-0000-0000-000000000000
+          format: uuid
+          readOnly: true
+        user_uuid:
+          type: string
+          example: 00000000-0000-0000-0000-000000000000
+          format: uuid
+          readOnly: true
+        status:
+          type: string
+          enum:
+          - applied
+          - pending
+          - rejected
+          example: pending
+          readOnly: true
+        command_count:
+          type: integer
+          example: 1
+          minimum: 1
+          readOnly: true
+        applied_count:
+          type: integer
+          example: 0
+          minimum: 0
+          readOnly: true
+        rejected_count:
+          type: integer
+          example: 0
+          minimum: 0
+          readOnly: true
+        created_at:
+          type: string
+          x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
+          example: '2006-01-02T15:04:05.000576Z'
+          format: date-time
+          readOnly: true
+        finished_at:
+          type: string
+          x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
+          example: '2006-01-02T15:04:05.000576Z'
+          format: date-time
+          readOnly: true
+          nullable: true
+      required:
+      - project_id
+      - user_uuid
+      - status
+      - command_count
+      - applied_count
+      - rejected_count
+      - created_at
     WorkspaceMessageReactions_Get:
       type: object
       properties:
+        source_name:
+          type: string
+          enum:
+          - native
+          - zulip
+          example: native
+          default: native
+        provider_uuid:
+          type: string
+          example: 00000000-0000-0000-0000-000000000000
+          format: uuid
+          nullable: true
+        provider_identity:
+          type: string
+          example: any_string
+          minLength: 1
+          maxLength: 255
+          nullable: true
         uuid:
           type: string
           example: 00000000-0000-0000-0000-000000000000
@@ -683,23 +802,20 @@ components:
           type: string
           enum:
           - native
+          - zulip
           example: native
           default: native
-        source:
-          type: object
-          oneOf:
-          - type: object
-            properties:
-              kind:
-                type: string
-                enum:
-                - native
-            example:
-              key: value
-          example:
-            key: value
-          default:
-            kind: native
+        provider_uuid:
+          type: string
+          example: 00000000-0000-0000-0000-000000000000
+          format: uuid
+          nullable: true
+        provider_identity:
+          type: string
+          example: any_string
+          minLength: 1
+          maxLength: 255
+          nullable: true
         stream_uuid:
           type: string
           example: 00000000-0000-0000-0000-000000000000
@@ -928,6 +1044,24 @@ components:
     WorkspaceStreamBinding_Get:
       type: object
       properties:
+        source_name:
+          type: string
+          enum:
+          - native
+          - zulip
+          example: native
+          default: native
+        provider_uuid:
+          type: string
+          example: 00000000-0000-0000-0000-000000000000
+          format: uuid
+          nullable: true
+        provider_identity:
+          type: string
+          example: any_string
+          minLength: 1
+          maxLength: 255
+          nullable: true
         uuid:
           type: string
           example: 00000000-0000-0000-0000-000000000000
@@ -1032,23 +1166,20 @@ components:
           type: string
           enum:
           - native
+          - zulip
           example: native
           default: native
-        source:
-          type: object
-          oneOf:
-          - type: object
-            properties:
-              kind:
-                type: string
-                enum:
-                - native
-            example:
-              key: value
-          example:
-            key: value
-          default:
-            kind: native
+        provider_uuid:
+          type: string
+          example: 00000000-0000-0000-0000-000000000000
+          format: uuid
+          nullable: true
+        provider_identity:
+          type: string
+          example: any_string
+          minLength: 1
+          maxLength: 255
+          nullable: true
         name:
           type: string
           example: any_string
@@ -1172,7 +1303,7 @@ components:
         description:
           type: string
           example: any_string
-          maxLength: 255
+          maxLength: 10000
           default: ''
         project_id:
           type: string
@@ -1249,20 +1380,19 @@ components:
           type: string
           enum:
           - native
+          - zulip
           example: native
-        source:
-          type: object
-          oneOf:
-          - type: object
-            properties:
-              kind:
-                type: string
-                enum:
-                - native
-            example:
-              key: value
-          example:
-            key: value
+        provider_uuid:
+          type: string
+          example: 00000000-0000-0000-0000-000000000000
+          format: uuid
+          nullable: true
+        provider_identity:
+          type: string
+          example: any_string
+          minLength: 1
+          maxLength: 255
+          nullable: true
         invite_only:
           type: boolean
           example: true
@@ -1307,7 +1437,6 @@ components:
       - owner
       - role
       - source_name
-      - source
       - encryption
       - current_encryption_key_uuid
     WorkspaceUserStream_Create:
@@ -1471,6 +1600,94 @@ components:
           default: false
     WorkspaceTopicSummarySettings_Update:
       $ref: '#/components/schemas/WorkspaceTopicSummarySettings_Get'
+    WorkspaceUser_Get:
+      type: object
+      properties:
+        uuid:
+          type: string
+          example: 00000000-0000-0000-0000-000000000000
+          format: uuid
+          readOnly: true
+        created_at:
+          type: string
+          x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
+          example: '2006-01-02T15:04:05.000576Z'
+          format: date-time
+          readOnly: true
+          default: '2006-01-02T15:04:05.000576Z'
+        updated_at:
+          type: string
+          x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
+          example: '2006-01-02T15:04:05.000576Z'
+          format: date-time
+          readOnly: true
+          default: '2006-01-02T15:04:05.000576Z'
+        username:
+          type: string
+          example: any_string
+          minLength: 1
+          maxLength: 128
+        source:
+          type: string
+          enum:
+          - hidden
+          - iam
+          - native
+          - zulip
+          example: iam
+          default: iam
+        disabled:
+          type: boolean
+          example: true
+          default: false
+        status:
+          type: string
+          enum:
+          - active
+          - do_not_disturb
+          - idle
+          - offline
+          example: active
+          default: active
+        status_emoji:
+          type: string
+          example: any_string
+          maxLength: 64
+          nullable: true
+        status_text:
+          type: string
+          example: any_string
+          maxLength: 256
+          nullable: true
+        first_name:
+          type: string
+          example: any_string
+          maxLength: 128
+          nullable: true
+        last_name:
+          type: string
+          example: any_string
+          maxLength: 128
+          nullable: true
+        email:
+          type: string
+          example: any_string
+          maxLength: 256
+          nullable: true
+        avatar:
+          type: string
+          example: any_string
+          minLength: 1
+          maxLength: 2048
+        last_ping_at:
+          type: string
+          x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
+          example: '2006-01-02T15:04:05.000576Z'
+          format: date-time
+          default: '2006-01-02T15:04:05.000576Z'
+      required:
+      - username
+      - avatar
     PushDevice_Update:
       type: object
       properties:
@@ -1566,7 +1783,7 @@ components:
         description:
           type: string
           example: any_string
-          maxLength: 255
+          maxLength: 10000
           default: ''
         created_at:
           type: string
@@ -1596,88 +1813,6 @@ components:
       - service_url
     Service_Filter:
       $ref: '#/components/schemas/Service_Get'
-    WorkspaceUser_Get:
-      type: object
-      properties:
-        uuid:
-          type: string
-          example: 00000000-0000-0000-0000-000000000000
-          format: uuid
-          readOnly: true
-        created_at:
-          type: string
-          x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
-          example: '2006-01-02T15:04:05.000576Z'
-          format: date-time
-          readOnly: true
-          default: '2006-01-02T15:04:05.000576Z'
-        updated_at:
-          type: string
-          x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
-          example: '2006-01-02T15:04:05.000576Z'
-          format: date-time
-          readOnly: true
-          default: '2006-01-02T15:04:05.000576Z'
-        username:
-          type: string
-          example: any_string
-          minLength: 1
-          maxLength: 128
-        source:
-          type: string
-          enum:
-          - iam
-          - native
-          example: iam
-          default: iam
-        status:
-          type: string
-          enum:
-          - active
-          - do_not_disturb
-          - idle
-          - offline
-          example: active
-          default: active
-        status_emoji:
-          type: string
-          example: any_string
-          maxLength: 64
-          nullable: true
-        status_text:
-          type: string
-          example: any_string
-          maxLength: 256
-          nullable: true
-        first_name:
-          type: string
-          example: any_string
-          maxLength: 128
-          nullable: true
-        last_name:
-          type: string
-          example: any_string
-          maxLength: 128
-          nullable: true
-        email:
-          type: string
-          example: any_string
-          maxLength: 256
-          nullable: true
-        avatar:
-          type: string
-          example: any_string
-          minLength: 1
-          maxLength: 2048
-        last_ping_at:
-          type: string
-          x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
-          example: '2006-01-02T15:04:05.000576Z'
-          format: date-time
-          default: '2006-01-02T15:04:05.000576Z'
-      required:
-      - username
-      - avatar
     WorkspaceUser_AvatarUpload:
       type: object
       properties:
@@ -1708,10 +1843,16 @@ components:
         source:
           type: string
           enum:
+          - hidden
           - iam
           - native
+          - zulip
           example: iam
           default: iam
+        disabled:
+          type: boolean
+          example: true
+          default: false
         status:
           type: string
           enum:
@@ -1930,10 +2071,19 @@ components:
       schema:
         type: string
         enum:
+        - hidden
         - iam
         - native
+        - zulip
         example: iam
         default: iam
+    WorkspaceUser_disabled:
+      name: disabled
+      in: query
+      schema:
+        type: boolean
+        example: true
+        default: false
     WorkspaceUser_status:
       name: status
       in: query
@@ -2268,6 +2418,39 @@ components:
         example: any_string
         minLength: 1
         maxLength: 64
+    ExternalAccount_provider_uuid:
+      name: provider_uuid
+      in: query
+      schema:
+        type: string
+        example: 00000000-0000-0000-0000-000000000000
+        format: uuid
+        nullable: true
+    ExternalAccount_external_account_id:
+      name: external_account_id
+      in: query
+      schema:
+        type: string
+        example: any_string
+        minLength: 1
+        maxLength: 255
+        readOnly: true
+        nullable: true
+    ExternalAccount_disabled:
+      name: disabled
+      in: query
+      schema:
+        type: boolean
+        example: true
+        default: false
+    ExternalAccount_has_completed_backfill:
+      name: has_completed_backfill
+      in: query
+      schema:
+        type: boolean
+        example: true
+        readOnly: true
+        default: false
     ExternalAccount_settings:
       name: settings
       in: query
@@ -2302,6 +2485,33 @@ components:
       schema:
         type: string
         example: any_string
+        nullable: true
+    WorkspaceFile_source_name:
+      name: source_name
+      in: query
+      schema:
+        type: string
+        enum:
+        - native
+        - zulip
+        example: native
+        default: native
+    WorkspaceFile_provider_uuid:
+      name: provider_uuid
+      in: query
+      schema:
+        type: string
+        example: 00000000-0000-0000-0000-000000000000
+        format: uuid
+        nullable: true
+    WorkspaceFile_provider_identity:
+      name: provider_identity
+      in: query
+      schema:
+        type: string
+        example: any_string
+        minLength: 1
+        maxLength: 255
         nullable: true
     WorkspaceFile_uuid:
       name: uuid
@@ -2341,7 +2551,7 @@ components:
       schema:
         type: string
         example: any_string
-        maxLength: 255
+        maxLength: 10000
         default: ''
     WorkspaceFile_created_at:
       name: created_at
@@ -2671,6 +2881,120 @@ components:
         example:
         - '1'
         default: []
+    WorkspaceMutationRequest_uuid:
+      name: uuid
+      in: query
+      schema:
+        type: string
+        example: 00000000-0000-0000-0000-000000000000
+        format: uuid
+        readOnly: true
+    WorkspaceMutationRequestUuid:
+      name: WorkspaceMutationRequestUuid
+      in: path
+      schema:
+        type: string
+        example: 00000000-0000-0000-0000-000000000000
+        format: uuid
+        readOnly: true
+      required: true
+    WorkspaceMutationRequest_project_id:
+      name: project_id
+      in: query
+      schema:
+        type: string
+        example: 00000000-0000-0000-0000-000000000000
+        format: uuid
+        readOnly: true
+    WorkspaceMutationRequest_user_uuid:
+      name: user_uuid
+      in: query
+      schema:
+        type: string
+        example: 00000000-0000-0000-0000-000000000000
+        format: uuid
+        readOnly: true
+    WorkspaceMutationRequest_status:
+      name: status
+      in: query
+      schema:
+        type: string
+        enum:
+        - applied
+        - pending
+        - rejected
+        example: pending
+        readOnly: true
+    WorkspaceMutationRequest_command_count:
+      name: command_count
+      in: query
+      schema:
+        type: integer
+        example: 1
+        minimum: 1
+        readOnly: true
+    WorkspaceMutationRequest_applied_count:
+      name: applied_count
+      in: query
+      schema:
+        type: integer
+        example: 0
+        minimum: 0
+        readOnly: true
+    WorkspaceMutationRequest_rejected_count:
+      name: rejected_count
+      in: query
+      schema:
+        type: integer
+        example: 0
+        minimum: 0
+        readOnly: true
+    WorkspaceMutationRequest_created_at:
+      name: created_at
+      in: query
+      schema:
+        type: string
+        x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
+        example: '2006-01-02T15:04:05.000576Z'
+        format: date-time
+        readOnly: true
+    WorkspaceMutationRequest_finished_at:
+      name: finished_at
+      in: query
+      schema:
+        type: string
+        x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
+        example: '2006-01-02T15:04:05.000576Z'
+        format: date-time
+        readOnly: true
+        nullable: true
+    WorkspaceMessageReactions_source_name:
+      name: source_name
+      in: query
+      schema:
+        type: string
+        enum:
+        - native
+        - zulip
+        example: native
+        default: native
+    WorkspaceMessageReactions_provider_uuid:
+      name: provider_uuid
+      in: query
+      schema:
+        type: string
+        example: 00000000-0000-0000-0000-000000000000
+        format: uuid
+        nullable: true
+    WorkspaceMessageReactions_provider_identity:
+      name: provider_identity
+      in: query
+      schema:
+        type: string
+        example: any_string
+        minLength: 1
+        maxLength: 255
+        nullable: true
     WorkspaceMessageReactions_uuid:
       name: uuid
       in: query
@@ -2804,26 +3128,26 @@ components:
         type: string
         enum:
         - native
+        - zulip
         example: native
         default: native
-    WorkspaceUserMessage_source:
-      name: source
+    WorkspaceUserMessage_provider_uuid:
+      name: provider_uuid
       in: query
       schema:
-        type: object
-        oneOf:
-        - type: object
-          properties:
-            kind:
-              type: string
-              enum:
-              - native
-          example:
-            key: value
-        example:
-          key: value
-        default:
-          kind: native
+        type: string
+        example: 00000000-0000-0000-0000-000000000000
+        format: uuid
+        nullable: true
+    WorkspaceUserMessage_provider_identity:
+      name: provider_identity
+      in: query
+      schema:
+        type: string
+        example: any_string
+        minLength: 1
+        maxLength: 255
+        nullable: true
     WorkspaceUserMessage_stream_uuid:
       name: stream_uuid
       in: query
@@ -3042,6 +3366,33 @@ components:
           key: value
         readOnly: true
         default: {}
+    WorkspaceStreamBinding_source_name:
+      name: source_name
+      in: query
+      schema:
+        type: string
+        enum:
+        - native
+        - zulip
+        example: native
+        default: native
+    WorkspaceStreamBinding_provider_uuid:
+      name: provider_uuid
+      in: query
+      schema:
+        type: string
+        example: 00000000-0000-0000-0000-000000000000
+        format: uuid
+        nullable: true
+    WorkspaceStreamBinding_provider_identity:
+      name: provider_identity
+      in: query
+      schema:
+        type: string
+        example: any_string
+        minLength: 1
+        maxLength: 255
+        nullable: true
     WorkspaceStreamBinding_uuid:
       name: uuid
       in: query
@@ -3208,26 +3559,26 @@ components:
         type: string
         enum:
         - native
+        - zulip
         example: native
         default: native
-    WorkspaceUserTopic_source:
-      name: source
+    WorkspaceUserTopic_provider_uuid:
+      name: provider_uuid
       in: query
       schema:
-        type: object
-        oneOf:
-        - type: object
-          properties:
-            kind:
-              type: string
-              enum:
-              - native
-          example:
-            key: value
-        example:
-          key: value
-        default:
-          kind: native
+        type: string
+        example: 00000000-0000-0000-0000-000000000000
+        format: uuid
+        nullable: true
+    WorkspaceUserTopic_provider_identity:
+      name: provider_identity
+      in: query
+      schema:
+        type: string
+        example: any_string
+        minLength: 1
+        maxLength: 255
+        nullable: true
     WorkspaceUserTopic_name:
       name: name
       in: query
@@ -3412,7 +3763,7 @@ components:
       schema:
         type: string
         example: any_string
-        maxLength: 255
+        maxLength: 10000
         default: ''
     WorkspaceUserStream_project_id:
       name: project_id
@@ -3518,23 +3869,25 @@ components:
         type: string
         enum:
         - native
+        - zulip
         example: native
-    WorkspaceUserStream_source:
-      name: source
+    WorkspaceUserStream_provider_uuid:
+      name: provider_uuid
       in: query
       schema:
-        type: object
-        oneOf:
-        - type: object
-          properties:
-            kind:
-              type: string
-              enum:
-              - native
-          example:
-            key: value
-        example:
-          key: value
+        type: string
+        example: 00000000-0000-0000-0000-000000000000
+        format: uuid
+        nullable: true
+    WorkspaceUserStream_provider_identity:
+      name: provider_identity
+      in: query
+      schema:
+        type: string
+        example: any_string
+        minLength: 1
+        maxLength: 255
+        nullable: true
     WorkspaceUserStream_invite_only:
       name: invite_only
       in: query
@@ -3985,7 +4338,7 @@ components:
       schema:
         type: string
         example: any_string
-        maxLength: 255
+        maxLength: 10000
         default: ''
     Service_created_at:
       name: created_at
@@ -4827,10 +5180,14 @@ paths:
         example: name = "vm1"
         x-ra-filter-fields:
         - created_at
+        - disabled
         - error_description
+        - external_account_id
+        - has_completed_backfill
         - owner_user_uuid
         - project_id
         - provider
+        - provider_uuid
         - settings
         - status
         - updated_at
@@ -4841,6 +5198,10 @@ paths:
       - $ref: '#/components/parameters/ExternalAccount_updated_at'
       - $ref: '#/components/parameters/ExternalAccount_owner_user_uuid'
       - $ref: '#/components/parameters/ExternalAccount_provider'
+      - $ref: '#/components/parameters/ExternalAccount_provider_uuid'
+      - $ref: '#/components/parameters/ExternalAccount_external_account_id'
+      - $ref: '#/components/parameters/ExternalAccount_disabled'
+      - $ref: '#/components/parameters/ExternalAccount_has_completed_backfill'
       - $ref: '#/components/parameters/ExternalAccount_status'
       - $ref: '#/components/parameters/ExternalAccount_error_description'
       - name: page_limit
@@ -4990,7 +5351,10 @@ paths:
         - hash
         - name
         - project_id
+        - provider_identity
+        - provider_uuid
         - size_bytes
+        - source_name
         - storage_id
         - storage_object_id
         - storage_type
@@ -4998,6 +5362,9 @@ paths:
         - updated_at
         - user_uuid
         - uuid
+      - $ref: '#/components/parameters/WorkspaceFile_source_name'
+      - $ref: '#/components/parameters/WorkspaceFile_provider_uuid'
+      - $ref: '#/components/parameters/WorkspaceFile_provider_identity'
       - $ref: '#/components/parameters/WorkspaceFile_uuid'
       - $ref: '#/components/parameters/WorkspaceFile_project_id'
       - $ref: '#/components/parameters/WorkspaceFile_name'
@@ -5086,6 +5453,7 @@ paths:
                   type: string
                 description:
                   type: string
+                  maxLength: 10000
                 content_type:
                   type: string
                 size_bytes:
@@ -5113,6 +5481,7 @@ paths:
                   type: string
                 description:
                   type: string
+                  maxLength: 10000
               oneOf:
               - required:
                 - stream_uuid
@@ -5564,6 +5933,44 @@ paths:
       operationId: Delete_v1_messenger_folders_UserFolderUuid
       security:
       - bearerAuth: []
+  /v1/messenger/me/:
+    get:
+      summary: Get current Workspace user
+      tags:
+      - WorkspaceUser
+      parameters: []
+      responses:
+        '200':
+          description: WorkspaceUser_Get
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceUser_Get'
+        default:
+          $ref: '#/components/responses/Error'
+      operationId: Filter_v1_messenger_me
+      security:
+      - bearerAuth: []
+      deprecated: true
+  /v1/messenger/message_mutations/{WorkspaceMutationRequestUuid}:
+    get:
+      summary: Get WorkspaceMutationRequest
+      tags:
+      - WorkspaceMutationRequest
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceMutationRequestUuid'
+      responses:
+        '200':
+          description: WorkspaceMutationRequest_Get
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceMutationRequest_Get'
+        default:
+          $ref: '#/components/responses/Error'
+      operationId: Get_v1_messenger_message_mutations_WorkspaceMutationRequestUuid
+      security:
+      - bearerAuth: []
   /v1/messenger/message_reactions/:
     get:
       summary: Get WorkspaceMessageReactionss
@@ -5589,9 +5996,15 @@ paths:
         - emoji_name
         - message_uuid
         - project_id
+        - provider_identity
+        - provider_uuid
+        - source_name
         - updated_at
         - user_uuid
         - uuid
+      - $ref: '#/components/parameters/WorkspaceMessageReactions_source_name'
+      - $ref: '#/components/parameters/WorkspaceMessageReactions_provider_uuid'
+      - $ref: '#/components/parameters/WorkspaceMessageReactions_provider_identity'
       - $ref: '#/components/parameters/WorkspaceMessageReactions_uuid'
       - $ref: '#/components/parameters/WorkspaceMessageReactions_project_id'
       - $ref: '#/components/parameters/WorkspaceMessageReactions_created_at'
@@ -5718,205 +6131,6 @@ paths:
       operationId: Delete_v1_messenger_message_reactions_WorkspaceMessageReactionsUuid
       security:
       - bearerAuth: []
-  /v1/messenger/me/:
-    get:
-      deprecated: true
-      operationId: Filter_v1_messenger_me
-      parameters: []
-      responses:
-        200:
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/WorkspaceUser_Get'
-          description: WorkspaceUser_Get
-        default: &id001
-          $ref: '#/components/responses/Error'
-      security:
-      - bearerAuth: []
-      summary: Get current Workspace user
-      tags:
-      - WorkspaceUser
-  /v1/messenger/users/:
-    get:
-      deprecated: true
-      operationId: Filter_v1_messenger_users
-      parameters:
-      - description: "Filter expression (a subset of AIP-160). Combines with the field\n\
-          parameters, which stay the typed way to ask for equality.\n\n    name =\
-          \ \"vm1\" AND size > 10\n    tags:\"env:prod\" OR tags:\"env:staging\"\n\
-          \    NOT (state = error) AND created_at >= \"2026-07-01T00:00:00Z\"\n\n\
-          Operators: `=` `!=` `<` `<=` `>` `>=`, `:` (an array holds the element,\n\
-          or with `*` that the field is set), `AND` `OR` `NOT`, parentheses.\nThe\
-          \ keywords are uppercase, and `OR` binds tighter than `AND`. Values\ncarrying\
-          \ `:`, `.` or spaces must be quoted."
-        example: name = "vm1"
-        in: query
-        name: q
-        required: false
-        schema:
-          type: string
-        x-ra-filter-fields:
-        - avatar
-        - created_at
-        - disabled
-        - email
-        - first_name
-        - last_name
-        - last_ping_at
-        - source
-        - status
-        - status_emoji
-        - status_text
-        - updated_at
-        - username
-        - uuid
-      - $ref: '#/components/parameters/WorkspaceUser_uuid'
-      - $ref: '#/components/parameters/WorkspaceUser_created_at'
-      - $ref: '#/components/parameters/WorkspaceUser_updated_at'
-      - $ref: '#/components/parameters/WorkspaceUser_username'
-      - $ref: '#/components/parameters/WorkspaceUser_source'
-      - $ref: '#/components/parameters/WorkspaceUser_disabled'
-      - $ref: '#/components/parameters/WorkspaceUser_status'
-      - $ref: '#/components/parameters/WorkspaceUser_status_emoji'
-      - $ref: '#/components/parameters/WorkspaceUser_status_text'
-      - $ref: '#/components/parameters/WorkspaceUser_first_name'
-      - $ref: '#/components/parameters/WorkspaceUser_last_name'
-      - $ref: '#/components/parameters/WorkspaceUser_email'
-      - $ref: '#/components/parameters/WorkspaceUser_avatar'
-      - $ref: '#/components/parameters/WorkspaceUser_last_ping_at'
-      - description: Maximum resources returned in this page.
-        in: query
-        name: page_limit
-        schema:
-          minimum: 0
-          type: integer
-      - description: Last resource identifier from the previous page.
-        in: query
-        name: page_marker
-        schema:
-          format: uuid
-          type: string
-      responses:
-        200:
-          content:
-            application/json:
-              schema:
-                items:
-                  $ref: '#/components/schemas/WorkspaceUser_Filter'
-                type: array
-          description: WorkspaceUser_Filter
-          headers:
-            X-Pagination-Limit:
-              description: Requested page limit.
-              schema:
-                type: integer
-            X-Pagination-Marker:
-              description: Continuation marker. Present only when another resource
-                exists.
-              schema:
-                format: uuid
-                type: string
-        default: *id001
-      security:
-      - bearerAuth: []
-      summary: Get WorkspaceUsers
-      tags:
-      - WorkspaceUser
-  /v1/messenger/users/{WorkspaceUserUuid}:
-    get:
-      deprecated: true
-      operationId: Get_v1_messenger_users_WorkspaceUserUuid
-      parameters:
-      - $ref: '#/components/parameters/WorkspaceUserUuid'
-      responses:
-        200:
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/WorkspaceUser_Get'
-          description: WorkspaceUser_Get
-        default: *id001
-      security:
-      - bearerAuth: []
-      summary: Get WorkspaceUser
-      tags:
-      - WorkspaceUser
-  /v1/messenger/users/{WorkspaceUserUuid}/actions/avatar_reset/invoke:
-    post:
-      deprecated: true
-      operationId: Avatar_reset_v1_messenger_users_WorkspaceUserUuid_actions_avatar_reset_invoke
-      parameters:
-      - $ref: '#/components/parameters/WorkspaceUserUuid'
-      responses: &id002
-        200:
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/WorkspaceUserTopic_Get'
-          description: WorkspaceUserTopic_Get
-        default: *id001
-        403:
-          content:
-            application/json:
-              schema:
-                additionalProperties: true
-                properties:
-                  message:
-                    type: string
-                required:
-                - message
-                type: object
-          description: The stream role cannot update summary configuration.
-      security:
-      - bearerAuth: []
-      summary: Avatar_reset WorkspaceUser
-      tags:
-      - WorkspaceUser
-  /v1/messenger/users/{WorkspaceUserUuid}/actions/avatar_upload/invoke:
-    post:
-      deprecated: true
-      operationId: Avatar_upload_v1_messenger_users_WorkspaceUserUuid_actions_avatar_upload_invoke
-      parameters:
-      - $ref: '#/components/parameters/WorkspaceUserUuid'
-      requestBody:
-        content:
-          multipart/form-data:
-            schema:
-              properties:
-                file:
-                  format: binary
-                  type: string
-              required:
-              - file
-              type: object
-        description: Upload own Workspace avatar
-        required: true
-      responses:
-        201:
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/WorkspaceUser_AvatarUpload'
-          description: WorkspaceUser_AvatarUpload
-        default: *id001
-      security:
-      - bearerAuth: []
-      summary: Upload own avatar
-      tags:
-      - WorkspaceUser
-  /v1/messenger/users/{WorkspaceUserUuid}/actions/presence/invoke:
-    post:
-      deprecated: true
-      operationId: Presence_v1_messenger_users_WorkspaceUserUuid_actions_presence_invoke
-      parameters:
-      - $ref: '#/components/parameters/WorkspaceUserUuid'
-      responses: *id002
-      security:
-      - bearerAuth: []
-      summary: Presence WorkspaceUser
-      tags:
-      - WorkspaceUser
   /v1/messenger/messages/:
     get:
       summary: Get WorkspaceUserMessages
@@ -5945,10 +6159,11 @@ paths:
         - payload
         - pinned
         - project_id
+        - provider_identity
+        - provider_uuid
         - reaction_users
         - reactions
         - read
-        - source
         - source_name
         - starred
         - stream_uuid
@@ -5962,6 +6177,8 @@ paths:
       - $ref: '#/components/parameters/WorkspaceUserMessage_created_at'
       - $ref: '#/components/parameters/WorkspaceUserMessage_updated_at'
       - $ref: '#/components/parameters/WorkspaceUserMessage_source_name'
+      - $ref: '#/components/parameters/WorkspaceUserMessage_provider_uuid'
+      - $ref: '#/components/parameters/WorkspaceUserMessage_provider_identity'
       - $ref: '#/components/parameters/WorkspaceUserMessage_stream_uuid'
       - $ref: '#/components/parameters/WorkspaceUserMessage_topic_uuid'
       - $ref: '#/components/parameters/WorkspaceUserMessage_author_uuid'
@@ -6572,12 +6789,18 @@ paths:
         - notification_mode
         - notification_updated_at
         - project_id
+        - provider_identity
+        - provider_uuid
         - role
+        - source_name
         - stream_uuid
         - updated_at
         - user_uuid
         - uuid
         - who_uuid
+      - $ref: '#/components/parameters/WorkspaceStreamBinding_source_name'
+      - $ref: '#/components/parameters/WorkspaceStreamBinding_provider_uuid'
+      - $ref: '#/components/parameters/WorkspaceStreamBinding_provider_identity'
       - $ref: '#/components/parameters/WorkspaceStreamBinding_uuid'
       - $ref: '#/components/parameters/WorkspaceStreamBinding_project_id'
       - $ref: '#/components/parameters/WorkspaceStreamBinding_created_at'
@@ -6714,7 +6937,8 @@ paths:
         - notification_mode
         - passive_unread_count
         - project_id
-        - source
+        - provider_identity
+        - provider_uuid
         - source_name
         - stream_uuid
         - summary
@@ -6733,6 +6957,8 @@ paths:
       - $ref: '#/components/parameters/WorkspaceUserTopic_created_at'
       - $ref: '#/components/parameters/WorkspaceUserTopic_updated_at'
       - $ref: '#/components/parameters/WorkspaceUserTopic_source_name'
+      - $ref: '#/components/parameters/WorkspaceUserTopic_provider_uuid'
+      - $ref: '#/components/parameters/WorkspaceUserTopic_provider_identity'
       - $ref: '#/components/parameters/WorkspaceUserTopic_name'
       - $ref: '#/components/parameters/WorkspaceUserTopic_stream_uuid'
       - $ref: '#/components/parameters/WorkspaceUserTopic_color'
@@ -7093,8 +7319,9 @@ paths:
         - private
         - private_index
         - project_id
+        - provider_identity
+        - provider_uuid
         - role
-        - source
         - source_name
         - unread_count
         - updated_at
@@ -7116,6 +7343,8 @@ paths:
       - $ref: '#/components/parameters/WorkspaceUserStream_active_unread_count'
       - $ref: '#/components/parameters/WorkspaceUserStream_passive_unread_count'
       - $ref: '#/components/parameters/WorkspaceUserStream_source_name'
+      - $ref: '#/components/parameters/WorkspaceUserStream_provider_uuid'
+      - $ref: '#/components/parameters/WorkspaceUserStream_provider_identity'
       - $ref: '#/components/parameters/WorkspaceUserStream_invite_only'
       - $ref: '#/components/parameters/WorkspaceUserStream_announce'
       - $ref: '#/components/parameters/WorkspaceUserStream_private'
@@ -7198,7 +7427,7 @@ paths:
                 description:
                   type: string
                   example: any_string
-                  maxLength: 255
+                  maxLength: 10000
                   default: ''
                 source_name:
                   type: string
@@ -7206,19 +7435,6 @@ paths:
                   - native
                   example: native
                   default: native
-                source:
-                  type: object
-                  oneOf:
-                  - type: object
-                    properties:
-                      kind:
-                        type: string
-                        enum:
-                        - native
-                    example:
-                      key: value
-                  example:
-                    key: value
                 invite_only:
                   type: boolean
                   example: true
@@ -7336,7 +7552,7 @@ paths:
                 description:
                   type: string
                   example: any_string
-                  maxLength: 255
+                  maxLength: 10000
                   default: ''
                 invite_only:
                   type: boolean
@@ -7845,6 +8061,210 @@ paths:
       - bearerAuth: []
       description: Set both topic summarization gates. The worker runs only when both
         are enabled. Requires workspace.topic_summary_settings.manage.
+  /v1/messenger/users/:
+    get:
+      summary: Get WorkspaceUsers
+      tags:
+      - WorkspaceUser
+      parameters:
+      - name: q
+        in: query
+        required: false
+        description: "Filter expression (a subset of AIP-160). Combines with the field\n\
+          parameters, which stay the typed way to ask for equality.\n\n    name =\
+          \ \"vm1\" AND size > 10\n    tags:\"env:prod\" OR tags:\"env:staging\"\n\
+          \    NOT (state = error) AND created_at >= \"2026-07-01T00:00:00Z\"\n\n\
+          Operators: `=` `!=` `<` `<=` `>` `>=`, `:` (an array holds the element,\n\
+          or with `*` that the field is set), `AND` `OR` `NOT`, parentheses.\nThe\
+          \ keywords are uppercase, and `OR` binds tighter than `AND`. Values\ncarrying\
+          \ `:`, `.` or spaces must be quoted."
+        schema:
+          type: string
+        example: name = "vm1"
+        x-ra-filter-fields:
+        - avatar
+        - created_at
+        - disabled
+        - email
+        - first_name
+        - last_name
+        - last_ping_at
+        - source
+        - status
+        - status_emoji
+        - status_text
+        - updated_at
+        - username
+        - uuid
+      - $ref: '#/components/parameters/WorkspaceUser_uuid'
+      - $ref: '#/components/parameters/WorkspaceUser_created_at'
+      - $ref: '#/components/parameters/WorkspaceUser_updated_at'
+      - $ref: '#/components/parameters/WorkspaceUser_username'
+      - $ref: '#/components/parameters/WorkspaceUser_source'
+      - $ref: '#/components/parameters/WorkspaceUser_disabled'
+      - $ref: '#/components/parameters/WorkspaceUser_status'
+      - $ref: '#/components/parameters/WorkspaceUser_status_emoji'
+      - $ref: '#/components/parameters/WorkspaceUser_status_text'
+      - $ref: '#/components/parameters/WorkspaceUser_first_name'
+      - $ref: '#/components/parameters/WorkspaceUser_last_name'
+      - $ref: '#/components/parameters/WorkspaceUser_email'
+      - $ref: '#/components/parameters/WorkspaceUser_avatar'
+      - $ref: '#/components/parameters/WorkspaceUser_last_ping_at'
+      - name: page_limit
+        in: query
+        description: Maximum resources returned in this page.
+        schema:
+          type: integer
+          minimum: 0
+      - name: page_marker
+        in: query
+        description: Last resource identifier from the previous page.
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: WorkspaceUser_Filter
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/WorkspaceUser_Filter'
+          headers:
+            X-Pagination-Limit:
+              description: Requested page limit.
+              schema:
+                type: integer
+            X-Pagination-Marker:
+              description: Continuation marker. Present only when another resource
+                exists.
+              schema:
+                type: string
+                format: uuid
+        default:
+          $ref: '#/components/responses/Error'
+      operationId: Filter_v1_messenger_users
+      security:
+      - bearerAuth: []
+      deprecated: true
+  /v1/messenger/users/{WorkspaceUserUuid}:
+    get:
+      summary: Get WorkspaceUser
+      tags:
+      - WorkspaceUser
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceUserUuid'
+      responses:
+        '200':
+          description: WorkspaceUser_Get
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceUser_Get'
+        default:
+          $ref: '#/components/responses/Error'
+      operationId: Get_v1_messenger_users_WorkspaceUserUuid
+      security:
+      - bearerAuth: []
+      deprecated: true
+  /v1/messenger/users/{WorkspaceUserUuid}/actions/avatar_reset/invoke:
+    post:
+      summary: Avatar_reset WorkspaceUser
+      tags:
+      - WorkspaceUser
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceUserUuid'
+      responses:
+        '200':
+          description: WorkspaceUserTopic_Get
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceUserTopic_Get'
+        default:
+          $ref: '#/components/responses/Error'
+        '403':
+          description: The stream role cannot update summary configuration.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - message
+                additionalProperties: true
+                properties:
+                  message:
+                    type: string
+      operationId: Avatar_reset_v1_messenger_users_WorkspaceUserUuid_actions_avatar_reset_invoke
+      security:
+      - bearerAuth: []
+      deprecated: true
+  /v1/messenger/users/{WorkspaceUserUuid}/actions/avatar_upload/invoke:
+    post:
+      summary: Upload own avatar
+      tags:
+      - WorkspaceUser
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceUserUuid'
+      responses:
+        '201':
+          description: WorkspaceUser_AvatarUpload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceUser_AvatarUpload'
+        default:
+          $ref: '#/components/responses/Error'
+      operationId: Avatar_upload_v1_messenger_users_WorkspaceUserUuid_actions_avatar_upload_invoke
+      requestBody:
+        description: Upload own Workspace avatar
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              properties:
+                file:
+                  format: binary
+                  type: string
+              type: object
+              required:
+              - file
+      security:
+      - bearerAuth: []
+      deprecated: true
+  /v1/messenger/users/{WorkspaceUserUuid}/actions/presence/invoke:
+    post:
+      summary: Presence WorkspaceUser
+      tags:
+      - WorkspaceUser
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceUserUuid'
+      responses:
+        '200':
+          description: WorkspaceUserTopic_Get
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceUserTopic_Get'
+        default:
+          $ref: '#/components/responses/Error'
+        '403':
+          description: The stream role cannot update summary configuration.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - message
+                additionalProperties: true
+                properties:
+                  message:
+                    type: string
+      operationId: Presence_v1_messenger_users_WorkspaceUserUuid_actions_presence_invoke
+      security:
+      - bearerAuth: []
+      deprecated: true
   /v1/push_devices/{PushDeviceUuid}:
     put:
       summary: Register or rotate a push device
@@ -8143,6 +8563,7 @@ paths:
         x-ra-filter-fields:
         - avatar
         - created_at
+        - disabled
         - email
         - first_name
         - last_name
@@ -8159,6 +8580,7 @@ paths:
       - $ref: '#/components/parameters/WorkspaceUser_updated_at'
       - $ref: '#/components/parameters/WorkspaceUser_username'
       - $ref: '#/components/parameters/WorkspaceUser_source'
+      - $ref: '#/components/parameters/WorkspaceUser_disabled'
       - $ref: '#/components/parameters/WorkspaceUser_status'
       - $ref: '#/components/parameters/WorkspaceUser_status_emoji'
       - $ref: '#/components/parameters/WorkspaceUser_status_text'
@@ -8337,6 +8759,8 @@ tags:
 - name: UserFolderItem
   description: ''
 - name: UserFolder
+  description: ''
+- name: WorkspaceMutationRequest
   description: ''
 - name: WorkspaceMessageReactions
   description: ''

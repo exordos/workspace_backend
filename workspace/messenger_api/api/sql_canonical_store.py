@@ -22,6 +22,7 @@ from workspace.messenger_api import exceptions as messenger_exceptions
 from workspace.messenger_api.api import resource_projection
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.dm import helpers
+from workspace.messenger_api.dm import base
 from workspace.messenger_api.dm import models
 
 
@@ -669,6 +670,7 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
         values = self._projection_values(values)
         values["uuid"] = values.get("uuid") or sys_uuid.uuid4()
         if resource == "files":
+            base.WorkspaceProviderBase.validate_native_creation(values)
             row = helpers.create_workspace_file(
                 project_id=self.project_uuid,
                 user_uuid=self.user_uuid,
@@ -686,6 +688,7 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
     ) -> dict[str, typing.Any]:
         values = self._projection_values(values)
         if resource == "files":
+            base.WorkspaceProviderBase.validate_provider_update(values)
             row = helpers.update_workspace_file(
                 self.project_uuid,
                 self.user_uuid,

@@ -37,7 +37,7 @@ def account(_database, db, scheduled_reconciliation):
         project_id=uuid.uuid4(),
         owner_user_uuid=owner,
         provider="zulip",
-        external_account_id="zulip.example.com:7",
+        external_account_id="7",
         status="backfill",
         settings={
             "server_url": "https://zulip.example.com",
@@ -648,7 +648,7 @@ def test_changing_zulip_identity_requires_full_import_again(account, monkeypatch
     with contexts.Context().session_manager():
         task.execute()
     current = stored(account)
-    assert current.external_account_id == "zulip.example.com:8"
+    assert current.external_account_id == "8"
     assert not current.has_completed_backfill
     assert (
         models.Task.objects.get_all(

@@ -269,7 +269,7 @@ def _record_owned(
         session.execute(
             """WITH account AS (
                  SELECT uuid,project_id,owner_user_uuid,
-                        regexp_replace(external_account_id, ':[^:]+$', '') AS hostname
+                        (SELECT hostname FROM messenger_providers WHERE uuid=provider_uuid) AS hostname
                  FROM m_external_accounts_v2 WHERE uuid=%s AND project_id=%s
                ), targets AS ("""
             + targets

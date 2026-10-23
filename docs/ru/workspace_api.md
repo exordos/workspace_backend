@@ -746,28 +746,20 @@ UUID в `direct_user_uuid`. Повторяющийся или одновреме
 ```json
 {
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  }
+  "provider_uuid": null,
+  "provider_identity": null
 }
 ```
 
 ```json
 {
   "source_name": "zulip",
-  "source": {
-    "kind": "zulip",
-    "stream_id": 123,
-    "server_url": "https://zulip.example.com",
-    "topic_name": null,
-    "message_id": null
-  }
+  "provider_uuid": "11111111-1111-5111-8111-111111111111",
+  "provider_identity": "123"
 }
 ```
 
-- Это ...`zulip`Форма полезной нагрузки - это место происхождения поставщика.Zulipвремя выполнения
-заполняет его через частного Провайдера HTTP API; браузер контракт скрывает
-Идентификаторы протокола поставщика, учетные данные и состояние синхронизации.
+Provider instances are stored once with their UUID and hostname. Public origins expose `source_name`, `provider_uuid`, and `provider_identity`; credentials and synchronization state remain private.
 
 | Поле | Тип | Требуется при создании | Только для чтения | Описание |
 | --- | --- | --- | --- | --- |
@@ -785,7 +777,8 @@ UUID в `direct_user_uuid`. Повторяющийся или одновреме
 | `active_unread_count` | цельное число | Нет | Да, я знаю. | Количество нечитаемых сообщений текущего пользователя, подлежащих уведомлению в режиме эффективного потока/topic. |
 | `passive_unread_count` | цельное число | Нет | Да, я знаю. | Остальное количество нечитаемых сообщений текущего пользователя от подавленного трафика уведомлений. |
 | `source_name` | `native`, `zulip` | Нет | Нет | Имя источника; по умолчанию `native`. |
-| `source` | объект | Нет | Нет | Источник полезной нагрузки; по умолчанию `{"kind": "native"}`. |
+| `provider_uuid` | UUID or `null` | no | yes | Provider instance UUID; `null` for native origins. |
+| `provider_identity` | string, max 255 or `null` | no | yes | Identity within that provider; `null` for native origins. |
 | `invite_only` | булевой | Нет | Нет | Флаг потока только для приглашенных. |
 | `announce` | булевой | Нет | Нет | Объявление флага потока. |
 | `direct_user_uuid` | UUID | Условно | Только при создании | Обязателен для приватного потока. UUID собеседника; совпадает с текущим пользователем только в чате с собой. |
@@ -806,9 +799,8 @@ UUID в `direct_user_uuid`. Повторяющийся или одновреме
   "name": "Engineering",
   "description": "Engineering workspace",
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "invite_only": false,
   "announce": false
 }
@@ -821,9 +813,8 @@ UUID в `direct_user_uuid`. Повторяющийся или одновреме
   "name": "Direct",
   "description": "Private workspace",
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "direct_user_uuid": "33333333-3333-3333-3333-333333333333"
 }
 ```
@@ -835,9 +826,8 @@ UUID в `direct_user_uuid`. Повторяющийся или одновреме
   "name": "Personal notes",
   "description": "",
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "direct_user_uuid": "11111111-1111-1111-1111-111111111111"
 }
 ```
@@ -851,15 +841,7 @@ IAM, включая субъект токена. Такие чаты досту�
 групп: у каждого приватного потока обязателен непустой `direct_user_uuid`.
 Создание потока с `private: true` без собеседника возвращает HTTP `400`.
 
-Прямое членство является неизменным.
-Пары идентификации: один связывающий для саморазговора и два для обычного прямого
-Добавление или удаление участников и обновление обязательных возвратов ролей HTTP
-`400`Удаление потока чат-сообщений также возвращаетсяHTTP `400`Так что история сообщений
-не может быть заменена путем удаления и воссоздания детерминированной идентичности.
-При создании потока `source_name` должен соответствовать `source.kind`.
-Оба поля источника, `direct_user_uuid`, `private` и внутренний `private_index`
-неизменны для любого потока; попытки изменить их возвращают HTTP `400`.
-Превратить обычный поток в приватный через обновление нельзя.
+`source_name`, `provider_uuid`, `provider_identity`, `direct_user_uuid`, `private`, and `private_index` are immutable through the public API. Native creation requires `source_name = "native"` and null provider fields.
 
 Запрос на режим уведомления потока:
 
@@ -1012,7 +994,8 @@ Content-Type: application/json
 | `summary_system_prompt` | string, max 16384, или `null` | Нет | управляемые действиями | Тематический LLM системный запрос; `null` выбирает приложение по умолчанию. |
 | `summary_reasoning_effort` | `off`, `minimal`, `low`, `medium`, `high` или `null` | Нет | управляемые действиями | Выбор обобщенного рассуждения; `off` явно отключает рассуждение, в то время как `null` исключает опцию провайдера. Используется только тогда, когда выбранная конечная точка заявляет поддержку рассуждения. |
 | `source_name` | `native`, `zulip` | Нет | Нет | Имя источника темы; по умолчанию `native`, если оно пропущено. |
-| `source` | объект | Нет | Нет | Источник цели. |
+| `provider_uuid` | UUID or `null` | no | yes | Provider instance UUID; `null` for native origins. |
+| `provider_identity` | string, max 255 or `null` | no | yes | Identity within that provider; `null` for native origins. |
 | `provider` | объект или `null` | Нет | Да, я знаю. | Значок поставщика для тем, поддерживаемых поставщиком; `null` для местных тем. |
 | `delivery` | объект или `null` | Нет | Да, я знаю. | Текущий провайдер команды доставки прогноз. |
 | `created_at` | дата и время | Нет | Да, я знаю. | Время сотворения. |
@@ -1390,7 +1373,8 @@ Workspace ссылки на объекты внутри контента с от
 | `reactions` | объект | Нет | Да, я знаю. | Совокупное количество реакций, обозначенное `emoji_name`. |
 | `reaction_users` | объект | Нет | Да, я знаю. | Полный список постоянных пользователей UUID для ограниченных реакционных групп, заданных ключами `emoji_name`. Пустой объект или отсутствующий ключ означает только подсчет; списки никогда не являются частичными. |
 | `source_name` | `native`, `zulip` | Нет | Нет | Имя источника сообщения; общественность API устанавливает его как `native` при пропуске. |
-| `source` | объект | Нет | Нет | По умолчанию `{"kind": "native"}`. Zulip `message_id` может быть `null` до успеха выходящей синхронизации. |
+| `provider_uuid` | UUID or `null` | no | yes | Provider instance UUID; `null` for native origins. |
+| `provider_identity` | string, max 255 or `null` | no | yes | Identity within that provider; `null` for native origins. |
 | `provider` | объект или `null` | Нет | Да, я знаю. | Значок поставщика, унаследованный от выбранного потока, поддерживаемого поставщиком. |
 | `delivery` | объект или `null` | Нет | Да, я знаю. | Прогноз доставки текущего создания /update/delete. |
 | `created_at` | дата и время | Нет | Да, я знаю. | Время сотворения. |
@@ -1423,9 +1407,8 @@ Workspace ссылки на объекты внутри контента с от
     "content": "Hello, workspace"
   },
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "user_uuid": "11111111-1111-1111-1111-111111111111",
   "read": true,
   "pinned": false,
@@ -1512,7 +1495,7 @@ Workspace и не синхронизирована с внешним поста�
 | читать сообщение или читать до сообщения | `message.read` | `message` | Полный снимок сообщения пользователя, возвращенный действием. |
 | читать нечитаемое сообщение | `topic.updated`, `stream.updated`, `folder.updated` | `topic`, `stream`, `folder` | Обновлены нечитаемые снимки текущего пользователя. |
 | Звездочка или незвездочка | `message.updated` | `message` | Полный снимок сообщения пользователя для текущего пользователя при изменении флага. |
-| Удалить сообщение | `message.deleted` | `message` | Удалённое сообщение `uuid`, `stream_uuid`, `topic_uuid`, `author_uuid`, `source_name` и `source`, отправленное каждому пользователю потока. |
+| Удалить сообщение | `message.deleted` | `message` | Удалённое сообщение `uuid`, `stream_uuid`, `topic_uuid`, `author_uuid`, `source_name`, `provider_uuid`, `provider_identity`, отправленное каждому пользователю потока. |
 | Удалить нечитаемое сообщение | `topic.updated`, `stream.updated` | `topic`, `stream` | Обновленные нечитаемые снимки для пользователей, где удаленное сообщение не было прочитано; пользовательский интерфейс получает агрегаты папок из потокового снимка. |
 
 ## Проекты {#drafts}
@@ -1688,10 +1671,10 @@ If-Match: "1"
 Снимка; они не должны объединять его с предыдущим значением.
 
 Реакционные полезные нагрузки в реальном времени включают `uuid`, `project_id`, `message_uuid`,
-`user_uuid`, `emoji_name`, `source_name`, `source`, `provider` и `delivery`.
+`user_uuid`, `emoji_name`, `source_name`, `provider_uuid`, `provider_identity`, `provider` и `delivery`.
 Они никогда не показывают сырой `provider_metadata` или `delivery_metadata`.
 `message_reaction.updated`, `old_message_uuid`, `old_emoji_name`,
-`old_source_name` и `old_source` описывают предыдущую цель реакции.
+`old_source_name` и `old_provider_uuid` and `old_provider_identity` описывают предыдущую цель реакции.
 
 ## Файлы {#files}
 
@@ -1884,7 +1867,8 @@ REST `/events/` и доставка веб-сокета используют о�
     "author_uuid": "author-user-uuid",
     "payload": {"kind": "markdown", "content": "Hello"},
     "source_name": "native",
-    "source": {"kind": "native"},
+    "provider_uuid": null,
+    "provider_identity": null,
     "read": true,
     "pinned": false,
     "starred": false,
@@ -1917,7 +1901,7 @@ Messenger события удаления объектов минимальны:
 - `stream.deleted`, `folder.deleted`, `folder_item.deleted`: `kind`, `uuid`
 - `topic.deleted`: `kind`, `uuid`, `stream_uuid`
 - `message.deleted`: `kind`, `uuid`, `stream_uuid`, `topic_uuid`,
-  `author_uuid`, `source_name`, `source`
+  `author_uuid`, `source_name`, `provider_uuid`, `provider_identity`
 
 `stream_bindings.created` - это полезная нагрузка для действия в серии:
 

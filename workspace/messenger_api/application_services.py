@@ -44,7 +44,7 @@ class ExternalAccountApplicationService:
         if account.provider != "zulip" or account.external_account_id is None:
             account.delete(session=session)
             return
-        hostname, user_id = account.external_account_id.rsplit(":", 1)
+        hostname, user_id = account.get_host(), account.external_account_id
         namespace = sys_uuid.uuid5(sys_uuid.NAMESPACE_DNS, hostname)
         user_uuid = sys_uuid.uuid5(namespace, f"user:{user_id}")
         user = messenger_models.WorkspaceUser.objects.get_one_or_none(
@@ -117,11 +117,16 @@ class ExternalAccountApplicationService:
         account: external_models.ExternalAccount,
         spec: dict[str, typing.Any],
     ) -> external_models.ExternalAccount:
-        connection = account.provider, account.connection_settings()
+        connection = (
+            account.provider,
+            account.provider_uuid,
+            account.connection_settings(),
+        )
         previous_revision = account.realtime_revision()
         account.update_dm(values=spec)
         verify_connection = account.provider == "zulip" and connection != (
             account.provider,
+            account.provider_uuid,
             account.connection_settings(),
         )
         status = account.status

@@ -76,7 +76,7 @@ class ConversionContext:
             "stream_urls": {},
             "dm_stream_uuids": set(),
             "zulip_namespace": str(self.namespace),
-            "own_user_id": account.external_account_id.rsplit(":", 1)[1],
+            "own_user_id": account.external_account_id,
             "topic_uuids": {},
             "topic_urls": {},
             "message_uuids": {},
@@ -101,14 +101,13 @@ class ConversionContext:
                FROM m_external_accounts_v2 AS account
                JOIN m_workspace_users AS owner ON owner.uuid = account.owner_user_uuid
                LEFT JOIN m_workspace_users AS imported ON imported.uuid = messenger_uuid_v5(
-                   %s, 'user:' || substring(account.external_account_id FROM %s))
+                   %s, 'user:' || account.external_account_id)
                WHERE account.project_id = %s AND account.provider = 'zulip'
-                 AND starts_with(account.external_account_id, %s)""",
+                 AND account.provider_uuid = %s""",
             (
                 self.namespace,
-                len(self.host) + 2,
                 self.account.project_id,
-                self.host + ":",
+                self.account.provider_uuid,
             ),
         ).fetchall()
         self.account_ids = [row["uuid"] for row in rows]
@@ -116,7 +115,7 @@ class ConversionContext:
         names: dict[str, set[str]] = {}
         owners: dict[str, list[tuple[str, str]]] = {}
         for row in rows:
-            remote_id = row["external_account_id"].rsplit(":", 1)[1]
+            remote_id = row["external_account_id"]
             owner = str(row["owner_user_uuid"])
             self.names[remote_id] = row["name"]
             self.context["mention_uuids"][f"id:{remote_id}"] = owner
@@ -151,7 +150,7 @@ class ConversionContext:
                     f"{self.server_url}/#narrow/channel/{row['stream_id']}"
                 )
             elif row["channel_type"] == "private" and row["peer_id"] is not None:
-                remote_id = row["peer_id"].rsplit(":", 1)[1]
+                remote_id = row["peer_id"]
                 self.context["stream_urls"][stream] = (
                     f"{self.server_url}/#narrow/dm/{remote_id}"
                 )
@@ -561,6 +560,9 @@ class ConversionContext:
                     name=name,
                     description="",
                     stream_uuid=stream_uuid,
+                    source_name="zulip",
+                    provider_uuid=self.account.provider_uuid,
+                    provider_identity=str(uuid.uuid5(self.account.provider_uuid, path)),
                     content_type=content_type,
                     size_bytes=len(data),
                     hash=digest,

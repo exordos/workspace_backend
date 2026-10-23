@@ -38,7 +38,7 @@ def test_shared_native_observation_updates_canonical_without_invalidating_peer_s
             project_id=account.project_id,
             owner_user_uuid=owner,
             provider="zulip",
-            external_account_id="zulip.example.com:8",
+            external_account_id="8",
             settings=account.settings,
         )
         peer.insert()

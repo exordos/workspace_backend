@@ -746,28 +746,20 @@ Unterstützte Quell-Nutzlasten:
 ```json
 {
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  }
+  "provider_uuid": null,
+  "provider_identity": null
 }
 ```
 
 ```json
 {
   "source_name": "zulip",
-  "source": {
-    "kind": "zulip",
-    "stream_id": 123,
-    "server_url": "https://zulip.example.com",
-    "topic_name": null,
-    "message_id": null
-  }
+  "provider_uuid": "11111111-1111-5111-8111-111111111111",
+  "provider_identity": "123"
 }
 ```
 
-Die `zulip` Nutzlastform ist Provider-Herkunft. Eine eingeschriebene Zulip Laufzeit
-wird durch den privaten Anbieter HTTP API ausgefüllt; der Browservertrag versteckt
-Roh-Providerprotokoll-Identifikatoren, Anmeldeinformationen und Synchronisationszustand.
+Provider instances are stored once with their UUID and hostname. Public origins expose `source_name`, `provider_uuid`, and `provider_identity`; credentials and synchronization state remain private.
 
 | Feld | Typ | Erforderlich bei der Erstellung | Nur für Lesen | Beschreibung |
 | --- | --- | --- | --- | --- |
@@ -785,7 +777,8 @@ Roh-Providerprotokoll-Identifikatoren, Anmeldeinformationen und Synchronisations
 | `active_unread_count` | ganzzahl | - Nein. | - Ja, das ist es. | Die Anzahl der nicht gelesenen Daten des aktuellen Benutzers, die unter den Notifizierungsmodi effektiver Streams /topic zulässig ist. |
 | `passive_unread_count` | ganzzahl | - Nein. | - Ja, das ist es. | Die verbleibende nicht gelesenen Daten des aktuellen Benutzers aus dem gedämpften Benachrichtigungsverkehr. |
 | `source_name` | `native`, `zulip` | - Nein. | - Nein. | Quelle-Name; Standard für `native`. |
-| `source` | Gegenstand | - Nein. | - Nein. | Quelle Nutzlast; Standard für `{"kind": "native"}`. |
+| `provider_uuid` | UUID or `null` | no | yes | Provider instance UUID; `null` for native origins. |
+| `provider_identity` | string, max 255 or `null` | no | yes | Identity within that provider; `null` for native origins. |
 | `invite_only` | Boolean | - Nein. | - Nein. | Streaming-Flagge nur auf Einladung. |
 | `announce` | Boolean | - Nein. | - Nein. | Ankündigung der Streaming-Flagge. |
 | `direct_user_uuid` | UUID | Bedingt | Nur bei Erstellung | Für private Streams erforderlich. UUID des Gesprächspartners; entspricht nur im Selbstchat dem aktuellen Benutzer. |
@@ -806,9 +799,8 @@ Erstellen einer Anfrage:
   "name": "Engineering",
   "description": "Engineering workspace",
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "invite_only": false,
   "announce": false
 }
@@ -821,9 +813,8 @@ Erstellen Sie eine direkte Chat-Anfrage:
   "name": "Direct",
   "description": "Private workspace",
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "direct_user_uuid": "33333333-3333-3333-3333-333333333333"
 }
 ```
@@ -835,9 +826,8 @@ Selbst-Chat-Erstellungsanfrage:
   "name": "Personal notes",
   "description": "",
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "direct_user_uuid": "11111111-1111-1111-1111-111111111111"
 }
 ```
@@ -851,15 +841,7 @@ Selbstchats an `private && direct_user_uuid == current_user_uuid`. Native Worksp
 unterstützt keine privaten Gruppen: Jeder private Stream benötigt eine nicht leere
 `direct_user_uuid`. `private: true` ohne Gesprächspartner ergibt HTTP `400`.
 
-Die direkte Mitgliedschaft ist unveränderlich.
-Das Identitätspaar: eine Bindung für einen Selbstchat und zwei für einen gewöhnlichen direkten
-Chat. Hinzufügen oder Entfernen von Teilnehmern und Aktualisierung einer verbindlichen Rollenrückgabe HTTP
-`400`. Das Löschen eines Selbst-Chat-Streams gibt auch HTTP `400` zurück, also Nachrichtenverlauf
-Die Definition der deterministischen Identität kann nicht durch Löschen und Neugestaltung ersetzt werden.
-Bei der Erstellung muss `source_name` mit `source.kind` übereinstimmen.
-Beide Quellfelder, `direct_user_uuid`, `private` und der interne `private_index`
-sind für jeden Stream unveränderlich; Änderungsversuche ergeben HTTP `400`.
-Ein gewöhnlicher Stream kann nicht in einen privaten Stream umgewandelt werden.
+`source_name`, `provider_uuid`, `provider_identity`, `direct_user_uuid`, `private`, and `private_index` are immutable through the public API. Native creation requires `source_name = "native"` and null provider fields.
 
 Stream-Benachrichtigungsmodus-Anfrage:
 
@@ -1012,7 +994,8 @@ dem aktuellen IAM Benutzer durch die aktuelle Strommitgliedschaft.
 | `summary_system_prompt` | String, max 16384, oder `null` | - Nein. | Aktionsmanagement | LLM Systemaufforderung für Themen; `null` wählt die Anwendungsstandard. |
 | `summary_reasoning_effort` | `off`, `minimal`, `low`, `medium`, `high` oder `null` | - Nein. | Aktionsmanagement | Per-summary-Reasoning-Selektion; `off` deaktiviert ausdrücklich die Reasoning, während `null` die Provider-Option weglässt. Nur verwendet, wenn der ausgewählte Endpunkt die Reasoning-Unterstützung deklariert. |
 | `source_name` | `native`, `zulip` | - Nein. | - Nein. | Thema-Quellname; bei Auslassen wird standardmäßig `native` angegeben. |
-| `source` | Gegenstand | - Nein. | - Nein. | Zielquelle Nutzlast. |
+| `provider_uuid` | UUID or `null` | no | yes | Provider instance UUID; `null` for native origins. |
+| `provider_identity` | string, max 255 or `null` | no | yes | Identity within that provider; `null` for native origins. |
 | `provider` | Gegenstand oder `null` | - Nein. | - Ja, das ist es. | Anbieter-Abzeichen für von Anbietern unterstützte Themen; `null` für native Themen. |
 | `delivery` | Gegenstand oder `null` | - Nein. | - Ja, das ist es. | Aktuelle Anbieter-Befehls-Versandprojektion. |
 | `created_at` | Zeit und Datum | - Nein. | - Ja, das ist es. | Die Schöpfungszeit. |
@@ -1390,7 +1373,8 @@ Die URL Teil ist ein Workspace URN:
 | `reactions` | Gegenstand | - Nein. | - Ja, das ist es. | Aggregate Reaktionszahlen mit `emoji_name`. |
 | `reaction_users` | Gegenstand | - Nein. | - Ja, das ist es. | Vollständige persistente Benutzerlisten UUID für begrenzte Reaktionsgruppen, die durch `emoji_name` eingeschlossen werden. |
 | `source_name` | `native`, `zulip` | - Nein. | - Nein. | Nachrichtenquelle Name; die öffentliche API setzt ihn standardmäßig auf `native`, wenn es ausgelassen wird. |
-| `source` | Gegenstand | - Nein. | - Nein. | Nachrichtquelle Nutzlast; Standardeinstellung `{"kind": "native"}`. Zulip `message_id` kann `null` sein, bis die ausgehende Synchronisation erfolgreich ist. |
+| `provider_uuid` | UUID or `null` | no | yes | Provider instance UUID; `null` for native origins. |
+| `provider_identity` | string, max 255 or `null` | no | yes | Identity within that provider; `null` for native origins. |
 | `provider` | Gegenstand oder `null` | - Nein. | - Ja, das ist es. | Anbieter-Badge, die vom ausgewählten, vom Anbieter unterstützten Stream geerbt wurde. |
 | `delivery` | Gegenstand oder `null` | - Nein. | - Ja, das ist es. | Aktuelle Erstellung/update/delete Lieferprojektion. |
 | `created_at` | Zeit und Datum | - Nein. | - Ja, das ist es. | Die Schöpfungszeit. |
@@ -1423,9 +1407,8 @@ Beispiel für die Antwort:
     "content": "Hello, workspace"
   },
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "user_uuid": "11111111-1111-1111-1111-111111111111",
   "read": true,
   "pinned": false,
@@ -1512,7 +1495,7 @@ Nebenwirkungen in Echtzeit:
 | Nachricht lesen oder bis zur Nachricht lesen | `message.read` | `message` | Vollständige Benutzernachricht-Snapshot, die durch die Aktion zurückgegeben wurde. |
 | Nichtgelesenes Nachrichten lesen | `topic.updated`, `stream.updated`, `folder.updated` | `topic`, `stream`, `folder` | Aktualisierte nicht gelesenen Schnappschüsse für den aktuellen Benutzer. |
 | Star oder Unstar-Nachricht | `message.updated` | `message` | Vollständige Benutzernachricht für den aktuellen Benutzer, wenn die Flagge geändert wird. |
-| Nachricht löschen | `message.deleted` | `message` | Löschungen von Nachrichten `uuid`, `stream_uuid`, `topic_uuid`, `author_uuid`, `source_name` und `source`, die an jeden Stream-Benutzer gesendet wurden. |
+| Nachricht löschen | `message.deleted` | `message` | Löschungen von Nachrichten `uuid`, `stream_uuid`, `topic_uuid`, `author_uuid`, `source_name` und `provider_uuid`, `provider_identity`, die an jeden Stream-Benutzer gesendet wurden. |
 | Nichtgelesenes Nachrichten löschen | `topic.updated`, `stream.updated` | `topic`, `stream` | Aktualisierte unverlesene Snapshots für Benutzer, bei denen die gelöschte Nachricht nicht gelesen wurde; Benutzeroberfläche leitet Ordneraggregate aus dem Stream-Snapshot ab. |
 
 ## Entwürfe {#drafts}
@@ -1688,10 +1671,10 @@ Klienten ersetzen die gesamte Karte bei jeder REST oder Echtzeitnachricht
 Schnappschuss; sie dürfen ihn nicht mit einem vorherigen Wert zusammenführen.
 
 Reaktions-Echtzeit-Nutzlasten umfassen `uuid`, `project_id`, `message_uuid`,
-`user_uuid`, `emoji_name`, `source_name`, `source`, `provider` und `delivery`.
+`user_uuid`, `emoji_name`, `source_name`, `provider_uuid`, `provider_identity`, `provider` und `delivery`.
 Sie zeigen nie Roh `provider_metadata` oder `delivery_metadata` für
 `message_reaction.updated`, `old_message_uuid`, `old_emoji_name`,
-`old_source_name` und `old_source` beschreiben das vorherige Reaktionsziel.
+`old_source_name` und `old_provider_uuid` and `old_provider_identity` beschreiben das vorherige Reaktionsziel.
 
 ## Dateien {#files}
 
@@ -1884,7 +1867,8 @@ von der sichtbaren Ereignisfläche PostgreSQL des aktuellen Benutzers.
     "author_uuid": "author-user-uuid",
     "payload": {"kind": "markdown", "content": "Hello"},
     "source_name": "native",
-    "source": {"kind": "native"},
+    "provider_uuid": null,
+    "provider_identity": null,
     "read": true,
     "pinned": false,
     "starred": false,
@@ -1917,7 +1901,7 @@ Messenger Entity-Delete-Ereignisse sind minimal:
 - `stream.deleted`, `folder.deleted`, `folder_item.deleted`: `kind`, `uuid`
 - `topic.deleted`: `kind`, `uuid`, `stream_uuid`
 - `message.deleted`: `kind`, `uuid`, `stream_uuid`, `topic_uuid`,
-  `author_uuid`, `source_name`, `source`
+  `author_uuid`, `source_name`, `provider_uuid`, `provider_identity`
 
 `stream_bindings.created` ist eine Batch-Action-Nutzlast:
 

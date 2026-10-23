@@ -34,7 +34,8 @@ def stream_factory(request):
             role=role,
             name="Encryption metadata",
             source_name="native",
-            source=models.NativeSource(),
+            provider_uuid=None,
+            provider_identity=None,
             **metadata,
         )
 
@@ -54,7 +55,8 @@ def test_canonical_stream_encryption_defaults():
         project_id=PROJECT_UUID,
         owner_uuid=USER_UUID,
         name="Encryption metadata",
-        source={"kind": "native"},
+        provider_uuid=None,
+        provider_identity=None,
     )
 
     assert stream.encryption is False
@@ -191,7 +193,8 @@ def test_key_announcements_cannot_be_created_or_changed_by_editing(original, new
         stream_uuid=sys_uuid.uuid4(),
         topic_uuid=sys_uuid.uuid4(),
         source_name="native",
-        source=models.NativeSource(),
+        provider_uuid=None,
+        provider_identity=None,
         payload=original,
     )
 

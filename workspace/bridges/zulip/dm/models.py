@@ -274,9 +274,8 @@ class ZulipStreamState(
                 filters={
                     "project_id": filters.EQ(self.project_id),
                     "provider": filters.EQ("zulip"),
-                    "external_account_id": filters.EQ(
-                        f"{account.get_host()}:{channel.creator_id}"
-                    ),
+                    "provider_uuid": filters.EQ(account.provider_uuid),
+                    "external_account_id": filters.EQ(str(channel.creator_id)),
                 },
             )
         self._create_stream(channel, account.owner_user_uuid)
@@ -321,7 +320,6 @@ class ZulipStreamState(
             name=channel.name,
             description=channel.description,
             source_name=messenger_models.StreamSourceName.ZULIP.value,
-            source={"kind": "zulip"},
             invite_only=channel.invite_only,
             is_archived=channel.is_archived,
             private=channel.channel_type == ZulipChannelType.PRIVATE.value,
@@ -338,10 +336,10 @@ class ZulipStreamState(
             ),
         )
         restored = session.execute(
-            "INSERT INTO messenger_streams (uuid,project_id,owner_uuid,name,description,source_name,source,invite_only,is_archived,private,direct_user_uuid,private_index,color,created_at,updated_at) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s,%s,%s,%s,%s) "
+            "INSERT INTO messenger_streams (uuid,project_id,owner_uuid,name,description,source_name,invite_only,is_archived,private,direct_user_uuid,private_index,color,created_at,updated_at) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
             "ON CONFLICT (project_id,uuid) DO UPDATE SET owner_uuid=EXCLUDED.owner_uuid, name=EXCLUDED.name,description=EXCLUDED.description, "
-            "source_name=EXCLUDED.source_name,source=EXCLUDED.source,invite_only=EXCLUDED.invite_only,is_archived=EXCLUDED.is_archived, "
+            "source_name=EXCLUDED.source_name,invite_only=EXCLUDED.invite_only,is_archived=EXCLUDED.is_archived, "
             "private=EXCLUDED.private,direct_user_uuid=EXCLUDED.direct_user_uuid,private_index=EXCLUDED.private_index,color=EXCLUDED.color, "
             "deleted_at=NULL,updated_at=EXCLUDED.updated_at WHERE messenger_streams.deleted_at IS NOT NULL RETURNING uuid",
             (
@@ -351,7 +349,6 @@ class ZulipStreamState(
                 stream.name,
                 stream.description,
                 stream.source_name,
-                json.dumps(stream.source),
                 stream.invite_only,
                 stream.is_archived,
                 stream.private,
@@ -608,14 +605,13 @@ class ZulipTopicState(
             stream_uuid=self.stream_uuid,
             name=topic.name,
             source_name=messenger_models.TopicSourceName.ZULIP.value,
-            source=messenger_models.ZulipSource(),
             created_at=topic.created_at,
         )
         session = contexts.Context().get_session()
         restored = session.execute(
-            "INSERT INTO messenger_topics (uuid,project_id,stream_uuid,name,color,source_name,source,created_at,updated_at) "
-            "VALUES (%s,%s,%s,%s,%s,'zulip','{\"kind\":\"zulip\"}'::jsonb,%s,%s) "
-            "ON CONFLICT (project_id,uuid) DO UPDATE SET name=EXCLUDED.name,color=EXCLUDED.color,source_name=EXCLUDED.source_name,source=EXCLUDED.source,deleted_at=NULL,updated_at=EXCLUDED.updated_at WHERE messenger_topics.deleted_at IS NOT NULL RETURNING uuid",
+            "INSERT INTO messenger_topics (uuid,project_id,stream_uuid,name,color,source_name,created_at,updated_at) "
+            "VALUES (%s,%s,%s,%s,%s,'zulip',%s,%s) "
+            "ON CONFLICT (project_id,uuid) DO UPDATE SET name=EXCLUDED.name,color=EXCLUDED.color,source_name=EXCLUDED.source_name,deleted_at=NULL,updated_at=EXCLUDED.updated_at WHERE messenger_topics.deleted_at IS NOT NULL RETURNING uuid",
             (
                 workspace_topic.uuid,
                 workspace_topic.project_id,
@@ -1106,7 +1102,8 @@ class ZulipMessageState(
                 message.topic_uuid,
                 message.author_uuid,
                 message.source_name,
-                message.source,
+                message.provider_uuid,
+                message.provider_identity,
                 session=session,
                 compact=True,
             )
@@ -1137,9 +1134,8 @@ class ZulipMessageState(
             filters={
                 "project_id": filters.EQ(self.project_id),
                 "provider": filters.EQ("zulip"),
-                "external_account_id": filters.EQ(
-                    f"{account.get_host()}:{source.sender_id}"
-                ),
+                "provider_uuid": filters.EQ(account.provider_uuid),
+                "external_account_id": filters.EQ(str(source.sender_id)),
             },
         )
         message = v2_models.WorkspaceMessage.objects.get_one_or_none(
@@ -1169,7 +1165,8 @@ class ZulipMessageState(
                     content=source.content.workspace_content,
                 ),
                 source_name=messenger_base.SourceName.ZULIP.value,
-                source={"kind": "zulip"},
+                provider_uuid=account.provider_uuid,
+                provider_identity=str(source.message_id),
                 ingest_sequence=sequence,
                 created_at=created_at,
                 updated_at=source.content.workspace_content_updated_at,
@@ -1207,9 +1204,8 @@ class ZulipMessageState(
             filters={
                 "project_id": filters.EQ(self.project_id),
                 "provider": filters.EQ("zulip"),
-                "external_account_id": filters.EQ(
-                    f"{observer.get_host()}:{source.sender_id}"
-                ),
+                "provider_uuid": filters.EQ(observer.provider_uuid),
+                "external_account_id": filters.EQ(str(source.sender_id)),
             }
         )
         author_changed = message.author_uuid != author.owner_user_uuid
@@ -1932,7 +1928,7 @@ class InitializeConnectionContent(AbstractZulipTaskContent):
             data = zulip.check_connection()
         finally:
             zulip.close()
-        external_account_id = f"{account.get_host()}:{data['user_id']}"
+        external_account_id = str(data["user_id"])
         if (
             account.external_account_id is not None
             and account.external_account_id != external_account_id
@@ -1942,6 +1938,7 @@ class InitializeConnectionContent(AbstractZulipTaskContent):
             filters={
                 "project_id": filters.EQ(task.project_id),
                 "provider": filters.EQ(account.provider),
+                "provider_uuid": filters.EQ(account.provider_uuid),
                 "external_account_id": filters.EQ(external_account_id),
             },
         )
@@ -2153,12 +2150,9 @@ class ImportUsersContent(AbstractZulipTaskContent):
             filters={
                 "project_id": filters.EQ(task.project_id),
                 "provider": filters.EQ("zulip"),
+                "provider_uuid": filters.EQ(account.provider_uuid),
                 **(
-                    {
-                        "external_account_id": filters.EQ(
-                            f"{hostname}:{person['user_id']}"
-                        )
-                    }
+                    {"external_account_id": filters.EQ(str(person["user_id"]))}
                     if person is not None
                     else {}
                 ),
@@ -2210,7 +2204,7 @@ class ImportUsersContent(AbstractZulipTaskContent):
             for data in users:
                 user_id = data["user_id"]
                 disabled = not data["is_active"]
-                external_account_id = f"{hostname}:{user_id}"
+                external_account_id = str(user_id)
                 user_uuid = sys_uuid.uuid5(server_namespace, f"user:{user_id}")
                 external_account = accounts_by_id.get(external_account_id)
                 user = messenger_models.WorkspaceUser.objects.get_one_or_none(
@@ -2240,6 +2234,7 @@ class ImportUsersContent(AbstractZulipTaskContent):
                         owner_user_uuid=user.uuid,
                         provider="zulip",
                         external_account_id=external_account_id,
+                        provider_uuid=account.provider_uuid,
                         disabled=disabled,
                         settings={
                             "server_url": account.settings["server_url"],
@@ -2829,7 +2824,7 @@ class ImportHistoryContent(AbstractZulipTaskContent):
                         raise ExternalAccountIdPendingError(
                             f"External account {account.uuid} is not verified yet."
                         )
-                    user_id = int(account.external_account_id.rsplit(":", 1)[1])
+                    user_id = int(account.external_account_id)
                     recipients = sorted(
                         data["display_recipient"], key=lambda recipient: recipient["id"]
                     )
@@ -2846,9 +2841,8 @@ class ImportHistoryContent(AbstractZulipTaskContent):
                             filters={
                                 "project_id": filters.EQ(task.project_id),
                                 "provider": filters.EQ("zulip"),
-                                "external_account_id": filters.EQ(
-                                    f"{hostname}:{peer_id}"
-                                ),
+                                "provider_uuid": filters.EQ(account.provider_uuid),
+                                "external_account_id": filters.EQ(str(peer_id)),
                             },
                         )
                         if peer is None:
@@ -4650,9 +4644,8 @@ class RealtimeEvent(
                 filters={
                     "project_id": filters.EQ(self.project_id),
                     "provider": filters.EQ("zulip"),
-                    "external_account_id": filters.EQ(
-                        f"{account.get_host()}:{self.payload['user_id']}"
-                    ),
+                    "provider_uuid": filters.EQ(account.provider_uuid),
+                    "external_account_id": filters.EQ(str(self.payload["user_id"])),
                 }
             )
             if actor is None:
@@ -4833,7 +4826,7 @@ class MessageDelivery(
         blocked = set()
         for data in messages:
             for delivery in pending:
-                sender = int(delivery["external_account_id"].rsplit(":", 1)[1])
+                sender = int(delivery["external_account_id"])
                 if data["sender_id"] != sender:
                     continue
                 # Edits may have changed both content and destination. Without
@@ -4961,7 +4954,7 @@ class MessageDelivery(
                 )
                 if peer.provider != "zulip" or peer.get_host() != account.get_host():
                     raise SubscriptionChangedError()
-                recipient = [int(peer.external_account_id.rsplit(":", 1)[1])]
+                recipient = [int(peer.external_account_id)]
             else:
                 members = session.execute(
                     "SELECT user_uuid FROM messenger_stream_bindings WHERE project_id=%s AND stream_uuid=%s AND active",
@@ -4978,7 +4971,7 @@ class MessageDelivery(
                 )
                 recipient = sorted(
                     {
-                        int(peer.external_account_id.rsplit(":", 1)[1])
+                        int(peer.external_account_id)
                         for peer in peers
                         if peer.external_account_id is not None
                         and peer.get_host() == account.get_host()
@@ -5017,9 +5010,7 @@ class MessageDelivery(
                 raise DeliveryPendingError(
                     "Waiting for the imported Zulip message identity"
                 )
-            if source["sender_id"] != int(
-                account.external_account_id.rsplit(":", 1)[1]
-            ):
+            if source["sender_id"] != int(account.external_account_id):
                 raise SubscriptionChangedError()
             delivery.zulip_message_id = source["message_id"]
             delivery.delivered_at = datetime.datetime.fromtimestamp(
@@ -5036,7 +5027,7 @@ class MessageDelivery(
         convert_text: bool = True,
     ) -> None:
         account = self.account(sending=False)
-        if data["sender_id"] != int(account.external_account_id.rsplit(":", 1)[1]):
+        if data["sender_id"] != int(account.external_account_id):
             raise SubscriptionChangedError()
         if self.zulip_message_id is not None and self.zulip_message_id != data["id"]:
             raise SubscriptionChangedError()

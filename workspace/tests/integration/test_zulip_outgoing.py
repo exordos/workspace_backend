@@ -36,7 +36,7 @@ def outgoing(api, db, scheduled_reconciliation, monkeypatch):
         conftest.seed_user_stream(db, api.project_id, api.user_uuid, "Channel")
     )
     db.execute(
-        "UPDATE messenger_streams SET source_name='zulip', source='{\"kind\":\"zulip\"}' WHERE project_id=%s AND uuid=%s",
+        "UPDATE messenger_streams SET source_name='zulip' WHERE project_id=%s AND uuid=%s",
         (api.project_id, stream_uuid),
     )
     topic = v2_models.WorkspaceStreamTopic(
@@ -54,7 +54,7 @@ def outgoing(api, db, scheduled_reconciliation, monkeypatch):
         project_id=api.project_id,
         owner_user_uuid=api.user_uuid,
         provider="zulip",
-        external_account_id="zulip.example.com:7",
+        external_account_id="7",
         status="active",
         settings={
             "server_url": "https://zulip.example.com",
@@ -283,7 +283,7 @@ def test_missing_sender_does_not_use_another_observers_credentials(outgoing, db)
         project_id=api.project_id,
         owner_user_uuid=observer,
         provider="zulip",
-        external_account_id="zulip.example.com:8",
+        external_account_id="8",
         status="active",
         settings={
             "server_url": "https://zulip.example.com",
@@ -482,7 +482,7 @@ def test_direct_message_routes_to_the_peer_without_a_channel_topic(outgoing, db)
         project_id=account.project_id,
         owner_user_uuid=owner,
         provider="zulip",
-        external_account_id="zulip.example.com:8",
+        external_account_id="8",
         settings={
             "server_url": "https://zulip.example.com",
             "email": "peer@example.com",
@@ -565,7 +565,7 @@ def test_rebound_identity_cannot_execute_an_old_send(outgoing):
     _api, account, _channel, _remote, zulip, _constructor = outgoing
     create(outgoing)
     dispatch()
-    account.properties["external_account_id"].set_value_force("zulip.example.com:99")
+    account.properties["external_account_id"].set_value_force("99")
     account.update()
     history_import.HistoryImportService()._iteration()
     assert tasks(account)[0].status == "cancel"
@@ -585,7 +585,7 @@ def test_edit_of_previously_imported_message_uses_its_existing_remote_id(outgoin
         event.processed_at = datetime.datetime.now(datetime.timezone.utc)
         event.update()
     db.execute(
-        "UPDATE messenger_messages SET source_name='zulip', source='{\"kind\":\"zulip\"}' WHERE project_id=%s AND uuid=%s",
+        "UPDATE messenger_messages SET source_name='zulip' WHERE project_id=%s AND uuid=%s",
         (account.project_id, canonical_uuid),
     )
     topic = models.ZulipTopic(
@@ -798,7 +798,7 @@ def test_deletion_does_not_use_a_rebound_account_or_invent_a_remote_id(
     assert api.delete("/v1/messenger/messages/" + public["uuid"]).status_code == 204
     if changed == "account":
         db.execute(
-            "UPDATE m_external_accounts_v2 SET external_account_id='zulip.example.com:99' WHERE uuid=%s",
+            "UPDATE m_external_accounts_v2 SET external_account_id='99' WHERE uuid=%s",
             (account.uuid,),
         )
     dispatch()

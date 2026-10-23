@@ -32,7 +32,7 @@ def user_import_account(_database, db):
         project_id=uuid.uuid4(),
         owner_user_uuid=owner_uuid,
         provider="zulip",
-        external_account_id=f"{host}:7",
+        external_account_id="7",
         settings={
             "server_url": f"https://{host}",
             "email": "owner@example.com",
@@ -88,7 +88,7 @@ def pending_user_connection(user_import_account, db, monkeypatch):
     imported = external_models.ExternalAccount.objects.get_one(
         filters={
             "project_id": filters.EQ(account.project_id),
-            "external_account_id": filters.EQ(f"{account.get_host()}:8"),
+            "external_account_id": filters.EQ("8"),
         }
     )
     owner_uuid = uuid.uuid4()
@@ -606,9 +606,10 @@ def test_connection_does_not_claim_external_identity_from_another_scope(
     elif scope == "provider":
         imported.provider = "other"
     else:
-        imported.properties["external_account_id"].set_value_force(
-            "other.example.com:8"
-        )
+        imported.settings = {
+            **imported.settings,
+            "server_url": f"https://other.{imported.get_host()}",
+        }
     imported.update()
     try:
         with contexts.Context().session_manager():
@@ -626,7 +627,7 @@ def test_connection_does_not_claim_external_identity_from_another_scope(
             external_models.ExternalAccount.objects.get_one(
                 filters={"uuid": filters.EQ(pending.uuid)}
             ).external_account_id
-            == f"{pending.get_host()}:8"
+            == "8"
         )
     finally:
         imported.delete()
@@ -676,7 +677,7 @@ def test_provider_identity_cannot_be_supplied_through_the_public_api(api, operat
         response = api.post(
             path,
             permissions=("workspace.external_account.create",),
-            json={**spec, "external_account_id": "zulip.example.com:7"},
+            json={**spec, "external_account_id": "7"},
         )
     else:
         created = api.post(
@@ -689,7 +690,7 @@ def test_provider_identity_cannot_be_supplied_through_the_public_api(api, operat
         response = api.put(
             f"{path}{created.json()['uuid']}",
             permissions=("workspace.external_account.update",),
-            json={"external_account_id": "zulip.example.com:7"},
+            json={"external_account_id": "7"},
         )
     assert response.status_code == 403, response.text
 
@@ -714,10 +715,10 @@ def test_user_import_creates_linked_profiles_without_credentials_and_updates_the
     assert owner.uuid == account.uuid
     assert owner.owner_user_uuid == account.owner_user_uuid
     assert owner.settings == account.settings
-    assert owner.external_account_id == f"{account.get_host()}:7"
+    assert owner.external_account_id == "7"
     assert owner.disabled is False
     for external_account, user_id in zip(imported, (8, 9)):
-        assert external_account.external_account_id == f"{account.get_host()}:{user_id}"
+        assert external_account.external_account_id == str(user_id)
         assert external_account.settings == {
             "server_url": account.settings["server_url"],
             "email": f"user-{user_id}@example.com",
@@ -813,7 +814,7 @@ def test_user_import_always_creates_missing_system_bots(
     imported = {row.external_account_id: row for row in _accounts(account)}
     assert len(imported) == (5 if include_realm_users else 3)
     for bot in bots:
-        stored = imported[f"{account.get_host()}:{bot['user_id']}"]
+        stored = imported[str(bot["user_id"])]
         assert stored.disabled is False
         assert stored.settings == {
             "server_url": account.settings["server_url"],
@@ -828,14 +829,14 @@ def test_user_import_always_creates_missing_system_bots(
         assert profile.disabled is False
         assert profile.status == "offline"
     if include_realm_users:
-        assert imported[f"{account.get_host()}:8"].disabled is False
-        assert imported[f"{account.get_host()}:9"].disabled is True
+        assert imported["8"].disabled is False
+        assert imported["9"].disabled is True
 
     assert _run_user_import(account).status == "done"
     assert {row.uuid: row.updated_at for row in _accounts(account)} == {
         row.uuid: row.updated_at for row in imported.values()
     }
-    missing = imported[f"{account.get_host()}:6"]
+    missing = imported["6"]
     missing.delete()
     assert _run_user_import(account).status == "done"
     restored = external_models.ExternalAccount.objects.get_one(
@@ -861,7 +862,7 @@ def test_user_import_repairs_native_profiles_and_tracks_deactivation_and_reactiv
         project_id=account.project_id,
         owner_user_uuid=user_uuid,
         provider="zulip",
-        external_account_id=f"{account.get_host()}:8",
+        external_account_id="8",
         settings={
             "server_url": account.settings["server_url"],
             "email": "old@example.com",
@@ -918,7 +919,7 @@ def test_user_import_reuses_connected_accounts_preserving_credentials_and_iam_pr
         project_id=account.project_id,
         owner_user_uuid=owner_uuid,
         provider="zulip",
-        external_account_id=f"{account.get_host()}:8",
+        external_account_id="8",
         status="active",
         settings={
             "server_url": account.settings["server_url"] + "/",
@@ -938,7 +939,7 @@ def test_user_import_reuses_connected_accounts_preserving_credentials_and_iam_pr
     restored = external_models.ExternalAccount.objects.get_one(
         filters={"uuid": filters.EQ(peer.uuid)}
     )
-    assert restored.external_account_id == f"{account.get_host()}:8"
+    assert restored.external_account_id == "8"
     assert restored.owner_user_uuid == owner_uuid
     assert restored.settings == peer.settings
     assert restored.status == "active"
@@ -952,7 +953,7 @@ def test_user_import_reuses_connected_accounts_preserving_credentials_and_iam_pr
     assert profile.disabled is False
 
 
-@pytest.mark.parametrize("pending_account", ("self", "peer", "other_host"))
+@pytest.mark.parametrize("pending_account", ("self", "peer"))
 def test_user_import_defers_before_reading_or_writing_users_with_unknown_identity(
     user_import_account, db, monkeypatch, pending_account
 ):
@@ -964,14 +965,14 @@ def test_user_import_defers_before_reading_or_writing_users_with_unknown_identit
     else:
         owner_uuid = uuid.uuid4()
         conftest.seed_workspace_user(db, owner_uuid, f"pending-{owner_uuid}")
-        host = account.get_host()
-        if pending_account == "other_host":
-            host = f"other.{host}"
         pending = external_models.ExternalAccount(
             project_id=account.project_id,
             owner_user_uuid=owner_uuid,
             provider="zulip",
-            settings={"server_url": f"https://{host}", "email": "user-8@example.com"},
+            settings={
+                "server_url": account.settings["server_url"],
+                "email": "user-8@example.com",
+            },
         )
         pending.insert()
     original = [(row.uuid, row.updated_at, row.settings) for row in _accounts(account)]
@@ -1008,7 +1009,7 @@ def test_user_import_defers_before_reading_or_writing_users_with_unknown_identit
     )
 
 
-@pytest.mark.parametrize("different_scope", ("project", "provider"))
+@pytest.mark.parametrize("different_scope", ("project", "provider", "host"))
 def test_unknown_identity_outside_zulip_project_does_not_block_user_import(
     user_import_account, monkeypatch, different_scope
 ):
@@ -1017,7 +1018,12 @@ def test_unknown_identity_outside_zulip_project_does_not_block_user_import(
         project_id=uuid.uuid4() if different_scope == "project" else account.project_id,
         owner_user_uuid=account.owner_user_uuid,
         provider="example" if different_scope == "provider" else "zulip",
-        settings=account.settings,
+        settings={
+            **account.settings,
+            "server_url": f"https://other.{account.get_host()}"
+            if different_scope == "host"
+            else account.settings["server_url"],
+        },
     )
     other.insert()
     zulip = mock.Mock()
@@ -1027,9 +1033,7 @@ def test_unknown_identity_outside_zulip_project_does_not_block_user_import(
         assert _run_user_import(account).status == "done"
         zulip.get_users.assert_called_once_with()
         (imported,) = [
-            row
-            for row in _accounts(account)
-            if row.external_account_id == f"{account.get_host()}:8"
+            row for row in _accounts(account) if row.external_account_id == "8"
         ]
         assert imported.owner_user_uuid != account.owner_user_uuid
     finally:
@@ -1090,7 +1094,7 @@ def test_connection_checks_run_before_immediate_user_import_retry(
         external_models.ExternalAccount.objects.get_one(
             filters={"uuid": filters.EQ(peer.uuid)}
         ).external_account_id
-        == f"{account.get_host()}:8"
+        == "8"
     )
 
     service._iteration()
@@ -1119,7 +1123,7 @@ def test_user_import_scopes_external_id_to_host_and_project(
         if different_scope == "project"
         else uuid.uuid4(),
         provider="zulip",
-        external_account_id=f"{host}:8",
+        external_account_id="8",
         settings={
             "server_url": f"https://{host}",
             "email": "user-8@example.com",
@@ -1139,7 +1143,8 @@ def test_user_import_scopes_external_id_to_host_and_project(
         (imported,) = [
             row
             for row in _accounts(account)
-            if row.external_account_id == f"{account.get_host()}:8"
+            if row.external_account_id == "8"
+            and row.provider_uuid == account.provider_uuid
         ]
         assert imported.uuid != other.uuid
         assert imported.owner_user_uuid != other.owner_user_uuid
@@ -1245,7 +1250,7 @@ def test_external_account_identity_migration_and_lookup_index(_database):
                 is True
             )
             db.execute(
-                "UPDATE m_external_accounts_v2 SET external_account_id='zulip.example.com:7' WHERE uuid=%s",
+                "UPDATE m_external_accounts_v2 SET external_account_id='7' WHERE uuid=%s",
                 (account_uuid,),
             )
             index = db.execute(

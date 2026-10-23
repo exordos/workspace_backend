@@ -31,6 +31,7 @@ import contextlib
 import datetime
 import gc
 import hashlib
+import importlib.util
 import json
 import os
 import pathlib
@@ -46,6 +47,7 @@ import requests
 
 from gcl_iam import engines as iam_engines
 from gcl_iam import middlewares as iam_mw
+from restalchemy.common import contexts
 from restalchemy.api import applications
 from restalchemy.api import middlewares
 from restalchemy.api.middlewares import contexts as contexts_mw
@@ -75,6 +77,37 @@ TEST_DB_URL = os.environ.get("WORKSPACE_TEST_DB_URL", DEFAULT_TEST_DB_URL)
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 MIGRATIONS_DIR = REPO_ROOT / "migrations"
+
+
+class DataMigration:
+    """Exercise one data/trigger migration without rolling back unrelated schema."""
+
+    def __init__(self, migration):
+        self.migration = migration
+        self.applied = True
+
+    def _run(self, filename, operation):
+        spec = importlib.util.spec_from_file_location(
+            "tested_data_migration", MIGRATIONS_DIR / filename
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with contexts.Context().session_manager() as session:
+            getattr(module.migration_step, operation)(session)
+
+    def apply_migration(self, filename):
+        if not self.applied:
+            self._run(filename, "upgrade")
+            self.applied = True
+
+    def rollback_migration(self, filename):
+        if self.applied:
+            self._run(filename, "downgrade")
+            self.applied = False
+
+    def get_latest_migration(self):
+        return self.migration
+
 
 # Headers used by the mocked auth middleware to build the request context.
 HEADER_USER = "X-Test-User-Uuid"

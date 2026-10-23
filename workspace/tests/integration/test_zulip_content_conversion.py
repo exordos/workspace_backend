@@ -179,7 +179,7 @@ def test_silent_notification_names_and_quotes_stay_readable_through_the_api(
     admin = external_models.ExternalAccount.objects.get_one(
         filters={
             "project_id": filters.EQ(account.project_id),
-            "external_account_id": filters.EQ("zulip.example.com:8"),
+            "external_account_id": filters.EQ("8"),
         }
     )
     silent = f'[Admin Example](urn:user:{admin.owner_user_uuid} "silent")'
@@ -606,7 +606,7 @@ def test_first_direct_message_with_an_attachment_does_not_wait_for_its_own_chat(
         project_id=account.project_id,
         owner_user_uuid=owner,
         provider="zulip",
-        external_account_id="zulip.example.com:8",
+        external_account_id="8",
         settings=account.settings,
     )
     peer.insert()
@@ -706,6 +706,14 @@ def test_realtime_message_is_converted_with_attachments_before_workspace_creatio
         api.get(f"/v1/messenger/files/{file_uuid}/actions/download").content == b"photo"
     )
     zulip.download_file.assert_called_once_with(path)
+    assert db.execute(
+        "SELECT source_name,provider_uuid,provider_identity FROM m_workspace_files WHERE uuid=%s",
+        (file_uuid,),
+    ).fetchone() == (
+        "zulip",
+        account.provider_uuid,
+        str(uuid.uuid5(account.provider_uuid, path)),
+    )
 
 
 def test_outgoing_messages_and_forwards_upload_before_sending_and_reuse_files(
@@ -966,7 +974,7 @@ def test_direct_and_group_chat_links_use_real_conversations(
             project_id=account.project_id,
             owner_user_uuid=owner,
             provider="zulip",
-            external_account_id=f"zulip.example.com:{user_id}",
+            external_account_id=str(user_id),
             settings=account.settings,
         )
         peer.insert()
@@ -1012,7 +1020,7 @@ def test_quote_cannot_read_another_users_private_history(
         project_id=account.project_id,
         owner_user_uuid=owner,
         provider="zulip",
-        external_account_id="zulip.example.com:8",
+        external_account_id="8",
         settings=account.settings,
     )
     other.insert()
@@ -1091,7 +1099,7 @@ def test_content_repair_restores_saved_content_without_an_edit(
         if repair_kind == "contextual_quote"
         else "0262-Reconvert-stored-Zulip-silent-user-mentions-80e205.py"
     )
-    engine = migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    engine = conftest.DataMigration(target)
     engine.rollback_migration(target)
     task = None
     try:
@@ -1536,7 +1544,7 @@ def test_editing_imported_content_preserves_its_workspace_representation(
         project_id=account.project_id,
         owner_user_uuid=owner,
         provider="zulip",
-        external_account_id="zulip.example.com:8",
+        external_account_id="8",
         status="active",
         settings=account.settings,
     )

@@ -96,7 +96,7 @@ Authorization: Bearer <accessToken>
 - `stream.deleted`, `folder.deleted`没有`folder_item.deleted`: `kind`, `uuid`;
 - `topic.deleted`: `kind`, `uuid`, `stream_uuid`;
 - `message.deleted`: `kind`, `uuid`, `stream_uuid`, `topic_uuid`,
-  `author_uuid`, `source_name`没有`source`.
+  `author_uuid`, `source_name`没有`provider_uuid`, `provider_identity`.
 
 反应变化发出`message_reaction.created`,
 `message_reaction.updated`,或者 `message_reaction.deleted` 作为代理用户.

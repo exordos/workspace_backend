@@ -138,7 +138,7 @@ def test_compare_conversion_and_worker_isolation(
                 project_id=uuid.uuid4(),
                 owner_user_uuid=account.owner_user_uuid,
                 provider="zulip",
-                external_account_id=f"zulip.example.com:{100 + i}",
+                external_account_id=str(100 + i),
                 settings=account.settings,
             )
             value.insert()

@@ -300,7 +300,7 @@ def test_different_accounts_run_concurrently_with_separate_sessions(
         project_id=uuid.uuid4(),
         owner_user_uuid=account.owner_user_uuid,
         provider="zulip",
-        external_account_id="zulip.example.com:8",
+        external_account_id="8",
         settings=account.settings,
     )
     other.insert()
@@ -698,7 +698,7 @@ def test_parallel_account_imports_preserve_shared_message_identities(
         project_id=account.project_id,
         owner_user_uuid=owner,
         provider="zulip",
-        external_account_id="zulip.example.com:8",
+        external_account_id="8",
         settings=account.settings,
     )
     other.insert()

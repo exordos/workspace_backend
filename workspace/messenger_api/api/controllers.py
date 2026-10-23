@@ -157,7 +157,6 @@ class StoreResourceController(ra_controllers.BaseResourceControllerPaginated):
         result["user_uuid"] = self._get_user_uuid()
         result.setdefault("uuid", sys_uuid.uuid4())
         result.setdefault("source_name", "native")
-        result.setdefault("source", {"kind": "native"})
         return result
 
     @classmethod

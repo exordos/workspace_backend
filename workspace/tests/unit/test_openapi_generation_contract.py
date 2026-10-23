@@ -610,7 +610,6 @@ def test_workspace_openapi_exposes_messenger_and_rest_events():
     _assert_multipart_object(paths[avatar_upload_path]["post"], ["file"])
 
     raw_provider_fields = {
-        "provider_uuid",
         "external_account_uuid",
         "provider_external_id",
     }

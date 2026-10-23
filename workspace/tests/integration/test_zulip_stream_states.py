@@ -89,16 +89,17 @@ def _stream(db, account, stream_uuid, source, deleted=False):
     db.execute(
         """
         INSERT INTO messenger_streams
-            (uuid, project_id, owner_uuid, name, source_name, source, deleted_at)
-        VALUES (%s, %s, %s, 'General', %s,
-            jsonb_build_object('kind', %s::text), CASE WHEN %s THEN NOW() END)
+            (uuid, project_id, owner_uuid, name, source_name, provider_uuid, provider_identity, deleted_at)
+        VALUES (%s, %s, %s, 'General', %s, %s, %s,
+            CASE WHEN %s THEN NOW() END)
         """,
         (
             stream_uuid,
             account.project_id,
             account.owner_user_uuid,
             source,
-            source,
+            account.provider_uuid if source == "zulip" else None,
+            "42" if source == "zulip" else None,
             deleted,
         ),
     )
@@ -743,8 +744,8 @@ def test_stream_states_do_not_match_other_projects(stream_state_account, db):
     db.execute(
         """
         INSERT INTO messenger_streams
-            (uuid, project_id, owner_uuid, name, source_name, source)
-        VALUES (%s, %s, %s, 'Other project', 'zulip', '{"kind":"zulip"}')
+            (uuid, project_id, owner_uuid, name, source_name)
+        VALUES (%s, %s, %s, 'Other project', 'zulip')
         """,
         (stream_uuid, other_project, account.owner_user_uuid),
     )
@@ -816,7 +817,7 @@ def test_stream_state_creates_each_stream_type(stream_state_account, db, channel
     assert stream.name == channel.name
     assert stream.description == channel.description
     assert stream.source_name == "zulip"
-    assert stream.source == {"kind": "zulip"}
+    assert stream.source_name == "zulip"
     assert stream.invite_only is True
     assert stream.is_archived is True
     assert stream.created_at == datetime.datetime.fromtimestamp(
@@ -840,7 +841,7 @@ def test_stream_state_resolves_channel_creator(stream_state_account, db):
         project_id=account.project_id,
         owner_user_uuid=creator_uuid,
         provider="zulip",
-        external_account_id=f"{account.get_host()}:17",
+        external_account_id="17",
         settings=account.settings,
     )
     creator.insert()
@@ -1019,7 +1020,8 @@ def test_zulip_stream_source_is_readable_in_models_and_events(stream_state_accou
         owner_uuid=account.owner_user_uuid,
         name="General",
         source_name="zulip",
-        source={"kind": "zulip"},
+        provider_uuid=account.provider_uuid,
+        provider_identity="42",
     ).insert()
     conftest.seed_user_stream_binding(
         db, account.project_id, stream_uuid, account.owner_user_uuid
@@ -1037,14 +1039,17 @@ def test_zulip_stream_source_is_readable_in_models_and_events(stream_state_accou
         }
     )
     assert canonical.source_name == legacy.source_name == visible.source_name == "zulip"
-    assert canonical.source == {"kind": "zulip"}
-    assert legacy.source == {"kind": "zulip"}
-    assert isinstance(visible.source, messenger_models.ZulipSource)
+    assert canonical.source_name == "zulip"
+    assert legacy.source_name == "zulip"
+    assert visible.provider_uuid == account.provider_uuid
     created = event_payloads.StreamCreatedEventPayload(**dict(visible))
     deleted = event_payloads.StreamDeletedEventPayload(
-        uuid=stream_uuid, source_name=visible.source_name, source=visible.source
+        uuid=stream_uuid,
+        source_name=visible.source_name,
+        provider_uuid=visible.provider_uuid,
+        provider_identity=visible.provider_identity,
     )
-    assert created.source.KIND == deleted.source.KIND == "zulip"
+    assert created.source_name == deleted.source_name == "zulip"
 
 
 def _seed_reconciliation_channels(db, account, count):

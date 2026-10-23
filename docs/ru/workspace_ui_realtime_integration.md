@@ -96,7 +96,7 @@ Socket дополнительно отправляет сообщения о в�
 - `stream.deleted`, `folder.deleted` и `folder_item.deleted`: `kind`, `uuid`;
 - `topic.deleted`: `kind`, `uuid`, `stream_uuid`;
 - `message.deleted`: `kind`, `uuid`, `stream_uuid`, `topic_uuid`,
-  `author_uuid`, `source_name` и `source`.
+  `author_uuid`, `source_name`, `provider_uuid`, `provider_identity`.
 
 Изменения реакции излучают `message_reaction.created`,
 `message_reaction.updated`, или `message_reaction.deleted` для действующего пользователя.

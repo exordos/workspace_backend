@@ -51,7 +51,9 @@ WORKSPACE_USER_PRESENCE_EVENT_FIELDS = (
     "status_text",
 )
 DIRECT_STREAM_NAMESPACE = sys_uuid.UUID("26f42131-4503-5f59-8aa6-32b20f551751")
-STREAM_SOURCE_IDENTITY_FIELDS = frozenset({"source_name", "source"})
+STREAM_SOURCE_IDENTITY_FIELDS = frozenset(
+    {"source_name", "provider_uuid", "provider_identity"}
+)
 DIRECT_STREAM_IDENTITY_FIELDS = frozenset(
     {"direct_user_uuid", "private_index", "private"}
 )
@@ -953,7 +955,8 @@ def delete_workspace_stream_binding(
             user_uuid=binding.user_uuid,
             stream_uuid=stream.uuid,
             source_name=stream.source_name,
-            source=stream.source,
+            provider_uuid=stream.provider_uuid,
+            provider_identity=stream.provider_identity,
             session=current_session,
         )
         current_session.execute(

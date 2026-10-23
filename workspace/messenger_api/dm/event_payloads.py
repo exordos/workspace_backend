@@ -105,12 +105,9 @@ class MessageDeletedEventPayload(
         types.Enum([source.value for source in base.SourceName]),
         required=True,
     )
-    source = properties.property(
-        types_dynamic.KindModelSelectorType(
-            types_dynamic.KindModelType(base.NativeSource),
-            types_dynamic.KindModelType(base.ZulipSource),
-        ),
-        required=True,
+    provider_uuid = properties.property(types.AllowNone(types.UUID()), default=None)
+    provider_identity = properties.property(
+        types.AllowNone(types.String(min_length=1, max_length=255)), default=None
     )
 
 
@@ -135,11 +132,9 @@ class MessageReactionEventPayloadBase(
         types.Enum([source.value for source in base.SourceName]),
         required=True,
     )
-    source = properties.property(
-        types_dynamic.KindModelSelectorType(
-            types_dynamic.KindModelType(base.NativeSource),
-        ),
-        required=True,
+    provider_uuid = properties.property(types.AllowNone(types.UUID()), default=None)
+    provider_identity = properties.property(
+        types.AllowNone(types.String(min_length=1, max_length=255)), default=None
     )
     old_message_uuid = properties.property(
         types.AllowNone(types.UUID()),
@@ -155,13 +150,9 @@ class MessageReactionEventPayloadBase(
         ),
         default=None,
     )
-    old_source = properties.property(
-        types.AllowNone(
-            types_dynamic.KindModelSelectorType(
-                types_dynamic.KindModelType(base.NativeSource),
-            ),
-        ),
-        default=None,
+    old_provider_uuid = properties.property(types.AllowNone(types.UUID()), default=None)
+    old_provider_identity = properties.property(
+        types.AllowNone(types.String(min_length=1, max_length=255)), default=None
     )
 
 
@@ -313,14 +304,9 @@ class TopicDeletedEventPayload(
         types.AllowNone(types.Enum([source.value for source in base.TopicSourceName])),
         default=None,
     )
-    source = properties.property(
-        types.AllowNone(
-            types_dynamic.KindModelSelectorType(
-                types_dynamic.KindModelType(base.NativeSource),
-                types_dynamic.KindModelType(base.ZulipSource),
-            )
-        ),
-        default=None,
+    provider_uuid = properties.property(types.AllowNone(types.UUID()), default=None)
+    provider_identity = properties.property(
+        types.AllowNone(types.String(min_length=1, max_length=255)), default=None
     )
 
 
@@ -334,14 +320,9 @@ class StreamDeletedEventPayload(
         types.AllowNone(types.Enum([source.value for source in base.StreamSourceName])),
         default=None,
     )
-    source = properties.property(
-        types.AllowNone(
-            types_dynamic.KindModelSelectorType(
-                types_dynamic.KindModelType(base.NativeSource),
-                types_dynamic.KindModelType(base.ZulipSource),
-            )
-        ),
-        default=None,
+    provider_uuid = properties.property(types.AllowNone(types.UUID()), default=None)
+    provider_identity = properties.property(
+        types.AllowNone(types.String(min_length=1, max_length=255)), default=None
     )
 
 

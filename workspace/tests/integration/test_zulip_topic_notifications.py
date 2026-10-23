@@ -11,7 +11,6 @@ import pytest
 import requests
 from restalchemy.common import contexts
 from restalchemy.dm import filters
-from restalchemy.storage.sql import migrations
 
 from workspace.bridges.zulip import client
 from workspace.bridges.zulip.dm import models
@@ -164,7 +163,7 @@ def test_native_stream_notification_does_not_create_a_provider_task(
 ):
     pair = notification_pair
     db.execute(
-        "UPDATE messenger_streams SET source_name='native',source='{\"kind\":\"native\"}' WHERE project_id=%s AND uuid=%s",
+        "UPDATE messenger_streams SET source_name='native',provider_uuid=NULL,provider_identity=NULL WHERE project_id=%s AND uuid=%s",
         (pair[1].project_id, pair[2].channel.stream_uuid),
     )
     assert _change(pair, "follow").status_code == 200
@@ -333,7 +332,7 @@ def test_workspace_created_topic_in_a_zulip_stream_also_syncs_its_notifications(
 ):
     pair = notification_pair
     db.execute(
-        "UPDATE messenger_topics SET source_name='native',source='{\"kind\":\"native\"}' WHERE project_id=%s AND uuid=%s",
+        "UPDATE messenger_topics SET source_name='native',provider_uuid=NULL,provider_identity=NULL WHERE project_id=%s AND uuid=%s",
         (pair[1].project_id, pair[2].topic.uuid),
     )
     assert _change(pair, "follow").status_code == 200
@@ -394,11 +393,11 @@ def test_catalog_refresh_after_delivery_keeps_the_stream_mode(notification_pair,
 def test_native_topic_notification_scope_migration_is_reversible(notification_pair, db):
     pair = notification_pair
     db.execute(
-        "UPDATE messenger_topics SET source_name='native',source='{\"kind\":\"native\"}' WHERE project_id=%s AND uuid=%s",
+        "UPDATE messenger_topics SET source_name='native',provider_uuid=NULL,provider_identity=NULL WHERE project_id=%s AND uuid=%s",
         (pair[1].project_id, pair[2].topic.uuid),
     )
-    engine = migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
     name = "0259-Preserve-bidirectional-Zulip-topic-notification-changes-0e2e4b.py"
+    engine = conftest.DataMigration(name)
     engine.rollback_migration(name)
     try:
         _event(pair, 1)
@@ -464,8 +463,8 @@ def test_notification_migration_rollback_removes_only_the_new_task_type(
         content=models.ImportChannelsContent(),
     )
     other.insert()
-    engine = migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
     name = "0259-Preserve-bidirectional-Zulip-topic-notification-changes-0e2e4b.py"
+    engine = conftest.DataMigration(name)
     engine.rollback_migration(name)
     try:
         assert _tasks(pair) == []

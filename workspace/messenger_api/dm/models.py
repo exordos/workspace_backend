@@ -46,8 +46,6 @@ class SystemFolderType(str, enum.Enum):
     CREATED = base.FOLDER_SYSTEM_TYPE_CREATED
 
 
-NativeSource = base.NativeSource
-ZulipSource = base.ZulipSource
 SourceName = base.SourceName
 StreamSourceName = base.StreamSourceName
 TopicSourceName = base.TopicSourceName
@@ -320,6 +318,7 @@ class WorkspaceDirectoryUser(WorkspaceUser):
 
 
 class WorkspaceFile(
+    base.WorkspaceProviderBase,
     models.ModelWithUUID,
     models.ModelWithProject,
     common_models.ModelWithRequiredNameDesc,
@@ -396,6 +395,7 @@ WorkspaceStream = v2_models.WorkspaceStream
 
 
 class WorkspaceStreamBinding(
+    base.WorkspaceProviderBase,
     models.ModelWithUUID,
     models.ModelWithProject,
     models.ModelWithTimestamp,
@@ -477,6 +477,7 @@ class WorkspaceUserStream(base.WorkspaceUserStreamBase, orm.SQLStorableMixin):
 
 
 class WorkspaceMessageReactions(
+    base.WorkspaceProviderBase,
     models.ModelWithUUID,
     models.ModelWithProject,
     models.ModelWithTimestamp,

@@ -23,7 +23,6 @@ from restalchemy.common import exceptions as ra_exc
 from restalchemy.dm import models
 from restalchemy.dm import properties
 from restalchemy.dm import types
-from restalchemy.dm import types_dynamic
 
 from workspace.common import models as common_models
 from workspace.messenger_api.dm import message_payloads
@@ -59,45 +58,55 @@ class Color(types.Integer):
         return super().to_openapi_spec(prop_kwargs)
 
 
-class NativeSource(types_dynamic.AbstractKindModel):
-    KIND = "native"
-
-
-class ZulipSource(types_dynamic.AbstractKindModel):
-    KIND = "zulip"
-
-
 class SourceName(str, enum.Enum):
-    NATIVE = NativeSource.KIND
-    ZULIP = ZulipSource.KIND
+    NATIVE = "native"
+    ZULIP = "zulip"
 
 
 class StreamSourceName(str, enum.Enum):
-    NATIVE = NativeSource.KIND
-    ZULIP = ZulipSource.KIND
+    NATIVE = "native"
+    ZULIP = "zulip"
 
 
 class TopicSourceName(str, enum.Enum):
-    NATIVE = NativeSource.KIND
-    ZULIP = ZulipSource.KIND
+    NATIVE = "native"
+    ZULIP = "zulip"
 
 
-def native_source() -> NativeSource:
-    return NativeSource()
-
-
-class WorkspaceSourceBase(models.Model):
+class WorkspaceProviderBase(models.Model):
     source_name = properties.property(
         types.Enum([source.value for source in SourceName]),
         default=SourceName.NATIVE.value,
     )
-    source = properties.property(
-        types_dynamic.KindModelSelectorType(
-            types_dynamic.KindModelType(NativeSource),
-            types_dynamic.KindModelType(ZulipSource),
-        ),
-        default=native_source,
+    provider_uuid = properties.property(types.AllowNone(types.UUID()), default=None)
+    provider_identity = properties.property(
+        types.AllowNone(types.String(min_length=1, max_length=255)), default=None
     )
+
+    def validate(self) -> None:
+        super().validate()
+        if (self.provider_uuid is None) != (self.provider_identity is None):
+            raise ra_exc.ValidationErrorException()
+        if self.source_name == "native" and self.provider_uuid is not None:
+            raise ra_exc.ValidationErrorException()
+
+    @staticmethod
+    def validate_native_creation(values: dict[str, typing.Any]) -> None:
+        if (
+            values.get("source_name", "native") != "native"
+            or values.get("provider_uuid") is not None
+            or values.get("provider_identity") is not None
+        ):
+            raise ra_exc.ValidationErrorException()
+
+    @staticmethod
+    def validate_provider_update(values: dict[str, typing.Any]) -> None:
+        if {"source_name", "provider_uuid", "provider_identity"}.intersection(values):
+            raise ra_exc.ValidationErrorException()
+
+
+class WorkspaceSourceBase(WorkspaceProviderBase):
+    pass
 
 
 class WorkspaceTopicSourceBase(WorkspaceSourceBase):
@@ -105,12 +114,9 @@ class WorkspaceTopicSourceBase(WorkspaceSourceBase):
         types.Enum([source.value for source in TopicSourceName]),
         default=SourceName.NATIVE.value,
     )
-    source = properties.property(
-        types_dynamic.KindModelSelectorType(
-            types_dynamic.KindModelType(NativeSource),
-            types_dynamic.KindModelType(ZulipSource),
-        ),
-        default=native_source,
+    provider_uuid = properties.property(types.AllowNone(types.UUID()), default=None)
+    provider_identity = properties.property(
+        types.AllowNone(types.String(min_length=1, max_length=255)), default=None
     )
 
 
@@ -261,12 +267,9 @@ class WorkspaceStreamBase(
         types.Enum([source.value for source in StreamSourceName]),
         required=True,
     )
-    source = properties.property(
-        types_dynamic.KindModelSelectorType(
-            types_dynamic.KindModelType(NativeSource),
-            types_dynamic.KindModelType(ZulipSource),
-        ),
-        required=True,
+    provider_uuid = properties.property(types.AllowNone(types.UUID()), default=None)
+    provider_identity = properties.property(
+        types.AllowNone(types.String(min_length=1, max_length=255)), default=None
     )
     invite_only = properties.property(
         types.Boolean(),
@@ -371,12 +374,9 @@ class WorkspaceUserStreamBase(
         types.Enum([source.value for source in StreamSourceName]),
         required=True,
     )
-    source = properties.property(
-        types_dynamic.KindModelSelectorType(
-            types_dynamic.KindModelType(NativeSource),
-            types_dynamic.KindModelType(ZulipSource),
-        ),
-        required=True,
+    provider_uuid = properties.property(types.AllowNone(types.UUID()), default=None)
+    provider_identity = properties.property(
+        types.AllowNone(types.String(min_length=1, max_length=255)), default=None
     )
     invite_only = properties.property(
         types.Boolean(),

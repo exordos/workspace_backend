@@ -554,9 +554,7 @@ def test_account_identity_change_never_reuses_old_fingerprints(
     scan(account, [message()], monkeypatch)
     apply(account)
     account.settings = {"server_url": "https://other-zulip.example.com"}
-    account.properties["external_account_id"].set_value_force(
-        "other-zulip.example.com:7"
-    )
+    account.properties["external_account_id"].set_value_force("7")
     account.update()
     scan(account, [message()], monkeypatch)
     (task,) = pending(account)

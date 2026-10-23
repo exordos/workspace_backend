@@ -709,7 +709,7 @@ def test_task_executes_connection_content():
     assert zulip.method_calls == [mock.call.check_connection(), mock.call.close()]
     assert task.status == "done"
     account.properties["external_account_id"].set_value_force.assert_called_once_with(
-        "zulip.example.com:7"
+        "7"
     )
     account.update.assert_called_once_with()
     account.update_status.assert_called_once_with("backfill")

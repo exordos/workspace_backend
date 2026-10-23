@@ -13,7 +13,6 @@ import psycopg
 import pytest
 from restalchemy.common import contexts
 from restalchemy.dm import filters
-from restalchemy.storage.sql import migrations
 
 from workspace.bridges.zulip.dm import models
 from workspace.messenger_api.dm import external_models
@@ -31,7 +30,7 @@ def account(_database, db, scheduled_reconciliation):
         project_id=uuid.uuid4(),
         owner_user_uuid=owner,
         provider="zulip",
-        external_account_id="zulip.example.com:7",
+        external_account_id="7",
         status="backfill",
         settings={
             "server_url": "https://zulip.example.com",
@@ -46,18 +45,8 @@ def account(_database, db, scheduled_reconciliation):
 
 @pytest.fixture
 def migration(_database, db):
-    engine = migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    engine = conftest.DataMigration(MIGRATION)
     engine.rollback_migration(MIGRATION)
-    # Keep current task models usable while testing the earlier data migration.
-    db.execute("""
-        ALTER TABLE bridge_zulip_v5_tasks
-            ADD COLUMN IF NOT EXISTS queue VARCHAR(16) NOT NULL DEFAULT 'background',
-            ADD COLUMN IF NOT EXISTS concurrency_key TEXT NOT NULL DEFAULT '',
-            ADD COLUMN IF NOT EXISTS execution_time DOUBLE PRECISION,
-            ADD COLUMN IF NOT EXISTS queue_wait_time DOUBLE PRECISION,
-            ADD COLUMN IF NOT EXISTS message_created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT 'epoch',
-            ADD COLUMN IF NOT EXISTS message_sequence BIGINT NOT NULL DEFAULT 0;
-    """)
     try:
         yield engine
     finally:

@@ -746,28 +746,20 @@ Supported source payloads:
 ```json
 {
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  }
+  "provider_uuid": null,
+  "provider_identity": null
 }
 ```
 
 ```json
 {
   "source_name": "zulip",
-  "source": {
-    "kind": "zulip",
-    "stream_id": 123,
-    "server_url": "https://zulip.example.com",
-    "topic_name": null,
-    "message_id": null
-  }
+  "provider_uuid": "11111111-1111-5111-8111-111111111111",
+  "provider_identity": "123"
 }
 ```
 
-The `zulip` payload shape is provider provenance. An enrolled Zulip runtime
-populates it through the private Provider HTTP API; the browser contract hides
-raw provider protocol identifiers, credentials, and synchronization state.
+Provider instances are stored once with their UUID and hostname. Public origins expose `source_name`, `provider_uuid`, and `provider_identity`; credentials and synchronization state remain private.
 
 | Field | Type | Required on create | Read-only | Description |
 | --- | --- | --- | --- | --- |
@@ -785,7 +777,8 @@ raw provider protocol identifiers, credentials, and synchronization state.
 | `active_unread_count` | integer | no | yes | Current user's unread count eligible under the effective stream/topic notification modes. |
 | `passive_unread_count` | integer | no | yes | Current user's remaining unread count from muted notification traffic. |
 | `source_name` | `native`, `zulip` | no | no | Source name; defaults to `native`. |
-| `source` | object | no | no | Source payload; defaults to `{"kind": "native"}`. |
+| `provider_uuid` | UUID or `null` | no | yes | Provider instance UUID; `null` for native origins. |
+| `provider_identity` | string, max 255 or `null` | no | yes | Identity within that provider; `null` for native origins. |
 | `invite_only` | boolean | no | no | Invite-only stream flag. |
 | `announce` | boolean | no | no | Announcement stream flag. |
 | `direct_user_uuid` | UUID | conditional | creation-only | Required for a private stream. Direct-chat counterpart; equals the current user UUID only for a self chat. |
@@ -806,9 +799,8 @@ Create request:
   "name": "Engineering",
   "description": "Engineering workspace",
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "invite_only": false,
   "announce": false
 }
@@ -821,9 +813,8 @@ Direct chat create request:
   "name": "Direct",
   "description": "Private workspace",
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "direct_user_uuid": "33333333-3333-3333-3333-333333333333"
 }
 ```
@@ -835,9 +826,8 @@ Self chat create request:
   "name": "Personal notes",
   "description": "",
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "direct_user_uuid": "11111111-1111-1111-1111-111111111111"
 }
 ```
@@ -852,15 +842,7 @@ identity check. Native Workspace has no private-group mode: every private stream
 requires a non-null `direct_user_uuid`. Creating a stream with `private: true`
 without a peer returns HTTP `400`.
 
-Direct membership is immutable. Its bindings must equal the unique users in
-the identity pair: one binding for a self chat and two for an ordinary direct
-chat. Adding or removing participants and updating a binding role returns HTTP
-`400`. Deleting a self-chat stream also returns HTTP `400` so message history
-cannot be replaced by deleting and recreating the deterministic identity.
-`source_name` must match `source.kind` when a stream is created. Both source
-fields, `direct_user_uuid`, `private`, and the internal `private_index` are
-immutable for every stream; attempts to change them return HTTP `400`.
-An ordinary stream cannot be converted into a private stream.
+`source_name`, `provider_uuid`, `provider_identity`, `direct_user_uuid`, `private`, and `private_index` are immutable through the public API. Native creation requires `source_name = "native"` and null provider fields.
 
 Stream notification mode request:
 
@@ -1013,7 +995,8 @@ to the current IAM user through current stream membership.
 | `summary_system_prompt` | string, max 16384, or `null` | no | action-managed | Topic-specific LLM system prompt; `null` selects the application default. |
 | `summary_reasoning_effort` | `off`, `minimal`, `low`, `medium`, `high`, or `null` | no | action-managed | Per-summary reasoning choice; `off` explicitly disables reasoning, while `null` omits the provider option. Used only when the selected endpoint declares reasoning support. |
 | `source_name` | `native`, `zulip` | no | no | Topic source name; defaults to `native` when omitted. |
-| `source` | object | no | no | Topic source payload. |
+| `provider_uuid` | UUID or `null` | no | yes | Provider instance UUID; `null` for native origins. |
+| `provider_identity` | string, max 255 or `null` | no | yes | Identity within that provider; `null` for native origins. |
 | `provider` | object or `null` | no | yes | Provider badge for provider-backed topics; `null` for native topics. |
 | `delivery` | object or `null` | no | yes | Current provider command delivery projection. |
 | `created_at` | datetime | no | yes | Creation time. |
@@ -1395,7 +1378,8 @@ syntax. The URL part is a Workspace URN:
 | `reactions` | object | no | yes | Aggregated reaction counts keyed by `emoji_name`. |
 | `reaction_users` | object | no | yes | Complete persisted user UUID lists for bounded reaction groups, keyed by `emoji_name`. An empty object or missing key means count-only; lists are never partial. |
 | `source_name` | `native`, `zulip` | no | no | Message source name; the public API defaults it to `native` when omitted. |
-| `source` | object | no | no | Message source payload; defaults to `{"kind": "native"}`. Zulip `message_id` can be `null` until outbound sync succeeds. |
+| `provider_uuid` | UUID or `null` | no | yes | Provider instance UUID; `null` for native origins. |
+| `provider_identity` | string, max 255 or `null` | no | yes | Identity within that provider; `null` for native origins. |
 | `provider` | object or `null` | no | yes | Provider badge inherited from the selected provider-backed stream. |
 | `delivery` | object or `null` | no | yes | Current create/update/delete delivery projection. |
 | `created_at` | datetime | no | yes | Creation time. |
@@ -1428,9 +1412,8 @@ Response example:
     "content": "Hello, workspace"
   },
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "user_uuid": "11111111-1111-1111-1111-111111111111",
   "read": true,
   "pinned": false,
@@ -1517,7 +1500,7 @@ Realtime side effects:
 | read message or read up to message | `message.read` | `message` | Full user message snapshot returned by the action. |
 | read unread message | `topic.updated`, `stream.updated`, `folder.updated` | `topic`, `stream`, `folder` | Updated unread-count snapshots for the current user. |
 | star or unstar message | `message.updated` | `message` | Full user message snapshot for the current user when the flag changes. |
-| delete message | `message.deleted` | `message` | Deleted message `uuid`, `stream_uuid`, `topic_uuid`, `author_uuid`, `source_name`, and `source`, sent to every stream user. |
+| delete message | `message.deleted` | `message` | Deleted message `uuid`, `stream_uuid`, `topic_uuid`, `author_uuid`, `source_name`, `provider_uuid`, and `provider_identity`, sent to every stream user. |
 | delete unread message | `topic.updated`, `stream.updated` | `topic`, `stream` | Updated unread-count snapshots for users where the deleted message was unread; UI derives folder aggregates from the stream snapshot. |
 
 ## Drafts {#drafts}
@@ -1703,10 +1686,10 @@ on every REST or realtime message snapshot; they must not merge it with a
 previous value or fetch per-message lists to fill absent keys.
 
 Reaction realtime payloads include `uuid`, `project_id`, `message_uuid`,
-`user_uuid`, `emoji_name`, `source_name`, `source`, `provider`, and `delivery`.
+`user_uuid`, `emoji_name`, `source_name`, `provider_uuid`, `provider_identity`, `provider`, and `delivery`.
 They never expose raw `provider_metadata` or `delivery_metadata`. For
 `message_reaction.updated`, `old_message_uuid`, `old_emoji_name`,
-`old_source_name`, and `old_source` describe the previous reaction target.
+`old_source_name`, and `old_provider_uuid` and `old_provider_identity` describe the previous reaction target.
 
 ## Files {#files}
 
@@ -1899,7 +1882,8 @@ from the current user's visible PostgreSQL event surface.
     "author_uuid": "author-user-uuid",
     "payload": {"kind": "markdown", "content": "Hello"},
     "source_name": "native",
-    "source": {"kind": "native"},
+    "provider_uuid": null,
+    "provider_identity": null,
     "read": true,
     "pinned": false,
     "starred": false,
@@ -1932,7 +1916,7 @@ Messenger entity delete events are minimal:
 - `stream.deleted`, `folder.deleted`, `folder_item.deleted`: `kind`, `uuid`
 - `topic.deleted`: `kind`, `uuid`, `stream_uuid`
 - `message.deleted`: `kind`, `uuid`, `stream_uuid`, `topic_uuid`,
-  `author_uuid`, `source_name`, `source`
+  `author_uuid`, `source_name`, `provider_uuid`, `provider_identity`
 
 `stream_bindings.created` is a batch action payload:
 

@@ -183,7 +183,7 @@ def test_backfill_starts_only_after_realtime_queue_registration(
         filters={"uuid": filters.EQ(task.external_account_uuid)}
     )
     assert account.status == "backfill"
-    assert account.external_account_id == "zulip.example.com:7"
+    assert account.external_account_id == "7"
     assert account.error_description is None
     pending = models.Task.objects.get_all(
         filters={

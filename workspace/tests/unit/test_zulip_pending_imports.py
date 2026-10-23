@@ -17,7 +17,7 @@ def test_unknown_send_defers_candidates_without_fencing_the_senders_history(
     account = mock.Mock(project_id="project")
     account.get_host.return_value = "zulip.example.com"
     pending = {
-        "external_account_id": "zulip.example.com:7",
+        "external_account_id": "7",
         "recipient": {"to": [8, 7] if direct else 42},
         "topic_name": None if direct else "General",
         "zulip_content": "\nSubmitted **text** \n"
@@ -72,7 +72,7 @@ def test_unknown_send_without_snapshot_retains_conservative_identity_fence():
     session = mock.Mock()
     session.execute.return_value.fetchall.return_value = [
         {
-            "external_account_id": "zulip.example.com:7",
+            "external_account_id": "7",
             "recipient": {"to": 42},
             "topic_name": "General",
             "zulip_content": None,

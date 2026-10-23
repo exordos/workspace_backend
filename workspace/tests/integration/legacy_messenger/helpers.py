@@ -32,7 +32,7 @@ from workspace.tests.integration.legacy_messenger import events as messenger_eve
 from workspace.messenger_api import exceptions as messenger_exc
 from workspace.messenger_api import file_storage
 from migrations import legacy_messenger_reaction_users as reaction_users
-from workspace.messenger_api.dm import base as messenger_dm_base
+from workspace.tests.integration.legacy_messenger import base as messenger_dm_base
 from workspace.messenger_api.dm import message_payloads, v2_models
 from workspace.tests.integration.legacy_messenger import models
 from migrations import legacy_messenger_read_state as read_state
