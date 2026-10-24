@@ -2,6 +2,10 @@
 # Licensed under the Apache License, Version 2.0 (the "License").
 
 import asyncio
+import contextlib
+import json
+import os
+import pathlib
 import datetime
 import concurrent.futures
 import time
@@ -771,7 +775,7 @@ def test_long_polling_reaches_an_actual_websocket_client(incoming, monkeypatch):
     asyncio.run(run())
 
 
-def peer_account(incoming):
+def peer_account(incoming, identifier=8):
     api, db, account, http, url = incoming
     peer = uuid.uuid4()
     conftest.seed_workspace_user(db, peer, f"peer-{peer}")
@@ -780,7 +784,7 @@ def peer_account(incoming):
         project_id=account["project_id"],
         owner_user_uuid=peer,
         provider="zulip",
-        external_account_id="8",
+        external_account_id=str(identifier),
         status="active",
         settings={**account["settings"], "email": "peer@example.com"},
     )
@@ -2449,3 +2453,759 @@ def test_permanent_non_message_failure_releases_the_account_lane(incoming):
 
     asyncio.run(run())
     assert api.get("/v1/messenger/streams/").json()[0]["name"] == "Valid catalog event"
+
+
+@pytest.mark.parametrize("attachment", [False, True])
+def test_shared_message_copies_keep_every_accounts_personal_effects(
+    incoming, monkeypatch, tmp_path, attachment
+):
+    api, db, account, http, url = incoming
+    monkeypatch.setenv("WORKSPACE_FILE_STORAGE_PATH", str(tmp_path))
+    linked, peer = peer_account(incoming)
+    peer_data = peer[2]
+    http.download = mock.AsyncMock(return_value=(b"shared file", "text/plain"))
+    apply(incoming, event(identifier=100))
+    apply(
+        peer,
+        {
+            "type": "subscription",
+            "op": "add",
+            "subscriptions": [{"stream_id": 42, "name": "Channel"}],
+        },
+    )
+    http.request.reset_mock()
+    content = (
+        "[shared file](/user_uploads/1/shared/file.txt)"
+        if attachment
+        else "Shared change"
+    )
+    first = {"id": 1, **event(content, 201)}
+    first["message"]["flags"] = ["read"]
+    second = {"id": 99, **event(content, 201)}
+    second["message"]["flags"] = ["starred"]
+    try:
+
+        async def run():
+            service = zulip_incoming.ZulipIncomingService(url)
+            await service.db.open()
+            service.operations = incoming_operations.Operations(service.db, http)
+            shared = mock.AsyncMock(wraps=service.operations.message)
+            service.operations.message = shared
+
+            async def admit(owner, queue, value):
+                async with service.admission() as (connection, stage):
+                    await service.append(
+                        connection, owner, {"queue_id": queue}, [value], stage
+                    )
+
+            try:
+                await asyncio.gather(
+                    admit(account, "shared-a", first),
+                    admit(peer_data, "shared-b", second),
+                )
+                saved = await service.db.sql(
+                    "SELECT payload FROM zulip_incoming_events WHERE payload->>'type'='message'"
+                )
+                assert len(saved) == 2
+                assert (
+                    sum(bool(row["payload"].get("_personal_only")) for row in saved)
+                    == 1
+                )
+                assert len(service.registry.entries) == 1
+                await drain_incoming(service)
+                assert shared.await_count == 1
+                assert (
+                    next(iter(service.registry.entries.values())).completed_at
+                    is not None
+                )
+            finally:
+                await service.db.close()
+
+        asyncio.run(run())
+        found = db.execute(
+            "SELECT state.user_uuid,state.read_at IS NOT NULL,state.starred FROM messenger_user_message_states state JOIN messenger_message_placements placement ON placement.uuid=state.placement_uuid JOIN messenger_messages message ON message.uuid=placement.message_uuid WHERE message.project_id=%s AND message.provider_identity='201'",
+            (account["project_id"],),
+        ).fetchall()
+        assert set(found) == {
+            (account["owner_user_uuid"], True, False),
+            (peer_data["owner_user_uuid"], False, True),
+        }
+        if attachment:
+            http.download.assert_awaited_once()
+            assert (
+                db.execute(
+                    "SELECT count(DISTINCT viewer_user_uuid) FROM m_workspace_visible_files_v1 WHERE project_id=%s",
+                    (account["project_id"],),
+                ).fetchone()[0]
+                == 2
+            )
+    finally:
+        linked.delete()
+
+
+def test_shared_admission_rolls_back_registry_and_cursor_on_commit_failure(incoming):
+    api, db, account, http, url = incoming
+    db.execute(
+        zulip_incoming.SAVE_SUBSCRIPTION_SQL,
+        (
+            account["uuid"],
+            account["project_id"],
+            account["provider_uuid"],
+            account["owner_user_uuid"],
+            account["external_account_id"],
+            account["settings"]["server_url"],
+            "commit-failure",
+            0,
+            90,
+        ),
+    )
+
+    async def run():
+        service = zulip_incoming.ZulipIncomingService(url)
+        await service.db.open()
+        service.operations = incoming_operations.Operations(service.db, http)
+        try:
+            with pytest.raises(psycopg.errors.UniqueViolation):
+                async with service.admission() as (connection, stage):
+                    await service.append(
+                        connection,
+                        account,
+                        {"queue_id": "commit-failure"},
+                        [{"id": 1, **event()}],
+                        stage,
+                    )
+                    assert service.registry.entries
+                    await connection.execute(
+                        "CREATE TEMP TABLE commit_guard(value int UNIQUE DEFERRABLE INITIALLY DEFERRED)"
+                    )
+                    await connection.execute("INSERT INTO commit_guard VALUES(1),(1)")
+            assert not service.registry.entries and not service.registry.seen
+            assert not service.registry.lock.locked()
+            assert not await service.db.sql("SELECT 1 FROM zulip_incoming_events")
+            assert (
+                await service.db.sql(
+                    "SELECT last_event_id FROM zulip_incoming_subscriptions WHERE external_account_uuid=%s",
+                    (account["uuid"],),
+                )
+            )[0]["last_event_id"] == 0
+            async with service.admission() as (connection, stage):
+                await service.append(
+                    connection,
+                    account,
+                    {"queue_id": "commit-failure"},
+                    [{"id": 1, **event()}],
+                    stage,
+                )
+            await drain_incoming(service)
+        finally:
+            await service.db.close()
+
+    asyncio.run(run())
+    assert len(api.get("/v1/messenger/messages/").json()) == 1
+
+
+def test_duplicate_shared_event_does_not_rollback_useful_batch_events(incoming):
+    api, db, account, http, url = incoming
+    linked, peer = peer_account(incoming)
+    peer_data = peer[2]
+    db.execute(
+        zulip_incoming.SAVE_SUBSCRIPTION_SQL,
+        (
+            peer_data["uuid"],
+            peer_data["project_id"],
+            peer_data["provider_uuid"],
+            peer_data["owner_user_uuid"],
+            peer_data["external_account_id"],
+            peer_data["settings"]["server_url"],
+            "mixed-batch",
+            0,
+            90,
+        ),
+    )
+    try:
+
+        async def run():
+            service = zulip_incoming.ZulipIncomingService(url)
+            await service.db.open()
+            service.operations = incoming_operations.Operations(service.db, http)
+            try:
+                async with service.admission() as (connection, stage):
+                    await service.append(
+                        connection,
+                        account,
+                        {"queue_id": "original-copy"},
+                        [{"id": 1, **event(identifier=201)}],
+                        stage,
+                    )
+                async with service.admission() as (connection, stage):
+                    await service.append(
+                        connection,
+                        peer_data,
+                        {"queue_id": "mixed-batch"},
+                        [
+                            {"id": 4, **event(identifier=201)},
+                            {"id": 5, **event("Useful next message", 202)},
+                        ],
+                        stage,
+                    )
+                saved = await service.db.sql(
+                    "SELECT payload FROM zulip_incoming_events"
+                )
+                assert (
+                    len(saved) == 3
+                    and sum(bool(row["payload"].get("_personal_only")) for row in saved)
+                    == 1
+                )
+                assert len(service.registry.entries) == 2
+                assert (
+                    await service.db.sql(
+                        "SELECT last_event_id FROM zulip_incoming_subscriptions WHERE queue_id='mixed-batch'"
+                    )
+                )[0]["last_event_id"] == 5
+                await drain_incoming(service)
+            finally:
+                await service.db.close()
+
+        asyncio.run(run())
+        assert (
+            db.execute(
+                "SELECT count(*) FROM messenger_messages WHERE project_id=%s",
+                (account["project_id"],),
+            ).fetchone()[0]
+            == 2
+        )
+        assert (
+            len(
+                api.get(
+                    "/v1/messenger/messages/", user=peer_data["owner_user_uuid"]
+                ).json()
+            )
+            == 2
+        )
+    finally:
+        linked.delete()
+
+
+def test_late_message_copies_after_delete_do_not_resurrect_it_after_cache_expiry(
+    incoming,
+):
+    api, db, account, http, url = incoming
+    apply(incoming, event(identifier=100))
+    linked, peer = peer_account(incoming)
+
+    async def run():
+        service = zulip_incoming.ZulipIncomingService(url)
+        await service.db.open()
+        service.http = http
+        service.operations = incoming_operations.Operations(service.db, http)
+
+        async def admit(owner, identifier, payload):
+            async with service.admission() as (connection, stage):
+                await service.append(
+                    connection,
+                    owner,
+                    {"queue_id": str(owner["uuid"])},
+                    [{"id": identifier, **payload}],
+                    stage,
+                )
+            await drain_incoming(service)
+
+        try:
+            await admit(account, 1, event(identifier=201))
+            await admit(account, 2, {"type": "delete_message", "message_id": 201})
+            assert not await service.db.sql(
+                "SELECT 1 FROM messenger_messages WHERE project_id=%s AND provider_identity='201' AND deleted_at IS NULL",
+                (account["project_id"],),
+            )
+            http.request.reset_mock()
+            await admit(peer[2], 3, event(identifier=201))
+            http.request.assert_not_called()
+            clock = service.registry.clock
+            service.registry.clock = lambda: clock() + 1801
+            service.registry.clean()
+            assert not service.registry.entries
+            http.request.side_effect = incoming_operations.outgoing_operations.ApiError(
+                404, {"msg": "Invalid message"}
+            )
+            await admit(peer[2], 4, event(identifier=201))
+            http.request.assert_not_called()
+            assert not await service.db.sql(
+                "SELECT 1 FROM messenger_messages WHERE project_id=%s AND provider_identity='201' AND deleted_at IS NULL",
+                (account["project_id"],),
+            )
+        finally:
+            await service.db.close()
+
+    try:
+        asyncio.run(run())
+    finally:
+        linked.delete()
+
+
+def test_personal_copy_can_recover_when_the_first_shared_account_is_disabled(incoming):
+    api, db, account, http, url = incoming
+    apply(incoming, event(identifier=100))
+    linked, peer = peer_account(incoming)
+    apply(
+        peer,
+        {
+            "type": "subscription",
+            "op": "add",
+            "subscriptions": [{"stream_id": 42, "name": "Channel"}],
+        },
+    )
+
+    async def run():
+        service = zulip_incoming.ZulipIncomingService(url)
+        await service.db.open()
+        service.http = http
+        service.operations = incoming_operations.Operations(service.db, http)
+        try:
+            async with service.admission() as (connection, stage):
+                await service.append(
+                    connection,
+                    account,
+                    {"queue_id": "disabled-shared"},
+                    [{"id": 1, **event(identifier=201)}],
+                    stage,
+                )
+            async with service.admission() as (connection, stage):
+                await service.append(
+                    connection,
+                    peer[2],
+                    {"queue_id": "valid-personal"},
+                    [{"id": 1, **event(identifier=201)}],
+                    stage,
+                )
+            db.execute(
+                "UPDATE m_external_accounts_v2 SET disabled=true WHERE uuid=%s",
+                (account["uuid"],),
+            )
+            http.request.return_value = {"message": event(identifier=201)["message"]}
+            http.request.reset_mock()
+            await drain_incoming(service)
+            assert await service.db.sql(
+                "SELECT 1 FROM messenger_messages WHERE project_id=%s AND provider_identity='201'",
+                (account["project_id"],),
+            )
+            http.request.assert_awaited_once()
+        finally:
+            await service.db.close()
+
+    try:
+        asyncio.run(run())
+    finally:
+        db.execute(
+            "UPDATE m_external_accounts_v2 SET disabled=false WHERE uuid=%s",
+            (account["uuid"],),
+        )
+        linked.delete()
+
+
+def test_registry_restores_unfinished_shared_work_and_personal_copies_after_restart(
+    incoming,
+):
+    api, db, account, http, url = incoming
+    linked, peer = peer_account(incoming)
+
+    async def run():
+        first = zulip_incoming.ZulipIncomingService(url)
+        await first.db.open()
+        try:
+            for owner, queue, identifier in (
+                (account, "restart-a", 1),
+                (peer[2], "restart-b", 99),
+            ):
+                async with first.admission() as (connection, stage):
+                    await first.append(
+                        connection,
+                        owner,
+                        {"queue_id": queue},
+                        [{"id": identifier, **event(identifier=201)}],
+                        stage,
+                    )
+        finally:
+            await first.db.close()
+        restarted = zulip_incoming.ZulipIncomingService(url)
+        await restarted.db.open()
+        restarted.operations = incoming_operations.Operations(restarted.db, http)
+        try:
+            restarted.registry.restore(
+                await restarted.db.sql(
+                    "SELECT * FROM zulip_incoming_events WHERE processed_at IS NULL ORDER BY id"
+                )
+            )
+            assert len(restarted.registry.entries) == 1
+            shared = mock.AsyncMock(wraps=restarted.operations.message)
+            restarted.operations.message = shared
+            await drain_incoming(restarted)
+            assert shared.await_count == 1
+            assert all(
+                entry.completed_at is not None
+                for entry in restarted.registry.entries.values()
+            )
+            assert (
+                len(
+                    await restarted.db.sql(
+                        "SELECT 1 FROM messenger_user_message_states WHERE project_id=%s",
+                        (account["project_id"],),
+                    )
+                )
+                == 2
+            )
+        finally:
+            await restarted.db.close()
+
+    try:
+        asyncio.run(run())
+    finally:
+        linked.delete()
+
+
+def test_bad_shared_payload_remains_durable_and_cannot_inject_registry_metadata(
+    incoming,
+):
+    api, db, account, http, url = incoming
+
+    async def run():
+        service = zulip_incoming.ZulipIncomingService(url)
+        await service.db.open()
+        service.operations = incoming_operations.Operations(service.db, http)
+        invalid = {"id": 1, **event(identifier=201)}
+        del invalid["message"]["timestamp"]
+        valid = {
+            "id": 2,
+            **event("Valid message", 202),
+            "_personal_only": True,
+            "_shared_key": {"entity": "other-provider"},
+        }
+        try:
+            async with service.admission() as (connection, stage):
+                await service.append(
+                    connection,
+                    account,
+                    {"queue_id": "bad-shared"},
+                    [invalid, valid],
+                    stage,
+                )
+            assert len(await service.db.sql("SELECT 1 FROM zulip_incoming_events")) == 2
+            await drain_incoming(service)
+            failures = await service.db.sql(
+                "SELECT payload FROM zulip_incoming_events WHERE error IS NOT NULL"
+            )
+            assert len(failures) == 1 and failures[0]["payload"]["message"]["id"] == 201
+        finally:
+            await service.db.close()
+
+    asyncio.run(run())
+    assert [
+        row["payload"]["content"] for row in api.get("/v1/messenger/messages/").json()
+    ] == ["Valid message"]
+
+
+def test_shared_edit_keeps_personal_flags_and_admits_a_previously_unobserved_recipient(
+    incoming,
+):
+    api, db, account, http, url = incoming
+    apply(incoming, event(identifier=201))
+    linked, peer = peer_account(incoming)
+    apply(
+        peer,
+        {
+            "type": "subscription",
+            "op": "add",
+            "subscriptions": [{"stream_id": 42, "name": "Channel"}],
+        },
+    )
+    edited = event("Edited shared content", 201)["message"]
+    edited["last_edit_timestamp"] = edited["timestamp"] + 10
+    http.request.return_value = {"message": edited}
+    http.request.reset_mock()
+
+    async def run():
+        service = zulip_incoming.ZulipIncomingService(url)
+        await service.db.open()
+        service.operations = incoming_operations.Operations(service.db, http)
+        payload = {
+            "type": "update_message",
+            "message_id": 201,
+            "message_ids": [201],
+            "edit_timestamp": edited["last_edit_timestamp"],
+            "orig_content": "Hello",
+            "content": edited["content"],
+        }
+        try:
+            for owner, queue, flags, identifier in (
+                (account, "edit-a", ["read"], 1),
+                (peer[2], "edit-b", ["starred"], 77),
+            ):
+                async with service.admission() as (connection, stage):
+                    await service.append(
+                        connection,
+                        owner,
+                        {"queue_id": queue},
+                        [{"id": identifier, **payload, "flags": flags}],
+                        stage,
+                    )
+            shared = mock.AsyncMock(wraps=service.operations.message)
+            service.operations.message = shared
+            await drain_incoming(service)
+            assert shared.await_count == 1
+            http.request.assert_awaited_once()
+        finally:
+            await service.db.close()
+
+    try:
+        asyncio.run(run())
+        states = db.execute(
+            "SELECT state.user_uuid,state.read_at IS NOT NULL,state.starred FROM messenger_user_message_states state JOIN messenger_message_placements placement ON placement.uuid=state.placement_uuid JOIN messenger_messages message ON message.uuid=placement.message_uuid WHERE message.project_id=%s AND message.provider_identity='201'",
+            (account["project_id"],),
+        ).fetchall()
+        assert set(states) == {
+            (account["owner_user_uuid"], True, False),
+            (peer[2]["owner_user_uuid"], False, True),
+        }
+        assert (
+            api.get("/v1/messenger/messages/", user=peer[2]["owner_user_uuid"]).json()[
+                0
+            ]["payload"]["content"]
+            == "Edited shared content"
+        )
+    finally:
+        linked.delete()
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_shared_incoming_database_benchmark(incoming, tmp_path, enabled):
+    api, db, account, http, url = incoming
+    apply(incoming, event(identifier=100))
+    peers = [peer_account(incoming, identifier) for identifier in (8, 9, 10)]
+    owners = [account, *[peer[1][2] for peer in peers]]
+    for _linked, peer in peers:
+        apply(
+            peer,
+            {
+                "type": "subscription",
+                "op": "add",
+                "subscriptions": [{"stream_id": 42, "name": "Channel"}],
+            },
+        )
+        apply(
+            peer,
+            {
+                "type": "user_topic",
+                "stream_id": 42,
+                "topic_name": "General",
+                "visibility_policy": 0,
+            },
+        )
+    packets = [event("Shared database benchmark", 201 + index) for index in range(16)]
+
+    async def run():
+        service = zulip_incoming.ZulipIncomingService(url)
+        await service.db.open()
+        count = [0]
+        original_sql, original_transaction = service.db.sql, service.db.transaction
+
+        async def sql(*args, **kwargs):
+            count[0] += 1
+            return await original_sql(*args, **kwargs)
+
+        class Connection:
+            def __init__(self, connection):
+                self.connection = connection
+
+            async def execute(self, *args, **kwargs):
+                count[0] += 1
+                return await self.connection.execute(*args, **kwargs)
+
+        @contextlib.asynccontextmanager
+        async def transaction():
+            async with original_transaction() as connection:
+                yield Connection(connection)
+
+        service.db.sql = sql
+        service.db.transaction = transaction
+        service.operations = incoming_operations.Operations(service.db, http)
+        shared = mock.AsyncMock(wraps=service.operations.message)
+        service.operations.message = shared
+        started = time.monotonic()
+        try:
+            for owner_index, owner in enumerate(owners):
+                values = [
+                    {
+                        "id": index + 100 * owner_index,
+                        **packet,
+                        "message": {
+                            **packet["message"],
+                            "flags": ["read"] if owner_index % 2 == 0 else ["starred"],
+                        },
+                    }
+                    for index, packet in enumerate(packets, 1)
+                ]
+                if enabled:
+                    async with service.admission() as (connection, stage):
+                        await service.append(
+                            connection,
+                            owner,
+                            {"queue_id": f"benchmark-{owner_index}"},
+                            values,
+                            stage,
+                        )
+                else:
+                    async with service.db.transaction() as connection:
+                        await service.append(
+                            connection,
+                            owner,
+                            {"queue_id": f"benchmark-{owner_index}"},
+                            values,
+                        )
+            for _ in range(100):
+                ready = await service.db.sql(zulip_incoming.SELECT_EVENT_SQL, ([], 128))
+                if not ready:
+                    break
+                for row in ready:
+                    await service.process(row)
+            assert not await service.db.sql(
+                "SELECT 1 FROM zulip_incoming_events WHERE processed_at IS NULL"
+            )
+            elapsed = (time.monotonic() - started) * 1000
+            total_sql = count[0]
+            assert shared.await_count == (16 if enabled else 64)
+            result = {
+                "enabled": enabled,
+                "accounts": 4,
+                "shared_changes": 16,
+                "account_copies": 64,
+                "shared_handler_calls": shared.await_count,
+                "sql_statements": total_sql,
+                "elapsed_ms": elapsed,
+                "measurement": "Real PostgreSQL statements in admission, dispatcher and handlers; one process, sequential consumer to make query counts deterministic; API polling excluded.",
+            }
+            target = pathlib.Path(
+                os.environ.get("CASSI_ZULIP_BENCHMARK_OUTPUT", str(tmp_path))
+            )
+            (target / f"registry-db-benchmark-{enabled}.json").write_text(
+                json.dumps(result, indent=2)
+            )
+        finally:
+            await service.db.close()
+
+    try:
+        asyncio.run(run())
+        assert (
+            db.execute(
+                "SELECT count(*) FROM messenger_messages WHERE project_id=%s AND provider_identity::integer BETWEEN 201 AND 216",
+                (account["project_id"],),
+            ).fetchone()[0]
+            == 16
+        )
+        states = db.execute(
+            "SELECT state.user_uuid,state.read_at IS NOT NULL,state.starred FROM messenger_user_message_states state JOIN messenger_message_placements placement ON placement.uuid=state.placement_uuid JOIN messenger_messages message ON message.uuid=placement.message_uuid WHERE message.project_id=%s AND message.provider_identity::integer BETWEEN 201 AND 216",
+            (account["project_id"],),
+        ).fetchall()
+        assert len(states) == 64
+        for index, owner in enumerate(owners):
+            assert [
+                row[1:] for row in states if row[0] == owner["owner_user_uuid"]
+            ] == [(index % 2 == 0, index % 2 == 1)] * 16
+    finally:
+        for linked, _peer in peers:
+            linked.delete()
+
+
+def test_shared_retry_keeps_intention_and_accepts_the_senders_late_receipt(incoming):
+    api, db, account, http, url = incoming
+    apply(incoming, event(identifier=100))
+    linked, peer = peer_account(incoming)
+    apply(
+        peer,
+        {
+            "type": "subscription",
+            "op": "add",
+            "subscriptions": [{"stream_id": 42, "name": "Channel"}],
+        },
+    )
+    stream = api.get("/v1/messenger/streams/").json()[0]
+    created = api.post(
+        "/v1/messenger/messages/",
+        json={
+            "stream_uuid": stream["uuid"],
+            "payload": {"kind": "markdown", "content": "Uncertain send"},
+        },
+    )
+    assert created.status_code == 201, created.text
+    canonical = db.execute(
+        "SELECT message_uuid FROM messenger_message_placements WHERE uuid=%s",
+        (created.json()["uuid"],),
+    ).fetchone()[0]
+    delivery = uuid.uuid4()
+    db.execute(zulip_incoming.INCOMING_TRANSACTION_SQL)
+    db.execute(
+        """INSERT INTO bridge_zulip_v5_deliveries
+        (uuid,project_id,message_uuid,stream_uuid,external_account_uuid,hostname,external_account_id,recipient,topic_name,sending)
+        VALUES (%s,%s,%s,%s,%s,%s,'7','{}','General',true)""",
+        (
+            delivery,
+            account["project_id"],
+            canonical,
+            stream["uuid"],
+            account["uuid"],
+            account["hostname"],
+        ),
+    )
+
+    async def run():
+        service = zulip_incoming.ZulipIncomingService(url, dependency_delay=0.001)
+        await service.db.open()
+        service.operations = incoming_operations.Operations(service.db, http)
+        packet = {"id": 1, **event("Uncertain send", 201)}
+        try:
+            # A different recipient observes the provider echo before the sender.
+            async with service.admission() as (connection, stage):
+                await service.append(
+                    connection, peer[2], {"queue_id": "receipt-peer"}, [packet], stage
+                )
+            first = (await service.db.sql(zulip_incoming.SELECT_EVENT_SQL, ([], 1)))[0]
+            await service.process(first)
+            pending = await service.db.sql(
+                "SELECT attempts,processed_at FROM zulip_incoming_events WHERE id=%s",
+                (first["id"],),
+            )
+            assert pending[0]["attempts"] == 1
+            assert pending[0]["processed_at"] is None
+            entry = next(iter(service.registry.entries.values()))
+            assert entry.completed_at is None
+            service.registry.clock = lambda: 1000000000
+            service.registry.clean()
+            assert entry.key in service.registry.entries
+            async with service.admission() as (connection, stage):
+                await service.append(
+                    connection,
+                    account,
+                    {"queue_id": "receipt-sender"},
+                    [{**packet, "local_message_id": str(canonical)}],
+                    stage,
+                )
+            await drain_incoming(service)
+            assert len(service.registry.entries) == 1
+            assert entry.completed_at is not None
+        finally:
+            await service.db.close()
+
+    try:
+        asyncio.run(run())
+        assert db.execute(
+            "SELECT provider_identity FROM messenger_messages WHERE uuid=%s",
+            (canonical,),
+        ).fetchone() == ("201",)
+        assert db.execute(
+            "SELECT zulip_message_id FROM bridge_zulip_v5_deliveries WHERE uuid=%s",
+            (delivery,),
+        ).fetchone() == (201,)
+        assert db.execute(
+            "SELECT count(*) FROM messenger_messages WHERE project_id=%s",
+            (account["project_id"],),
+        ).fetchone() == (2,)
+    finally:
+        linked.delete()

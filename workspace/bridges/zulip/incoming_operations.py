@@ -318,7 +318,7 @@ ENSURE_MESSAGE_STATES_SQL = """
           AND provider_uuid = %s AND external_account_id IS NOT NULL
         ORDER BY uuid LIMIT 1
     ) actor ON true
-    WHERE access.project_id = %s AND access.placement_uuid = %s
+    WHERE access.project_id = %s AND access.placement_uuid = %s AND access.user_uuid=%s
     ON CONFLICT (project_id, user_uuid, placement_uuid) DO UPDATE SET
         membership_generation = EXCLUDED.membership_generation,
         binding_uuid = EXCLUDED.binding_uuid,
@@ -442,6 +442,10 @@ async def rows(
     connection: typing.Any, query: str, parameters: tuple = ()
 ) -> list[dict]:
     return await (await connection.execute(query, parameters)).fetchall()
+
+
+class MissingSharedMessage(Exception):
+    pass
 
 
 class MissingDependency(Exception):
@@ -1133,10 +1137,27 @@ class Operations:
             "files": {},
         }
         kind = event["type"]
+        if event.get("_personal_only"):
+            return {"event": event, "personal": True}
         if kind == "ensure_dependency":
             return await self.prepare_dependency(account, event["dependency"])
         message_ids = []
         if kind == "message":
+            if "_shared_key" in event:
+                known = await self.db.sql(
+                    "SELECT payload,deleted_at FROM messenger_messages WHERE project_id=%s AND provider_uuid=%s AND source_name='zulip' AND provider_identity=%s",
+                    (
+                        account["project_id"],
+                        account["provider_uuid"],
+                        str(event["message"]["id"]),
+                    ),
+                )
+                if known and (
+                    known[0]["deleted_at"] is not None
+                    or known[0]["payload"]
+                    == {"kind": "markdown", "content": event["message"]["content"]}
+                ):
+                    return {"event": event, "personal": True}
             prepared["messages"] = [dict(event["message"])]
             if "flags" in event:
                 prepared["messages"][0]["flags"] = event["flags"]
@@ -1192,6 +1213,12 @@ class Operations:
                 prepared.setdefault("deleted", []).append(identifier)
             else:
                 message = dict(data["message"])
+                if (
+                    kind == "update_message"
+                    and "flags" in event
+                    and identifier == event.get("message_id")
+                ):
+                    message["flags"] = event["flags"]
                 if (
                     kind == "update_message"
                     and "edit_timestamp" in event
@@ -1780,12 +1807,16 @@ class Operations:
         return stream
 
     async def counters(
-        self, connection: typing.Any, account: dict, placement: dict
+        self, connection: typing.Any, account: dict, placement: dict, *, user=None
     ) -> None:
-        members = await rows(
-            connection,
-            SELECT_MEMBERS_SQL,
-            (account["project_id"], placement["stream_uuid"]),
+        members = (
+            [{"user_uuid": user}]
+            if user is not None
+            else await rows(
+                connection,
+                SELECT_MEMBERS_SQL,
+                (account["project_id"], placement["stream_uuid"]),
+            )
         )
         for member in members:
             event_uuid = uuid.uuid4()
@@ -2196,6 +2227,7 @@ class Operations:
                 account["provider_uuid"],
                 account["project_id"],
                 placement["uuid"],
+                account["owner_user_uuid"],
             ),
         )
         if "flags" in data:
@@ -2518,11 +2550,198 @@ class Operations:
                 placement["stream_uuid"],
             )
 
+    async def personal(self, connection, account: dict, event: dict) -> None:
+        kind = event["type"]
+        if kind not in ("message", "update_message"):
+            return
+        data = event["message"] if kind == "message" else event
+        identifier = data["id"] if kind == "message" else event["message_id"]
+        canonical = await rows(
+            connection,
+            "SELECT * FROM messenger_messages WHERE project_id=%s AND provider_uuid=%s AND source_name='zulip' AND provider_identity=%s",
+            (account["project_id"], account["provider_uuid"], str(identifier)),
+        )
+        if not canonical:
+            raise MissingSharedMessage()
+        message = canonical[0]
+        if message["deleted_at"] is not None:
+            return
+        placements = await rows(
+            connection, SELECT_PLACEMENTS_SQL, (account["project_id"], message["uuid"])
+        )
+        if not placements:
+            return
+        placement = placements[0]
+        stream = (
+            await rows(
+                connection,
+                SELECT_ROW_SQL.format(table=TABLES["stream"]),
+                (account["project_id"], placement["stream_uuid"]),
+            )
+        )[0]
+        if kind == "message" and stream["provider_identity"] != stream_identity(
+            account, data
+        ):
+            return
+        if (
+            kind == "update_message"
+            and "stream_id" in event
+            and str(event["stream_id"]) != stream["provider_identity"]
+        ):
+            return
+        context = {"stream_identity": stream["provider_identity"]}
+        if kind == "message" and data["type"] != "stream":
+            context["recipients"] = data["display_recipient"]
+        await self.dependency(
+            account,
+            {
+                "kind": "stream_binding",
+                "identity": stream["provider_identity"],
+                "user": account["external_account_id"],
+                **context,
+            },
+            connection,
+        )
+        topic = (
+            await rows(
+                connection,
+                SELECT_ROW_SQL.format(table=TABLES["topic"]),
+                (account["project_id"], placement["topic_uuid"]),
+            )
+        )[0]
+        subject = topic["provider_identity"][len(stream["provider_identity"]) + 1 :]
+        await self.dependency(
+            account,
+            {
+                "kind": "topic_binding",
+                "identity": topic["provider_identity"],
+                "subject": subject,
+                "user": account["external_account_id"],
+                **context,
+            },
+            connection,
+        )
+        for target in message_conversion.get_zulip_files(data, {}):
+            endpoint = message_conversion.parse_url(
+                target, account["settings"]["server_url"]
+            )
+            if (
+                endpoint is None
+                or endpoint.hostname != account["hostname"]
+                or not endpoint.path.startswith("/user_uploads/")
+            ):
+                continue
+            files = await rows(
+                connection,
+                SELECT_SCOPED_FILE_SQL,
+                (
+                    account["project_id"],
+                    stream["uuid"],
+                    account["provider_uuid"],
+                    endpoint.path,
+                ),
+            )
+            if not files:
+                continue
+            file = files[0]
+            linked = await rows(
+                connection,
+                SELECT_ENTITY_LINK_SQL,
+                (
+                    account["project_id"],
+                    "file",
+                    file["uuid"],
+                    account["provider_uuid"],
+                    account["uuid"],
+                ),
+            )
+            if not linked:
+                await connection.execute(
+                    SAVE_ATTACHMENT_LINK_SQL,
+                    (
+                        account["project_id"],
+                        file["uuid"],
+                        account["provider_uuid"],
+                        account["uuid"],
+                        endpoint.path,
+                        json_value(
+                            {"account_identity": account["external_account_id"]}
+                        ),
+                    ),
+                )
+                audience = await rows(
+                    connection, SELECT_FILE_RECIPIENTS_SQL, (file["uuid"],)
+                )
+                audience = [
+                    row
+                    for row in audience
+                    if row["viewer_user_uuid"] == account["owner_user_uuid"]
+                ]
+                await self.publish(
+                    connection,
+                    account,
+                    "file.created",
+                    file["uuid"],
+                    audience,
+                    stream["uuid"],
+                    recipients=[row["viewer_user_uuid"] for row in audience],
+                )
+        cursor = await connection.execute(
+            ENSURE_MESSAGE_BINDINGS_SQL,
+            (
+                placement["uuid"],
+                placement["uuid"],
+                message["author_uuid"],
+                account["project_id"],
+                stream["uuid"],
+                account["owner_user_uuid"],
+            ),
+        )
+        fresh = await cursor.fetchall()
+        await connection.execute(
+            ENSURE_MESSAGE_STATES_SQL,
+            (
+                message["payload"]["content"].lower(),
+                str(identifier),
+                account["provider_uuid"],
+                account["project_id"],
+                placement["uuid"],
+                account["owner_user_uuid"],
+            ),
+        )
+        flags = event.get("flags", data.get("flags"))
+        if flags is not None:
+            await self.flags(connection, account, [identifier], flags, snapshot=True)
+        if fresh:
+            snapshots = await rows(
+                connection,
+                SELECT_SNAPSHOT_SQL.format(view=VIEWS["message"]),
+                (account["project_id"], placement["uuid"]),
+            )
+            await self.publish(
+                connection,
+                account,
+                "message.created",
+                placement["uuid"],
+                [
+                    row
+                    for row in snapshots
+                    if row["user_uuid"] == account["owner_user_uuid"]
+                ],
+                stream["uuid"],
+            )
+            await self.counters(
+                connection, account, placement, user=account["owner_user_uuid"]
+            )
+
     async def apply(
         self, connection: typing.Any, account: dict, prepared: dict
     ) -> None:
         event = prepared["event"]
         kind = event["type"]
+        if prepared.get("personal"):
+            await self.personal(connection, account, event)
+            return
         if kind == "ensure_dependency":
             await self.ensure_dependency(connection, account, prepared)
             return

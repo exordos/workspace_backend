@@ -5,6 +5,7 @@
 
 import asyncio
 import contextlib
+import dataclasses
 import logging
 import json
 import signal
@@ -15,6 +16,7 @@ import aiohttp
 import psycopg
 from psycopg.types import json as pg_json
 
+from workspace.bridges.zulip import incoming_registry
 from workspace.bridges.zulip import incoming_operations
 from workspace.bridges.zulip import outgoing_operations
 from workspace.services import zulip_outgoing
@@ -55,7 +57,7 @@ INSERT_EVENT_SQL = """
         project_id, external_account_uuid, provider_uuid, owner_user_uuid,
         account_identity, queue_id, event_id, payload, ordering_keys
     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-    ON CONFLICT (external_account_uuid, queue_id, event_id) DO NOTHING
+    ON CONFLICT (external_account_uuid, queue_id, event_id) DO NOTHING RETURNING id
 """
 ADVANCE_CURSOR_SQL = """
     UPDATE zulip_incoming_subscriptions
@@ -117,6 +119,13 @@ CURRENT_ACCOUNT_SQL = """
 INCOMING_TRANSACTION_SQL = "SELECT set_config('workspace.zulip_incoming', 'on', true)"
 
 
+@dataclasses.dataclass
+class Admission:
+    locked: bool = False
+    created: list[str] = dataclasses.field(default_factory=list)
+    seen_before: dict = dataclasses.field(default_factory=dict)
+
+
 class ZulipIncomingService:
     """One process, one receiver and ordered inbox consumer per account."""
 
@@ -139,6 +148,7 @@ class ZulipIncomingService:
         self.tasks: dict[int, asyncio.Task] = {}
         self.poll_interval = poll_interval
         self.dependency_delay = dependency_delay
+        self.registry = incoming_registry.Registry()
         self.ready = asyncio.Event()
         self.stopping = asyncio.Event()
         self.accounts: dict[object, tuple[tuple, asyncio.Task]] = {}
@@ -155,7 +165,13 @@ class ZulipIncomingService:
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, self.stopping.set)
+        self.registry.restore(
+            await self.db.sql(
+                "SELECT * FROM zulip_incoming_events WHERE processed_at IS NULL AND payload ? '_shared_key' ORDER BY id"
+            )
+        )
         listener = asyncio.create_task(self.listen())
+        cleaner = asyncio.create_task(self.clean_registry())
         try:
             while not self.stopping.is_set():
                 self.ready.clear()
@@ -168,6 +184,7 @@ class ZulipIncomingService:
         finally:
             tasks = [
                 listener,
+                cleaner,
                 *self.tasks.values(),
                 *(entry[1] for entry in self.accounts.values()),
             ]
@@ -308,7 +325,7 @@ class ZulipIncomingService:
                             "event_queue_longpoll_timeout_seconds", 90
                         ),
                     }
-                    async with self.db.transaction() as connection:
+                    async with self.admission() as (connection, stage):
                         if not await self.current(connection, account):
                             return
                         await connection.execute(
@@ -350,6 +367,7 @@ class ZulipIncomingService:
                                 {"id": index - len(initial), **item}
                                 for index, item in enumerate(initial)
                             ],
+                            stage,
                         )
                     self.ready.set()
                 data = await self.poll_http.request(
@@ -363,10 +381,12 @@ class ZulipIncomingService:
                     },
                     timeout=subscription["longpoll_timeout"] + 10,
                 )
-                async with self.db.transaction() as connection:
+                async with self.admission() as (connection, stage):
                     if not await self.current(connection, account):
                         return
-                    await self.append(connection, account, subscription, data["events"])
+                    await self.append(
+                        connection, account, subscription, data["events"], stage
+                    )
                 if data["events"]:
                     subscription["last_event_id"] = max(
                         subscription["last_event_id"],
@@ -387,24 +407,108 @@ class ZulipIncomingService:
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 60)
 
+    @contextlib.asynccontextmanager
+    async def admission(self):
+        stage = Admission()
+        try:
+            async with self.db.transaction() as connection:
+                yield connection, stage
+        except BaseException:
+            if stage.locked:
+                for key in stage.created:
+                    self.registry.remove(key)
+                for key, value in stage.seen_before.items():
+                    if value is None:
+                        self.registry.seen.pop(key, None)
+                    else:
+                        self.registry.seen[key] = value
+            raise
+        finally:
+            if stage.locked:
+                self.registry.lock.release()
+
+    async def clean_registry(self):
+        while not self.stopping.is_set():
+            try:
+                await asyncio.wait_for(self.stopping.wait(), 60)
+            except asyncio.TimeoutError:
+                async with self.registry.lock:
+                    self.registry.clean()
+
     async def append(
-        self, connection: typing.Any, account: dict, subscription: dict, events: list
+        self,
+        connection: typing.Any,
+        account: dict,
+        subscription: dict,
+        events: list,
+        stage: Admission | None = None,
     ) -> None:
-        for event in sorted(events, key=lambda item: item["id"]):
-            await connection.execute(
-                INSERT_EVENT_SQL,
-                (
-                    account["project_id"],
-                    account["uuid"],
-                    account["provider_uuid"],
-                    account["owner_user_uuid"],
-                    account["external_account_id"],
-                    subscription["queue_id"],
-                    event["id"],
-                    pg_json.Jsonb(event),
-                    self.ordering_keys(account, event),
-                ),
+        for source in sorted(events, key=lambda item: item["id"]):
+            event = dict(source)
+            event.pop("_shared_key", None)
+            event.pop("_personal_only", None)
+            parameters = (
+                account["project_id"],
+                account["uuid"],
+                account["provider_uuid"],
+                account["owner_user_uuid"],
+                account["external_account_id"],
+                subscription["queue_id"],
+                event["id"],
+                pg_json.Jsonb(event),
+                self.ordering_keys(account, event),
             )
+            if stage is not None:
+                await connection.execute("SAVEPOINT zulip_shared_admission")
+            cursor = await connection.execute(INSERT_EVENT_SQL, parameters)
+            saved = await cursor.fetchone()
+            if stage is not None:
+                try:
+                    identity = (
+                        incoming_registry.change(account, event) if saved else None
+                    )
+                except (KeyError, TypeError, ValueError):
+                    # Keep invalid provider events durable for the ordinary
+                    # terminal-error path instead of poisoning the receiver.
+                    identity = None
+                if identity is not None:
+                    if not stage.locked:
+                        await self.registry.lock.acquire()
+                        stage.locked = True
+                    source_key = (identity[1], str(account["uuid"]))
+                    stage.seen_before.setdefault(
+                        source_key, self.registry.seen.get(source_key)
+                    )
+                    entry, duplicate = self.registry.admit(account, event, saved["id"])
+                    metadata = dataclasses.asdict(
+                        typing.cast(incoming_registry.Intention, entry)
+                    )
+                    metadata.pop("completed_at")
+                    event["_shared_key"] = metadata
+                    if duplicate:
+                        await connection.execute(
+                            "ROLLBACK TO SAVEPOINT zulip_shared_admission"
+                        )
+                        event["_personal_only"] = True
+                        await connection.execute(
+                            INSERT_EVENT_SQL,
+                            (*parameters[:7], pg_json.Jsonb(event), parameters[-1]),
+                        )
+                        if "local_message_id" in event:
+                            await connection.execute(
+                                "UPDATE zulip_incoming_events SET payload=jsonb_set(payload,'{local_message_id}',%s) WHERE id=%s AND processed_at IS NULL",
+                                (
+                                    pg_json.Jsonb(event["local_message_id"]),
+                                    entry.identifier,
+                                ),
+                            )
+                    else:
+                        stage.created.append(entry.key)
+                        await connection.execute(
+                            "UPDATE zulip_incoming_events SET payload=%s WHERE id=%s",
+                            (pg_json.Jsonb(event), saved["id"]),
+                        )
+                await connection.execute("RELEASE SAVEPOINT zulip_shared_admission")
         if events:
             await connection.execute(
                 ADVANCE_CURSOR_SQL,
@@ -474,6 +578,65 @@ class ZulipIncomingService:
             LOG.error("Incoming event %s failed", key, exc_info=task.exception())
         self.ready.set()
 
+    async def finish_registry(self, event: dict, successful: bool):
+        metadata = event["payload"].get("_shared_key")
+        if metadata and not event["payload"].get("_personal_only"):
+            async with self.registry.lock:
+                if successful:
+                    self.registry.complete(metadata["key"])
+                else:
+                    self.registry.remove(metadata["key"])
+
+    async def recover_shared_message(self, event: dict, account: dict):
+        source = event["payload"]
+        remote = (
+            source["message"]["id"]
+            if source["type"] == "message"
+            else source["message_id"]
+        )
+        metadata = source["_shared_key"]
+        previous = await self.db.sql(
+            "SELECT processed_at,error FROM zulip_incoming_events WHERE id=%s AND project_id=%s AND provider_uuid=%s",
+            (metadata["identifier"], account["project_id"], account["provider_uuid"]),
+        )
+        if previous and previous[0]["processed_at"] is None:
+            await self.db.sql(
+                RETRY_EVENT_SQL,
+                ("Waiting for shared message", self.dependency_delay, event["id"]),
+            )
+            return
+        payload = None
+        if not previous or previous[0]["error"] is not None:
+            try:
+                latest = await self.http.request(
+                    account,
+                    "GET",
+                    f"/messages/{remote}",
+                    {"apply_markdown": False},
+                )
+            except outgoing_operations.ApiError as error:
+                if not outgoing_operations.Operations.absent(error):
+                    raise
+            else:
+                payload = {
+                    key: value
+                    for key, value in event["payload"].items()
+                    if key not in ("_shared_key", "_personal_only")
+                }
+                payload["type"] = "message"
+                payload["message"] = latest["message"]
+        async with self.db.transaction() as connection:
+            if not await self.current(connection, account):
+                return
+            if payload is None:
+                await connection.execute(COMPLETE_EVENT_SQL, (event["id"],))
+            else:
+                await connection.execute(
+                    "UPDATE zulip_incoming_events SET payload=%s,next_retry_at=now() WHERE id=%s",
+                    (pg_json.Jsonb(payload), event["id"]),
+                )
+        self.ready.set()
+
     async def process(self, event: dict) -> None:
         account = None
         try:
@@ -487,7 +650,19 @@ class ZulipIncomingService:
                 and event["account_identity"] == account["external_account_id"]
             )
             if not valid:
-                await self.db.sql(COMPLETE_EVENT_SQL, (event["id"],))
+                if event["payload"].get("_shared_key") and not event["payload"].get(
+                    "_personal_only"
+                ):
+                    await self.db.sql(
+                        FAIL_EVENT_SQL,
+                        (
+                            "Account identity changed before shared application",
+                            event["id"],
+                        ),
+                    )
+                else:
+                    await self.db.sql(COMPLETE_EVENT_SQL, (event["id"],))
+                await self.finish_registry(event, False)
                 return
             account = typing.cast(dict, account)
             prepared = await self.operations.prepare(account, event["payload"])
@@ -505,48 +680,65 @@ class ZulipIncomingService:
                     )
                 else:
                     await connection.execute(COMPLETE_EVENT_SQL, (event["id"],))
+            await self.finish_registry(event, True)
+        except incoming_operations.MissingSharedMessage:
+            try:
+                await self.recover_shared_message(event, typing.cast(dict, account))
+            except Exception as error:
+                await self.failure(event, account, error)
         except incoming_operations.MissingDependency as error:
-            await self.defer_dependency(event, typing.cast(dict, account), error)
+            try:
+                terminal = await self.defer_dependency(
+                    event, typing.cast(dict, account), error
+                )
+                if terminal:
+                    await self.finish_registry(event, False)
+            except Exception as failure:
+                await self.failure(event, account, failure)
         except outgoing_operations.Pending as error:
             await self.db.sql(
                 RETRY_EVENT_SQL, (str(error), self.dependency_delay, event["id"])
             )
             await asyncio.sleep(self.dependency_delay)
         except Exception as error:
-            LOG.exception("Cannot apply Zulip event %s", event["id"])
-            permanent = isinstance(
-                error,
-                (
-                    ValueError,
-                    KeyError,
-                    TypeError,
-                    psycopg.DataError,
-                    psycopg.errors.NotNullViolation,
-                    psycopg.errors.CheckViolation,
-                ),
-            ) or (
-                isinstance(error, outgoing_operations.ApiError)
-                and 400 <= error.status < 500
-                and error.status not in (408, 429)
-            )
-            if permanent:
-                if account is not None:
-                    await self.operations.account_error(
-                        account, f"Incoming event {event['id']}: {error}"
-                    )
-                await self.db.sql(FAIL_EVENT_SQL, (str(error), event["id"]))
-            else:
-                delay = min(2 ** min(event["attempts"], 6), 60)
-                await self.db.sql(RETRY_EVENT_SQL, (str(error), delay, event["id"]))
+            await self.failure(event, account, error)
+
+    async def failure(self, event: dict, account: dict | None, error: Exception):
+        LOG.exception("Cannot apply Zulip event %s", event["id"])
+        permanent = isinstance(
+            error,
+            (
+                ValueError,
+                KeyError,
+                TypeError,
+                psycopg.DataError,
+                psycopg.errors.NotNullViolation,
+                psycopg.errors.CheckViolation,
+            ),
+        ) or (
+            isinstance(error, outgoing_operations.ApiError)
+            and 400 <= error.status < 500
+            and error.status not in (408, 429)
+        )
+        if permanent:
+            if account is not None:
+                await self.operations.account_error(
+                    account, f"Incoming event {event['id']}: {error}"
+                )
+            await self.db.sql(FAIL_EVENT_SQL, (str(error), event["id"]))
+            await self.finish_registry(event, False)
+        else:
+            delay = min(2 ** min(event["attempts"], 6), 60)
+            await self.db.sql(RETRY_EVENT_SQL, (str(error), delay, event["id"]))
 
     async def defer_dependency(
         self, event: dict, account: dict, error: incoming_operations.MissingDependency
-    ) -> None:
+    ) -> bool:
         spec = error.spec
         key = json.dumps([spec["kind"], spec["identity"], spec.get("user")])
         async with self.db.transaction() as connection:
             if not await self.current(connection, account):
-                return
+                return False
             failures = await incoming_operations.rows(
                 connection,
                 SELECT_FAILED_DEPENDENCY_SQL,
@@ -557,7 +749,7 @@ class ZulipIncomingService:
                     FAIL_EVENT_SQL,
                     (f"Dependency failed: {failures[0]['error']}", event["id"]),
                 )
-                return
+                return True
             await connection.execute(
                 INSERT_DEPENDENCY_SQL,
                 (
@@ -580,3 +772,4 @@ class ZulipIncomingService:
                 RETRY_EVENT_SQL, (str(error), self.dependency_delay, event["id"])
             )
         self.ready.set()
+        return False
