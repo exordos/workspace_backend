@@ -1197,7 +1197,26 @@ def test_provenance_migration_converts_legacy_children_and_retires_root_links(
         (identifier,),
     )
     filename = next(conftest.MIGRATIONS_DIR.glob("0267-*.py")).name
-    conftest.DataMigration(filename)._run(filename, "upgrade")
+    spec = importlib.util.spec_from_file_location(
+        "provenance_cutover", conftest.MIGRATIONS_DIR / filename
+    )
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    topic_uuid = db.execute(
+        "SELECT default_topic_uuid FROM messenger_streams WHERE uuid=%s",
+        (channel.stream_uuid,),
+    ).fetchone()[0]
+    with contexts.Context().session_manager() as session:
+        session.execute("SET CONSTRAINTS ALL DEFERRED")
+        session.execute(
+            "UPDATE messenger_streams SET default_topic_uuid=NULL WHERE uuid=%s",
+            (channel.stream_uuid,),
+        )
+        session.execute(
+            "UPDATE messenger_streams SET default_topic_uuid=%s WHERE uuid=%s",
+            (topic_uuid, channel.stream_uuid),
+        )
+        migration.migration_step.upgrade(session)
     assert db.execute(
         "SELECT source_name,provider_uuid,provider_identity FROM messenger_messages WHERE uuid=%s",
         (identifier,),

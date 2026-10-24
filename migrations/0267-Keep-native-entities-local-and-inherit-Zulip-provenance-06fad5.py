@@ -185,6 +185,7 @@ class MigrationStep(migrations.AbstractMigrationStep):
         return False
 
     def upgrade(self, session):
+        session.execute("SET CONSTRAINTS ALL IMMEDIATE")
         triggers = session.execute(
             """SELECT tgrelid::regclass::text AS table_name,
             tgname,tgenabled FROM pg_trigger WHERE tgrelid=ANY(%s::regclass[])
