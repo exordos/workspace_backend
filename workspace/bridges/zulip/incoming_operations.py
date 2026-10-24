@@ -290,6 +290,12 @@ ENSURE_MESSAGE_BINDINGS_SQL = """
     FROM messenger_stream_bindings member
     WHERE member.project_id = %s AND member.stream_uuid = %s AND member.active
       AND member.user_uuid = %s
+      AND NOT EXISTS (
+          SELECT 1 FROM messenger_user_message_bindings existing
+          WHERE existing.project_id=member.project_id
+            AND existing.placement_uuid=%s AND existing.user_uuid=member.user_uuid
+            AND existing.membership_generation=member.membership_generation
+      )
     ON CONFLICT (project_id, placement_uuid, user_uuid) DO UPDATE SET
         membership_generation = EXCLUDED.membership_generation,
         relation_role = EXCLUDED.relation_role, visibility = EXCLUDED.visibility,
@@ -2218,6 +2224,7 @@ class Operations:
                 account["project_id"],
                 stream_uuid,
                 account["owner_user_uuid"],
+                placement["uuid"],
             ),
         )
         new_access = await access_cursor.fetchall()
@@ -2702,6 +2709,7 @@ class Operations:
                 account["project_id"],
                 stream["uuid"],
                 account["owner_user_uuid"],
+                placement["uuid"],
             ),
         )
         fresh = await cursor.fetchall()

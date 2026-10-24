@@ -3276,3 +3276,28 @@ def test_shared_content_edits_refresh_each_recipients_mention_state(incoming):
         asyncio.run(run())
     finally:
         linked.delete()
+
+
+def test_personal_copy_does_not_lock_an_unchanged_message_binding(incoming):
+    _api, db, account, http, url = incoming
+    value = event(identifier=201)
+    apply(incoming, value)
+    with psycopg.connect(url) as writer:
+        writer.execute(
+            "SELECT binding.uuid FROM messenger_user_message_bindings binding JOIN messenger_message_placements placement ON placement.uuid=binding.placement_uuid JOIN messenger_messages message ON message.uuid=placement.message_uuid WHERE message.project_id=%s AND message.provider_identity='201' AND binding.user_uuid=%s FOR UPDATE OF binding",
+            (account["project_id"], account["owner_user_uuid"]),
+        ).fetchall()
+
+        async def run():
+            database = zulip_outgoing.Database(url)
+            await database.open()
+            try:
+                operations = incoming_operations.Operations(database, http)
+                async with database.transaction() as connection:
+                    await connection.execute("SET LOCAL statement_timeout='300ms'")
+                    await connection.execute(zulip_incoming.INCOMING_TRANSACTION_SQL)
+                    await operations.personal(connection, account, value)
+            finally:
+                await database.close()
+
+        asyncio.run(run())
