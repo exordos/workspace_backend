@@ -1187,3 +1187,54 @@ def test_cutover_keeps_live_events_and_cursor_and_removes_history_tasks(
                 ).fetchone()["status"]
                 == "syncing"
             )
+
+
+@pytest.mark.parametrize("message", ["Invalid message(s)", "Invalid message ID"])
+def test_topic_edit_skips_already_deleted_messages_in_the_event(incoming, message):
+    api, _db, _account, http, _url = incoming
+    initial = event()
+    apply(incoming, initial)
+    drain()
+    updated = {
+        **initial["message"],
+        "subject": "Renamed surviving topic",
+        "content": "Surviving edit",
+        "last_edit_timestamp": initial["message"]["timestamp"] + 10,
+    }
+    original = http.request.side_effect
+
+    async def get_message(account, method, path, data=None, **kwargs):
+        if path == "/messages/102":
+            raise incoming_operations.outgoing_operations.ApiError(
+                400, {"code": "BAD_REQUEST", "msg": message}, "GET"
+            )
+        if path == "/messages/101":
+            return {"message": updated}
+        if original:
+            return await original(account, method, path, data, **kwargs)
+        raise AssertionError(path)
+
+    http.request.side_effect = get_message
+    apply(
+        incoming,
+        {
+            "type": "update_message",
+            "message_id": 102,
+            "message_ids": [101, 102],
+            "stream_id": 42,
+            "orig_subject": "General",
+            "subject": updated["subject"],
+            "propagate_mode": "change_all",
+            "edit_timestamp": updated["last_edit_timestamp"],
+        },
+    )
+    drain()
+    messages = api.get("/v1/messenger/messages/").json()
+    assert len(messages) == 1
+    assert messages[0]["payload"]["content"] == "Surviving edit"
+    assert (
+        api.get("/v1/messenger/stream_topics/" + messages[0]["topic_uuid"]).json()[
+            "name"
+        ]
+        == updated["subject"]
+    )

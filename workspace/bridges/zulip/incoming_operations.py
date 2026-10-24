@@ -806,7 +806,7 @@ class Operations:
                     },
                 )
             except outgoing_operations.ApiError as error:
-                if error.status != 404:
+                if not outgoing_operations.Operations.absent(error):
                     raise
                 prepared.setdefault("deleted", []).append(identifier)
             else:
@@ -1020,7 +1020,10 @@ class Operations:
                         {"apply_markdown": False},
                     )
                 except outgoing_operations.ApiError as error:
-                    if error.status not in (403, 404):
+                    if (
+                        error.status != 403
+                        and not outgoing_operations.Operations.absent(error)
+                    ):
                         raise
                 else:
                     prepared["quoted_messages"][identifier] = remote["message"]
