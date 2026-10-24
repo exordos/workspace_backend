@@ -6,8 +6,10 @@
 import asyncio
 import contextlib
 import logging
+import json
 import signal
 import typing
+import uuid
 
 import aiohttp
 import psycopg
@@ -64,17 +66,33 @@ SELECT_EVENT_SQL = """
     SELECT event.* FROM zulip_incoming_events event
     WHERE event.processed_at IS NULL AND event.next_retry_at <= now()
       AND NOT (event.id = ANY(%s::bigint[]))
-      AND NOT EXISTS (
+      AND (event.payload->>'type'='ensure_dependency' OR NOT EXISTS (
           SELECT 1 FROM zulip_incoming_events earlier
           WHERE earlier.project_id = event.project_id
             AND earlier.provider_uuid = event.provider_uuid
             AND earlier.id < event.id AND earlier.processed_at IS NULL
+            AND earlier.payload->>'type'<>'ensure_dependency'
             AND (earlier.ordering_keys && event.ordering_keys
                  OR earlier.ordering_keys = ARRAY['*']::text[]
                  OR event.ordering_keys = ARRAY['*']::text[])
-      )
+      ))
     ORDER BY event.id LIMIT %s
 """
+INSERT_DEPENDENCY_SQL = """
+    INSERT INTO zulip_incoming_events (
+        project_id, external_account_uuid, provider_uuid, owner_user_uuid,
+        account_identity, queue_id, event_id, payload, ordering_keys
+    ) VALUES (%s,%s,%s,%s,%s,%s,0,%s,ARRAY[]::text[])
+    ON CONFLICT DO NOTHING
+"""
+SELECT_FAILED_DEPENDENCY_SQL = """
+    SELECT error FROM zulip_incoming_events
+    WHERE project_id=%s AND provider_uuid=%s
+      AND payload->>'type'='ensure_dependency'
+      AND payload->>'dependency_key'=%s
+      AND processed_at IS NOT NULL AND error IS NOT NULL LIMIT 1
+"""
+
 COMPLETE_EVENT_SQL = """
     UPDATE zulip_incoming_events
     SET processed_at = now(), error = NULL
@@ -163,8 +181,17 @@ class ZulipIncomingService:
                 loop.remove_signal_handler(sig)
 
     async def wait(self) -> None:
+        retries = await self.db.sql(
+            "SELECT EXTRACT(EPOCH FROM min(next_retry_at)-now()) AS delay FROM zulip_incoming_events WHERE processed_at IS NULL AND next_retry_at>now()"
+        )
+        delay = retries[0]["delay"]
+        timeout = (
+            self.poll_interval
+            if delay is None
+            else min(self.poll_interval, max(0.001, float(delay)))
+        )
         with contextlib.suppress(asyncio.TimeoutError):
-            await asyncio.wait_for(self.ready.wait(), self.poll_interval)
+            await asyncio.wait_for(self.ready.wait(), timeout)
 
     async def listen(self) -> None:
         while True:
@@ -469,7 +496,17 @@ class ZulipIncomingService:
                     return
                 await connection.execute(INCOMING_TRANSACTION_SQL)
                 await self.operations.apply(connection, account, prepared)
-                await connection.execute(COMPLETE_EVENT_SQL, (event["id"],))
+                if event["payload"]["type"] == "ensure_dependency":
+                    await connection.execute(
+                        "DELETE FROM zulip_incoming_events WHERE id=%s", (event["id"],)
+                    )
+                    await connection.execute(
+                        "SELECT pg_notify('workspace_zulip_incoming','')"
+                    )
+                else:
+                    await connection.execute(COMPLETE_EVENT_SQL, (event["id"],))
+        except incoming_operations.MissingDependency as error:
+            await self.defer_dependency(event, typing.cast(dict, account), error)
         except outgoing_operations.Pending as error:
             await self.db.sql(
                 RETRY_EVENT_SQL, (str(error), self.dependency_delay, event["id"])
@@ -491,3 +528,45 @@ class ZulipIncomingService:
             else:
                 delay = min(2 ** min(event["attempts"], 6), 60)
                 await self.db.sql(RETRY_EVENT_SQL, (str(error), delay, event["id"]))
+
+    async def defer_dependency(
+        self, event: dict, account: dict, error: incoming_operations.MissingDependency
+    ) -> None:
+        spec = error.spec
+        key = json.dumps([spec["kind"], spec["identity"], spec.get("user")])
+        async with self.db.transaction() as connection:
+            if not await self.current(connection, account):
+                return
+            failures = await incoming_operations.rows(
+                connection,
+                SELECT_FAILED_DEPENDENCY_SQL,
+                (account["project_id"], account["provider_uuid"], key),
+            )
+            if failures:
+                await connection.execute(
+                    FAIL_EVENT_SQL,
+                    (f"Dependency failed: {failures[0]['error']}", event["id"]),
+                )
+                return
+            await connection.execute(
+                INSERT_DEPENDENCY_SQL,
+                (
+                    account["project_id"],
+                    account["uuid"],
+                    account["provider_uuid"],
+                    account["owner_user_uuid"],
+                    account["external_account_id"],
+                    f"ensure:{uuid.uuid4()}",
+                    pg_json.Jsonb(
+                        {
+                            "type": "ensure_dependency",
+                            "dependency": spec,
+                            "dependency_key": key,
+                        }
+                    ),
+                ),
+            )
+            await connection.execute(
+                RETRY_EVENT_SQL, (str(error), self.dependency_delay, event["id"])
+            )
+        self.ready.set()

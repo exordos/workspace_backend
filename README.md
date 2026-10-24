@@ -73,8 +73,11 @@ blocks later intentions for that entity until it is resolved.
 The sender uses no explicit database/application locks, revisions or leases.
 Each SQL statement commits before HTTP or a dependency wait. Missing parent IDs
 are reread after 10 ms. `LISTEN workspace_zulip_outgoing` wakes the dispatcher;
-a one-second poll recovers missed notifications. Native rows keep empty
-`provider_identity`; external copies are recorded in `zulip_entity_links`.
+a one-second poll recovers missed notifications. Native entities are local and
+never enter the provider outbox. Entities created in a Zulip context inherit
+`source_name=zulip` and `provider_uuid` immediately; `provider_identity` remains
+empty until the provider receipt arrives. A canonical message has one destination;
+a copy requires a new UUID.
 
 `[zulip_outgoing] concurrency` and `connections` default to 128. The HTTP connector
 opens connections on demand, reuses them and closes connections idle for 15 seconds.
@@ -89,11 +92,23 @@ Zulip topics are created by their first message. Stream deletion archives the
 channel. Workspace-only attributes (colors, pins, summaries and Workspace roles)
 stay local. Exported attachments retain their blob until queued uploads finish.
 
-Migration 0266 preserves received Zulip events and live queue cursors, removes
-historical tasks and their metadata, and replaces the previous realtime process.
-Stop the old realtime and history services before upgrading, then start incoming,
-outgoing, Messenger projection and WebSocket services. The cutover is forward-only;
-rollback requires a database backup.
+Incoming messages only read ready users, streams, topics and personal bindings.
+A missing dependency creates one active `ensure_dependency` intention in the
+existing inbox, deduplicated by project, provider, dependency type, provider identity
+and user for personal bindings. Inserting it and deferring its parent are one short
+transaction. The existing dispatcher runs the intention, including any parent
+dependencies; successful creation and intention removal commit together and wake
+the dispatcher. Catalog updates run in their own provider event handlers.
+Permanent failures remain visible with an error and do not block subsequent events.
+
+Before upgrading, back up the database and stop the old realtime, history,
+incoming, outgoing and Messenger projection workers. Apply all migrations through
+0271 before starting the new workers and WebSocket services. Migration 0266
+preserves live queue cursors and received events while retiring history tasks;
+0267 enforces local native entities, 0269 retires queued delivery snapshots,
+0270 orders independent incoming messages separately, and 0271 deduplicates active
+dependency intentions. History import stays disabled. These cutovers are
+forward-only; rollback requires the backup.
 
 ## Storage
 

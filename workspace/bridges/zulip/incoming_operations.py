@@ -444,6 +444,12 @@ async def rows(
     return await (await connection.execute(query, parameters)).fetchall()
 
 
+class MissingDependency(Exception):
+    def __init__(self, spec: dict):
+        self.spec = spec
+        super().__init__(f"Waiting for Zulip {spec['kind']} {spec['identity']}")
+
+
 class Operations:
     def __init__(
         self, db: typing.Any, http: typing.Any, reaction_user_limit: int = 5
@@ -852,6 +858,261 @@ class Operations:
             if changed:
                 await self.account_snapshot(connection, {**account, **changed})
 
+    async def dependency(self, account: dict, spec: dict, connection=None) -> dict:
+        async def query(sql, parameters):
+            return (
+                await self.db.sql(sql, parameters)
+                if connection is None
+                else await rows(connection, sql, parameters)
+            )
+
+        kind, remote = spec["kind"], spec["identity"]
+        if kind == "user":
+            found = await query(
+                SELECT_USER_SQL,
+                (account["project_id"], account["provider_uuid"], remote),
+            )
+        elif kind == "stream":
+            found = await query(
+                "SELECT * FROM messenger_streams WHERE project_id=%s AND provider_uuid=%s AND source_name='zulip' AND provider_identity=%s AND deleted_at IS NULL",
+                (account["project_id"], account["provider_uuid"], remote),
+            )
+        else:
+            stream = await self.dependency(
+                account,
+                {
+                    "kind": "stream",
+                    "identity": spec["stream_identity"],
+                    **(
+                        {"recipients": spec["recipients"]}
+                        if "recipients" in spec
+                        else {}
+                    ),
+                },
+                connection,
+            )
+            if kind == "topic":
+                found = await query(
+                    SELECT_TOPIC_SQL,
+                    (
+                        account["project_id"],
+                        stream["uuid"],
+                        remote,
+                        spec["subject"].removeprefix("✔ ") or "General",
+                        spec["subject"].startswith("✔ "),
+                    ),
+                )
+                found = [row for row in found if row["deleted_at"] is None]
+            else:
+                user = await self.dependency(
+                    account, {"kind": "user", "identity": spec["user"]}, connection
+                )
+                if kind == "stream_binding":
+                    found = await query(
+                        SELECT_BINDING_SQL,
+                        (
+                            account["project_id"],
+                            stream["uuid"],
+                            user["owner_user_uuid"],
+                        ),
+                    )
+                    if found and not found[0]["active"]:
+                        raise ValueError(
+                            "Incoming message belongs to an inactive membership"
+                        )
+                elif kind == "topic_binding":
+                    topic = await self.dependency(
+                        account,
+                        {
+                            "kind": "topic",
+                            "identity": remote,
+                            "stream_identity": spec["stream_identity"],
+                            "subject": spec["subject"],
+                        },
+                        connection,
+                    )
+                    found = await query(
+                        SELECT_TOPIC_BINDING_SQL,
+                        (account["project_id"], user["owner_user_uuid"], topic["uuid"]),
+                    )
+                else:
+                    raise ValueError("Unknown incoming dependency type")
+        if not found:
+            raise MissingDependency(spec)
+        return found[0]
+
+    async def message_dependencies(
+        self, account: dict, messages: list, connection=None, event=None
+    ) -> None:
+        for message in messages:
+            people = {
+                message["sender_id"],
+                *(
+                    int(value)
+                    for value in re.findall(r"\|([0-9]+)\*\*", message["content"])
+                ),
+            }
+            if message["type"] != "stream":
+                people.update(item["id"] for item in message["display_recipient"])
+            for person in sorted(people):
+                await self.dependency(
+                    account, {"kind": "user", "identity": str(person)}, connection
+                )
+            remote = stream_identity(account, message)
+            context = {"stream_identity": remote}
+            if message["type"] != "stream":
+                context["recipients"] = message["display_recipient"]
+            await self.dependency(
+                account, {"kind": "stream", "identity": remote, **context}, connection
+            )
+            members = (
+                [account["external_account_id"]]
+                if message["type"] == "stream"
+                else [str(item["id"]) for item in message["display_recipient"]]
+            )
+            for member in members:
+                await self.dependency(
+                    account,
+                    {
+                        "kind": "stream_binding",
+                        "identity": remote,
+                        "user": member,
+                        **context,
+                    },
+                    connection,
+                )
+            subject = message["subject"] if message["type"] == "stream" else ""
+            if (
+                event
+                and event["type"] == "update_message"
+                and event.get("propagate_mode") == "change_all"
+                and "orig_subject" in event
+                and "subject" in event
+                and "new_stream_id" not in event
+            ):
+                # The existing rename handler updates this topic in the parent transaction.
+                subject = event["orig_subject"]
+            await self.dependency(
+                account,
+                {
+                    "kind": "topic_binding",
+                    "identity": f"{remote}:{subject}",
+                    "subject": subject,
+                    "user": account["external_account_id"],
+                    **context,
+                },
+                connection,
+            )
+
+    async def prepare_dependency(self, account: dict, spec: dict) -> dict:
+        prepared = {"event": {"type": "ensure_dependency", "dependency": spec}}
+        try:
+            await self.dependency(account, spec)
+        except MissingDependency as missing:
+            if missing.spec != spec:
+                raise
+        else:
+            return prepared
+        kind = spec["kind"]
+        if kind == "user":
+            prepared["person"] = (
+                await self.http.request(account, "GET", f"/users/{spec['identity']}")
+            )["user"]
+            if str(prepared["person"]["user_id"]) != spec["identity"]:
+                raise ValueError("Provider returned a different dependency user")
+        elif kind == "stream" and "recipients" not in spec:
+            prepared["channel"] = (
+                await self.http.request(account, "GET", f"/streams/{spec['identity']}")
+            )["stream"]
+            if str(prepared["channel"]["stream_id"]) != spec["identity"]:
+                raise ValueError("Provider returned a different dependency stream")
+        elif kind == "stream" or kind == "stream_binding":
+            people = spec.get("recipients", []) or [{"id": spec["user"]}]
+            for person in people:
+                await self.dependency(
+                    account, {"kind": "user", "identity": str(person["id"])}
+                )
+        return prepared
+
+    async def ensure_dependency(
+        self, connection, account: dict, prepared: dict
+    ) -> None:
+        spec = prepared["event"]["dependency"]
+        try:
+            await self.dependency(account, spec, connection)
+        except MissingDependency as missing:
+            if missing.spec != spec:
+                raise
+        else:
+            return
+        kind = spec["kind"]
+        if kind == "user":
+            await self.person(connection, account, prepared["person"])
+        elif kind == "stream":
+            if "recipients" in spec:
+                members = sorted(spec["recipients"], key=lambda item: item["id"])
+                owner = await self.user(connection, account, members[0]["id"])
+                peer = await self.user(connection, account, members[-1]["id"])
+                identifier = await self.identity(
+                    account, "stream", spec["identity"], connection=connection
+                )
+                private = len(members) <= 2
+                await self.save(
+                    connection,
+                    TABLES["stream"],
+                    {
+                        "uuid": identifier,
+                        "project_id": account["project_id"],
+                        "name": ", ".join(item["full_name"] for item in members),
+                        "owner_uuid": owner,
+                        "private": private,
+                        "direct_user_uuid": peer if private else None,
+                        "private_index": f"zulip:{identifier}" if private else None,
+                        "invite_only": True,
+                        **origin(account, spec["identity"]),
+                    },
+                )
+            else:
+                await self.stream(
+                    connection, account, prepared["channel"], subscribe=False
+                )
+        else:
+            stream = await self.dependency(
+                account,
+                {"kind": "stream", "identity": spec["stream_identity"]},
+                connection,
+            )
+            if kind == "topic":
+                topic = await self.topic(connection, account, stream, spec["subject"])
+                if not spec["subject"] and stream["default_topic_uuid"] is None:
+                    await self.save(
+                        connection,
+                        TABLES["stream"],
+                        {
+                            "uuid": stream["uuid"],
+                            "project_id": account["project_id"],
+                            "default_topic_uuid": topic["uuid"],
+                        },
+                    )
+            else:
+                user = await self.user(connection, account, spec["user"])
+                if kind == "stream_binding":
+                    await self.bind(connection, account, stream, user, spec["user"])
+                else:
+                    topic = await self.dependency(
+                        account,
+                        {
+                            "kind": "topic",
+                            "identity": spec["identity"],
+                            "stream_identity": spec["stream_identity"],
+                            "subject": spec["subject"],
+                        },
+                        connection,
+                    )
+                    await self.topic_binding(
+                        connection, account, topic, user, spec["user"], spec["identity"]
+                    )
+
     async def prepare(self, account: dict, event: dict) -> dict:
         prepared: dict[str, typing.Any] = {
             "event": event,
@@ -861,6 +1122,8 @@ class Operations:
             "files": {},
         }
         kind = event["type"]
+        if kind == "ensure_dependency":
+            return await self.prepare_dependency(account, event["dependency"])
         message_ids = []
         if kind == "message":
             prepared["messages"] = [dict(event["message"])]
@@ -946,6 +1209,7 @@ class Operations:
             people.add(event["user_id"])
         if kind == "subscription" and event["op"] in ("peer_add", "peer_remove"):
             people.update(event["user_ids"])
+        await self.message_dependencies(account, prepared["messages"], event=event)
         for message in prepared["messages"]:
             people.add(message["sender_id"])
             people.update(
@@ -954,22 +1218,6 @@ class Operations:
             )
             if message["type"] != "stream":
                 people.update(item["id"] for item in message["display_recipient"])
-            elif message["stream_id"] not in prepared["channels"]:
-                stream_uuid = await self.identity(
-                    account, "stream", message["stream_id"]
-                )
-                known = await self.db.sql(
-                    SELECT_ROW_SQL.format(table=TABLES["stream"]),
-                    (
-                        account["project_id"],
-                        stream_uuid,
-                    ),
-                )
-                if not known:
-                    result = await self.http.request(
-                        account, "GET", f"/streams/{message['stream_id']}"
-                    )
-                    prepared["channels"][message["stream_id"]] = result["stream"]
             file_stream = await self.identity(
                 account, "stream", stream_identity(account, message)
             )
@@ -1074,7 +1322,9 @@ class Operations:
                     str(identifier),
                 ),
             )
-            if not known or kind == "realm_user":
+            if not known and kind != "realm_user":
+                raise MissingDependency({"kind": "user", "identity": str(identifier)})
+            if kind == "realm_user":
                 try:
                     result = await self.http.request(
                         account, "GET", f"/users/{identifier}"
@@ -1688,72 +1938,22 @@ class Operations:
                     "Waiting for the outgoing send receipt"
                 )
         author = await self.user(connection, account, data["sender_id"])
-        if data["type"] == "stream":
-            stream_uuid = await self.identity(
-                account, "stream", data["stream_id"], connection=connection
-            )
-            known = await rows(
-                connection,
-                SELECT_ROW_SQL.format(table=TABLES["stream"]),
-                (account["project_id"], stream_uuid),
-            )
-            if not known:
-                raise outgoing_operations.Pending("Waiting for the Zulip channel")
-            stream = known[0]
-            topic = await self.topic(connection, account, stream, data["subject"])
-        else:
-            members = sorted(item["id"] for item in data["display_recipient"])
-            remote = stream_identity(account, data)
-            stream_uuid = await self.identity(
-                account, "stream", remote, connection=connection
-            )
-            private = len(members) <= 2
-            dm_owner = await self.user(connection, account, members[0])
-            peer = await self.user(connection, account, members[-1])
-            changed = await self.save(
-                connection,
-                TABLES["stream"],
-                {
-                    "uuid": stream_uuid,
-                    "project_id": account["project_id"],
-                    "name": ", ".join(
-                        item["full_name"]
-                        for item in sorted(
-                            data["display_recipient"], key=lambda value: value["id"]
-                        )
-                    ),
-                    "owner_uuid": dm_owner,
-                    "private": private,
-                    "direct_user_uuid": peer if private else None,
-                    "private_index": f"zulip:{stream_uuid}" if private else None,
-                    "invite_only": True,
-                    **origin(account, remote),
-                },
-            )
-            stream = (
-                changed
-                or (
-                    await rows(
-                        connection,
-                        SELECT_ROW_SQL.format(table=TABLES["stream"]),
-                        (account["project_id"], stream_uuid),
-                    )
-                )[0]
-            )
-            for member in members:
-                user = await self.user(connection, account, member)
-                await self.bind(connection, account, stream, user, member)
-            topic = await self.topic(connection, account, stream, "")
-            if not stream["default_topic_uuid"]:
-                await self.save(
-                    connection,
-                    TABLES["stream"],
-                    {
-                        "uuid": stream_uuid,
-                        "project_id": account["project_id"],
-                        "default_topic_uuid": topic["uuid"],
-                    },
-                )
+        remote = stream_identity(account, data)
+        stream = await self.dependency(
+            account, {"kind": "stream", "identity": remote}, connection
+        )
+        stream_uuid = stream["uuid"]
+        subject = data["subject"] if data["type"] == "stream" else ""
+        topic = await self.dependency(
+            account,
+            {
+                "kind": "topic",
+                "identity": f"{remote}:{subject}",
+                "stream_identity": remote,
+                "subject": subject,
+            },
+            connection,
+        )
         current_placements = await rows(
             connection, SELECT_PLACEMENTS_SQL, (account["project_id"], identifier)
         )
@@ -2312,6 +2512,12 @@ class Operations:
     ) -> None:
         event = prepared["event"]
         kind = event["type"]
+        if kind == "ensure_dependency":
+            await self.ensure_dependency(connection, account, prepared)
+            return
+        await self.message_dependencies(
+            account, prepared["messages"], connection, event
+        )
         if kind == "account_ready":
             changed = await self.save(
                 connection,

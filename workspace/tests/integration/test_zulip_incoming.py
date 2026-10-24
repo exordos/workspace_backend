@@ -78,7 +78,9 @@ def apply(incoming, *events):
         operations = incoming_operations.Operations(database, http)
         try:
             for value in events:
-                prepared = await operations.prepare(account, value)
+                prepared = await prepare_dependencies(
+                    operations, database, account, value
+                )
                 async with database.transaction() as connection:
                     await connection.execute(zulip_incoming.INCOMING_TRANSACTION_SQL)
                     await operations.apply(connection, account, prepared)
@@ -86,6 +88,22 @@ def apply(incoming, *events):
             await database.close()
 
     asyncio.run(run())
+
+
+async def prepare_dependencies(operations, database, account, value):
+    while True:
+        try:
+            return await operations.prepare(account, value)
+        except incoming_operations.MissingDependency as error:
+            prepared = await prepare_dependencies(
+                operations,
+                database,
+                account,
+                {"type": "ensure_dependency", "dependency": error.spec},
+            )
+            async with database.transaction() as connection:
+                await connection.execute(zulip_incoming.INCOMING_TRANSACTION_SQL)
+                await operations.apply(connection, account, prepared)
 
 
 def drain():
@@ -387,7 +405,7 @@ def test_failed_application_keeps_domain_and_client_events_unchanged(incoming):
         database = zulip_outgoing.Database(url)
         await database.open()
         operations = incoming_operations.Operations(database, http)
-        prepared = await operations.prepare(account, event())
+        prepared = await prepare_dependencies(operations, database, account, event())
         try:
             with pytest.raises(RuntimeError):
                 async with database.transaction() as connection:
@@ -1020,6 +1038,23 @@ def test_api_changes_on_incoming_objects_capture_outgoing_routes(incoming):
 
 
 def test_inbox_preserves_order_across_retry_and_service_restart(incoming):
+    apply(
+        incoming,
+        {
+            "type": "subscription",
+            "op": "add",
+            "subscriptions": [{"stream_id": 42, "name": "Channel"}],
+        },
+    )
+    apply(
+        incoming,
+        {
+            "type": "user_topic",
+            "stream_id": 42,
+            "topic_name": "General",
+            "visibility_policy": 0,
+        },
+    )
     _api, _db, account, http, url = incoming
 
     async def run():
@@ -1592,6 +1627,24 @@ def test_incoming_publication_lock_contention_rolls_back_and_retries(incoming):
 
 
 def test_missing_dependency_does_not_block_another_message_in_the_same_chat(incoming):
+    apply(
+        incoming,
+        {
+            "type": "subscription",
+            "op": "add",
+            "subscriptions": [{"stream_id": 42, "name": "Channel"}],
+        },
+    )
+    # Prepare the topic without creating a message.
+    apply(
+        incoming,
+        {
+            "type": "user_topic",
+            "stream_id": 42,
+            "topic_name": "General",
+            "visibility_policy": 0,
+        },
+    )
     api, _db, account, http, url = incoming
 
     async def run():
@@ -1794,6 +1847,23 @@ def test_stale_queued_edit_cannot_replace_a_newer_provider_update(incoming):
 def test_permanent_event_failure_does_not_block_the_next_event(
     incoming, error, terminal
 ):
+    apply(
+        incoming,
+        {
+            "type": "subscription",
+            "op": "add",
+            "subscriptions": [{"stream_id": 42, "name": "Channel"}],
+        },
+    )
+    apply(
+        incoming,
+        {
+            "type": "user_topic",
+            "stream_id": 42,
+            "topic_name": "General",
+            "visibility_policy": 0,
+        },
+    )
     api, _db, account, http, url = incoming
 
     async def run():
@@ -1961,3 +2031,355 @@ def test_incoming_file_removal_cleans_storage_after_commit(
     assert blob.exists() is (reference == "file")
     assert not sidecar.exists()
     http.request.assert_not_called()
+
+
+async def drain_incoming(service, limit=100):
+    for _ in range(limit):
+        ready = await service.db.sql(zulip_incoming.SELECT_EVENT_SQL, ([], 128))
+        if not ready:
+            if not await service.db.sql(
+                "SELECT 1 FROM zulip_incoming_events WHERE processed_at IS NULL"
+            ):
+                return
+            await service.db.sql(
+                "UPDATE zulip_incoming_events SET next_retry_at=now() WHERE processed_at IS NULL"
+            )
+            continue
+        await asyncio.gather(*(service.process(row) for row in ready))
+        await service.db.sql(
+            "UPDATE zulip_incoming_events SET next_retry_at=now() WHERE processed_at IS NULL"
+        )
+    pytest.fail("Incoming inbox did not drain")
+
+
+def test_ready_message_does_not_write_locked_topic_binding(incoming):
+    api, db, account, http, url = incoming
+    apply(incoming, event(identifier=100))
+    http.request.reset_mock()
+
+    async def run():
+        service = zulip_incoming.ZulipIncomingService(url)
+        await service.db.open()
+        service.operations = incoming_operations.Operations(service.db, http)
+        try:
+            async with service.db.transaction() as connection:
+                await service.append(
+                    connection,
+                    account,
+                    {"queue_id": "ready-binding"},
+                    [{"id": 1, **event(identifier=101)}],
+                )
+            ready = await service.db.sql(zulip_incoming.SELECT_EVENT_SQL, ([], 10))
+            with psycopg.connect(url) as locker:
+                locker.execute(
+                    "SELECT 1 FROM messenger_user_topic_bindings WHERE project_id=%s FOR UPDATE",
+                    (account["project_id"],),
+                )
+                await asyncio.wait_for(service.process(ready[0]), 0.5)
+            assert await service.db.sql(
+                "SELECT 1 FROM zulip_incoming_events WHERE id=%s AND processed_at IS NOT NULL",
+                (ready[0]["id"],),
+            )
+        finally:
+            await service.db.close()
+
+    asyncio.run(run())
+    assert len(api.get("/v1/messenger/messages/").json()) == 2
+
+
+def test_missing_topic_burst_shares_one_intention_and_removes_it_on_success(incoming):
+    api, db, account, http, url = incoming
+    apply(incoming, event(identifier=100))
+    http.request.reset_mock()
+
+    async def run():
+        service = zulip_incoming.ZulipIncomingService(url)
+        await service.db.open()
+        service.operations = incoming_operations.Operations(service.db, http)
+        try:
+            values = [
+                {"id": index, **event(identifier=200 + index)} for index in range(1, 17)
+            ]
+            for value in values:
+                value["message"]["subject"] = "Missing topic"
+            async with service.db.transaction() as connection:
+                await service.append(
+                    connection, account, {"queue_id": "missing-topic"}, values
+                )
+            ready = await service.db.sql(zulip_incoming.SELECT_EVENT_SQL, ([], 128))
+            await asyncio.gather(*(service.process(row) for row in ready))
+            intentions = await service.db.sql(
+                "SELECT * FROM zulip_incoming_events WHERE payload->>'type'='ensure_dependency'"
+            )
+            assert len(intentions) == 1
+            assert intentions[0]["payload"]["dependency"]["kind"] == "topic"
+            assert not await service.db.sql(
+                "SELECT 1 FROM zulip_incoming_events WHERE queue_id='missing-topic' AND processed_at IS NOT NULL"
+            )
+            await drain_incoming(service)
+            assert not await service.db.sql(
+                "SELECT 1 FROM zulip_incoming_events WHERE payload->>'type'='ensure_dependency'"
+            )
+            topics = await service.db.sql(
+                "SELECT uuid FROM messenger_topics WHERE project_id=%s AND name='Missing topic'",
+                (account["project_id"],),
+            )
+            assert len(topics) == 1
+            assert (
+                len(
+                    await service.db.sql(
+                        "SELECT 1 FROM messenger_user_topic_bindings WHERE topic_uuid=%s",
+                        (topics[0]["uuid"],),
+                    )
+                )
+                == 1
+            )
+            # A later missing dependency can be ensured again after successful deletion of its intention.
+            async with service.db.transaction() as connection:
+                await connection.execute(zulip_incoming.INCOMING_TRANSACTION_SQL)
+                await connection.execute(
+                    "DELETE FROM messenger_user_topic_bindings WHERE topic_uuid=%s",
+                    (topics[0]["uuid"],),
+                )
+                value = {"id": 17, **event(identifier=217)}
+                value["message"]["subject"] = "Missing topic"
+                await service.append(
+                    connection, account, {"queue_id": "missing-topic"}, [value]
+                )
+            await drain_incoming(service)
+        finally:
+            await service.db.close()
+
+    asyncio.run(run())
+    assert len(api.get("/v1/messenger/messages/").json()) == 18
+    http.request.assert_not_called()
+
+
+def test_dependency_chain_uses_dispatcher_without_inline_catalog_creation(incoming):
+    api, db, account, http, url = incoming
+
+    async def run():
+        service = zulip_incoming.ZulipIncomingService(url)
+        await service.db.open()
+        service.operations = incoming_operations.Operations(service.db, http)
+        try:
+            async with service.db.transaction() as connection:
+                await service.append(
+                    connection,
+                    account,
+                    {"queue_id": "dependency-chain"},
+                    [{"id": 1, **event()}],
+                )
+            ready = await service.db.sql(zulip_incoming.SELECT_EVENT_SQL, ([], 10))
+            await service.process(ready[0])
+            assert not await service.db.sql(
+                "SELECT 1 FROM messenger_streams WHERE project_id=%s",
+                (account["project_id"],),
+            )
+            assert not await service.db.sql(
+                "SELECT 1 FROM messenger_messages WHERE project_id=%s",
+                (account["project_id"],),
+            )
+            http.request.assert_not_called()
+            await drain_incoming(service)
+            assert not await service.db.sql(
+                "SELECT 1 FROM zulip_incoming_events WHERE payload->>'type'='ensure_dependency'"
+            )
+        finally:
+            await service.db.close()
+
+    asyncio.run(run())
+    assert len(api.get("/v1/messenger/messages/").json()) == 1
+    http.request.assert_awaited_once()
+
+
+def test_provider_identity_collisions_do_not_cross_message_or_read_state(incoming):
+    api, db, account, http, url = incoming
+    other = external_models.ExternalAccount(
+        project_id=account["project_id"],
+        owner_user_uuid=account["owner_user_uuid"],
+        provider="zulip",
+        external_account_id="7",
+        status="active",
+        settings={
+            **account["settings"],
+            "server_url": "https://other-zulip.example.com",
+        },
+    )
+    other.insert()
+    with db.cursor(row_factory=rows.dict_row) as cursor:
+        cursor.execute(zulip_incoming.SELECT_ACCOUNT_SQL, (other.uuid,))
+        second = cursor.fetchone()
+    try:
+        apply(incoming, event("First provider"))
+        apply((api, db, second, http, url), event("Second provider"))
+        apply(
+            incoming,
+            {
+                "type": "update_message_flags",
+                "messages": [101],
+                "flag": "read",
+                "op": "add",
+            },
+        )
+        found = db.execute(
+            "SELECT message.provider_uuid,message.payload->>'content',state.read_at IS NOT NULL FROM messenger_messages message JOIN messenger_message_placements placement ON placement.message_uuid=message.uuid AND placement.project_id=message.project_id JOIN messenger_user_message_states state ON state.placement_uuid=placement.uuid AND state.project_id=placement.project_id WHERE message.project_id=%s",
+            (account["project_id"],),
+        ).fetchall()
+        assert set(found) == {
+            (account["provider_uuid"], "First provider", True),
+            (second["provider_uuid"], "Second provider", False),
+        }
+        apply(incoming, {"type": "delete_message", "message_id": 101})
+        assert [
+            row["payload"]["content"]
+            for row in api.get("/v1/messenger/messages/").json()
+        ] == ["Second provider"]
+    finally:
+        other.delete()
+
+
+def test_dependency_enqueue_and_parent_deferral_rollback_together(incoming):
+    _api, db, account, http, url = incoming
+
+    async def run():
+        service = zulip_incoming.ZulipIncomingService(url)
+        await service.db.open()
+        try:
+            async with service.db.transaction() as connection:
+                await service.append(
+                    connection,
+                    account,
+                    {"queue_id": "atomic-intention"},
+                    [{"id": 1, **event()}],
+                )
+            ready = (await service.db.sql(zulip_incoming.SELECT_EVENT_SQL, ([], 10)))[0]
+            with mock.patch.object(
+                zulip_incoming,
+                "RETRY_EVENT_SQL",
+                "SELECT 1/0 FROM (SELECT %s::text,%s::float,%s::bigint) ignored",
+            ):
+                with pytest.raises(psycopg.errors.DivisionByZero):
+                    await service.defer_dependency(
+                        ready,
+                        account,
+                        incoming_operations.MissingDependency(
+                            {"kind": "stream", "identity": "42"}
+                        ),
+                    )
+            assert not await service.db.sql(
+                "SELECT 1 FROM zulip_incoming_events WHERE payload->>'type'='ensure_dependency'"
+            )
+            assert (
+                await service.db.sql(
+                    "SELECT attempts FROM zulip_incoming_events WHERE id=%s",
+                    (ready["id"],),
+                )
+            )[0]["attempts"] == 0
+        finally:
+            await service.db.close()
+
+    asyncio.run(run())
+
+
+def test_dependency_creation_and_intention_removal_rollback_together(incoming):
+    _api, db, account, http, url = incoming
+
+    async def run():
+        service = zulip_incoming.ZulipIncomingService(url)
+        await service.db.open()
+        service.operations = incoming_operations.Operations(service.db, http)
+        try:
+            async with service.db.transaction() as connection:
+                await service.append(
+                    connection,
+                    account,
+                    {"queue_id": "atomic-creation"},
+                    [{"id": 1, **event()}],
+                )
+            parent = (await service.db.sql(zulip_incoming.SELECT_EVENT_SQL, ([], 10)))[
+                0
+            ]
+            await service.process(parent)
+            intention = (
+                await service.db.sql(
+                    "SELECT * FROM zulip_incoming_events WHERE payload->>'type'='ensure_dependency'"
+                )
+            )[0]
+            original = service.operations.ensure_dependency
+
+            async def fail_after_creation(*args):
+                await original(*args)
+                raise psycopg.OperationalError("Connection lost before completion")
+
+            with mock.patch.object(
+                service.operations, "ensure_dependency", fail_after_creation
+            ):
+                await service.process(intention)
+            assert not await service.db.sql(
+                "SELECT 1 FROM messenger_streams WHERE project_id=%s",
+                (account["project_id"],),
+            )
+            assert await service.db.sql(
+                "SELECT 1 FROM zulip_incoming_events WHERE id=%s AND processed_at IS NULL",
+                (intention["id"],),
+            )
+            await service.db.sql(
+                "UPDATE zulip_incoming_events SET next_retry_at=now() WHERE id=%s",
+                (intention["id"],),
+            )
+            await drain_incoming(service)
+            assert not await service.db.sql(
+                "SELECT 1 FROM zulip_incoming_events WHERE payload->>'type'='ensure_dependency'"
+            )
+        finally:
+            await service.db.close()
+
+    asyncio.run(run())
+
+
+def test_permanent_dependency_failure_is_visible_without_retry_amplification(incoming):
+    api, db, account, http, url = incoming
+    apply(incoming, event(identifier=100))
+
+    async def reply(account, method, path, *args, **kwargs):
+        assert path == "/users/8"
+        raise incoming_operations.outgoing_operations.ApiError(
+            404, {"msg": "Unknown user"}
+        )
+
+    http.request.side_effect = reply
+    http.request.reset_mock()
+
+    async def run():
+        service = zulip_incoming.ZulipIncomingService(url)
+        await service.db.open()
+        service.operations = incoming_operations.Operations(service.db, http)
+        unknown = {"id": 1, **event("Unknown sender", 101)}
+        unknown["message"]["sender_id"] = 8
+        try:
+            async with service.db.transaction() as connection:
+                await service.append(
+                    connection,
+                    account,
+                    {"queue_id": "terminal-dependency"},
+                    [unknown, {"id": 2, **event("Valid event", 102)}],
+                )
+            await drain_incoming(service)
+            failures = await service.db.sql(
+                "SELECT payload,error FROM zulip_incoming_events WHERE error IS NOT NULL"
+            )
+            assert len(failures) == 2
+            assert {row["payload"]["type"] for row in failures} == {
+                "message",
+                "ensure_dependency",
+            }
+            assert all(row["error"] for row in failures)
+        finally:
+            await service.db.close()
+
+    asyncio.run(run())
+    http.request.assert_awaited_once()
+    assert {
+        row["payload"]["content"] for row in api.get("/v1/messenger/messages/").json()
+    } == {"Hello", "Valid event"}
