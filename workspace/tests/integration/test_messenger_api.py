@@ -6719,8 +6719,18 @@ def test_message_reaction_crud_is_user_scoped_and_writes_message_events(api, db)
         f"{MESSAGE_REACTIONS}{reaction_uuid}",
         json={"emoji_name": "heart"},
     )
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["emoji_name"] == "heart"
+    assert resp.status_code == 405, resp.text
+    assert (
+        api.get(f"{MESSAGE_REACTIONS}{reaction_uuid}").json()["emoji_name"]
+        == "thumbs_up"
+    )
+    removed = api.delete(f"{MESSAGE_REACTIONS}{reaction_uuid}")
+    assert removed.status_code == 204, removed.text
+    added = api.post(
+        MESSAGE_REACTIONS, json={"message_uuid": message_uuid, "emoji_name": "heart"}
+    )
+    assert added.status_code == 201, added.text
+    heart_reaction_uuid = added.json()["uuid"]
 
     resp = api.get(f"{MESSAGES}{message_uuid}")
     assert resp.status_code == 200, resp.text
@@ -6793,6 +6803,7 @@ def test_message_reaction_crud_is_user_scoped_and_writes_message_events(api, db)
         {"thumbs_up": 1},
         {"eyes": 1, "thumbs_up": 1},
         {"eyes": 1, "thumbs_up": 2},
+        {"eyes": 1, "thumbs_up": 1},
         {"eyes": 1, "heart": 1, "thumbs_up": 1},
         {"heart": 1, "thumbs_up": 1},
     ]
@@ -6816,6 +6827,9 @@ def test_message_reaction_crud_is_user_scoped_and_writes_message_events(api, db)
             "thumbs_up": [str(other_user)],
         },
     ]
+    expected_reaction_user_snapshots.insert(
+        3, {"eyes": [str(api.user_uuid)], "thumbs_up": [str(other_user)]}
+    )
     message_event_rows = [row for row in reaction_event_rows if row[0] == "message"]
     reaction_state_event_rows = [
         row for row in reaction_event_rows if row[0] == "message_reaction"
@@ -6847,7 +6861,8 @@ def test_message_reaction_crud_is_user_scoped_and_writes_message_events(api, db)
         ("created", str(api.user_uuid), reaction_uuid, "thumbs_up"),
         ("created", str(api.user_uuid), second_reaction_uuid, "eyes"),
         ("created", str(other_user), other_reaction_uuid, "thumbs_up"),
-        ("updated", str(api.user_uuid), reaction_uuid, "heart"),
+        ("deleted", str(api.user_uuid), reaction_uuid, "thumbs_up"),
+        ("created", str(api.user_uuid), heart_reaction_uuid, "heart"),
         ("deleted", str(api.user_uuid), second_reaction_uuid, "eyes"),
     ]
     assert len(reaction_state_event_rows) == len(expected_reaction_events)

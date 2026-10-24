@@ -325,7 +325,9 @@ def test_native_stream_accepts_e2ee_with_an_old_key(api, db, encryption):
 
 
 @pytest.mark.parametrize("other_source", ["native"])
-def test_message_update_checks_every_stream_placement(api, db, other_source):
+def test_encrypting_a_message_does_not_change_its_independent_copy(
+    api, db, other_source
+):
     streams = []
     for name in ("Original stream", "Other placement stream"):
         response = api.post(STREAMS, json={"name": name})
@@ -335,14 +337,13 @@ def test_message_update_checks_every_stream_placement(api, db, other_source):
         test_messenger_v2._seed_v2_provider_route(
             db, api.project_id, api.user_uuid, streams[1]["uuid"]
         )
-    canonical_uuid = str(sys_uuid.uuid4())
     plaintext = {"kind": "markdown", "content": "Shared message"}
     placements = []
     for stream in streams:
         response = api.post(
             MESSAGES,
             json={
-                "uuid": canonical_uuid,
+                "uuid": str(sys_uuid.uuid4()),
                 "stream_uuid": stream["uuid"],
                 "payload": plaintext,
             },
@@ -360,7 +361,7 @@ def test_message_update_checks_every_stream_placement(api, db, other_source):
         response.text
     )
     expected = encrypted if other_source == "native" else plaintext
-    for placement_uuid in placements:
+    for index, placement_uuid in enumerate(placements):
         read = api.get(f"{MESSAGES}{placement_uuid}")
         assert read.status_code == 200, read.text
-        assert read.json()["payload"] == expected
+        assert read.json()["payload"] == (expected if index == 0 else plaintext)

@@ -613,9 +613,16 @@ def test_reaction_burst_coalesces_and_preserves_realtime_events(
         f"{MESSAGE_REACTIONS}{reaction_uuid}",
         json={"emoji_name": "heart"},
     )
-    assert updated.status_code == 200, updated.text
+    assert updated.status_code == 405, updated.text
+    removed = api.delete(f"{MESSAGE_REACTIONS}{reaction_uuid}")
+    assert removed.status_code == 204, removed.text
+    added = api.post(
+        MESSAGE_REACTIONS, json={"message_uuid": message["uuid"], "emoji_name": "heart"}
+    )
+    assert added.status_code == 201, added.text
+    heart_reaction_uuid = added.json()["uuid"]
     if delete_reaction:
-        deleted = api.delete(f"{MESSAGE_REACTIONS}{reaction_uuid}")
+        deleted = api.delete(f"{MESSAGE_REACTIONS}{heart_reaction_uuid}")
         assert deleted.status_code in (200, 204), deleted.text
 
     with contexts.Context().session_manager() as session:
@@ -632,10 +639,10 @@ def test_reaction_burst_coalesces_and_preserves_realtime_events(
                    jsonb_agg(execution_stats ORDER BY created_at, uuid)
             FROM messenger_projection_tasks
             WHERE project_id = %s AND task_kind = 'reaction_snapshot'
-              AND payload->>'reaction_uuid' = %s
+              AND payload->>'reaction_uuid' IN (%s,%s)
               AND status = 'completed'
             """,
-            (api.project_id, reaction_uuid),
+            (api.project_id, reaction_uuid, heart_reaction_uuid),
         )
         completed, actually_claimed, execution_stats = cursor.fetchone()
         cursor.execute(
@@ -650,7 +657,7 @@ def test_reaction_burst_coalesces_and_preserves_realtime_events(
         )
         events = cursor.fetchall()
 
-    expected_events = 3 if delete_reaction else 2
+    expected_events = 4 if delete_reaction else 3
     assert completed == expected_events
     assert actually_claimed == 1
     claimed_stats = [stats for stats in execution_stats if stats.get("claim_count")]
@@ -672,7 +679,7 @@ def test_reaction_burst_coalesces_and_preserves_realtime_events(
     reaction_actions = [
         action for kind, action, _payload in events if kind == "message_reaction"
     ]
-    assert reaction_actions == ["created", "updated"] + (
+    assert reaction_actions == ["created", "deleted", "created"] + (
         ["deleted"] if delete_reaction else []
     )
     message_events = [payload for kind, _action, payload in events if kind == "message"]
@@ -1027,7 +1034,9 @@ def test_coalesced_reaction_events_resolve_each_placement(api, db, monkeypatch):
     assert set(guarded_streams) == {stream_uuid for _, stream_uuid in placements}
 
 
-def test_reaction_move_rebuilds_both_message_snapshots(api, db, monkeypatch):
+def test_replacing_a_reaction_on_another_message_rebuilds_both_snapshots(
+    api, db, monkeypatch
+):
     stream, source = _create_message(api, "reaction-move-source")
     target_response = api.post(
         MESSAGES,
@@ -1057,7 +1066,13 @@ def test_reaction_move_rebuilds_both_message_snapshots(api, db, monkeypatch):
         f"{MESSAGE_REACTIONS}{reaction_uuid}",
         json={"message_uuid": target["uuid"], "emoji_name": "heart"},
     )
-    assert moved.status_code == 200, moved.text
+    assert moved.status_code == 405, moved.text
+    removed = api.delete(f"{MESSAGE_REACTIONS}{reaction_uuid}")
+    assert removed.status_code == 204, removed.text
+    added = api.post(
+        MESSAGE_REACTIONS, json={"message_uuid": target["uuid"], "emoji_name": "heart"}
+    )
+    assert added.status_code == 201, added.text
     with contexts.Context().session_manager() as session:
         assert v2_projection.process_one_projection_task(
             session, "integration:reaction-move:new"
@@ -1074,15 +1089,15 @@ def test_reaction_move_rebuilds_both_message_snapshots(api, db, monkeypatch):
             SELECT payload->>'source_kind', status
             FROM messenger_projection_tasks
             WHERE project_id = %s AND task_kind = 'reaction_snapshot'
-              AND payload->>'reaction_uuid' = %s
-              AND payload->>'source_kind' LIKE 'message_reaction.updated%%'
+              AND payload->>'reaction_uuid' IN (%s,%s)
+              AND payload->>'source_kind' IN ('message_reaction.created','message_reaction.deleted')
             ORDER BY created_at, uuid
             """,
-            (api.project_id, reaction_uuid),
+            (api.project_id, reaction_uuid, added.json()["uuid"]),
         )
         assert set(cursor.fetchall()) == {
-            ("message_reaction.updated", "completed"),
-            ("message_reaction.updated_old", "completed"),
+            ("message_reaction.created", "completed"),
+            ("message_reaction.deleted", "completed"),
         }
 
 
