@@ -16,21 +16,20 @@ from workspace.services import zulip_outgoing
 from workspace.bridges.zulip import outgoing_operations
 from workspace.bridges.zulip import message_conversion
 import uuid
+import types
 
 import pytest
 import psycopg
 from restalchemy.common import contexts
 from restalchemy.dm import filters
 
-from workspace.bridges.zulip import client
-from workspace.bridges.zulip.dm import models
 from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.dm import v2_models
 from workspace.tests.integration import conftest
 
 
 @pytest.fixture
-def outgoing(api, db, scheduled_reconciliation, monkeypatch):
+def outgoing(api, db, monkeypatch):
     api.project_id = uuid.UUID(api.project_id)
     api.user_uuid = uuid.UUID(api.user_uuid)
     stream_uuid = uuid.UUID(
@@ -68,7 +67,11 @@ def outgoing(api, db, scheduled_reconciliation, monkeypatch):
         "UPDATE messenger_streams SET provider_uuid=%s,provider_identity='42' WHERE project_id=%s AND uuid=%s",
         (account.provider_uuid, api.project_id, stream_uuid),
     )
-    channel = models.ZulipChannel(
+    channel = types.SimpleNamespace(
+        uuid=uuid.uuid4(),
+        date_created=None,
+        creator_id=None,
+        message_retention_days=None,
         external_account_uuid=account.uuid,
         stream_uuid=stream_uuid,
         stream_id=42,
@@ -80,17 +83,28 @@ def outgoing(api, db, scheduled_reconciliation, monkeypatch):
         history_public_to_subscribers=True,
         is_archived=False,
     )
-    channel.insert()
-    subscription = models.RealtimeSubscription(
-        project_id=api.project_id,
-        external_account_uuid=account.uuid,
-        generation=uuid.uuid4(),
-        queue_id="sender-queue",
-        last_event_id=-1,
-        account_revision=account.subscription_revision(),
-        longpoll_timeout=90,
-    )
-    subscription.insert()
+    conftest.seed_legacy_zulip_channel(db, channel)
+    if db.execute("SELECT to_regclass('zulip_incoming_subscriptions')").fetchone()[0]:
+        db.execute(
+            """INSERT INTO zulip_incoming_subscriptions
+            (external_account_uuid,project_id,provider_uuid,owner_user_uuid,account_identity,
+             server_url,queue_id,last_event_id,longpoll_timeout)
+            VALUES (%s,%s,%s,%s,'7',%s,'sender-queue',-1,90)""",
+            (
+                account.uuid,
+                account.project_id,
+                account.provider_uuid,
+                account.owner_user_uuid,
+                account.settings["server_url"],
+            ),
+        )
+    else:
+        db.execute(
+            """INSERT INTO bridge_zulip_v5_subscriptions
+            (uuid,project_id,external_account_uuid,generation,queue_id,last_event_id,account_revision,longpoll_timeout)
+            VALUES (%s,%s,%s,%s,'sender-queue',-1,'published-schema-test',90)""",
+            (uuid.uuid4(), account.project_id, account.uuid, uuid.uuid4()),
+        )
     remote = {
         "id": 12345,
         "sender_id": 7,
@@ -106,7 +120,6 @@ def outgoing(api, db, scheduled_reconciliation, monkeypatch):
     zulip.send_message.return_value = remote["id"]
     zulip.get_messages.side_effect = lambda first, last: [dict(remote)]
     constructor = mock.Mock(return_value=zulip)
-    monkeypatch.setattr(client, "ZulipClient", constructor)
     yield api, account, channel, remote, zulip, constructor
     for message in v2_models.WorkspaceMessage.objects.get_all(
         filters={"project_id": filters.EQ(api.project_id)}
@@ -117,17 +130,15 @@ def outgoing(api, db, scheduled_reconciliation, monkeypatch):
         filters={"project_id": filters.EQ(api.project_id)}
     ):
         stream.delete()
-    for model in (
-        models.ZulipTopicChange,
-        models.ZulipMessageChange,
-        models.ZulipMessageCounterChange,
-        v2_models.WorkspaceMessageChange,
-        v2_models.WorkspaceMessageCounterChange,
+    for table in (
+        "bridge_zulip_v5_topic_changes",
+        "bridge_zulip_v5_message_changes",
+        "bridge_zulip_v5_message_counter_changes",
+        "messenger_message_changes",
+        "messenger_user_message_counter_changes",
     ):
-        for change in model.objects.get_all(
-            filters={"project_id": filters.EQ(api.project_id)}
-        ):
-            change.delete()
+        if db.execute("SELECT to_regclass(%s)", (table,)).fetchone()[0]:
+            db.execute(f"DELETE FROM {table} WHERE project_id=%s", (api.project_id,))
 
 
 def create(outgoing, canonical_uuid=None):
@@ -546,8 +557,8 @@ def test_other_api_entities_capture_only_provider_operations(
     assert response.status_code == 200, response.text
     assert len(intents(db, account)) == count
     assert db.execute(
-        "SELECT notification_mode FROM bridge_zulip_v5_channels WHERE uuid=%s",
-        (channel.uuid,),
+        "SELECT notification_mode FROM messenger_stream_bindings WHERE project_id=%s AND stream_uuid=%s AND user_uuid=%s",
+        (account.project_id, channel.stream_uuid, account.owner_user_uuid),
     ).fetchone() == ("muted",)
 
     async def run():
@@ -738,29 +749,28 @@ def test_create_then_delete_executes_from_snapshots_after_root_cleanup(
 
 def seed_delivery(account, placement, message):
     """Persist a known copy when testing inbound observations without HTTP."""
-    channel = models.ZulipChannel.objects.get_one(
-        filters={
-            "external_account_uuid": filters.EQ(account.uuid),
-            "stream_uuid": filters.EQ(placement.stream_uuid),
-        }
-    )
     topic = v2_models.WorkspaceStreamTopic.objects.get_one(
         filters={
             "project_id": filters.EQ(account.project_id),
             "uuid": filters.EQ(placement.topic_uuid),
         }
     )
-    delivery = models.MessageDelivery(
-        project_id=account.project_id,
-        message_uuid=message.uuid,
-        stream_uuid=placement.stream_uuid,
-        external_account_uuid=account.uuid,
-        hostname=account.get_host(),
-        external_account_id=account.external_account_id,
-        recipient={"to": channel.stream_id},
-        topic_name=topic.name,
-    )
-    delivery.insert()
+    session = contexts.Context().get_session()
+    row = session.execute(
+        outgoing_operations.UPSERT_SENDING_MESSAGE_SQL,
+        (
+            uuid.uuid4(),
+            account.project_id,
+            message.uuid,
+            placement.stream_uuid,
+            account.uuid,
+            account.get_host(),
+            account.external_account_id,
+            pg_json.Jsonb({"to": 42}),
+            topic.name,
+        ),
+    ).fetchone()
+    delivery = types.SimpleNamespace(uuid=row["uuid"])
     return delivery
 
 
@@ -849,10 +859,14 @@ def test_cutover_preserves_queued_and_unscheduled_changes(outgoing, db):
                 }
             )
             copies.append(seed_delivery(account, placement, message))
-        copies[0].sending = True
-        copies[0].update()
-        copies[1].zulip_message_id = 123
-        copies[1].update()
+        contexts.Context().get_session().execute(
+            "UPDATE bridge_zulip_v5_deliveries SET sending=true WHERE uuid=%s",
+            (copies[0].uuid,),
+        )
+        contexts.Context().get_session().execute(
+            "UPDATE bridge_zulip_v5_deliveries SET zulip_message_id=123 WHERE uuid=%s",
+            (copies[1].uuid,),
+        )
     assert (
         api.post(
             f"/v1/messenger/messages/{second['uuid']}/actions/star/invoke"

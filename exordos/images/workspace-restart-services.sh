@@ -21,8 +21,7 @@ set -o pipefail
 
 SERVICE_NAMES=(
     workspace-api
-    workspace-history-import
-    workspace-zulip-realtime
+    workspace-zulip-incoming
     workspace-zulip-outgoing
     workspace-messenger-worker
     workspace-messenger-events

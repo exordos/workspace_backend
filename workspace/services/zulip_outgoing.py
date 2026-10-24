@@ -98,8 +98,15 @@ FAIL_DELIVERY_SQL = """
 
 
 class Database:
-    def __init__(self, url: str, size: int = 4) -> None:
+    def __init__(
+        self,
+        url: str,
+        size: int = 4,
+        *,
+        application_name: str = "workspace-zulip-outgoing",
+    ) -> None:
         self.url = url
+        self.application_name = application_name
         self.size = size
         self.connections: asyncio.Queue = asyncio.Queue()
 
@@ -112,7 +119,7 @@ class Database:
             self.url,
             autocommit=True,
             row_factory=rows.dict_row,
-            application_name="workspace-zulip-outgoing",
+            application_name=self.application_name,
         )
 
     async def close(self) -> None:
@@ -126,6 +133,17 @@ class Database:
                 connection = await self.connect()
             cursor = await connection.execute(query, parameters)
             return await cursor.fetchall() if cursor.description else []
+        finally:
+            self.connections.put_nowait(connection)
+
+    @contextlib.asynccontextmanager
+    async def transaction(self) -> typing.AsyncIterator[typing.Any]:
+        connection = await self.connections.get()
+        try:
+            if connection.closed:
+                connection = await self.connect()
+            async with connection.transaction():
+                yield connection
         finally:
             self.connections.put_nowait(connection)
 
@@ -146,15 +164,7 @@ class Http:
             await session.close()
         await self.connector.close()
 
-    async def request(
-        self,
-        account: dict,
-        method: str,
-        path: str,
-        data: dict | None = None,
-        *,
-        file: tuple | None = None,
-    ) -> dict:
+    async def session(self, account: dict) -> aiohttp.ClientSession:
         key = str(account["uuid"])
         settings = account["settings"]
         cached = self.sessions.get(key)
@@ -169,7 +179,20 @@ class Http:
                 cookie_jar=aiohttp.DummyCookieJar(),
             )
             self.sessions[key] = (settings, session)
-        session = self.sessions[key][1]
+        return self.sessions[key][1]
+
+    async def request(
+        self,
+        account: dict,
+        method: str,
+        path: str,
+        data: dict | None = None,
+        *,
+        file: tuple | None = None,
+        timeout: float = 30,
+    ) -> dict:
+        session = await self.session(account)
+        settings = account["settings"]
         values = {
             key: json.dumps(value) if not isinstance(value, str) else value
             for key, value in (data or {}).items()
@@ -185,6 +208,7 @@ class Http:
             method,
             settings["server_url"].rstrip("/") + "/api/v1" + path,
             allow_redirects=False,
+            timeout=aiohttp.ClientTimeout(total=timeout, connect=5),
             **kwargs,
         ) as response:
             try:
@@ -198,6 +222,16 @@ class Http:
             if response.status >= 300 or body.get("result") == "error":
                 raise outgoing_operations.ApiError(response.status, body, method)
             return body
+
+    async def download(self, account: dict, path: str) -> tuple[bytes, str]:
+        url = account["settings"]["server_url"].rstrip("/") + path
+        session = await self.session(account)
+        async with session.get(url, allow_redirects=False) as response:
+            if response.status >= 300:
+                raise outgoing_operations.ApiError(
+                    response.status, {"msg": response.reason}, "GET"
+                )
+            return await response.read(), response.content_type
 
 
 class ZulipOutgoingService:

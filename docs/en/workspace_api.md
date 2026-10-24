@@ -21,7 +21,7 @@ Messenger REST API:  http://127.0.0.1:21084/v1/messenger
 Events WebSocket:    ws://127.0.0.1:21082/v1/events/ws
 Workspace REST API:  http://127.0.0.1:21084/v1
 Worker:              workspace-messenger-worker
-History importer:    workspace-history-import
+Zulip incoming:      workspace-zulip-incoming
 Workspace OpenAPI:   http://127.0.0.1:21084/specifications/3.0.3
 ```
 
@@ -2159,11 +2159,12 @@ as generated OpenAPI paths. The private Provider contract is maintained
 separately in
 `workspace_provider_api_v1.yaml`.
 
-The Workspace backend element installs `workspace-api`,
-`workspace-messenger-events`, `workspace-messenger-worker`, and
-`workspace-history-import`. The history importer is a scaffold with an empty
-`step()` method, called every three seconds by default; configure its minimum
-period with `[history_import] step_interval`. The REST API
+The Workspace backend installs `workspace-api`, `workspace-messenger-events`,
+`workspace-messenger-worker`, `workspace-zulip-incoming` and
+`workspace-zulip-outgoing`. The incoming service receives live events using
+long polling and publishes object changes through Workspace client events.
+Historical message imports and backfill tasks are removed. Configure the
+incoming HTTP pool and fallback checks in `[zulip_incoming]`. The REST API
 uses sixteen HTTP workers by default. DBaaS provides PostgreSQL storage, and
 S3aaS stores file bytes and JSON sidecars. The separately versioned
 `workspace_ui` element serves the web UI and proxies API requests to the

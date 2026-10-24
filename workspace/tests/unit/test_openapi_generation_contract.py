@@ -666,8 +666,7 @@ def test_external_account_status_contract():
 
     assert set(schema["properties"]["status"]["enum"]) == {
         "new",
-        "backfill",
-        "fast_backfill",
+        "syncing",
         "active",
         "error",
     }

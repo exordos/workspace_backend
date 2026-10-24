@@ -26,8 +26,7 @@ VENV_PATH="$GC_PATH/.venv"
 
 WORKSPACE_BINARIES=(
     workspace-api
-    workspace-history-import
-    workspace-zulip-realtime
+    workspace-zulip-incoming
     workspace-zulip-outgoing
     workspace-messenger-worker
     workspace-messenger-events
@@ -91,6 +90,8 @@ sudo cp "$GC_PATH/etc/workspace/logging.yaml" "$GC_CFG_DIR/"
 
 cd "$GC_PATH"
 uv sync --locked --no-dev
+
+sudo rm -f /usr/bin/workspace-history-import /usr/bin/workspace-zulip-realtime
 
 for binary in "${WORKSPACE_BINARIES[@]}"; do
     sudo ln -sf "$VENV_PATH/bin/$binary" "/usr/bin/$binary"

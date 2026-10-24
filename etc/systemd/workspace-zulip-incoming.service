@@ -1,14 +1,14 @@
 [Unit]
-Description=Workspace History Import
+Description=Workspace Zulip Incoming Events
 After=network-online.target
 
 [Service]
-TimeoutStopSec=5
+TimeoutStopSec=40
 Restart=always
 RestartSec=5s
 KillSignal=SIGINT
 ExecStartPre=/bin/sleep 2
-ExecStart=workspace-history-import --config-file /etc/workspace/workspace.conf
+ExecStart=workspace-zulip-incoming --config-file /etc/workspace/workspace.conf
 
 [Install]
 WantedBy=multi-user.target

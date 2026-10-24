@@ -105,11 +105,19 @@ SELECT_CHANNEL_SQL = """
 """
 
 SELECT_STREAM_PRIVACY_SQL = """
-    SELECT private
+    SELECT private, provider_identity
     FROM messenger_streams
     WHERE project_id = %s AND uuid = %s
 """
 
+SELECT_REACTION_COPY_SQL = """
+    SELECT data->>'emoji_name' AS emoji_name, data->>'emoji_code' AS emoji_code,
+           data->>'reaction_type' AS reaction_type
+    FROM zulip_entity_links
+    WHERE project_id = %s AND entity_type = 'reaction' AND entity_uuid = %s
+      AND provider_uuid = %s AND data ? 'emoji_code'
+    LIMIT 1
+"""
 SELECT_REACTION_OBSERVATIONS_SQL = """
     SELECT reaction.emoji_name, reaction.emoji_code, reaction.reaction_type
     FROM bridge_zulip_v5_reactions reaction
@@ -183,7 +191,7 @@ SELECT_MESSAGE_RECIPIENTS_SQL = """
 
 SELECT_SUBSCRIPTION_SQL = """
     SELECT queue_id, last_event_id
-    FROM bridge_zulip_v5_subscriptions
+    FROM zulip_incoming_subscriptions
     WHERE external_account_uuid = %s
 """
 
@@ -270,7 +278,7 @@ SELECT_DELIVERY_MESSAGE_SQL = """
 
 SELECT_MESSAGE_RECEIPT_SQL = """
     SELECT payload
-    FROM bridge_zulip_v5_events
+    FROM zulip_incoming_events
     WHERE external_account_uuid = %s AND payload->>'local_message_id' = %s
     LIMIT 1
 """
@@ -430,7 +438,10 @@ class Operations:
             SELECT_STREAM_PRIVACY_SQL,
             (intent["project_id"], data["stream_uuid"]),
         )
-        if streams and streams[0]["private"]:
+        if streams and (
+            streams[0]["private"]
+            or (streams[0]["provider_identity"] or "").startswith("dm:")
+        ):
             return {"channel_type": "group"}
         identity = await self.identity(intent, account, "stream", data["stream_uuid"])
         return {"stream_id": int(typing.cast(str, identity)), "channel_type": "channel"}
@@ -475,6 +486,34 @@ class Operations:
                     observations = await self.db.sql(
                         SELECT_REACTION_OBSERVATIONS_SQL,
                         (intent["project_id"], data["message_uuid"]),
+                    )
+                copies = await self.db.sql(
+                    SELECT_REACTION_COPY_SQL,
+                    (
+                        intent["project_id"],
+                        intent["entity_uuid"],
+                        account["provider_uuid"],
+                    ),
+                )
+                observations = [*observations, *copies]
+                custom = next(
+                    (
+                        row
+                        for row in observations
+                        if row["reaction_type"] != "unicode_emoji"
+                        and row["emoji_name"] == data["emoji_name"]
+                    ),
+                    None,
+                )
+                if custom is not None:
+                    return request(
+                        "reaction",
+                        "DELETE" if operation == "delete" else "POST",
+                        f"/messages/{remote}/reactions",
+                        custom,
+                        message_id=int(remote),
+                        present=operation != "delete",
+                        user_id=int(account["external_account_id"]),
                     )
                 identity = emoji.zulip_identity(data["emoji_name"], observations)
                 if identity is None:
@@ -758,7 +797,7 @@ class Operations:
                 SELECT_MESSAGE_RECIPIENTS_SQL,
                 (intent["project_id"], data["stream_uuid"], account["provider_uuid"]),
             )
-            recipient = [row["id"] for row in peers]
+            recipient = data.get("recipient_ids") or [row["id"] for row in peers]
             topic = None
         subscriptions = await self.db.sql(
             SELECT_SUBSCRIPTION_SQL,

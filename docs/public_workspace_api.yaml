@@ -367,11 +367,6 @@ components:
           type: boolean
           example: true
           default: false
-        has_completed_backfill:
-          type: boolean
-          example: true
-          readOnly: true
-          default: false
         settings:
           type: object
           additionalProperties:
@@ -388,9 +383,8 @@ components:
           type: string
           enum:
           - active
-          - backfill
           - error
-          - fast_backfill
+          - syncing
           - new
           example: new
           default: new
@@ -2503,14 +2497,6 @@ components:
         type: boolean
         example: true
         default: false
-    ExternalAccount_has_completed_backfill:
-      name: has_completed_backfill
-      in: query
-      schema:
-        type: boolean
-        example: true
-        readOnly: true
-        default: false
     ExternalAccount_settings:
       name: settings
       in: query
@@ -2533,9 +2519,8 @@ components:
         type: string
         enum:
         - active
-        - backfill
         - error
-        - fast_backfill
+        - syncing
         - new
         example: new
         default: new
@@ -5321,7 +5306,6 @@ paths:
         - disabled
         - error_description
         - external_account_id
-        - has_completed_backfill
         - owner_user_uuid
         - project_id
         - provider
@@ -5339,7 +5323,6 @@ paths:
       - $ref: '#/components/parameters/ExternalAccount_provider_uuid'
       - $ref: '#/components/parameters/ExternalAccount_external_account_id'
       - $ref: '#/components/parameters/ExternalAccount_disabled'
-      - $ref: '#/components/parameters/ExternalAccount_has_completed_backfill'
       - $ref: '#/components/parameters/ExternalAccount_status'
       - $ref: '#/components/parameters/ExternalAccount_error_description'
       - name: page_limit

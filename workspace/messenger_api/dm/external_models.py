@@ -4,8 +4,6 @@
 # you may not use this file except in compliance with the License.
 
 import enum
-import hashlib
-import json
 import typing
 import urllib.parse
 import uuid as sys_uuid
@@ -45,8 +43,7 @@ class Provider(models.ModelWithUUID, orm.SQLStorableMixin):
 
 class ExternalAccountStatus(str, enum.Enum):
     NEW = "new"
-    BACKFILL = "backfill"
-    FAST_BACKFILL = "fast_backfill"
+    SYNCING = "syncing"
     ACTIVE = "active"
     ERROR = "error"
 
@@ -71,9 +68,6 @@ class ExternalAccount(
         read_only=True,
     )
     disabled = properties.property(types.Boolean(), default=False)
-    has_completed_backfill = properties.property(
-        types.Boolean(), default=False, read_only=True
-    )
     settings = properties.property(types.Dict(), required=True)
     status = properties.property(
         types.Enum([status.value for status in ExternalAccountStatus]),
@@ -141,49 +135,10 @@ class ExternalAccount(
                 "server_url": endpoint._replace(netloc=netloc).geturl(),
             }
 
-    def realtime_revision(self) -> str:
-        return hashlib.sha256(
-            json.dumps(
-                [
-                    str(self.project_id),
-                    str(self.owner_user_uuid),
-                    self.provider,
-                    str(self.provider_uuid),
-                    self.external_account_id,
-                    self.connection_settings(),
-                ],
-                sort_keys=True,
-            ).encode()
-        ).hexdigest()
-
     def connection_settings(self) -> dict:
         return {
             name: self.settings.get(name) for name in ("server_url", "email", "api_key")
         }
-
-    def subscription_revision(self) -> str:
-        return hashlib.sha256(
-            json.dumps(
-                [
-                    str(self.project_id),
-                    str(self.owner_user_uuid),
-                    self.provider,
-                    str(self.provider_uuid),
-                    self.external_account_id,
-                    self.settings["server_url"].rstrip("/"),
-                ],
-                sort_keys=True,
-            ).encode()
-        ).hexdigest()
-
-    def can_stream(self) -> bool:
-        return (
-            self.provider == "zulip"
-            and not self.disabled
-            and self.external_account_id is not None
-            and self.status != ExternalAccountStatus.NEW.value
-            and bool(self.settings.get("api_key"))
-        )
 
     def update_status(
         self,
@@ -192,8 +147,6 @@ class ExternalAccount(
     ) -> None:
         self.status = status
         self.error_description = error_description
-        if status == ExternalAccountStatus.ACTIVE.value:
-            self.properties["has_completed_backfill"].set_value_force(True)
         if not self.is_dirty():
             return
         self.update()

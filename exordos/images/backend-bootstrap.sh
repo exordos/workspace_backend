@@ -48,9 +48,11 @@ rm -f "$READY_FILE"
 SERVICE_NAMES=(
     workspace-api
     workspace-messenger-api
+    # Retired writers must stop before their tables are removed.
     workspace-history-import-worker
     workspace-history-import
     workspace-zulip-realtime
+    workspace-zulip-incoming
     workspace-zulip-outgoing
     workspace-external-bridge-control
     workspace-external-bridge-api

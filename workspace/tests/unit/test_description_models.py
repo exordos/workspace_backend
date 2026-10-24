@@ -6,7 +6,6 @@
 import pytest
 from restalchemy.common import exceptions
 
-from workspace.bridges.zulip.dm import models as zulip_models
 from workspace.common import models as common_models
 from workspace.messenger_api.dm import event_payloads
 from workspace.messenger_api.dm import models as messenger_models
@@ -30,7 +29,6 @@ from workspace.user_api.dm import models as user_models
         event_payloads.StreamUpdatedEventPayload,
         event_payloads.FileCreatedEventPayload,
         event_payloads.FileUpdatedEventPayload,
-        zulip_models.ZulipChannel,
     ],
     ids=lambda model: f"{model.__module__}.{model.__name__}",
 )

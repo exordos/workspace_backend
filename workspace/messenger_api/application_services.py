@@ -14,10 +14,19 @@ import typing
 import uuid as sys_uuid
 
 
-from workspace.bridges.zulip.dm import models as zulip_models
 from workspace.messenger_api import events as messenger_events
+from workspace.messenger_api.dm import helpers
 from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.dm import models as messenger_models
+
+
+SELECT_PROVIDER_MEMBERSHIPS_SQL = """
+    SELECT member.uuid FROM messenger_stream_bindings member
+    JOIN messenger_streams stream
+      ON stream.project_id = member.project_id AND stream.uuid = member.stream_uuid
+    WHERE member.project_id = %s AND member.user_uuid = %s AND member.active
+      AND stream.source_name = 'zulip' AND stream.provider_uuid = %s
+"""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -27,6 +36,34 @@ class ExternalAccountActor:
 
 
 class ExternalAccountApplicationService:
+    @staticmethod
+    def _detach_streams(
+        session: typing.Any,
+        account: external_models.ExternalAccount,
+        provider_uuid: object,
+    ) -> None:
+        bindings = session.execute(
+            SELECT_PROVIDER_MEMBERSHIPS_SQL,
+            (
+                account.project_id,
+                account.owner_user_uuid,
+                provider_uuid,
+            ),
+        ).fetchall()
+        previous = session.execute(
+            "SELECT current_setting('workspace.outgoing_actor', true) AS actor"
+        ).fetchone()["actor"]
+        session.execute("SELECT set_config('workspace.outgoing_actor', '', true)")
+        for binding in bindings:
+            helpers.delete_workspace_stream_binding(
+                account.project_id,
+                binding["uuid"],
+                session=session,
+            )
+        session.execute(
+            "SELECT set_config('workspace.outgoing_actor', %s, true)", (previous or "",)
+        )
+
     @staticmethod
     def delete(
         session: typing.Any,
@@ -44,6 +81,9 @@ class ExternalAccountApplicationService:
         if account.provider != "zulip" or account.external_account_id is None:
             account.delete(session=session)
             return
+        ExternalAccountApplicationService._detach_streams(
+            session, account, account.provider_uuid
+        )
         hostname, user_id = account.get_host(), account.external_account_id
         namespace = sys_uuid.uuid5(sys_uuid.NAMESPACE_DNS, hostname)
         user_uuid = sys_uuid.uuid5(namespace, f"user:{user_id}")
@@ -64,11 +104,6 @@ class ExternalAccountApplicationService:
         else:
             user.source = messenger_models.WorkspaceUserSource.ZULIP.value
             user.update(session=session)
-        zulip_models.Task(
-            project_id=account.project_id,
-            external_account_uuid=account.uuid,
-            content=zulip_models.InitializeConnectionContent(),
-        ).cancel_pending_tasks()
         account.properties["owner_user_uuid"].set_value_force(user.uuid)
         account.settings = {
             name: account.settings[name]
@@ -91,15 +126,6 @@ class ExternalAccountApplicationService:
             **spec,
         )
         account.insert(session=session)
-        if account.provider == "zulip":
-            task = zulip_models.Task(
-                project_id=account.project_id,
-                external_account_uuid=account.uuid,
-                priority=zulip_models.TASK_PRIORITY_INITIALIZE_CONNECTION,
-                content=zulip_models.InitializeConnectionContent(),
-            )
-            task.cancel_pending_tasks(exclude_current=True)
-            task.insert(session=session)
         messenger_events.create_external_resource_event(
             actor.project_id,
             actor.user_uuid,
@@ -122,7 +148,6 @@ class ExternalAccountApplicationService:
             account.provider_uuid,
             account.connection_settings(),
         )
-        previous_revision = account.realtime_revision()
         account.update_dm(values=spec)
         verify_connection = account.provider == "zulip" and connection != (
             account.provider,
@@ -134,19 +159,12 @@ class ExternalAccountApplicationService:
         if verify_connection:
             status = external_models.ExternalAccountStatus.NEW.value
             error_description = None
-        # Keep account and task writes in the same order as the importer.
         account.update_status(
             status,
             error_description=error_description,
         )
-        if verify_connection:
-            task = zulip_models.Task(
-                project_id=account.project_id,
-                external_account_uuid=account.uuid,
-                priority=zulip_models.TASK_PRIORITY_INITIALIZE_CONNECTION,
-                content=zulip_models.InitializeConnectionContent(
-                    previous_revision=previous_revision
-                ),
+        if connection[1] != account.provider_uuid:
+            ExternalAccountApplicationService._detach_streams(
+                session, account, connection[1]
             )
-            task.insert(session=session)
         return account
