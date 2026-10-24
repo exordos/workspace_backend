@@ -385,11 +385,22 @@ class ZulipIncomingService:
 
     @staticmethod
     def ordering_keys(account: dict, event: dict) -> list[str]:
-        keys = {f"account:{account['uuid']}"}
+        message_event = event["type"] in {
+            "message",
+            "update_message",
+            "delete_message",
+            "reaction",
+            "update_message_flags",
+        }
+        if event["type"] == "update_message_flags" and event.get("all"):
+            return ["*"]
+        keys = set() if message_event else {f"account:{account['uuid']}"}
         message = event.get("message", {})
         identifiers = event.get("message_ids", event.get("messages", []))
         identifiers = [*identifiers, event.get("message_id"), message.get("id")]
         keys.update(f"message:{value}" for value in identifiers if value is not None)
+        if message_event:
+            return sorted(keys)
         streams = event.get("stream_ids", [])
         streams = [
             *streams,

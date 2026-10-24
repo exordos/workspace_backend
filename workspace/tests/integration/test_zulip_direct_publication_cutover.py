@@ -141,3 +141,43 @@ def test_cutover_publishes_pending_snapshots_and_discards_empty_flag_artifacts(
         ).fetchone()[0]
         == 1
     )
+
+
+def test_incoming_order_cutover_keeps_entity_fifo_and_explicit_global_barrier(incoming):
+    _api, db, account, _http, _url = incoming
+    for index, all_messages in enumerate((False, True), 1):
+        db.execute(
+            """INSERT INTO zulip_incoming_events
+            (project_id,external_account_uuid,provider_uuid,owner_user_uuid,
+             account_identity,queue_id,event_id,payload,ordering_keys)
+            VALUES (%s,%s,%s,%s,%s,'cassi-old-order',%s,%s,%s)""",
+            (
+                account["project_id"],
+                account["uuid"],
+                account["provider_uuid"],
+                account["owner_user_uuid"],
+                account["external_account_id"],
+                index,
+                incoming_operations.json_value(
+                    {
+                        "type": "update_message_flags",
+                        "messages": [101] if not all_messages else [],
+                        "flag": "read",
+                        "op": "add",
+                        "all": all_messages,
+                    }
+                ),
+                ["account:old", "stream:42", "user:7", "message:101"],
+            ),
+        )
+    path = next(conftest.MIGRATIONS_DIR.glob("0270-*.py"))
+    spec = importlib.util.spec_from_file_location("independent_zulip_cutover", path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    with contexts.Context().session_manager() as session:
+        migration.migration_step.upgrade(session)
+        migration.migration_step.upgrade(session)
+    assert db.execute(
+        "SELECT ordering_keys FROM zulip_incoming_events "
+        "WHERE queue_id='cassi-old-order' ORDER BY event_id"
+    ).fetchall() == [(["message:101"],), (["*"],)]

@@ -1462,3 +1462,53 @@ def test_incoming_publication_lock_contention_rolls_back_and_retries(incoming):
         )
         == 1
     )
+
+
+def test_missing_dependency_does_not_block_another_message_in_the_same_chat(incoming):
+    api, _db, account, http, url = incoming
+
+    async def run():
+        service = zulip_incoming.ZulipIncomingService(url)
+        await service.db.open()
+        operations = incoming_operations.Operations(service.db, http)
+        original_prepare = operations.prepare
+
+        async def prepare(account, payload):
+            if payload.get("message", {}).get("id") == 101:
+                raise incoming_operations.outgoing_operations.Pending(
+                    "Dependency pending"
+                )
+            return await original_prepare(account, payload)
+
+        operations.prepare = prepare
+        service.operations = operations
+        try:
+            async with service.db.transaction() as connection:
+                await service.append(
+                    connection,
+                    account,
+                    {"queue_id": "independent"},
+                    [
+                        {"id": 1, **event("Waiting", 101)},
+                        {"id": 2, **event("Independent", 102)},
+                        {"id": 3, "type": "update_message", "message_id": 101},
+                    ],
+                )
+            ready = await service.db.sql(zulip_incoming.SELECT_EVENT_SQL, ([], 10))
+            assert [row["event_id"] for row in ready] == [1, 2]
+            await asyncio.gather(*(service.process(row) for row in ready))
+            rows = api.get("/v1/messenger/messages/").json()
+            assert [row["payload"]["content"] for row in rows] == ["Independent"]
+            assert any(
+                row["payload"]["kind"] == "message.created"
+                for row in api.get("/v1/events/").json()
+            )
+            assert not await service.db.sql(
+                "SELECT 1 FROM zulip_incoming_events WHERE queue_id=%s AND event_id=3 "
+                "AND processed_at IS NOT NULL",
+                ("independent",),
+            )
+        finally:
+            await service.db.close()
+
+    asyncio.run(run())
