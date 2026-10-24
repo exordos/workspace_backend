@@ -600,13 +600,13 @@ class MutationRuntime:
                         task["project_id"],
                         _uuid(payload["stream_uuid"]),
                         _uuid(payload["topic_uuid"]),
-                        [_uuid(payload["user_uuid"])],
+                        v2_projection._counter_users(payload),
                     )
                 else:
                     changes.stream(
                         task["project_id"],
                         _uuid(payload["stream_uuid"]),
-                        [_uuid(payload["user_uuid"])],
+                        v2_projection._counter_users(payload),
                     )
                 completed = True
             else:

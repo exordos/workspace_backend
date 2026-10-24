@@ -15,16 +15,20 @@ from unittest import mock
 import psycopg
 from psycopg import rows
 import pytest
+from oslo_config import cfg
 from restalchemy.common import contexts
 
 from workspace.bridges.zulip import incoming_operations
+from workspace.common import mutation_journal_opts
 from workspace.messenger_api import file_storage
 from workspace.messenger_api import publication
 from workspace.messenger_api.dm import external_models
 from workspace.services import zulip_incoming
 from workspace.services import zulip_outgoing
 from workspace.services.messenger_workers import v2_projection
+from workspace.services.messenger_workers import mutation_runtime
 from workspace.tests.integration import conftest
+from workspace.tests.integration import test_mutation_journal as journal_tests
 
 
 @pytest.fixture
@@ -810,6 +814,231 @@ def peer_account(incoming, identifier=8):
     return linked, (api, db, data, http, url)
 
 
+@pytest.mark.parametrize("attachment", [False, True])
+def test_first_message_initializes_current_members_and_keeps_personal_flags(
+    incoming, attachment, monkeypatch, tmp_path
+):
+    api, db, account, _http, _url = incoming
+    linked, peer = peer_account(incoming)
+    if attachment:
+        monkeypatch.setenv("WORKSPACE_FILE_STORAGE_PATH", str(tmp_path))
+        _http.download = mock.AsyncMock(
+            return_value=(b"shared attachment", "text/plain")
+        )
+    subscription = {
+        "type": "subscription",
+        "op": "add",
+        "subscriptions": [{"stream_id": 42, "name": "Channel"}],
+    }
+    try:
+        apply(incoming, subscription)
+        apply(peer, subscription)
+        value = {
+            **event(
+                "[shared](/user_uploads/1/a/shared.txt)" if attachment else "Hello", 201
+            ),
+            "flags": ["read", "starred"],
+        }
+        apply(incoming, value)
+        own = api.get("/v1/messenger/messages/").json()[0]
+        others = api.get("/v1/messenger/messages/", user=linked.owner_user_uuid).json()
+        assert len(others) == 1
+        assert others[0]["uuid"] == own["uuid"]
+        assert own["read"] and own["starred"]
+        assert not others[0]["read"] and not others[0]["starred"]
+        if attachment:
+            file_uuid = db.execute(
+                "SELECT uuid FROM m_workspace_files WHERE project_id=%s",
+                (account["project_id"],),
+            ).fetchone()[0]
+            assert (
+                api.get(
+                    f"/v1/messenger/files/{file_uuid}", user=linked.owner_user_uuid
+                ).status_code
+                == 200
+            )
+        assert (
+            api.get(
+                "/v1/messenger/stream_topics/" + own["topic_uuid"],
+                user=linked.owner_user_uuid,
+            ).status_code
+            == 200
+        )
+        apply(
+            peer,
+            {
+                "type": "update_message_flags",
+                "messages": [201],
+                "flag": "starred",
+                "op": "add",
+            },
+        )
+        apply(incoming, value)
+        other = api.get(
+            "/v1/messenger/messages/" + own["uuid"], user=linked.owner_user_uuid
+        ).json()
+        assert other["starred"] and not other["read"]
+        assert (
+            db.execute(
+                "SELECT count(*) FROM messenger_messages WHERE project_id=%s",
+                (account["project_id"],),
+            ).fetchone()[0]
+            == 1
+        )
+    finally:
+        linked.delete()
+
+
+def test_incoming_counter_invalidations_are_batched_by_topic(incoming):
+    _api, db, account, _http, _url = incoming
+    linked, peer = peer_account(incoming)
+    subscription = {
+        "type": "subscription",
+        "op": "add",
+        "subscriptions": [{"stream_id": 42, "name": "Channel"}],
+    }
+    try:
+        apply(incoming, subscription)
+        apply(peer, subscription)
+        apply(incoming, *(event(identifier=value) for value in range(201, 205)))
+        invalidations = db.execute(
+            """SELECT payload FROM messenger_domain_outbox_events
+            WHERE project_id=%s AND event_kind='read_counters'
+              AND payload->>'source_kind'='zulip.incoming'""",
+            (account["project_id"],),
+        ).fetchall()
+        assert len(invalidations) == 4
+        assert all(
+            set(item[0]["user_uuids"])
+            == {str(account["owner_user_uuid"]), str(linked.owner_user_uuid)}
+            for item in invalidations
+        )
+    finally:
+        linked.delete()
+
+
+@pytest.mark.parametrize("journal", [False, True])
+def test_batched_counter_consumers_merge_recipients_without_losing_updates(
+    incoming, journal
+):
+    api, db, account, _http, _url = incoming
+    linked, peer = peer_account(incoming)
+    subscription = {
+        "type": "subscription",
+        "op": "add",
+        "subscriptions": [{"stream_id": 42, "name": "Channel"}],
+    }
+    runtime = mutation_runtime.MutationRuntime() if journal else None
+    try:
+        apply(incoming, subscription)
+        apply(peer, subscription)
+        cfg.CONF.set_override("enabled", journal, group=mutation_journal_opts.DOMAIN)
+        if runtime is not None:
+            journal_tests.drain(runtime, db)
+        else:
+            drain()
+        packets = [event(identifier=value) for value in range(201, 205)]
+        for packet in packets:
+            packet["message"]["timestamp"] += 2
+        apply(incoming, *packets)
+        topic_uuid = api.get("/v1/messenger/messages/").json()[0]["topic_uuid"]
+        with mock.patch.object(
+            v2_projection,
+            "_refresh_recipient_counters",
+            wraps=v2_projection._refresh_recipient_counters,
+        ) as refresh:
+            if runtime is not None:
+                journal_tests.drain(runtime, db)
+            else:
+                drain()
+        merged = [
+            call
+            for call in refresh.call_args_list
+            if str(call.args[3]) == topic_uuid
+            and set(call.args[4])
+            == {account["owner_user_uuid"], linked.owner_user_uuid}
+        ]
+        assert len(merged) == 1
+        for user in (account["owner_user_uuid"], linked.owner_user_uuid):
+            assert (
+                api.get("/v1/messenger/stream_topics/" + topic_uuid, user=user).json()[
+                    "unread_count"
+                ]
+                == 4
+            )
+        apply(
+            incoming,
+            {
+                "type": "update_message_flags",
+                "flag": "read",
+                "op": "add",
+                "messages": [201],
+            },
+        )
+        if runtime is not None:
+            journal_tests.drain(runtime, db)
+        else:
+            drain()
+        assert (
+            api.get("/v1/messenger/stream_topics/" + topic_uuid).json()["unread_count"]
+            == 3
+        )
+        assert (
+            api.get(
+                "/v1/messenger/stream_topics/" + topic_uuid, user=linked.owner_user_uuid
+            ).json()["unread_count"]
+            == 4
+        )
+    finally:
+        if runtime is not None:
+            runtime.close()
+        cfg.CONF.clear_override("enabled", group=mutation_journal_opts.DOMAIN)
+        linked.delete()
+
+
+def test_first_message_uses_membership_at_observation_not_after_rejoin(incoming):
+    api, db, account, http, url = incoming
+    linked, peer = peer_account(incoming)
+    subscription = {
+        "type": "subscription",
+        "op": "add",
+        "subscriptions": [{"stream_id": 42, "name": "Channel"}],
+    }
+    try:
+        apply(incoming, subscription)
+        apply(peer, subscription)
+
+        async def run():
+            service = zulip_incoming.ZulipIncomingService(url)
+            await service.db.open()
+            service.operations = incoming_operations.Operations(service.db, http)
+            try:
+                async with service.db.transaction() as connection:
+                    await service.append(
+                        connection,
+                        account,
+                        {"queue_id": "before-rejoin"},
+                        [{"id": 1, **event(identifier=201)}],
+                    )
+                db.execute(
+                    """UPDATE messenger_stream_bindings SET membership_generation=2,
+                    membership_started_at=now()+interval '1 hour'
+                    WHERE project_id=%s AND user_uuid=%s""",
+                    (account["project_id"], linked.owner_user_uuid),
+                )
+                await drain_incoming(service)
+            finally:
+                await service.db.close()
+
+        asyncio.run(run())
+        assert len(api.get("/v1/messenger/messages/").json()) == 1
+        assert (
+            api.get("/v1/messenger/messages/", user=linked.owner_user_uuid).json() == []
+        )
+    finally:
+        linked.delete()
+
+
 def test_provider_membership_does_not_grant_unobserved_messages_or_files(
     incoming, monkeypatch, tmp_path
 ):
@@ -989,10 +1218,10 @@ def test_direct_messages_share_one_conversation_in_both_directions(incoming):
         ).fetchall()
         assert len(streams) == 1
         assert streams[0] == (account["owner_user_uuid"], linked.owner_user_uuid)
-        assert len(api.get("/v1/messenger/messages/").json()) == 1
+        assert len(api.get("/v1/messenger/messages/").json()) == 2
         assert (
             len(api.get("/v1/messenger/messages/", user=linked.owner_user_uuid).json())
-            == 1
+            == 2
         )
     finally:
         linked.delete()

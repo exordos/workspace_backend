@@ -2145,11 +2145,25 @@ def _process_reaction_snapshot(
         )
 
 
+def _counter_users(payload: typing.Mapping[str, typing.Any]) -> list[sys_uuid.UUID]:
+    return sorted(
+        {
+            _uuid(value)
+            for value in (
+                payload["user_uuids"]
+                if "user_uuids" in payload
+                else [payload["user_uuid"]]
+            )
+        }
+    )
+
+
 def _process_read_counters(
     session: typing.Any, task: typing.Mapping[str, typing.Any]
 ) -> None:
     payload = task["payload"]
-    user_uuid = _uuid(payload["user_uuid"])
+    users = _counter_users(payload)
+    user_uuid = users[0]
     topic_value = payload.get("topic_uuid")
     topic_uuid = None if topic_value is None else _uuid(topic_value)
     if task["scope_kind"] == "user-topic" and topic_uuid is None:
@@ -2172,7 +2186,7 @@ def _process_read_counters(
             task["project_id"],
             _uuid(payload["stream_uuid"]),
             topic_uuid,
-            [user_uuid],
+            users,
             task["scope_kind"],
         )
         return
@@ -2182,7 +2196,7 @@ def _process_read_counters(
         # Counter tasks are authoritative snapshots.  One claimed snapshot can
         # absorb every idle snapshot-only sibling for the same user scope;
         # tasks that must emit a per-message read event remain independent.
-        session.execute(
+        coalesced = session.execute(
             """
             WITH siblings AS MATERIALIZED (
                 SELECT uuid
@@ -2203,6 +2217,7 @@ def _process_read_counters(
                 last_error = NULL, updated_at = NOW()
             FROM siblings
             WHERE task.project_id = %s AND task.uuid = siblings.uuid
+            RETURNING task.payload
             """,
             (
                 task["project_id"],
@@ -2212,34 +2227,44 @@ def _process_read_counters(
                 task["project_id"],
             ),
         )
+        if "user_uuids" in payload:
+            users = sorted(
+                set(users).union(
+                    user
+                    for sibling in coalesced.fetchall()
+                    for user in _counter_users(sibling["payload"])
+                )
+            )
     pending = _refresh_recipient_counters(
         session,
         task["project_id"],
         _uuid(payload["stream_uuid"]),
         topic_uuid,
-        [user_uuid],
+        users,
         task["scope_kind"],
     )
     if pending:
-        _enqueue_counter_outbox_events(
-            session,
-            source_event_uuid=task["outbox_event_uuid"],
-            project_id=task["project_id"],
-            source_kind="zulip.reconciled",
-            user_uuid=user_uuid,
-            stream_uuid=_uuid(payload["stream_uuid"]),
-            topic_uuid=topic_uuid,
-            include_topic=topic_uuid is not None,
-        )
+        for user_uuid in users:
+            _enqueue_counter_outbox_events(
+                session,
+                source_event_uuid=task["outbox_event_uuid"],
+                project_id=task["project_id"],
+                source_kind="zulip.reconciled",
+                user_uuid=user_uuid,
+                stream_uuid=_uuid(payload["stream_uuid"]),
+                topic_uuid=topic_uuid,
+                include_topic=topic_uuid is not None,
+            )
     if task["scope_kind"] == "user-stream":
-        _enqueue_folder_outbox_events(
-            session,
-            source_event_uuid=task["outbox_event_uuid"],
-            project_id=task["project_id"],
-            source_kind=payload["source_kind"],
-            user_uuid=user_uuid,
-            stream_uuid=_uuid(payload["stream_uuid"]),
-        )
+        for user_uuid in users:
+            _enqueue_folder_outbox_events(
+                session,
+                source_event_uuid=task["outbox_event_uuid"],
+                project_id=task["project_id"],
+                source_kind=payload["source_kind"],
+                user_uuid=user_uuid,
+                stream_uuid=_uuid(payload["stream_uuid"]),
+            )
     _try_lock_project_event_tail(session, task["project_id"])
     if payload.get("placement_uuid") and payload.get("emit_message_read"):
         messages = _v2_rows(
@@ -2265,7 +2290,7 @@ def _process_read_counters(
         task["project_id"],
         _uuid(payload["stream_uuid"]),
         topic_uuid,
-        [user_uuid],
+        users,
         task["scope_kind"],
     )
 

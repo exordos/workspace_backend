@@ -679,6 +679,7 @@ class ZulipIncomingService:
                 return
             account = typing.cast(dict, account)
             prepared = await self.operations.prepare(account, event["payload"])
+            prepared["received_at"] = event["received_at"]
             async with self.db.transaction() as connection:
                 if not await self.current(connection, account):
                     return

@@ -262,6 +262,25 @@ SAVE_ATTACHMENT_LINK_SQL = """
     ON CONFLICT (entity_type, entity_uuid, provider_uuid, external_account_uuid)
     DO UPDATE SET data = zulip_entity_links.data || EXCLUDED.data
 """
+SAVE_RECIPIENT_ATTACHMENT_LINKS_SQL = """
+    INSERT INTO zulip_entity_links (
+        project_id, entity_type, entity_uuid, provider_uuid,
+        external_account_uuid, provider_identity, data
+    )
+    SELECT account.project_id, 'file', %s, account.provider_uuid,
+           account.uuid, %s, jsonb_build_object('account_identity',account.external_account_id)
+    FROM m_external_accounts_v2 account
+    JOIN messenger_stream_bindings member
+      ON member.project_id=account.project_id AND member.user_uuid=account.owner_user_uuid
+     AND member.stream_uuid=%s AND member.active
+    JOIN unnest(%s::uuid[],%s::integer[]) AS target(user_uuid,membership_generation)
+      ON target.user_uuid=member.user_uuid
+     AND target.membership_generation=member.membership_generation
+    WHERE account.project_id=%s AND account.provider_uuid=%s
+      AND account.external_account_id IS NOT NULL
+    ON CONFLICT (entity_type, entity_uuid, provider_uuid, external_account_uuid)
+    DO UPDATE SET data=zulip_entity_links.data || EXCLUDED.data
+"""
 SELECT_ATTACHMENT_LINK_SQL = """
     SELECT to_jsonb(file) AS file
     FROM zulip_entity_links link
@@ -277,6 +296,15 @@ SELECT_REACTION_COUNTS_SQL = """
     GROUP BY emoji_name
 """
 
+SELECT_MESSAGE_AUDIENCE_SQL = """
+    SELECT user_uuid, membership_generation
+    FROM messenger_stream_bindings
+    WHERE project_id=%s AND stream_uuid=%s AND active
+      AND (%s::uuid IS NULL OR user_uuid=%s)
+      AND (membership_started_at <= COALESCE(%s::timestamptz,statement_timestamp())
+           OR (user_uuid=%s AND membership_generation=1))
+    ORDER BY user_uuid
+"""
 ENSURE_MESSAGE_BINDINGS_SQL = """
     INSERT INTO messenger_user_message_bindings (
         uuid, project_id, placement_uuid, user_uuid, membership_generation,
@@ -287,8 +315,10 @@ ENSURE_MESSAGE_BINDINGS_SQL = """
            CASE WHEN member.user_uuid = %s THEN 'author' ELSE 'member' END,
            'visible', '{"read":true,"react":true,"star":true,"pin":true}'::jsonb
     FROM messenger_stream_bindings member
+    JOIN unnest(%s::uuid[],%s::integer[]) AS target(user_uuid,membership_generation)
+      ON target.user_uuid=member.user_uuid
+     AND target.membership_generation=member.membership_generation
     WHERE member.project_id = %s AND member.stream_uuid = %s AND member.active
-      AND member.user_uuid = %s
       AND NOT EXISTS (
           SELECT 1 FROM messenger_user_message_bindings existing
           WHERE existing.project_id=member.project_id
@@ -323,7 +353,7 @@ ENSURE_MESSAGE_STATES_SQL = """
           AND provider_uuid = %s AND external_account_id IS NOT NULL
         ORDER BY uuid LIMIT 1
     ) actor ON true
-    WHERE access.project_id = %s AND access.placement_uuid = %s AND access.user_uuid=%s
+    WHERE access.project_id = %s AND access.placement_uuid = %s AND access.user_uuid=ANY(%s::uuid[])
     ON CONFLICT (project_id, user_uuid, placement_uuid) DO UPDATE SET
         membership_generation = EXCLUDED.membership_generation,
         binding_uuid = EXCLUDED.binding_uuid,
@@ -355,7 +385,14 @@ ENSURE_TOPIC_BINDINGS_SQL = """
         ORDER BY uuid LIMIT 1
     ) actor ON true
     WHERE member.project_id = %s AND member.stream_uuid = %s AND member.active
-      AND member.user_uuid = %s
+      AND member.user_uuid = ANY(%s::uuid[])
+      AND NOT EXISTS (
+          SELECT 1 FROM messenger_user_topic_bindings existing
+          WHERE existing.project_id=member.project_id AND existing.topic_uuid=%s
+            AND existing.user_uuid=member.user_uuid
+            AND existing.provider_identity IS NOT DISTINCT FROM
+                (%s || ':' || actor.external_account_id)
+      )
     ON CONFLICT (project_id, user_uuid, topic_uuid) DO UPDATE SET
         source_name=EXCLUDED.source_name,provider_uuid=EXCLUDED.provider_uuid,
         provider_identity=EXCLUDED.provider_identity,status=EXCLUDED.status
@@ -1676,7 +1713,9 @@ class Operations:
                 account["provider_uuid"],
                 account["project_id"],
                 stream["uuid"],
-                account["owner_user_uuid"],
+                [account["owner_user_uuid"]],
+                topic["uuid"],
+                identity,
             ),
         )
         new_binding = await binding_cursor.fetchall()
@@ -1793,26 +1832,26 @@ class Operations:
                 (account["project_id"], placement["stream_uuid"]),
             )
         )
-        for member in members:
-            event_uuid = uuid.uuid4()
-            user = member["user_uuid"]
-            await connection.execute(
-                ENQUEUE_COUNTERS_SQL,
-                (
-                    event_uuid,
-                    account["project_id"],
-                    f"{account['project_id']}:{user}:{placement['topic_uuid']}",
-                    json_value(
-                        {
-                            "source_kind": "zulip.incoming",
-                            "user_uuid": user,
-                            "stream_uuid": placement["stream_uuid"],
-                            "topic_uuid": placement["topic_uuid"],
-                            "placement_uuid": placement["uuid"],
-                        }
-                    ),
+        users = sorted({member["user_uuid"] for member in members}, key=str)
+        if not users:
+            return
+        await connection.execute(
+            ENQUEUE_COUNTERS_SQL,
+            (
+                uuid.uuid4(),
+                account["project_id"],
+                f"{account['project_id']}:topic:{placement['topic_uuid']}",
+                json_value(
+                    {
+                        "source_kind": "zulip.incoming",
+                        "user_uuids": [str(value) for value in users],
+                        "stream_uuid": placement["stream_uuid"],
+                        "topic_uuid": placement["topic_uuid"],
+                        "placement_uuid": placement["uuid"],
+                    }
                 ),
-            )
+            ),
+        )
 
     async def delete_message(
         self, connection: typing.Any, account: dict, remote: object
@@ -1971,6 +2010,20 @@ class Operations:
             },
             connection,
         )
+        audience = await rows(
+            connection,
+            SELECT_MESSAGE_AUDIENCE_SQL,
+            (
+                account["project_id"],
+                stream_uuid,
+                account["owner_user_uuid"] if old else None,
+                account["owner_user_uuid"] if old else None,
+                prepared.get("received_at"),
+                account["owner_user_uuid"],
+            ),
+        )
+        recipient_users = [member["user_uuid"] for member in audience]
+        recipient_generations = [member["membership_generation"] for member in audience]
         current_placements = await rows(
             connection, SELECT_PLACEMENTS_SQL, (account["project_id"], identifier)
         )
@@ -2051,14 +2104,15 @@ class Operations:
                 ),
             )
             await connection.execute(
-                SAVE_ATTACHMENT_LINK_SQL,
+                SAVE_RECIPIENT_ATTACHMENT_LINKS_SQL,
                 (
-                    account["project_id"],
                     values["uuid"],
-                    account["provider_uuid"],
-                    account["uuid"],
                     path,
-                    json_value({"account_identity": account["external_account_id"]}),
+                    stream_uuid,
+                    recipient_users,
+                    recipient_generations,
+                    account["project_id"],
+                    account["provider_uuid"],
                 ),
             )
             if changed or not linked:
@@ -2188,13 +2242,43 @@ class Operations:
                 placement["uuid"],
                 placement["uuid"],
                 author,
+                recipient_users,
+                recipient_generations,
                 account["project_id"],
                 stream_uuid,
-                account["owner_user_uuid"],
                 placement["uuid"],
             ),
         )
         new_access = await access_cursor.fetchall()
+        topic_cursor = await connection.execute(
+            ENSURE_TOPIC_BINDINGS_SQL,
+            (
+                topic["uuid"],
+                topic["uuid"],
+                topic["provider_identity"],
+                account["provider_uuid"],
+                account["project_id"],
+                stream_uuid,
+                [item["user_uuid"] for item in new_access],
+                topic["uuid"],
+                topic["provider_identity"],
+            ),
+        )
+        new_topics = {item["user_uuid"] for item in await topic_cursor.fetchall()}
+        if new_topics:
+            topic_snapshots = await rows(
+                connection,
+                SELECT_SNAPSHOT_SQL.format(view=VIEWS["topic"]),
+                (account["project_id"], topic["uuid"]),
+            )
+            await self.publish(
+                connection,
+                account,
+                "topic.created",
+                topic["uuid"],
+                [item for item in topic_snapshots if item["user_uuid"] in new_topics],
+                stream_uuid,
+            )
         await connection.execute(
             ENSURE_MESSAGE_STATES_SQL,
             (
@@ -2208,7 +2292,7 @@ class Operations:
                 account["provider_uuid"],
                 account["project_id"],
                 placement["uuid"],
-                account["owner_user_uuid"],
+                recipient_users,
             ),
         )
         if "flags" in data:
@@ -2575,7 +2659,7 @@ class Operations:
         context = {"stream_identity": stream["provider_identity"]}
         if kind == "message" and data["type"] != "stream":
             context["recipients"] = data["display_recipient"]
-        await self.dependency(
+        membership = await self.dependency(
             account,
             {
                 "kind": "stream_binding",
@@ -2675,9 +2759,10 @@ class Operations:
                 placement["uuid"],
                 placement["uuid"],
                 message["author_uuid"],
+                [account["owner_user_uuid"]],
+                [membership["membership_generation"]],
                 account["project_id"],
                 stream["uuid"],
-                account["owner_user_uuid"],
                 placement["uuid"],
             ),
         )
@@ -2690,7 +2775,7 @@ class Operations:
                 account["provider_uuid"],
                 account["project_id"],
                 placement["uuid"],
-                account["owner_user_uuid"],
+                [account["owner_user_uuid"]],
             ),
         )
         changed_states = await state_cursor.fetchall()
