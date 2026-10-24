@@ -1340,3 +1340,40 @@ def test_flags_do_not_recreate_a_state_deleted_with_its_message(incoming):
         ).fetchone()[0]
         == 0
     )
+
+
+def test_topic_merge_uses_existing_destination_without_duplicate_identity(incoming):
+    api, db, account, http, _url = incoming
+    apply(incoming, event())
+    destination = {**event(identifier=102)["message"], "subject": "Destination"}
+    apply(incoming, {"type": "message", "message": destination})
+    target = db.execute(
+        "SELECT uuid FROM messenger_topics WHERE project_id=%s "
+        "AND provider_identity='42:Destination'",
+        (account["project_id"],),
+    ).fetchone()[0]
+    http.request.return_value = {
+        "message": {**event()["message"], "subject": "Destination"}
+    }
+    apply(
+        incoming,
+        {
+            "type": "update_message",
+            "message_ids": [101],
+            "stream_id": 42,
+            "orig_subject": "General",
+            "subject": "Destination",
+            "propagate_mode": "change_all",
+        },
+    )
+    drain()
+    topics = db.execute(
+        "SELECT uuid FROM messenger_topics WHERE project_id=%s "
+        "AND deleted_at IS NULL AND provider_identity IN ('42:General','42:Destination')",
+        (account["project_id"],),
+    ).fetchall()
+    assert topics == [(target,)]
+    messages = api.get("/v1/messenger/messages/").json()
+    assert len(messages) == 2
+    assert all(message["topic_uuid"] == str(target) for message in messages)
+    assert len({message["uuid"] for message in messages}) == 2

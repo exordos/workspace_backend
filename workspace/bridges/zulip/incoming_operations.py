@@ -2230,7 +2230,7 @@ class Operations:
             stream_uuid = await self.identity(
                 account, "stream", event["stream_id"], connection=connection
             )
-            for subject in (event["orig_subject"], event["subject"]):
+            for subject in (event["subject"], event["orig_subject"]):
                 identifier = await self.identity(
                     account,
                     "topic",
