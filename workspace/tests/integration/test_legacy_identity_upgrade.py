@@ -30,7 +30,8 @@ V5_HEADS = sorted(
 )
 def test_legacy_conversion_still_requires_coordinated_rollback(captured_table):
     engine = migrations.MigrationEngine(str(conftest.MIGRATIONS_DIR))
-    with conftest.isolated_migration_database(engine.get_latest_migration()) as url:
+    capture_migration = next(conftest.MIGRATIONS_DIR.glob("0247-*.py")).name
+    with conftest.isolated_migration_database(capture_migration) as url:
         with psycopg.connect(url, autocommit=True) as database:
             database.execute(f"CREATE TABLE {captured_table} (kind TEXT)")
         with pytest.raises(RuntimeError, match="coordinated pre-upgrade checkpoint"):
@@ -67,7 +68,16 @@ def test_existing_v5_upgrade_does_not_rewrite_data_or_require_a_bridge(starting_
                 "SELECT to_jsonb(stream) FROM messenger_streams stream WHERE uuid=%s",
                 (stream,),
             ).fetchone()[0]
-            assert {key: after[key] for key in before} == before
+            # The v6 cutover intentionally removes the nested source column.
+            # All original business data must survive its replacement.
+            assert {key: after[key] for key in before if key != "source"} == {
+                key: value for key, value in before.items() if key != "source"
+            }
+            assert "source" not in after
+            assert after["source_name"] == "native"
+            assert after["provider_uuid"] is None
+            assert after["provider_identity"] is None
+            assert after["status"] == "active"
             assert database.execute(
                 "SELECT to_regclass('public.workspace_zulip_v5_legacy_state')"
             ).fetchone() == (None,)
