@@ -51,7 +51,7 @@ SERVICE_NAMES=(
     workspace-history-import-worker
     workspace-history-import
     workspace-zulip-realtime
-    workspace-zulip-task-worker
+    workspace-zulip-outgoing
     workspace-external-bridge-control
     workspace-external-bridge-api
     workspace-messenger-worker

@@ -89,7 +89,6 @@ class ConversionContext:
         self._workspace_messages: set[uuid.UUID] = set()
         self._topic_references: set[tuple[str, str]] = set()
         self._message_versions: dict[str, datetime.datetime | None] = {}
-        self._outgoing = False
         self._delivered: dict[int, dict[str, typing.Any]] = {}
         self._users()
         self._channels()
@@ -346,7 +345,7 @@ class ConversionContext:
                 self.account_ids,
                 list(remote_ids),
                 canonical_ids,
-                self._outgoing,
+                False,
                 self.account.uuid,
                 self.account.owner_user_uuid,
                 self.account.uuid,
@@ -393,7 +392,7 @@ class ConversionContext:
                 self.host,
                 list(remote_ids),
                 canonical_ids,
-                self._outgoing,
+                False,
                 self.account.uuid,
                 self.account.owner_user_uuid,
             ),
@@ -563,7 +562,7 @@ class ConversionContext:
                     source_name="zulip",
                     status="active",
                     provider_uuid=self.account.provider_uuid,
-                    provider_identity=str(uuid.uuid5(self.account.provider_uuid, path)),
+                    provider_identity=path,
                     content_type=content_type,
                     size_bytes=len(data),
                     hash=digest,
@@ -612,80 +611,3 @@ class ConversionContext:
                  AND message.deleted_at IS NULL AND message.payload->>'kind'='markdown'""",
             (self.account.project_id, self.host, message_id),
         ).fetchone()
-
-    def to_zulip(
-        self,
-        payload: dict[str, typing.Any],
-        stream_uuid: uuid.UUID,
-        zulip: client.ZulipClient,
-    ) -> str:
-        self._outgoing = True
-        text = message_conversion.workspace_reference_text(payload["content"])
-        self._topics(text)
-        self._messages(text)
-        references = list(message_conversion.workspace_references(text))
-        quoted = {
-            self.context["message_ids"].get(value)
-            for kind, value, _query in references
-            if kind == "quote"
-        } - {None}
-        for remote_id in quoted:
-            source = self.context["messages"][remote_id]
-            if not source["original_available"]:
-                (original,) = zulip.get_messages(int(remote_id), int(remote_id))
-                source["content"] = original["content"]
-                source["original_available"] = True
-        unresolved = [
-            uuid.UUID(value)
-            for kind, value, _query in references
-            if kind in ("message", "quote") and value not in self.context["message_ids"]
-        ]
-        if unresolved:
-            pending = self.session.execute(
-                """SELECT visible.uuid FROM messenger_api_user_messages_v1 AS visible
-                   JOIN bridge_zulip_v5_channels AS channel ON channel.stream_uuid=visible.stream_uuid
-                    AND channel.external_account_uuid=%s
-                   WHERE visible.project_id=%s AND visible.user_uuid=%s AND visible.visible
-                     AND visible.uuid=ANY(%s) LIMIT 1""",
-                (
-                    self.account.uuid,
-                    self.account.project_id,
-                    self.account.owner_user_uuid,
-                    unresolved,
-                ),
-            ).fetchone()
-            if pending is not None:
-                raise ConversionPendingError(
-                    "Waiting for the referenced message's Zulip identity"
-                )
-        for urn in message_conversion.get_workspace_files(payload, include_quotes=True):
-            file_uuid = uuid.UUID(urn.split(":", 2)[2].partition("?")[0])
-            file = self.session.execute(
-                """SELECT file.* FROM m_workspace_visible_files_v1 AS file
-                   WHERE file.uuid=%s AND (file.acl_mode='public' OR
-                       (file.project_id=%s AND file.viewer_user_uuid=%s))""",
-                (
-                    file_uuid,
-                    self.account.project_id,
-                    self.account.owner_user_uuid,
-                ),
-            ).fetchone()
-            if file is None:
-                raise ValueError(f"Workspace attachment is not accessible: {file_uuid}")
-            link = self.session.execute(
-                """SELECT zulip_url FROM bridge_zulip_v5_file_links
-                   WHERE project_id=%s AND hostname=%s AND stream_uuid=%s AND file_uuid=%s""",
-                (self.account.project_id, self.host, stream_uuid, file_uuid),
-            ).fetchone()
-            if link is None:
-                data = file_storage.read_workspace_file(
-                    file_uuid,
-                    storage_type=file["storage_type"],
-                    storage_object_id=file["storage_object_id"],
-                )
-                url = zulip.upload_file(file["name"], data, file["content_type"])
-                self._file_link(stream_uuid, file_uuid, url)
-            else:
-                url = link["zulip_url"]
-            self.context["files"][url] = urn
-        return message_conversion.workspace_to_zulip(payload, self.context)

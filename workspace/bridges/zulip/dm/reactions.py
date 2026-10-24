@@ -9,7 +9,6 @@ import json
 import typing
 import uuid
 
-import requests
 from restalchemy.common import contexts
 from restalchemy.dm import filters
 from restalchemy.dm import models
@@ -21,7 +20,6 @@ from restalchemy.storage.sql import sessions
 from workspace.common import mutation_journal_opts
 from workspace.services.messenger_workers import owned_projection
 
-from workspace.bridges.zulip import client
 from workspace.common import emoji
 from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.dm import synchronization
@@ -29,7 +27,7 @@ from workspace.messenger_api.dm import v2_models
 
 
 if typing.TYPE_CHECKING:
-    from workspace.bridges.zulip.dm import models as zulip_models
+    pass
 
 
 def _session() -> sessions.PgSQLSession:
@@ -47,11 +45,18 @@ def _enqueue(project_id: uuid.UUID, message_uuid: uuid.UUID) -> None:
                SELECT 1 FROM bridge_zulip_v5_reactions AS reaction
                JOIN bridge_zulip_v5_reaction_messages AS message ON message.uuid=reaction.reaction_message_uuid
                WHERE message.project_id=%s AND message.canonical_message_uuid=%s)
-           OR EXISTS (SELECT 1 FROM bridge_zulip_v5_reaction_intents
-               WHERE project_id=%s AND canonical_message_uuid=%s)
+           OR EXISTS (SELECT 1 FROM zulip_outgoing_intents
+               WHERE project_id=%s AND entity_type='reaction' AND data->>'message_uuid'=%s)
            ON CONFLICT (project_id, canonical_message_uuid) DO UPDATE
                SET revision=EXCLUDED.revision, next_retry_at=NULL""",
-        (project_id, message_uuid, project_id, message_uuid, project_id, message_uuid),
+        (
+            project_id,
+            message_uuid,
+            project_id,
+            message_uuid,
+            project_id,
+            str(message_uuid),
+        ),
     )
 
 
@@ -304,115 +309,8 @@ def remote_state(
     )
 
 
-def _unicode_identity(
-    name: str, observations: list[dict[str, typing.Any]]
-) -> tuple[str, str] | None:
-    code = emoji.code_for_name(name)
-    for row in observations:
-        if row["reaction_type"] == "unicode_emoji" and (
-            (code is not None and emoji.normalize_code(row["emoji_code"]) == code)
-            or emoji.name_for_code(row["emoji_code"], row["emoji_name"]) == name
-        ):
-            # Existing reactions retain the exact code and alias the server
-            # supplied, including emoji introduced after our pinned catalog.
-            return row["emoji_code"], row["emoji_name"]
-    if code is not None and code in emoji.ZULIP_NAME_BY_CODE:
-        return code, emoji.ZULIP_NAME_BY_CODE[code]
-    return None
-
-
-def _schedule(
-    intent: "ReactionIntent", observations: list[dict[str, typing.Any]]
-) -> bool:
-    from workspace.bridges.zulip.dm import models as zulip_models
-
-    identity = _unicode_identity(intent.emoji_name, observations)
-    if identity is None:
-        description = f"Unsupported Unicode emoji: {intent.emoji_name}"
-        _session().execute(
-            "UPDATE bridge_zulip_v5_reaction_intents SET error_description=%s WHERE uuid=%s AND error_description IS DISTINCT FROM %s",
-            (description, intent.uuid, description),
-        )
-        return False
-    code, _name = identity
-    _session().execute(
-        "UPDATE bridge_zulip_v5_reaction_intents SET error_description=NULL "
-        "WHERE uuid=%s AND error_description IS NOT NULL",
-        (intent.uuid,),
-    )
-    targets = _targets(
-        intent.project_id, intent.canonical_message_uuid, intent.user_uuid
-    )
-    verifying_account = False
-    for target in targets:
-        account = external_models.ExternalAccount.objects.get_one(
-            filters={"uuid": filters.EQ(target["external_account_uuid"])}
-        )
-        if not account.can_stream():
-            verifying_account |= (
-                account.status == external_models.ExternalAccountStatus.NEW.value
-                and bool(account.settings.get("api_key"))
-            )
-            continue
-        message = message_for(account, target["message_id"])
-        user_id = int(account.external_account_id)
-        value, at, _remote_name = remote_state(message, user_id, code)
-        if value == intent.present or (
-            at is not None and at >= _naive(intent.changed_at)
-        ):
-            continue
-        revision = account.realtime_revision()
-        task_uuid = uuid.uuid5(
-            intent.uuid,
-            f"{message['uuid']}:{intent.changed_at.isoformat()}:{intent.present}:{revision}",
-        )
-        if (
-            zulip_models.Task.objects.get_one_or_none(
-                filters={"uuid": filters.EQ(task_uuid)}
-            )
-            is None
-        ):
-            zulip_models.Task(
-                uuid=task_uuid,
-                project_id=intent.project_id,
-                external_account_uuid=account.uuid,
-                priority=zulip_models.TASK_PRIORITY_REALTIME_FLAGS,
-                content=zulip_models.UpdateReactionContent(
-                    intent_uuid=intent.uuid,
-                    reaction_message_uuid=message["uuid"],
-                    changed_at=intent.changed_at,
-                    present=intent.present,
-                    account_revision=revision,
-                ),
-            ).insert()
-    return (
-        verifying_account
-        or not targets
-        and any(
-            account.can_stream()
-            for account in external_models.ExternalAccount.objects.get_all(
-                filters={
-                    "project_id": filters.EQ(intent.project_id),
-                    "owner_user_uuid": filters.EQ(intent.user_uuid),
-                    "provider": filters.EQ("zulip"),
-                },
-            )
-        )
-    )
-
-
 def reconcile(project_id: uuid.UUID, canonical_uuid: uuid.UUID) -> bool:
-    # Keep the same account-before-message lock order as outgoing HTTP tasks.
     row_lock = "FOR UPDATE" if owned_projection.CURRENT.get() is None else ""
-    _session().execute(
-        f"""SELECT uuid FROM m_external_accounts_v2 WHERE project_id=%s AND provider='zulip'
-           AND (owner_user_uuid IN (SELECT user_uuid FROM bridge_zulip_v5_reaction_intents
-                   WHERE project_id=%s AND canonical_message_uuid=%s)
-                OR uuid IN (SELECT observer_account_uuid FROM bridge_zulip_v5_reaction_messages
-                   WHERE project_id=%s AND canonical_message_uuid=%s))
-           ORDER BY uuid {row_lock}""",
-        (project_id, project_id, canonical_uuid, project_id, canonical_uuid),
-    )
     messages = (
         _session()
         .execute(
@@ -463,13 +361,19 @@ def _reconcile_observations(
         ):
             name = emoji.name_for_code(row["emoji_code"], row["emoji_name"])
             groups.setdefault((row["owner_user_uuid"], name), []).append(row)
-    intents = ReactionIntent.objects.get_all(
-        filters={
-            "project_id": filters.EQ(project_id),
-            "canonical_message_uuid": filters.EQ(canonical_uuid),
-        }
+    intents = (
+        _session()
+        .execute(
+            """SELECT DISTINCT ON (data->>'user_uuid',data->>'emoji_name')
+            (data->>'user_uuid')::uuid AS user_uuid,data->>'emoji_name' AS emoji_name,
+            operation<>'delete' AS present,created_at AS changed_at,status
+            FROM zulip_outgoing_intents WHERE project_id=%s AND entity_type='reaction'
+              AND data->>'message_uuid'=%s ORDER BY data->>'user_uuid',data->>'emoji_name',id DESC""",
+            (project_id, str(canonical_uuid)),
+        )
+        .fetchall()
     )
-    by_key = {(intent.user_uuid, intent.emoji_name): intent for intent in intents}
+    by_key = {(intent["user_uuid"], intent["emoji_name"]): intent for intent in intents}
     facts = v2_models.WorkspaceMessageReactionFact.objects.get_all(
         filters={
             "project_id": filters.EQ(project_id),
@@ -523,9 +427,11 @@ def _reconcile_observations(
                 default=None,
             )
         if intent is not None and (
-            remote_time is None or _naive(intent.changed_at) > remote_time
+            remote_time is None
+            or intent["status"] != "done"
+            or _naive(intent["changed_at"]) > remote_time
         ):
-            present = intent.present
+            present = intent["present"]
         else:
             present = bool(present_rows)
         if present and fact is None:
@@ -549,13 +455,6 @@ def _reconcile_observations(
             fact.delete()
             _publish(fact, "deleted")
             fact = None
-        if fact is not None and rows and fact.provider_uuid is None:
-            fact.source_name = "zulip"
-            fact.provider_uuid = rows[0]["provider_uuid"]
-            fact.provider_identity = (
-                f"{rows[0]['message_id']}:{rows[0]['user_id']}:{key[1]}"
-            )
-            fact.update()
         for row in rows:
             _session().execute(
                 "UPDATE bridge_zulip_v5_reactions SET fact_uuid=%s WHERE uuid=%s",
@@ -565,171 +464,7 @@ def _reconcile_observations(
         "SELECT set_config('workspace.zulip_reaction_import',%s,true)",
         (previous or "off",),
     )
-    for intent in intents:
-        deferred = _schedule(intent, observations) or deferred
     return deferred
-
-
-def prepare_outgoing(
-    task: "zulip_models.Task",
-) -> (
-    tuple[external_models.ExternalAccount, typing.Any, "ReactionIntent", str, str, int]
-    | None
-):
-    content = task.content
-    from workspace.bridges.zulip.dm import models as zulip_models
-
-    row_lock = "" if mutation_journal_opts.enabled() else "FOR UPDATE"
-    _session().execute(
-        f"SELECT uuid FROM m_external_accounts_v2 WHERE project_id=%s AND uuid=%s {row_lock}",
-        (task.project_id, task.external_account_uuid),
-    )
-    account = external_models.ExternalAccount.objects.get_one(
-        filters={
-            "uuid": filters.EQ(task.external_account_uuid),
-            "project_id": filters.EQ(task.project_id),
-        }
-    )
-    if (
-        not account.can_stream()
-        or account.realtime_revision() != content.account_revision
-    ):
-        raise zulip_models.SubscriptionChangedError()
-    message = (
-        _session()
-        .execute(
-            f"SELECT * FROM bridge_zulip_v5_reaction_messages WHERE uuid=%s AND project_id=%s {row_lock}",
-            (content.reaction_message_uuid, task.project_id),
-        )
-        .fetchone()
-    )
-    intent = ReactionIntent.objects.get_one(
-        filters={
-            "uuid": filters.EQ(content.intent_uuid),
-            "project_id": filters.EQ(task.project_id),
-        }
-    )
-    if intent.changed_at != content.changed_at or intent.present != content.present:
-        return None
-    if (
-        account.owner_user_uuid != intent.user_uuid
-        or message["hostname"] != account.get_host()
-        or message["canonical_message_uuid"] != intent.canonical_message_uuid
-    ):
-        raise zulip_models.SubscriptionChangedError()
-    if not any(
-        row["external_account_uuid"] == account.uuid
-        and row["message_id"] == message["message_id"]
-        for row in _targets(
-            task.project_id, intent.canonical_message_uuid, intent.user_uuid
-        )
-    ):
-        raise zulip_models.SubscriptionChangedError()
-    observations = (
-        _session()
-        .execute(
-            "SELECT emoji_code,emoji_name,reaction_type FROM bridge_zulip_v5_reactions "
-            "WHERE reaction_message_uuid=%s",
-            (message["uuid"],),
-        )
-        .fetchall()
-    )
-    identity = _unicode_identity(intent.emoji_name, observations)
-    if identity is None:
-        raise ValueError(f"Unsupported Unicode emoji: {intent.emoji_name}")
-    code, observed_name = identity
-    user_id = int(account.external_account_id)
-    value, at, name = remote_state(message, user_id, code)
-    if value == intent.present or (at is not None and at >= _naive(intent.changed_at)):
-        return None
-    return account, message, intent, code, name or observed_name, user_id
-
-
-def send_prepared(
-    prepared: tuple[
-        external_models.ExternalAccount, typing.Any, "ReactionIntent", str, str, int
-    ],
-) -> None:
-    account, message, intent, code, name, user_id = prepared
-    if mutation_journal_opts.enabled():
-        from workspace.bridges.zulip.dm import models as zulip_models
-
-        zulip_models.validate_outgoing_account(account)
-    zulip = client.ZulipClient(account)
-    try:
-        try:
-            zulip.update_reaction(
-                message["message_id"],
-                name,
-                code,
-                "unicode_emoji",
-                intent.present,
-            )
-        except (requests.HTTPError, client.ZulipApiError) as error:
-            if (
-                isinstance(error, requests.HTTPError)
-                and error.response.status_code != 400
-            ):
-                raise
-            code_error = (
-                error.code
-                if isinstance(error, client.ZulipApiError)
-                else error.response.json()["code"]
-            )
-            expected = (
-                "REACTION_ALREADY_EXISTS"
-                if intent.present
-                else "REACTION_DOES_NOT_EXIST"
-            )
-            if code_error != expected:
-                raise
-    finally:
-        zulip.close()
-
-
-def confirm_prepared(
-    prepared: tuple[
-        external_models.ExternalAccount, typing.Any, "ReactionIntent", str, str, int
-    ],
-) -> None:
-    account, message, intent, code, name, user_id = prepared
-    _record(
-        message,
-        {
-            "user_id": user_id,
-            "emoji_code": code,
-            "emoji_name": name,
-            "reaction_type": "unicode_emoji",
-        },
-        intent.present,
-        intent.changed_at,
-    )
-
-
-def send(
-    content: "zulip_models.UpdateReactionContent", task: "zulip_models.Task"
-) -> None:
-    prepared = prepare_outgoing(task)
-    if prepared is not None:
-        send_prepared(prepared)
-        confirm_prepared(prepared)
-
-
-class ReactionIntent(
-    models.ModelWithUUID, models.ModelWithProject, orm.SQLStorableMixin
-):
-    __tablename__ = "bridge_zulip_v5_reaction_intents"
-
-    canonical_message_uuid = properties.property(
-        types.UUID(), required=True, read_only=True
-    )
-    user_uuid = properties.property(types.UUID(), required=True, read_only=True)
-    emoji_name = properties.property(types.String(max_length=128), required=True)
-    present = properties.property(types.Boolean(), required=True)
-    changed_at = properties.property(types.UTCDateTimeZ(), required=True)
-    error_description = properties.property(
-        types.AllowNone(types.String()), default=None
-    )
 
 
 class ReactionChange(models.ModelWithID, models.ModelWithProject, orm.SQLStorableMixin):

@@ -8,7 +8,6 @@ import datetime
 import logging
 import time
 import typing
-import types
 import uuid
 
 from gcl_looper.services import basic
@@ -17,8 +16,6 @@ from restalchemy.dm import filters
 
 from workspace.bridges.zulip import client
 from workspace.bridges.zulip.dm import models
-from workspace.bridges.zulip.dm import flags
-from workspace.bridges.zulip.dm import reactions
 from workspace.common import mutation_journal_opts
 from workspace.messenger_api.dm import external_models
 
@@ -124,23 +121,10 @@ class HistoryImportService(basic.BasicService):
         if mutation_journal_opts.enabled() or self.queue != "all" or self.workers != 1:
             self._pool_iteration()
             return
-        prepared = []
         with contexts.Context().session_manager():
             self._ensure_reconciliation_task()
             tasks = self._get_tasks()
             for task in tasks:
-                if isinstance(task.content, models.OutboundMessageContent):
-                    with task.track_execution():
-                        try:
-                            if task.content.prepare(task):
-                                prepared.append(task)
-                        except Exception as error:
-                            task.on_error(error)
-                else:
-                    self._execute_task(task)
-        # Commit the send attempt before HTTP: a crash must not replay POST.
-        for task in prepared:
-            with contexts.Context().session_manager():
                 self._execute_task(task)
         if tasks:
             self.boost(iterations=2)
@@ -252,16 +236,10 @@ class HistoryImportService(basic.BasicService):
         return task
 
     def _run_task(self, task_uuid: uuid.UUID, owner: uuid.UUID) -> None:
-        unsubmitted_delivery = None
         try:
-            if mutation_journal_opts.enabled() and self._run_state_http(
-                task_uuid, owner
-            ):
-                return
             imported, prepare_error, prepare_seconds = self._fetch_import(
                 task_uuid, owner
             )
-            prepared = None
             with contexts.Context().session_manager():
                 task = self._locked_task(task_uuid, owner)
                 if task is None:
@@ -270,95 +248,13 @@ class HistoryImportService(basic.BasicService):
                     task.content._prepared_import = imported
                     task.content._prepared_error = prepare_error
                     task.execution_time = (task.execution_time or 0.0) + prepare_seconds
-                if isinstance(task.content, models.OutboundMessageContent):
-                    with task.track_execution():
-                        try:
-                            if task.content.prepare(task):
-                                prepared = task
-                        except Exception as error:
-                            task.on_error(error)
-                else:
-                    self._execute_task(task)
-            # Preserve the committed attempt marker across a lost HTTP response.
-            if prepared is not None:
-                if isinstance(prepared.content, models.SendMessageContent) and getattr(
-                    prepared.content, "_submit", False
-                ):
-                    unsubmitted_delivery = prepared.content.delivery_uuid
-                with contexts.Context().session_manager():
-                    task = self._locked_task(task_uuid, owner)
-                    if task is not None:
-                        task.content._submit = getattr(
-                            prepared.content, "_submit", False
-                        )
-                        try:
-                            self._execute_task(task)
-                        finally:
-                            if isinstance(
-                                task.content, models.SendMessageContent
-                            ) and not getattr(task.content, "_submit", False):
-                                unsubmitted_delivery = None
+                self._execute_task(task)
         finally:
             with contexts.Context().session_manager() as session:
-                released = session.execute(
-                    "UPDATE bridge_zulip_v5_tasks SET lease_owner=NULL,lease_expires_at=NULL "
-                    "WHERE uuid=%s AND lease_owner=%s RETURNING project_id",
+                session.execute(
+                    "UPDATE bridge_zulip_v5_tasks SET lease_owner=NULL,lease_expires_at=NULL WHERE uuid=%s AND lease_owner=%s",
                     (task_uuid, owner),
-                ).fetchone()
-                if released is not None and unsubmitted_delivery is not None:
-                    # Hold the owned task row until reset commits: a reclaimed
-                    # lease must never clear another worker's send attempt.
-                    session.execute(
-                        "UPDATE bridge_zulip_v5_deliveries SET sending=FALSE "
-                        "WHERE project_id=%s AND uuid=%s AND zulip_message_id IS NULL",
-                        (released["project_id"], unsubmitted_delivery),
-                    )
-
-    def _run_state_http(self, task_uuid: uuid.UUID, owner: uuid.UUID) -> bool:
-        prepared, error = None, None
-        handler: types.ModuleType
-        with contexts.Context().session_manager():
-            task = models.Task.objects.get_one(filters={"uuid": filters.EQ(task_uuid)})
-            if isinstance(task.content, models.UpdateMessageFlagsContent):
-                handler = flags
-            elif isinstance(task.content, models.UpdateReactionContent):
-                handler = reactions
-            else:
-                return False
-            if task.lease_owner != owner:
-                return True
-            try:
-                prepared = handler.prepare_outgoing(task)
-            except Exception as caught:
-                error = caught
-        # There is deliberately no active restalchemy session on this hop.
-        if prepared is not None and error is None:
-            try:
-                handler.send_prepared(prepared)
-            except Exception as caught:
-                error = caught
-        with contexts.Context().session_manager():
-            task = self._locked_task(task_uuid, owner)
-            if task is None:
-                return True
-            with task.track_execution():
-                if error is not None:
-                    task.on_error(error)
-                else:
-                    if prepared is not None:
-                        account = external_models.ExternalAccount.objects.get_one(
-                            filters={"uuid": filters.EQ(task.external_account_uuid)}
-                        )
-                        if (
-                            not account.can_stream()
-                            or account.realtime_revision()
-                            != task.content.account_revision
-                        ):
-                            task.on_error(models.SubscriptionChangedError())
-                            return True
-                        handler.confirm_prepared(prepared)
-                    task.on_done()
-        return True
+                )
 
     @staticmethod
     def _fetch_import(

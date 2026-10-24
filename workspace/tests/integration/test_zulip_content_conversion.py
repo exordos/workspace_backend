@@ -3,7 +3,6 @@
 # you may not use this file except in compliance with the License.
 
 import base64
-import datetime
 import hashlib
 import re
 from unittest import mock
@@ -97,8 +96,8 @@ def test_imported_references_open_real_api_objects_and_convert_back(
         response = api.get(path)
         assert response.status_code == 200, (path, response.text)
     with contexts.Context().session_manager():
-        text = content_conversion.ConversionContext(account).to_zulip(
-            {"kind": "markdown", "content": converted}, stream_uuid, zulip
+        text = test_zulip_outgoing.export(
+            account, {"kind": "markdown", "content": converted}, stream_uuid, zulip
         )
     assert "|7**" in text
     assert "/#narrow/channel/42" in text
@@ -119,8 +118,8 @@ def test_imported_references_open_real_api_objects_and_convert_back(
         assert message_conversion.parse_snapshot("snapshot=" + snapshot) == (
             f'[Alias](urn:user:{account.owner_user_uuid} "silent")'
         )
-        selected = content_conversion.ConversionContext(account).to_zulip(
-            {"kind": "markdown", "content": selected}, stream_uuid, zulip
+        selected = test_zulip_outgoing.export(
+            account, {"kind": "markdown", "content": selected}, stream_uuid, zulip
         )
         assert re.search(r"```quote\n@_\*\*[^*\n]+\|7\*\*\n```", selected)
         assert "urn:user:" not in selected
@@ -207,7 +206,8 @@ def test_silent_notification_names_and_quotes_stay_readable_through_the_api(
     with contexts.Context().session_manager():
         converter = content_conversion.ConversionContext(account)
         rendered = [
-            converter.to_zulip(
+            test_zulip_outgoing.export(
+                converter.account,
                 {"kind": "markdown", "content": content},
                 rows[0].channel.stream_uuid,
                 zulip,
@@ -329,9 +329,7 @@ def test_nested_edited_quote_keeps_snapshot_structure_through_the_api(
     assert payload["content"].endswith("\n\nOutside reply.")
     stream_uuid = imported[0].channel.stream_uuid
     with contexts.Context().session_manager():
-        text = content_conversion.ConversionContext(account).to_zulip(
-            payload, stream_uuid, zulip
-        )
+        text = test_zulip_outgoing.export(account, payload, stream_uuid, zulip)
         returned = content_conversion.ConversionContext(account).to_workspace(
             {**sources[-1], "content": text}, stream_uuid, zulip
         )
@@ -349,99 +347,6 @@ def test_nested_edited_quote_keeps_snapshot_structure_through_the_api(
     assert [
         line for line in returned_snapshot.splitlines() if "urn:quote:" not in line
     ] == [line for line in snapshot.splitlines() if "urn:quote:" not in line]
-
-
-def test_native_delivery_keeps_workspace_text_and_uses_public_message_ids(outgoing, db):
-    api, account, channel, remote, zulip, _constructor = outgoing
-    original = f"[Me](urn:user:{api.user_uuid}) [Chat](urn:stream:{channel.stream_uuid}) :sunset:"
-    remote["content"] = original
-    public = test_zulip_outgoing.create(outgoing)
-    test_zulip_outgoing.dispatch()
-    service = history_import.HistoryImportService()
-    service._iteration()
-    transmitted = zulip.send_message.call_args.args[1]
-    assert "|7**" in transmitted and "/#narrow/channel/42" in transmitted
-    assert "urn:" not in transmitted
-    assert ":city_sunrise:" in transmitted
-    remote["content"] = transmitted
-    test_zulip_outgoing.ready(test_zulip_outgoing.tasks(account)[0])
-    service._iteration()
-    assert (
-        api.get(f"/v1/messenger/messages/{public['uuid']}").json()["payload"]["content"]
-        == original
-    )
-    with contexts.Context().session_manager():
-        converter = content_conversion.ConversionContext(account)
-        converted = converter.to_workspace(
-            {
-                **remote,
-                "id": 12346,
-                "content": f"[Sent](https://zulip.example.com/#narrow/near/{remote['id']})",
-            },
-            channel.stream_uuid,
-            zulip,
-        )
-        assert converted == f"[Sent](urn:message:{public['uuid']})"
-        text = content_conversion.ConversionContext(account).to_zulip(
-            {"kind": "markdown", "content": converted}, channel.stream_uuid, zulip
-        )
-        assert text.endswith(f"/#narrow/near/{remote['id']})")
-    (delivery,) = models.MessageDelivery.objects.get_all(
-        filters={"project_id": filters.EQ(account.project_id)}
-    )
-    external_edit = {
-        **remote,
-        "content": "@**Me|7** :sunset:",
-        "last_edit_timestamp": remote["timestamp"] + 1,
-    }
-    with contexts.Context().session_manager():
-        delivery.observe(external_edit)
-        delivery.observe(remote)
-    content = api.get(f"/v1/messenger/messages/{public['uuid']}").json()["payload"][
-        "content"
-    ]
-    assert f"urn:user:{api.user_uuid}" in content and "🌆" in content
-    legacy_uuid = uuid.uuid4()
-    db.execute(
-        "UPDATE messenger_message_placements SET legacy_public_uuid=%s WHERE project_id=%s AND uuid=%s",
-        (legacy_uuid, account.project_id, public["uuid"]),
-    )
-    with contexts.Context().session_manager():
-        converter = content_conversion.ConversionContext(account)
-        text = converter.to_zulip(
-            {
-                "kind": "markdown",
-                "content": f"[Old link](urn:message:{legacy_uuid})\n[Quote](urn:quote:{public['uuid']})",
-            },
-            channel.stream_uuid,
-            zulip,
-        )
-        assert f"/near/{remote['id']}" in text
-        assert "```quote\n@**Me|7** :sunset:\n```" in text
-        converted = content_conversion.ConversionContext(account).to_workspace(
-            {
-                **remote,
-                "content": f"[Sent](https://zulip.example.com/#narrow/near/{remote['id']})",
-            },
-            channel.stream_uuid,
-            zulip,
-        )
-        assert converted == f"[Sent](urn:message:{public['uuid']})"
-
-
-@pytest.mark.parametrize("kind", ["user", "stream", "topic", "message"])
-def test_missing_mapping_fails_before_the_send_attempt_is_marked(outgoing, kind):
-    _api, account, _channel, remote, zulip, _constructor = outgoing
-    remote["content"] = f"[Unknown](urn:{kind}:{uuid.uuid4()})"
-    test_zulip_outgoing.create(outgoing)
-    test_zulip_outgoing.dispatch()
-    history_import.HistoryImportService()._iteration()
-    (delivery,) = models.MessageDelivery.objects.get_all(
-        filters={"project_id": filters.EQ(account.project_id)}
-    )
-    assert not delivery.sending
-    assert test_zulip_outgoing.tasks(account)[0].status == "error"
-    zulip.send_message.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -713,71 +618,8 @@ def test_realtime_message_is_converted_with_attachments_before_workspace_creatio
     ).fetchone() == (
         "zulip",
         account.provider_uuid,
-        str(uuid.uuid5(account.provider_uuid, path)),
+        path,
     )
-
-
-def test_outgoing_messages_and_forwards_upload_before_sending_and_reuse_files(
-    outgoing, monkeypatch, tmp_path
-):
-    api, account, channel, remote, zulip, _constructor = outgoing
-    monkeypatch.setenv(file_storage.ENV_STORAGE_PATH, str(tmp_path))
-    uploaded = api.post(
-        "/v1/messenger/files/",
-        data={"stream_uuid": str(channel.stream_uuid)},
-        files={"file": ("report.txt", b"report", "text/plain")},
-    )
-    assert uploaded.status_code == 201, uploaded.text
-    body = f"[Me](urn:user:{account.owner_user_uuid}) [report](urn:file:{uploaded.json()['uuid']})"
-    order, sent = [], []
-    path = "/user_uploads/2/new/report.txt"
-
-    def upload(*args):
-        order.append("upload")
-        return path
-
-    def send(recipient, content, topic, queue_id, local_id):
-        order.append("send")
-        sent.append(content)
-        remote["content"] = content
-        return remote["id"]
-
-    zulip.upload_file.side_effect = upload
-    zulip.send_message.side_effect = send
-    remote["content"] = body
-    first = test_zulip_outgoing.create(outgoing)
-    test_zulip_outgoing.dispatch()
-    history_import.HistoryImportService()._iteration()
-    test_zulip_outgoing.ready(test_zulip_outgoing.tasks(account)[0])
-    history_import.HistoryImportService()._iteration()
-    assert order == ["upload", "send"]
-    assert (
-        api.get(f"/v1/messenger/messages/{first['uuid']}").json()["payload"]["content"]
-        == body
-    )
-    snapshot = base64.urlsafe_b64encode(body.encode()).decode().rstrip("=")
-    forward = f"[Forward](urn:forward:{first['uuid']}?snapshot={snapshot})"
-    remote["id"] += 1
-    remote["content"] = forward
-    second = test_zulip_outgoing.create(outgoing)
-    test_zulip_outgoing.dispatch()
-    history_import.HistoryImportService()._iteration()
-    test_zulip_outgoing.ready(test_zulip_outgoing.tasks(account)[-1])
-    history_import.HistoryImportService()._iteration()
-    assert order == ["upload", "send", "send"]
-    assert all(
-        "urn:" not in content and "|7**" in content and f"[report]({path})" in content
-        for content in sent
-    )
-    assert sent[1] == f"```quote\n{sent[0]}\n```"
-    assert (
-        api.get(f"/v1/messenger/messages/{second['uuid']}").json()["payload"]["content"]
-        == forward
-    )
-    zulip.upload_file.assert_called_once_with("report.txt", b"report", "text/plain")
-    assert all(task.status == "done" for task in test_zulip_outgoing.tasks(account)), [
-        (task.content.kind, task.status) for task in test_zulip_outgoing.tasks(account)
-    ]
 
 
 def test_attachments_are_downloadable_and_uploaded_once(
@@ -814,7 +656,8 @@ def test_attachments_are_downloadable_and_uploaded_once(
     )
     with contexts.Context().session_manager():
         assert (
-            content_conversion.ConversionContext(account).to_zulip(
+            test_zulip_outgoing.export(
+                account,
                 {"kind": "markdown", "content": source.content.workspace_content},
                 stream_uuid,
                 zulip,
@@ -828,7 +671,8 @@ def test_attachments_are_downloadable_and_uploaded_once(
         .rstrip("=")
     )
     with contexts.Context().session_manager():
-        text = content_conversion.ConversionContext(account).to_zulip(
+        text = test_zulip_outgoing.export(
+            account,
             {
                 "kind": "markdown",
                 "content": f"[Quote](urn:forward:{uuid.uuid4()}?snapshot={encoded})",
@@ -847,13 +691,16 @@ def test_attachments_are_downloadable_and_uploaded_once(
     zulip.upload_file.return_value = "/user_uploads/1/new/report.txt"
     for _ in range(2):
         with contexts.Context().session_manager():
-            text = content_conversion.ConversionContext(account).to_zulip(
+            text = test_zulip_outgoing.export(
+                account,
                 {"kind": "markdown", "content": f"[report](urn:file:{file_uuid})"},
                 stream_uuid,
                 zulip,
             )
         assert text == "[report](/user_uploads/1/new/report.txt)"
-    zulip.upload_file.assert_called_once_with("report.txt", b"report", "text/plain")
+    assert zulip.upload_file.call_count == 1
+    assert zulip.upload_file.call_args.args[0].endswith("-report.txt")
+    assert zulip.upload_file.call_args.args[1:] == (b"report", "text/plain")
 
 
 @pytest.mark.parametrize("same_server", [True, False])
@@ -880,7 +727,8 @@ def test_context_scopes_user_ids_to_project_and_server(
                 account.owner_user_uuid
             )
             with pytest.raises(ValueError, match="mapping"):
-                converter.to_zulip(
+                test_zulip_outgoing.export(
+                    converter.account,
                     {
                         "kind": "markdown",
                         "content": f"[Foreign](urn:user:{foreign_owner})",
@@ -941,27 +789,6 @@ def test_reconversion_updates_old_content_without_faking_an_edit(
         task.delete()
 
 
-def test_reference_to_pending_native_message_waits_for_its_remote_id(outgoing):
-    _api, account, _channel, remote, zulip, _constructor = outgoing
-    first = test_zulip_outgoing.create(outgoing)
-    remote["content"] = f"[Earlier](urn:message:{first['uuid']})"
-    test_zulip_outgoing.create(outgoing)
-    test_zulip_outgoing.dispatch()
-    _first_task, second_task = test_zulip_outgoing.tasks(account)
-    with contexts.Context().session_manager():
-        with pytest.raises(content_conversion.ConversionPendingError):
-            second_task.content.prepare(second_task)
-    zulip.send_message.assert_not_called()
-    history_import.HistoryImportService()._iteration()
-    with contexts.Context().session_manager() as session:
-        assert second_task.content.prepare(second_task)
-        text = session.execute(
-            "SELECT zulip_content FROM bridge_zulip_v5_content_snapshots WHERE uuid=%s",
-            (second_task.uuid,),
-        ).fetchone()["zulip_content"]
-    assert text == f"[Earlier](https://zulip.example.com/#narrow/near/{remote['id']})"
-
-
 @pytest.mark.parametrize("user_ids", [(7, 8), (7, 8, 9)])
 def test_direct_and_group_chat_links_use_real_conversations(
     history_account, db, monkeypatch, user_ids
@@ -1000,7 +827,8 @@ def test_direct_and_group_chat_links_use_real_conversations(
             )
         assert source.content.workspace_content == f"[Chat](urn:stream:{stream_uuid})"
         with contexts.Context().session_manager():
-            text = content_conversion.ConversionContext(account).to_zulip(
+            text = test_zulip_outgoing.export(
+                account,
                 {"kind": "markdown", "content": source.content.workspace_content},
                 stream_uuid,
                 zulip,
@@ -1042,7 +870,8 @@ def test_quote_cannot_read_another_users_private_history(
         with contexts.Context().session_manager():
             converter = content_conversion.ConversionContext(account)
             with pytest.raises(ValueError, match="mapping"):
-                converter.to_zulip(
+                test_zulip_outgoing.export(
+                    converter.account,
                     {
                         "kind": "markdown",
                         "content": f"[Secret](urn:quote:{public_uuid})",
@@ -1299,8 +1128,8 @@ def test_malformed_workspace_references_export_as_text(
     }
 
     with contexts.Context().session_manager():
-        text = content_conversion.ConversionContext(account).to_zulip(
-            payload, source.channel.stream_uuid, zulip
+        text = test_zulip_outgoing.export(
+            account, payload, source.channel.stream_uuid, zulip
         )
     prefix, mention = text.split("\n")
     assert prefix == original
@@ -1426,7 +1255,8 @@ def test_attachment_export_uses_live_membership_and_allows_public_files(
         )
         with contexts.Context().session_manager():
             with pytest.raises(ValueError, match="not accessible"):
-                content_conversion.ConversionContext(account).to_zulip(
+                test_zulip_outgoing.export(
+                    account,
                     {"kind": "markdown", "content": f"[Private](urn:file:{files[0]})"},
                     channel.stream_uuid,
                     zulip,
@@ -1443,13 +1273,16 @@ def test_attachment_export_uses_live_membership_and_allows_public_files(
         api.project_id = account.project_id
         zulip.upload_file.return_value = "/user_uploads/1/hash/public.txt"
         with contexts.Context().session_manager():
-            text = content_conversion.ConversionContext(account).to_zulip(
+            text = test_zulip_outgoing.export(
+                account,
                 {"kind": "markdown", "content": f"[Public](urn:file:{files[1]})"},
                 channel.stream_uuid,
                 zulip,
             )
         assert text == "[Public](/user_uploads/1/hash/public.txt)"
-        zulip.upload_file.assert_called_once_with("public.txt", b"public", "text/plain")
+        assert zulip.upload_file.call_count == 1
+        assert zulip.upload_file.call_args.args[0].endswith("-public.txt")
+        assert zulip.upload_file.call_args.args[1:] == (b"public", "text/plain")
     finally:
         api.project_id = account.project_id
         for file_uuid in files:
@@ -1475,96 +1308,3 @@ def test_unverified_import_waits_instead_of_guessing_user_identity(
     assert task.status == "retry"
     constructor.assert_not_called()
     assert test_zulip_messages._messages(account) == []
-
-
-def test_editing_imported_content_preserves_its_workspace_representation(
-    history_account, api, db, monkeypatch, scheduled_reconciliation
-):
-    account = history_account
-    account.status = "active"
-    account.settings = {
-        **account.settings,
-        "email": "sender@example.com",
-        "api_key": "sender-key",
-    }
-    account.update()
-    remote = test_zulip_messages._message_data(content="Original")
-    zulip = mock.Mock()
-    zulip.get_messages.side_effect = lambda first, last: [dict(remote)]
-    monkeypatch.setattr(client, "ZulipClient", lambda account: zulip)
-    assert test_zulip_messages._import_history(account).status == "done"
-    _publish(account, db)
-    api.project_id, api.user_uuid = account.project_id, account.owner_user_uuid
-    public = api.get("/v1/messenger/messages/").json()[0]
-    original = f"Edited [My label](urn:user:{account.owner_user_uuid}) :sunset:"
-    response = api.put(
-        f"/v1/messenger/messages/{public['uuid']}",
-        json={"payload": {"kind": "markdown", "content": original}},
-    )
-    assert response.status_code == 200, response.text
-    remote["last_edit_timestamp"] = (
-        int(datetime.datetime.now(datetime.timezone.utc).timestamp()) + 10
-    )
-    zulip.edit_message.side_effect = lambda message_id, text: remote.update(
-        content=text
-    )
-    test_zulip_outgoing.dispatch()
-    history_import.HistoryImportService()._iteration()
-    transmitted = zulip.edit_message.call_args.args[1]
-    assert "urn:" not in transmitted and ":city_sunrise:" in transmitted
-    for _ in range(2):
-        assert test_zulip_messages._import_history(account).status == "done"
-        _publish(account, db)
-        assert (
-            api.get(f"/v1/messenger/messages/{public['uuid']}").json()["payload"][
-                "content"
-            ]
-            == original
-        )
-        assert (
-            test_zulip_messages._messages(account)[0].content.workspace_content
-            == original
-        )
-    remote["content"] = "External :sunset:"
-    remote["last_edit_timestamp"] += 1
-    assert test_zulip_messages._import_history(account).status == "done"
-    assert (
-        api.get(f"/v1/messenger/messages/{public['uuid']}").json()["payload"]["content"]
-        == "External 🌆"
-    )
-    remote["content"] = transmitted
-    remote["last_edit_timestamp"] += 1
-    assert test_zulip_messages._import_history(account).status == "done"
-    assert (
-        api.get(f"/v1/messenger/messages/{public['uuid']}").json()["payload"]["content"]
-        == original
-    )
-    owner = uuid.uuid4()
-    conftest.seed_workspace_user(db, owner, f"observer-{owner}")
-    observer = external_models.ExternalAccount(
-        project_id=account.project_id,
-        owner_user_uuid=owner,
-        provider="zulip",
-        external_account_id="8",
-        status="active",
-        settings=account.settings,
-    )
-    observer.insert()
-    try:
-        test_zulip_messages._channel(observer)
-        account.settings = {
-            key: value for key, value in account.settings.items() if key != "api_key"
-        }
-        account.disabled = True
-        account.update()
-        remote["content"] = "Observed external edit :sunset:"
-        remote["last_edit_timestamp"] += 1
-        assert test_zulip_messages._import_history(observer).status == "done"
-        assert (
-            api.get(f"/v1/messenger/messages/{public['uuid']}").json()["payload"][
-                "content"
-            ]
-            == "Observed external edit 🌆"
-        )
-    finally:
-        observer.delete()

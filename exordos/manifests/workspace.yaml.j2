@@ -448,7 +448,15 @@ resources:
 
 
           [history_import]
+          queue = all
           step_interval = 3
+
+
+          [zulip_outgoing]
+          concurrency = 128
+          connections = 128
+          dependency_delay = 0.01
+          poll_interval = 1
 
 
           [zulip_realtime]
@@ -645,8 +653,8 @@ resources:
           command: /usr/local/bin/workspace-bootstrap
     workspace_zulip_task_worker:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
-      name: workspace-zulip-task-worker
-      path: /usr/bin/workspace-zulip-task-worker --config-file /etc/workspace/workspace.conf
+      name: workspace-zulip-outgoing
+      path: /usr/bin/workspace-zulip-outgoing --config-file /etc/workspace/workspace.conf
       user: root
       target:
         kind: node

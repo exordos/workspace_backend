@@ -93,26 +93,6 @@ class SubscriptionChangedError(Exception):
     pass
 
 
-def validate_outgoing_account(account: external_models.ExternalAccount) -> None:
-    """Authorize this send with a fresh account snapshot, then close the DB hop.
-
-    Revocation after this check cannot cancel an HTTP request already authorized.
-    The completion hop checks the revision again before recording its ACK.
-    """
-    with contexts.Context().session_manager():
-        current = external_models.ExternalAccount.objects.get_one(
-            filters={
-                "uuid": filters.EQ(account.uuid),
-                "project_id": filters.EQ(account.project_id),
-            }
-        )
-        if (
-            not current.can_stream()
-            or current.realtime_revision() != account.realtime_revision()
-        ):
-            raise SubscriptionChangedError()
-
-
 class MessageContent(
     models.ModelWithUUID,
     models.ModelWithTimestamp,
@@ -3127,213 +3107,6 @@ class DeliveryPendingError(Exception):
     pass
 
 
-class UpdateNotificationsContent(AbstractZulipTaskContent):
-    KIND = "update_notifications"
-
-    channel_uuid = properties.property(types.UUID(), required=True, read_only=True)
-    topic_name = properties.property(
-        types.AllowNone(types.String()), default=None, read_only=True
-    )
-    notification_mode = properties.property(
-        types.Enum(
-            [mode.value for mode in messenger_models.WorkspaceTopicNotificationMode]
-            + [mode.value for mode in messenger_models.WorkspaceStreamNotificationMode]
-        ),
-        required=True,
-        read_only=True,
-    )
-
-    account_revision = properties.property(
-        types.String(), required=True, read_only=True
-    )
-
-    def remember(self, channel: "ZulipChannel") -> None:
-        # Reconciliation reads this same cache. Remember the local choice in
-        # the API transaction so the unchanged cache does not immediately undo it.
-        if self.topic_name is None:
-            channel.notification_mode = self.notification_mode
-            channel.update()
-            return
-        name = self.topic_name.lower()
-        row = ZulipTopicNotification.objects.get_one_or_none(
-            filters={
-                "channel_uuid": filters.EQ(channel.uuid),
-                "topic_name": filters.EQ(name),
-            }
-        )
-        policy = {"default": 0, "mute": 1, "unmute": 2, "follow": 3}[
-            self.notification_mode
-        ]
-        if policy == 0:
-            if row is not None:
-                row.delete()
-        elif row is None:
-            ZulipTopicNotification(
-                channel_uuid=channel.uuid,
-                topic_name=name,
-                visibility_policy=policy,
-                last_updated=0,
-            ).insert()
-        else:
-            row.visibility_policy = policy
-            row.last_updated = 0
-            row.update()
-
-    def execute(self, task: "Task") -> None:
-        account = external_models.ExternalAccount.objects.get_one(
-            filters={
-                "uuid": filters.EQ(task.external_account_uuid),
-                "project_id": filters.EQ(task.project_id),
-            }
-        )
-        if (
-            not account.can_stream()
-            or account.realtime_revision() != self.account_revision
-        ):
-            raise SubscriptionChangedError()
-        channel = ZulipChannel.objects.get_one_or_none(
-            filters={
-                "uuid": filters.EQ(self.channel_uuid),
-                "external_account_uuid": filters.EQ(account.uuid),
-                "channel_type": filters.EQ("channel"),
-            }
-        )
-        if channel is None:
-            return
-        zulip = client.ZulipClient(account)
-        try:
-            if self.topic_name is None:
-                zulip.update_stream_notifications(
-                    channel.stream_id, self.notification_mode != "all_messages"
-                )
-            else:
-                zulip.update_topic_notifications(
-                    channel.stream_id,
-                    self.topic_name,
-                    {"default": 0, "mute": 1, "unmute": 2, "follow": 3}[
-                        self.notification_mode
-                    ],
-                )
-        finally:
-            zulip.close()
-        self.remember(channel)
-
-    def on_error(self, task: "Task", error: Exception) -> None:
-        if isinstance(error, SubscriptionChangedError):
-            task.status = TaskStatus.CANCEL.value
-        else:
-            super().on_error(task, error)
-
-
-class UpdateMessageFlagsContent(AbstractZulipTaskContent):
-    KIND = "update_message_flags"
-
-    state_uuid = properties.property(types.UUID(), required=True, read_only=True)
-    flag = properties.property(
-        types.Enum(message_flags.FLAGS), required=True, read_only=True
-    )
-    value = properties.property(types.Boolean(), required=True, read_only=True)
-    changed_at = properties.property(
-        types.UTCDateTimeZ(), required=True, read_only=True
-    )
-    account_revision = properties.property(
-        types.String(), required=True, read_only=True
-    )
-
-    def execute(self, task: "Task") -> None:
-        if not mutation_journal_opts.enabled():
-            message_flags.lock_state(
-                task.project_id, self.state_uuid, task.external_account_uuid
-            )
-        account = external_models.ExternalAccount.objects.get_one(
-            filters={
-                "uuid": filters.EQ(task.external_account_uuid),
-                "project_id": filters.EQ(task.project_id),
-            }
-        )
-        if (
-            not account.can_stream()
-            or account.realtime_revision() != self.account_revision
-        ):
-            raise SubscriptionChangedError()
-        targets = message_flags.flag_states(
-            task.project_id, self.state_uuid, account.uuid, self.flag
-        )
-        if not targets:
-            return
-        target = targets[0]
-        changed_at = self.changed_at.replace(tzinfo=None)
-        if (
-            target["local_updated_at"] != changed_at
-            or target["local_value"] != self.value
-            or (
-                target["remote_updated_at"] is not None
-                and target["remote_updated_at"] >= changed_at
-            )
-        ):
-            return
-        batch = message_flags.outgoing_batch(
-            task.project_id, account.uuid, self.state_uuid, self.flag, self.value
-        )
-        if not batch:
-            return
-        message_ids = sorted({row["message_id"] for row in batch}, reverse=True)
-        zulip = client.ZulipClient(account)
-        try:
-            result = zulip.update_message_flags(message_ids, self.flag, self.value)
-            if result.get("ignored_because_not_subscribed_channels"):
-                raise client.ZulipApiError(
-                    "NOT_SUBSCRIBED",
-                    "Cannot mark messages in unsubscribed Zulip channels as unread",
-                )
-            by_time: dict[datetime.datetime, set[int]] = {}
-            for row in batch:
-                by_time.setdefault(row["local_updated_at"], set()).add(
-                    row["message_id"]
-                )
-            for observed_at, ids in sorted(by_time.items()):
-                message_flags.record(
-                    account,
-                    sorted(ids),
-                    self.flag,
-                    self.value,
-                    observed_at.replace(tzinfo=datetime.timezone.utc),
-                )
-        finally:
-            zulip.close()
-
-    def on_error(self, task: "Task", error: Exception) -> None:
-        if isinstance(error, SubscriptionChangedError):
-            task.status = TaskStatus.CANCEL.value
-        else:
-            super().on_error(task, error)
-
-
-class UpdateReactionContent(AbstractZulipTaskContent):
-    KIND = "update_reaction"
-
-    intent_uuid = properties.property(types.UUID(), required=True, read_only=True)
-    reaction_message_uuid = properties.property(
-        types.UUID(), required=True, read_only=True
-    )
-    changed_at = properties.property(
-        types.UTCDateTimeZ(), required=True, read_only=True
-    )
-    present = properties.property(types.Boolean(), required=True, read_only=True)
-    account_revision = properties.property(
-        types.String(), required=True, read_only=True
-    )
-
-    def execute(self, task: "Task") -> None:
-        message_reactions.send(self, task)
-
-    def on_error(self, task: "Task", error: Exception) -> None:
-        if isinstance(error, SubscriptionChangedError):
-            task.status = TaskStatus.CANCEL.value
-        else:
-            super().on_error(task, error)
-
-
 class RefreshMessageFlagsContent(AbstractZulipTaskContent):
     """Refresh flags and reactions on known messages, including old history."""
 
@@ -3418,295 +3191,6 @@ class RefreshMessageFlagsContent(AbstractZulipTaskContent):
             task.status = TaskStatus.CANCEL.value
         else:
             super().on_error(task, error)
-
-
-class OutboundMessageContent(AbstractTaskContent):
-    delivery_uuid = properties.property(types.UUID(), required=True, read_only=True)
-    content = properties.property(
-        types.String(max_length=40000), required=True, read_only=True
-    )
-
-    def prepare_content(self, task: "Task", delivery: "MessageDelivery") -> str:
-        session = contexts.Context().get_session()
-        snapshot = session.execute(
-            "SELECT zulip_content FROM bridge_zulip_v5_content_snapshots WHERE uuid=%s",
-            (task.uuid,),
-        ).fetchone()
-        if snapshot is not None:
-            return snapshot["zulip_content"]
-        account = delivery.account()
-        zulip = client.ZulipClient(account)
-        try:
-            converter = content_conversion.ConversionContext(account, session=session)
-            text = converter.to_zulip(
-                {"kind": "markdown", "content": self.content},
-                delivery.stream_uuid,
-                zulip,
-            )
-        finally:
-            zulip.close()
-        if len(text) > 10000:
-            raise ValueError("Converted Zulip message exceeds 10000 characters")
-        session.execute(
-            """INSERT INTO bridge_zulip_v5_content_snapshots
-                   (uuid, delivery_uuid, workspace_content, zulip_content)
-               VALUES (%s,%s,%s,%s)""",
-            (task.uuid, delivery.uuid, self.content, text),
-        )
-        return text
-
-    def ready_to_prepare(self, task: "Task") -> bool:
-        row = (
-            contexts.Context()
-            .get_session()
-            .execute(
-                "SELECT status, lease_owner, lease_expires_at FROM bridge_zulip_v5_tasks WHERE uuid=%s FOR UPDATE",
-                (task.uuid,),
-            )
-            .fetchone()
-        )
-        return row["status"] in ("new", "waiting", "retry") and (
-            (
-                getattr(task, "_worker_owner", None) is not None
-                and row["lease_owner"] == task._worker_owner
-            )
-            or row["lease_expires_at"] is None
-            or row["lease_expires_at"]
-            <= datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
-        )
-
-    def claim(self, task: "Task") -> None:
-        task.lease_owner = getattr(task, "_worker_owner", None) or sys_uuid.uuid4()
-        task.lease_expires_at = datetime.datetime.now(
-            datetime.timezone.utc
-        ) + datetime.timedelta(minutes=2)
-        task.update()
-
-    def delivery(self, task: "Task") -> "MessageDelivery":
-        session = contexts.Context().get_session()
-        session.execute(
-            "SELECT uuid FROM m_external_accounts_v2 WHERE uuid=%s AND project_id=%s FOR UPDATE",
-            (task.external_account_uuid, task.project_id),
-        )
-        session.execute(
-            "SELECT uuid FROM bridge_zulip_v5_deliveries WHERE uuid=%s FOR UPDATE",
-            (self.delivery_uuid,),
-        )
-        delivery = MessageDelivery.objects.get_one(
-            filters={
-                "uuid": filters.EQ(self.delivery_uuid),
-                "project_id": filters.EQ(task.project_id),
-            }
-        )
-        delivery.account()
-        if delivery.external_account_uuid != task.external_account_uuid:
-            raise SubscriptionChangedError()
-        return delivery
-
-    def on_error(self, task: "Task", error: Exception) -> None:
-        if (
-            isinstance(self, SendMessageContent)
-            and isinstance(error, requests.HTTPError)
-            and 400 <= error.response.status_code < 500
-        ):
-            delivery = MessageDelivery.objects.get_one(
-                filters={"uuid": filters.EQ(self.delivery_uuid)}
-            )
-            if delivery.zulip_message_id is None:
-                delivery.sending = False
-                delivery.update()
-        if isinstance(error, SubscriptionChangedError):
-            task.status = TaskStatus.CANCEL.value
-        elif isinstance(
-            error,
-            (
-                DeliveryPendingError,
-                content_conversion.ConversionPendingError,
-                requests.Timeout,
-                requests.ConnectionError,
-            ),
-        ) or (
-            isinstance(error, requests.HTTPError)
-            and (
-                error.response.status_code in (408, 429)
-                or error.response.status_code >= 500
-            )
-        ):
-            task.status = TaskStatus.RETRY.value
-            task.next_retry_at = datetime.datetime.now(datetime.timezone.utc) + (
-                REALTIME_MESSAGE_RETRY_DELAY
-                if isinstance(
-                    error,
-                    (DeliveryPendingError, content_conversion.ConversionPendingError),
-                )
-                else datetime.timedelta(seconds=3)
-            )
-
-
-class SendMessageContent(OutboundMessageContent):
-    KIND = "send_message"
-
-    def prepare(self, task: "Task") -> bool:
-        delivery = self.delivery(task)
-        if not self.ready_to_prepare(task):
-            return False
-        self._submit = not delivery.sending and delivery.zulip_message_id is None
-        if self._submit:
-            subscription = RealtimeSubscription.for_account(delivery.account())
-            if subscription is None:
-                raise DeliveryPendingError(
-                    "Waiting for the sender's realtime subscription"
-                )
-            self.prepare_content(task, delivery)
-            delivery.sending = True
-            delivery.update()
-        self.claim(task)
-        return True
-
-    def execute(self, task: "Task") -> None:
-        delivery = self.delivery(task)
-        if delivery.delivered_at is not None:
-            return
-        if delivery.zulip_message_id is None and not getattr(self, "_submit", False):
-            # The attempt marker commits before HTTP. After a lost response or
-            # worker crash, wait for local echo instead of posting a duplicate.
-            raise DeliveryPendingError(
-                "Waiting for the Zulip send result or local echo"
-            )
-        account = delivery.account()
-        zulip = client.ZulipClient(account)
-        try:
-            if delivery.zulip_message_id is None:
-                subscription = RealtimeSubscription.for_account(account)
-                if subscription is None:
-                    raise DeliveryPendingError(
-                        "Waiting for the sender's realtime subscription"
-                    )
-                text = (
-                    contexts.Context()
-                    .get_session()
-                    .execute(
-                        "SELECT zulip_content FROM bridge_zulip_v5_content_snapshots WHERE uuid=%s",
-                        (task.uuid,),
-                    )
-                    .fetchone()["zulip_content"]
-                )
-                self._submit = False
-                delivery.zulip_message_id = zulip.send_message(
-                    delivery.recipient["to"],
-                    text,
-                    delivery.topic_name,
-                    subscription.queue_id,
-                    str(delivery.uuid),
-                )
-                delivery.update()
-            else:
-                (data,) = zulip.get_messages(
-                    delivery.zulip_message_id, delivery.zulip_message_id
-                )
-                delivery.observe(data)
-        finally:
-            zulip.close()
-
-    def on_done(self, task: "Task") -> None:
-        delivery = MessageDelivery.objects.get_one(
-            filters={"uuid": filters.EQ(self.delivery_uuid)}
-        )
-        if delivery.delivered_at is None:
-            task.status = TaskStatus.RETRY.value
-            task.next_retry_at = (
-                datetime.datetime.now(datetime.timezone.utc)
-                + REALTIME_MESSAGE_RETRY_DELAY
-            )
-
-
-class EditMessageContent(OutboundMessageContent):
-    KIND = "edit_message"
-
-    def prepare(self, task: "Task") -> bool:
-        delivery = self.delivery(task)
-        if not self.ready_to_prepare(task):
-            return False
-        if delivery.zulip_message_id is None or delivery.delivered_at is None:
-            raise DeliveryPendingError("Waiting for message delivery before editing")
-        message = v2_models.WorkspaceMessage.objects.get_one(
-            filters={
-                "uuid": filters.EQ(delivery.message_uuid),
-                "project_id": filters.EQ(task.project_id),
-            }
-        )
-        if message.payload.content == self.content:
-            self.prepare_content(task, delivery)
-        self.claim(task)
-        return True
-
-    def execute(self, task: "Task") -> None:
-        delivery = self.delivery(task)
-        if delivery.zulip_message_id is None or delivery.delivered_at is None:
-            raise DeliveryPendingError("Waiting for message delivery before editing")
-        message = v2_models.WorkspaceMessage.objects.get_one(
-            filters={
-                "uuid": filters.EQ(delivery.message_uuid),
-                "project_id": filters.EQ(task.project_id),
-            }
-        )
-        if message.payload.content != self.content:
-            return
-        text = self.prepare_content(task, delivery)
-        zulip = client.ZulipClient(delivery.account())
-        try:
-            zulip.edit_message(delivery.zulip_message_id, text)
-            (data,) = zulip.get_messages(
-                delivery.zulip_message_id, delivery.zulip_message_id
-            )
-            delivery.observe(data)
-        finally:
-            zulip.close()
-
-
-class DeleteMessageContent(AbstractTaskContent):
-    KIND = "delete_message"
-
-    message_id = properties.property(types.Integer(min_value=1), required=True)
-    hostname = properties.property(types.String(), required=True)
-    external_account_id = properties.property(types.String(), required=True)
-    author_uuid = properties.property(types.UUID(), required=True)
-
-    def execute(self, task: "Task") -> None:
-        account = external_models.ExternalAccount.objects.get_one(
-            filters={
-                "project_id": filters.EQ(task.project_id),
-                "uuid": filters.EQ(task.external_account_uuid),
-            }
-        )
-        if (
-            account.provider != "zulip"
-            or account.get_host() != self.hostname
-            or account.external_account_id != self.external_account_id
-            or account.owner_user_uuid != self.author_uuid
-            or not account.can_stream()
-        ):
-            raise SubscriptionChangedError()
-        zulip = client.ZulipClient(account)
-        try:
-            zulip.delete_message(self.message_id)
-        finally:
-            zulip.close()
-
-    def on_error(self, task: "Task", error: Exception) -> None:
-        if isinstance(error, SubscriptionChangedError):
-            task.status = TaskStatus.CANCEL.value
-        elif isinstance(error, (requests.Timeout, requests.ConnectionError)) or (
-            isinstance(error, requests.HTTPError)
-            and (
-                error.response.status_code in (408, 429)
-                or error.response.status_code >= 500
-            )
-        ):
-            task.status = TaskStatus.RETRY.value
-            task.next_retry_at = datetime.datetime.now(
-                datetime.timezone.utc
-            ) + datetime.timedelta(seconds=3)
 
 
 class ConvertMessageContent(AbstractTaskContent):
@@ -3995,13 +3479,7 @@ TASK_CONTENT_TYPE = types_dynamic.KindModelSelectorType(
     types_dynamic.KindModelType(ScanHistoryContent),
     types_dynamic.KindModelType(ReconcileRealtimeContent),
     types_dynamic.KindModelType(ConvertMessageContent),
-    types_dynamic.KindModelType(UpdateReactionContent),
-    types_dynamic.KindModelType(UpdateMessageFlagsContent),
-    types_dynamic.KindModelType(UpdateNotificationsContent),
     types_dynamic.KindModelType(RefreshMessageFlagsContent),
-    types_dynamic.KindModelType(SendMessageContent),
-    types_dynamic.KindModelType(EditMessageContent),
-    types_dynamic.KindModelType(DeleteMessageContent),
     types_dynamic.KindModelType(InitializeConnectionContent),
     types_dynamic.KindModelType(FullBackfillContent),
     types_dynamic.KindModelType(ActualizeBackfillContent),
@@ -4086,12 +3564,6 @@ class Task(
         if "queue" not in kwargs and typing.cast(
             AbstractTaskContent, kwargs["content"]
         ).kind in (
-            "send_message",
-            "edit_message",
-            "delete_message",
-            "update_message_flags",
-            "update_notifications",
-            "update_reaction",
             "initialize_connection",
             "reconcile_realtime",
         ):
@@ -4543,21 +4015,6 @@ class RealtimeEvent(
                     )
                     if delivery is not None:
                         delivery.observe(self.payload["message"])
-                        for task in Task.objects.get_all(
-                            filters={
-                                "project_id": filters.EQ(self.project_id),
-                                "content": filters.JSONFields(
-                                    {
-                                        "kind": "send_message",
-                                        "delivery_uuid": str(delivery.uuid),
-                                    }
-                                ),
-                                "status": filters.In(["error", "retry"]),
-                            }
-                        ):
-                            task.status = TaskStatus.RETRY.value
-                            task.next_retry_at = None
-                            task.update()
                 message_ids = [self.payload["message"]["id"]]
             elif "message_ids" in self.payload:
                 message_ids = self.payload["message_ids"]
@@ -4796,26 +4253,24 @@ class MessageDelivery(
         types.AllowNone(types.String(max_length=40000)), default=None
     )
 
-    def account(self, sending: bool = True) -> external_models.ExternalAccount:
+    def account(self) -> external_models.ExternalAccount:
         account = external_models.ExternalAccount.objects.get_one(
             filters={
                 "uuid": filters.EQ(self.external_account_uuid),
                 "project_id": filters.EQ(self.project_id),
             }
         )
-        message = v2_models.WorkspaceMessage.objects.get_one(
+        message = v2_models.WorkspaceMessage.objects.get_one_or_none(
             filters={
                 "uuid": filters.EQ(self.message_uuid),
                 "project_id": filters.EQ(self.project_id),
             }
         )
         if (
-            account.owner_user_uuid != message.author_uuid
-            or message.deleted_at is not None
+            (message is not None and account.owner_user_uuid != message.author_uuid)
             or account.provider != "zulip"
             or account.get_host() != self.hostname
             or account.external_account_id != self.external_account_id
-            or (sending and not account.can_stream())
         ):
             raise SubscriptionChangedError()
         return account
@@ -4891,150 +4346,6 @@ class MessageDelivery(
                     break
         return blocked
 
-    @classmethod
-    def route(
-        cls,
-        project_id: sys_uuid.UUID,
-        placement: v2_models.WorkspaceMessagePlacement,
-        message: v2_models.WorkspaceMessage,
-    ) -> "MessageDelivery":
-        session = contexts.Context().get_session()
-        # Serialize all events for this local message without borrowing another
-        # observer's credentials when several accounts see the same channel.
-        session.execute(
-            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
-            (f"zulip-delivery:{project_id}:{message.uuid}:{placement.stream_uuid}",),
-        )
-        delivery = cls.objects.get_one_or_none(
-            filters={
-                "project_id": filters.EQ(project_id),
-                "message_uuid": filters.EQ(message.uuid),
-                "stream_uuid": filters.EQ(placement.stream_uuid),
-            }
-        )
-        if delivery is not None:
-            delivery.account()
-            return delivery
-        accounts = external_models.ExternalAccount.objects.get_all(
-            filters={
-                "project_id": filters.EQ(project_id),
-                "owner_user_uuid": filters.EQ(message.author_uuid),
-                "provider": filters.EQ("zulip"),
-                "disabled": filters.EQ(False),
-            }
-        )
-        channels = (
-            ZulipChannel.objects.get_all(
-                filters={
-                    "external_account_uuid": filters.In(
-                        [account.uuid for account in accounts]
-                    ),
-                    "stream_uuid": filters.EQ(placement.stream_uuid),
-                }
-            )
-            if accounts
-            else []
-        )
-        routes = [
-            (account, channel)
-            for account in accounts
-            for channel in channels
-            if channel.external_account_uuid == account.uuid and account.can_stream()
-        ]
-        if len(routes) != 1:
-            raise DeliveryPendingError(
-                "Waiting for an unambiguous sender account and Zulip channel"
-            )
-        account, channel = routes[0]
-        topic = v2_models.WorkspaceStreamTopic.objects.get_one(
-            filters={
-                "project_id": filters.EQ(project_id),
-                "uuid": filters.EQ(placement.topic_uuid),
-            }
-        )
-        if channel.channel_type == ZulipChannelType.CHANNEL.value:
-            recipient = channel.stream_id
-            topic_name = (
-                ""
-                if topic.uuid == sys_uuid.uuid5(channel.stream_uuid, "")
-                else topic.name
-            )
-        else:
-            topic_name = None
-            if channel.channel_type == ZulipChannelType.PRIVATE.value:
-                peer = external_models.ExternalAccount.objects.get_one(
-                    filters={
-                        "project_id": filters.EQ(project_id),
-                        "uuid": filters.EQ(channel.direct_user_uuid),
-                    }
-                )
-                if peer.provider != "zulip" or peer.get_host() != account.get_host():
-                    raise SubscriptionChangedError()
-                recipient = [int(peer.external_account_id)]
-            else:
-                members = session.execute(
-                    "SELECT user_uuid FROM messenger_stream_bindings WHERE project_id=%s AND stream_uuid=%s AND active",
-                    (project_id, placement.stream_uuid),
-                ).fetchall()
-                peers = external_models.ExternalAccount.objects.get_all(
-                    filters={
-                        "project_id": filters.EQ(project_id),
-                        "provider": filters.EQ("zulip"),
-                        "owner_user_uuid": filters.In(
-                            [row["user_uuid"] for row in members]
-                        ),
-                    }
-                )
-                recipient = sorted(
-                    {
-                        int(peer.external_account_id)
-                        for peer in peers
-                        if peer.external_account_id is not None
-                        and peer.get_host() == account.get_host()
-                    }
-                )
-                namespace = sys_uuid.uuid5(sys_uuid.NAMESPACE_DNS, account.get_host())
-                if (
-                    sys_uuid.uuid5(namespace, "dm:" + ",".join(map(str, recipient)))
-                    != channel.stream_uuid
-                ):
-                    raise DeliveryPendingError(
-                        "Waiting for the complete Zulip group recipient list"
-                    )
-        delivery = cls(
-            project_id=project_id,
-            message_uuid=message.uuid,
-            stream_uuid=placement.stream_uuid,
-            external_account_uuid=account.uuid,
-            hostname=account.get_host(),
-            external_account_id=account.external_account_id,
-            recipient={"to": recipient},
-            topic_name=topic_name,
-        )
-        if message.source_name == "zulip":
-            source = session.execute(
-                """
-                SELECT observed.message_id, observed.timestamp, observed.sender_id
-                FROM bridge_zulip_v5_messages observed JOIN m_external_accounts_v2 account
-                  ON account.uuid=observed.external_account_uuid AND account.project_id=observed.project_id
-                WHERE observed.project_id=%s AND messenger_uuid_v5(observed.project_id, observed.message_uuid::text)=%s
-                  AND rtrim(account.settings->>'server_url','/')=%s ORDER BY observed.updated_at DESC LIMIT 1
-            """,
-                (project_id, message.uuid, account.settings["server_url"].rstrip("/")),
-            ).fetchone()
-            if source is None:
-                raise DeliveryPendingError(
-                    "Waiting for the imported Zulip message identity"
-                )
-            if source["sender_id"] != int(account.external_account_id):
-                raise SubscriptionChangedError()
-            delivery.zulip_message_id = source["message_id"]
-            delivery.delivered_at = datetime.datetime.fromtimestamp(
-                source["timestamp"], datetime.timezone.utc
-            )
-        delivery.insert()
-        return delivery
-
     def observe(
         self,
         data: dict,
@@ -5042,7 +4353,7 @@ class MessageDelivery(
         zulip: client.ZulipClient | None = None,
         convert_text: bool = True,
     ) -> None:
-        account = self.account(sending=False)
+        account = self.account()
         if data["sender_id"] != int(account.external_account_id):
             raise SubscriptionChangedError()
         if self.zulip_message_id is not None and self.zulip_message_id != data["id"]:
@@ -5052,12 +4363,15 @@ class MessageDelivery(
             data["timestamp"], datetime.timezone.utc
         )
         session = contexts.Context().get_session()
-        message = v2_models.WorkspaceMessage.objects.get_one(
+        message = v2_models.WorkspaceMessage.objects.get_one_or_none(
             filters={
                 "project_id": filters.EQ(self.project_id),
                 "uuid": filters.EQ(self.message_uuid),
             }
         )
+        if message is None:
+            self.update()
+            return
         edited_at = datetime.datetime.fromtimestamp(
             data.get("last_edit_timestamp", data["timestamp"]), datetime.timezone.utc
         )
@@ -5086,16 +4400,10 @@ class MessageDelivery(
             ).to_workspace(data, self.stream_uuid, zulip)
         self.observed_workspace_content = text
         self.update()
-        pending_edits = Task.objects.get_all(
-            filters={
-                "project_id": filters.EQ(self.project_id),
-                "content": filters.JSONFields(
-                    {"kind": "edit_message", "delivery_uuid": str(self.uuid)}
-                ),
-                "status": filters.In(["new", "waiting", "retry"]),
-            },
-            limit=1,
-        )
+        pending_edits = session.execute(
+            "SELECT 1 FROM zulip_outgoing_intents WHERE project_id=%s AND entity_type='message' AND entity_uuid=%s AND operation='update' AND status<>'done' LIMIT 1",
+            (self.project_id, self.message_uuid),
+        ).fetchone()
         replace_content = message.payload.content == text or (
             (snapshot is None or previous_content == message.payload.content)
             and not pending_edits
@@ -5167,179 +4475,3 @@ class MessageDelivery(
                 ),
             ),
         )
-
-
-class WorkspaceEvent(
-    models.ModelWithUUID,
-    models.ModelWithProject,
-    models.ModelWithTimestamp,
-    orm.SQLStorableMixin,
-):
-    """Independent delivery receipts for the existing Messenger domain outbox."""
-
-    __tablename__ = "bridge_zulip_v5_workspace_events"
-
-    processed_at = properties.property(
-        types.AllowNone(types.UTCDateTimeZ()), default=None
-    )
-    attempts = properties.property(types.Integer(min_value=0), default=0)
-    next_retry_at = properties.property(
-        types.AllowNone(types.UTCDateTimeZ()), default=None
-    )
-    error_description = properties.property(
-        types.AllowNone(types.String()), default=None
-    )
-
-    def dispatch(self) -> None:
-        outbox = v2_models.WorkspaceDomainOutboxEvent.objects.get_one(
-            filters={
-                "uuid": filters.EQ(self.uuid),
-                "project_id": filters.EQ(self.project_id),
-            }
-        )
-        if outbox.payload["source_kind"] == "message.deleted":
-            for snapshot in outbox.payload.get("zulip_deletions", []):
-                task_uuid = sys_uuid.uuid5(self.uuid, snapshot["delivery_uuid"])
-                if (
-                    Task.objects.get_one_or_none(
-                        filters={"uuid": filters.EQ(task_uuid)}
-                    )
-                    is None
-                ):
-                    Task(
-                        uuid=task_uuid,
-                        project_id=self.project_id,
-                        external_account_uuid=sys_uuid.UUID(
-                            snapshot["external_account_uuid"]
-                        ),
-                        priority=TASK_PRIORITY_REALTIME_EDIT,
-                        content=TASK_CONTENT_TYPE.from_simple_type(snapshot["content"]),
-                    ).insert()
-            return
-        placement = v2_models.WorkspaceMessagePlacement.objects.get_one_or_none(
-            filters={
-                "uuid": filters.EQ(sys_uuid.UUID(outbox.payload["placement_uuid"])),
-                "project_id": filters.EQ(self.project_id),
-            }
-        )
-        if placement is None:
-            return
-        stream = v2_models.WorkspaceStream.objects.get_one(
-            filters={
-                "uuid": filters.EQ(placement.stream_uuid),
-                "project_id": filters.EQ(self.project_id),
-            }
-        )
-        if stream.source_name != "zulip":
-            return
-        message = v2_models.WorkspaceMessage.objects.get_one(
-            filters={
-                "uuid": filters.EQ(placement.message_uuid),
-                "project_id": filters.EQ(self.project_id),
-            }
-        )
-        if message.deleted_at is not None or message.payload.kind != "markdown":
-            return
-        delivery = MessageDelivery.route(self.project_id, placement, message)
-        creating = outbox.payload["source_kind"] == "message.created"
-        content = (
-            SendMessageContent(
-                delivery_uuid=delivery.uuid, content=message.payload.content
-            )
-            if creating
-            else EditMessageContent(
-                delivery_uuid=delivery.uuid, content=message.payload.content
-            )
-        )
-        task_uuid = sys_uuid.uuid5(
-            delivery.uuid, "send" if creating else f"edit:{message.content_updated_at}"
-        )
-        if (
-            Task.objects.get_one_or_none(filters={"uuid": filters.EQ(task_uuid)})
-            is None
-        ):
-            Task(
-                uuid=task_uuid,
-                project_id=self.project_id,
-                external_account_uuid=delivery.external_account_uuid,
-                priority=TASK_PRIORITY_REALTIME_MESSAGE
-                if creating
-                else TASK_PRIORITY_REALTIME_EDIT,
-                content=content,
-            ).insert()
-
-    @classmethod
-    def dispatch_one(cls) -> bool:
-        row = (
-            contexts.Context()
-            .get_session()
-            .execute("""
-            SELECT uuid FROM bridge_zulip_v5_workspace_events
-            WHERE processed_at IS NULL AND (next_retry_at IS NULL OR next_retry_at<=NOW() AT TIME ZONE 'UTC')
-            ORDER BY created_at, uuid LIMIT 1 FOR UPDATE SKIP LOCKED
-        """)
-            .fetchone()
-        )
-        if row is None:
-            return False
-        event = cls.objects.get_one(filters={"uuid": filters.EQ(row["uuid"])})
-        now = datetime.datetime.now(datetime.timezone.utc)
-        try:
-            with utils.savepoint():
-                event.dispatch()
-        except Exception as error:
-            LOG.exception("Failed to dispatch Workspace event %s to Zulip", event.uuid)
-            event.attempts += 1
-            event.error_description = str(error)
-            event.next_retry_at = now + datetime.timedelta(seconds=3)
-        else:
-            event.processed_at = now
-            event.error_description = None
-            event.next_retry_at = None
-        event.update()
-        return True
-
-
-def enqueue_notifications(
-    project_id: sys_uuid.UUID,
-    user_uuid: sys_uuid.UUID,
-    stream_uuid: sys_uuid.UUID,
-    topic_uuid: sys_uuid.UUID | None,
-    notification_mode: str,
-    session: sessions.PgSQLSession,
-) -> None:
-    targets = session.execute(
-        "SELECT channel.uuid, account.uuid AS account_uuid, topic.name FROM bridge_zulip_v5_channels AS channel "
-        "JOIN m_external_accounts_v2 AS account ON account.uuid=channel.external_account_uuid "
-        "JOIN messenger_streams AS stream ON stream.project_id=account.project_id AND stream.uuid=channel.stream_uuid "
-        "LEFT JOIN messenger_topics AS topic ON topic.project_id=stream.project_id AND topic.stream_uuid=stream.uuid AND topic.uuid=%s "
-        "WHERE account.project_id=%s AND account.owner_user_uuid=%s AND account.provider='zulip' "
-        "AND stream.uuid=%s AND stream.source_name='zulip' AND channel.channel_type='channel'",
-        (topic_uuid, project_id, user_uuid, stream_uuid),
-    ).fetchall()
-    for target in targets:
-        account = external_models.ExternalAccount.objects.get_one(
-            filters={"uuid": filters.EQ(target["account_uuid"])}, session=session
-        )
-        if not account.can_stream():
-            continue
-        channel = ZulipChannel.objects.get_one(
-            filters={"uuid": filters.EQ(target["uuid"])}, session=session
-        )
-        content = UpdateNotificationsContent(
-            channel_uuid=channel.uuid,
-            account_revision=account.realtime_revision(),
-            topic_name=(
-                "" if topic_uuid == sys_uuid.uuid5(stream_uuid, "") else target["name"]
-            )
-            if topic_uuid is not None
-            else None,
-            notification_mode=notification_mode,
-        )
-        content.remember(channel)
-        Task(
-            project_id=project_id,
-            external_account_uuid=account.uuid,
-            priority=TASK_PRIORITY_REALTIME_FLAGS,
-            content=content,
-        ).insert(session=session)

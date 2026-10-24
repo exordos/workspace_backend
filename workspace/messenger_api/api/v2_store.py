@@ -14,11 +14,11 @@ from restalchemy.common import contexts
 from restalchemy.common import exceptions as ra_exceptions
 from restalchemy.dm import filters as dm_filters
 
+from workspace.messenger_api.api import outgoing
 from workspace.messenger_api.api import resource_projection
 from workspace.messenger_api.api import sql_canonical_store
 from workspace.messenger_api.api import store as api_store
 from workspace.common import emoji
-from workspace.bridges.zulip.dm import models as zulip_models
 from workspace.common import mutation_journal_opts
 from workspace.messenger_api.dm import base
 from workspace.messenger_api.dm import helpers
@@ -794,6 +794,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         )
         return _public(self._folder_item(item_uuid), "folder_items")
 
+    @outgoing.api_change
     def create_resource(
         self,
         resource: str,
@@ -857,6 +858,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             (key_uuid, self.project_uuid, stream_uuid),
         )
 
+    @outgoing.api_change
     def create_message(
         self,
         values: dict[str, typing.Any],
@@ -1069,6 +1071,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         row = _public(self._message(placement_uuid), "messages")
         return row
 
+    @outgoing.api_change
     def update_message(
         self,
         message_uuid: sys_uuid.UUID,
@@ -1123,6 +1126,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         row = _public(self._message(message_uuid), "messages")
         return row
 
+    @outgoing.api_change
     def delete_message(
         self,
         message_uuid: sys_uuid.UUID,
@@ -1240,6 +1244,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         )
         return reaction
 
+    @outgoing.api_change
     def update_resource(
         self,
         resource: str,
@@ -1464,6 +1469,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             return self.get_resource(resource, binding.uuid)
         return super().update_resource(resource, resource_uuid, values)
 
+    @outgoing.api_change
     def delete_resource(
         self,
         resource: str,
@@ -1742,6 +1748,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             candidate_values,
         ).fetchone()["present"]
 
+    @outgoing.api_change
     def perform_action(
         self,
         resource: str,
@@ -2171,14 +2178,6 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 """,
                 (self.project_uuid, stream.uuid, self.user_uuid),
             ).fetchone()
-            zulip_models.enqueue_notifications(
-                self.project_uuid,
-                self.user_uuid,
-                stream.uuid,
-                None,
-                values["notification_mode"],
-                session,
-            )
             topics = session.execute(
                 """
                 SELECT uuid FROM messenger_topics
@@ -2345,14 +2344,6 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 """,
                 (self.project_uuid, topic.uuid, self.user_uuid),
             ).fetchone()
-            zulip_models.enqueue_notifications(
-                self.project_uuid,
-                self.user_uuid,
-                topic.stream_uuid,
-                topic.uuid,
-                values["notification_mode"],
-                session,
-            )
             self._enqueue_counter_projections(
                 source_kind="topic.updated",
                 user_uuid=self.user_uuid,

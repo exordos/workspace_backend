@@ -122,17 +122,11 @@ def test_key_rotation_verifies_identity_and_resumes_without_backfill(
         (pending,) = reaction_tests.pending(account)
     current = update(account, settings={**account.settings, "api_key": "rotated"})
     assert current.status == "new"
-    assert models.Task.objects.get_one(filters={"uuid": pending.uuid}).status == "new"
+    assert db.execute(
+        "SELECT status,request FROM zulip_outgoing_intents WHERE uuid=%s",
+        (pending["uuid"],),
+    ).fetchone() == ("new", None)
     assert not realtime_tests.dispatch()
-    owner = uuid.uuid4()
-    db.execute(
-        "UPDATE bridge_zulip_v5_tasks SET lease_owner=%s WHERE uuid=%s",
-        (owner, pending.uuid),
-    )
-    service = realtime_tests.history_import.HistoryImportService(queue="realtime")
-    service._run_task(pending.uuid, owner)
-    paused = models.Task.objects.get_one(filters={"uuid": pending.uuid})
-    assert paused.status == "new" and paused.lease_owner is None
     zulip = _zulip
     zulip.check_connection.return_value = user_tests._user_data(
         7, email=account.settings["email"]
@@ -149,20 +143,10 @@ def test_key_rotation_verifies_identity_and_resumes_without_backfill(
     assert initialization.status == "done"
     current = realtime_tests.stored(account)
     assert current.status == "active"
-    assert (
-        models.Task.objects.get_one(
-            filters={"uuid": pending.uuid}
-        ).content.account_revision
-        == current.realtime_revision()
-    )
-    with contexts.Context().session_manager():
-        saved = models.Task.objects.get_one(filters={"uuid": pending.uuid})
-        saved.execute()
-    assert saved.status == "done"
-    if kind == "flags":
-        zulip.update_message_flags.assert_called_once()
-    else:
-        zulip.update_reaction.assert_called_once()
+    assert db.execute(
+        "SELECT status,request FROM zulip_outgoing_intents WHERE uuid=%s",
+        (pending["uuid"],),
+    ).fetchone() == ("new", None)
     poller = resume(current, monkeypatch)
     poller.get_events.assert_awaited_once_with(subscription.queue_id, -1, 90)
     assert len(realtime_tests.events(account)) == 1
@@ -312,9 +296,7 @@ def test_channel_events_apply_without_catalog_reads(
         )
 
 
-def test_migration_preserves_queue_cursor_and_outgoing_work_but_cancels_polling(
-    imported, db
-):
+def test_migration_preserves_queue_cursor_but_cancels_polling(imported, db):
     account, _source, state, subscription, _zulip, _constructor = imported
     migration = next(conftest.MIGRATIONS_DIR.glob("0246-*.py")).name
     engine = conftest.DataMigration(migration)
@@ -332,9 +314,6 @@ def test_migration_preserves_queue_cursor_and_outgoing_work_but_cancels_polling(
             [*scope, account.settings["server_url"].rstrip("/")], sort_keys=True
         ).encode()
     ).hexdigest()
-    legacy_realtime_revision = hashlib.sha256(
-        json.dumps([*scope, account.connection_settings()], sort_keys=True).encode()
-    ).hexdigest()
     tasks = []
     try:
         engine.rollback_migration(migration)
@@ -342,19 +321,6 @@ def test_migration_preserves_queue_cursor_and_outgoing_work_but_cancels_polling(
             "UPDATE bridge_zulip_v5_subscriptions SET last_event_id=123,account_revision=%s WHERE uuid=%s",
             (old_revision, subscription.uuid),
         )
-        outgoing = models.Task(
-            project_id=account.project_id,
-            external_account_uuid=account.uuid,
-            content=models.UpdateMessageFlagsContent(
-                state_uuid=state.uuid,
-                flag="read",
-                value=True,
-                changed_at=datetime.datetime.now(datetime.timezone.utc),
-                account_revision=old_revision,
-            ),
-        )
-        outgoing.insert()
-        tasks.append(outgoing)
         for kind in (models.ImportUsersContent, models.ImportChannelsContent):
             for periodic in (False, True):
                 task = models.Task(
@@ -383,13 +349,7 @@ def test_migration_preserves_queue_cursor_and_outgoing_work_but_cancels_polling(
             123,
         )
         assert current.account_revision == legacy_subscription_revision
-        assert (
-            models.Task.objects.get_one(
-                filters={"uuid": outgoing.uuid}
-            ).content.account_revision
-            == legacy_realtime_revision
-        )
-        for task in tasks[1:-1]:
+        for task in tasks[:-1]:
             current = models.Task.objects.get_one(filters={"uuid": task.uuid})
             assert current.status == ("cancel" if task.content.periodic else "waiting")
         assert (
@@ -405,9 +365,6 @@ def test_migration_preserves_queue_cursor_and_outgoing_work_but_cancels_polling(
             models.RealtimeSubscription.for_account(account).account_revision
             == legacy_subscription_revision
         )
-        assert (
-            models.Task.objects.get_one(filters={"uuid": outgoing.uuid}).status == "new"
-        )
     finally:
         engine.apply_migration(engine.get_latest_migration())
         for task in tasks:
@@ -415,60 +372,10 @@ def test_migration_preserves_queue_cursor_and_outgoing_work_but_cancels_polling(
 
 
 @pytest.mark.parametrize("kind", ["flags", "reaction"])
-def test_local_changes_wait_for_verification_without_a_history_scan(
-    imported, db, monkeypatch, api, kind
-):
-    account, _source, state, _subscription, zulip, _constructor = imported
-    update(account, settings={**account.settings, "api_key": "rotated"})
-    if kind == "flags":
-        api.project_id, api.user_uuid = account.project_id, account.owner_user_uuid
-        api.post(f"{flag_tests.MESSAGES}{state.placement_uuid}/actions/unstar/invoke")
-        change_model = flag_tests.flags.FlagChange
-        pending = flag_tests.pending
-    else:
-        reaction_tests.add(api, imported)
-        change_model = reaction_tests.reactions.ReactionChange
-        pending = reaction_tests.pending
-    with contexts.Context().session_manager():
-        change_model.reconcile_batch(100)
-    assert change_model.objects.get_all(filters={"project_id": account.project_id})
-    assert pending(account) == []
-    zulip.check_connection.return_value = user_tests._user_data(
-        7, email=account.settings["email"]
-    )
-    (initialization,) = models.Task.objects.get_all(
-        filters={
-            "external_account_uuid": account.uuid,
-            "content": filters.JSONFields({"kind": "initialize_connection"}),
-        }
-    )
-    with contexts.Context().session_manager():
-        initialization.execute()
-    assert initialization.status == "done"
-    if kind == "reaction":
-        db.execute(
-            "UPDATE bridge_zulip_v5_reaction_changes SET next_retry_at=NULL WHERE project_id=%s",
-            (account.project_id,),
-        )
-    with contexts.Context().session_manager():
-        change_model.reconcile_batch(100)
-        (task,) = pending(account)
-        task.execute()
-    assert task.status == "done"
-    if kind == "flags":
-        zulip.update_message_flags.assert_called_once()
-    else:
-        zulip.update_reaction.assert_called_once()
-    zulip.get_messages.assert_not_called()
-    zulip.get_users.assert_not_called()
-    zulip.get_channels.assert_not_called()
-
-
-@pytest.mark.parametrize("kind", ["flags", "reaction"])
 def test_background_projection_does_not_deadlock_realtime_changes(
     imported, api, db, monkeypatch, kind
 ):
-    account, _source, state, *_rest = imported
+    account, source, state, subscription, *_rest = imported
     if kind == "flags":
         api.project_id, api.user_uuid = account.project_id, account.owner_user_uuid
         response = api.post(
@@ -478,7 +385,18 @@ def test_background_projection_does_not_deadlock_realtime_changes(
         changes = flag_tests.flags.FlagChange
         pending = flag_tests.pending
     else:
-        reaction_tests.add(api, imported)
+        with contexts.Context().session_manager():
+            reaction_tests.reactions.record_event(
+                account,
+                {
+                    "message_id": source.message_id,
+                    "op": "add",
+                    **reaction_tests.reaction(),
+                },
+                datetime.datetime.now(datetime.timezone.utc),
+                0,
+                subscription.queue_id,
+            )
         changes = reaction_tests.reactions.ReactionChange
         pending = reaction_tests.pending
 
@@ -543,8 +461,8 @@ def test_background_projection_does_not_deadlock_realtime_changes(
                 assert consumer.result(timeout=5) == 1
 
     assert models.Task.objects.get_one(filters={"uuid": task.uuid}).status == "done"
-    assert len(pending(account)) == 1
+    assert len(pending(account)) == (1 if kind == "flags" else 0)
     with contexts.Context().session_manager():
         changes.reconcile_batch(16)
     assert not changes.objects.get_all(filters={"project_id": account.project_id})
-    assert len(pending(account)) == 1
+    assert len(pending(account)) == (1 if kind == "flags" else 0)

@@ -9,7 +9,6 @@ from unittest import mock
 
 import pytest
 import psycopg
-import requests
 from restalchemy.common import contexts
 from restalchemy.dm import filters
 
@@ -45,13 +44,11 @@ def reload(state):
 
 
 def pending(account):
-    return models.Task.objects.get_all(
-        filters={
-            "external_account_uuid": filters.EQ(account.uuid),
-            "content": filters.JSONFields({"kind": "update_message_flags"}),
-            "status": filters.In(["new", "retry"]),
-        }
-    )
+    with contexts.Context().session_manager() as session:
+        return session.execute(
+            "SELECT * FROM zulip_outgoing_intents WHERE external_account_uuid=%s AND entity_type='message_state' AND status<>'done' ORDER BY id",
+            (account.uuid,),
+        ).fetchall()
 
 
 @pytest.fixture
@@ -153,78 +150,6 @@ def test_incoming_flags_use_receipt_time_and_do_not_echo(imported, flag, db):
         assert cursor.fetchone()[0] >= 1
 
 
-@pytest.mark.parametrize("flag,action", [("read", "read"), ("starred", "unstar")])
-def test_local_flags_use_the_viewer_account_and_confirm_once(
-    imported, api, flag, action
-):
-    account, source, state, _subscription, zulip, constructor = imported
-    api.project_id = account.project_id
-    api.user_uuid = account.owner_user_uuid
-    if flag == "read":
-        receive(
-            imported,
-            [
-                {
-                    "id": 0,
-                    "type": "update_message_flags",
-                    "flag": "read",
-                    "op": "remove",
-                    "messages": [source.message_id],
-                }
-            ],
-        )
-    response = api.post(f"{MESSAGES}{state.placement_uuid}/actions/{action}/invoke")
-    assert response.status_code == 200, response.text
-    reconcile()
-    (task,) = pending(account)
-    before = reload(state)
-    with contexts.Context().session_manager():
-        task.execute()
-    assert task.status == "done"
-    zulip.update_message_flags.assert_called_once_with(
-        [source.message_id], flag, flag == "read"
-    )
-    assert constructor.call_args.args[0].owner_user_uuid == api.user_uuid
-    reconcile()
-    assert pending(account) == []
-    assert getattr(reload(state), f"{flag}_updated_at") == getattr(
-        before, f"{flag}_updated_at"
-    )
-
-
-def test_old_received_event_cannot_override_a_newer_local_change(imported, api):
-    account, source, state, subscription, zulip, _constructor = imported
-    old_time = datetime.datetime.now(datetime.timezone.utc)
-    with contexts.Context().session_manager():
-        models.RealtimeSubscription.append_events(
-            account,
-            subscription.generation,
-            [
-                {
-                    "id": 0,
-                    "type": "update_message_flags",
-                    "flag": "starred",
-                    "op": "add",
-                    "messages": [source.message_id],
-                }
-            ],
-            old_time,
-        )
-    api.project_id, api.user_uuid = account.project_id, account.owner_user_uuid
-    response = api.post(f"{MESSAGES}{state.placement_uuid}/actions/unstar/invoke")
-    assert response.status_code == 200, response.text
-    with contexts.Context().session_manager():
-        models.RealtimeEvent.dispatch_one()
-    reconcile()
-    assert not reload(state).starred
-    (task,) = pending(account)
-    with contexts.Context().session_manager():
-        task.execute()
-    zulip.update_message_flags.assert_called_once_with(
-        [source.message_id], "starred", False
-    )
-
-
 def test_flags_in_one_poll_keep_event_order_and_replay_does_not_refresh_time(imported):
     account, source, state, subscription, _zulip, _constructor = imported
     payloads = [
@@ -274,50 +199,6 @@ def test_same_poll_flags_can_be_reconciled_between_each_event(imported):
         assert current.starred == (operation == "add")
         assert current.starred_updated_at == received_at
         assert pending(account) == []
-
-
-def test_stale_outgoing_task_does_not_restore_a_removed_star(imported, api):
-    account, _source, state, _subscription, zulip, _constructor = imported
-    api.project_id, api.user_uuid = account.project_id, account.owner_user_uuid
-    api.post(f"{MESSAGES}{state.placement_uuid}/actions/unstar/invoke")
-    reconcile()
-    (old,) = pending(account)
-    api.post(f"{MESSAGES}{state.placement_uuid}/actions/star/invoke")
-    reconcile()
-    with contexts.Context().session_manager():
-        old.execute()
-    zulip.update_message_flags.assert_not_called()
-    assert reload(state).starred
-
-
-def test_newer_incoming_flag_supersedes_pending_http_retry(imported, api):
-    account, source, state, _subscription, zulip, _constructor = imported
-    api.project_id, api.user_uuid = account.project_id, account.owner_user_uuid
-    api.post(f"{MESSAGES}{state.placement_uuid}/actions/unstar/invoke")
-    reconcile()
-    (task,) = pending(account)
-    zulip.update_message_flags.side_effect = requests.Timeout("response lost")
-    with contexts.Context().session_manager():
-        task.execute()
-    assert task.status == "retry"
-    receive(
-        imported,
-        [
-            {
-                "id": 0,
-                "type": "update_message_flags",
-                "flag": "starred",
-                "op": "add",
-                "messages": [source.message_id],
-            }
-        ],
-    )
-    assert reload(state).starred
-    zulip.update_message_flags.reset_mock()
-    with contexts.Context().session_manager():
-        task.execute()
-    zulip.update_message_flags.assert_not_called()
-    assert task.status == "done"
 
 
 def test_mark_all_read_handles_empty_message_ids_and_late_import(
@@ -414,99 +295,6 @@ def test_all_read_covers_messages_materialized_after_the_event(imported):
     assert late.read is False  # The newer all-read event wins over this older snapshot.
 
 
-def test_bulk_read_sends_one_batch_and_does_not_include_later_messages(imported, api):
-    account, source, state, _subscription, zulip, _constructor = imported
-    add_source(account, source, 43)
-    with contexts.Context().session_manager():
-        models.ZulipMessageState.reconcile_batch(100)
-    reconcile()
-    receive(
-        imported,
-        [
-            {
-                "id": 0,
-                "type": "update_message_flags",
-                "flag": "read",
-                "op": "remove",
-                "messages": [42, 43],
-            }
-        ],
-    )
-    api.project_id, api.user_uuid = account.project_id, account.owner_user_uuid
-    response = api.post(
-        f"/v1/messenger/streams/{source.channel.stream_uuid}/actions/read/invoke"
-    )
-    assert response.status_code == 200, response.text
-    add_source(account, source, 44)
-    with contexts.Context().session_manager():
-        models.ZulipMessageState.reconcile_batch(100)
-    reconcile()
-    for task in pending(account):
-        with contexts.Context().session_manager():
-            task.execute()
-    zulip.update_message_flags.assert_called_once_with([43, 42], "read", True)
-    reconcile()
-    unread = api.get(MESSAGES).json()
-    assert sum(not message["read"] for message in unread) == 1
-
-
-def test_flags_on_another_authors_message_use_the_readers_credentials(
-    imported, message_sources, api
-):
-    author, _source, _state, _subscription, zulip, constructor = imported
-    reader, _copy = message_sources(project_id=author.project_id, sender_id=8)
-    reader.settings = {
-        **reader.settings,
-        "email": "reader@example.com",
-        "api_key": "reader-key",
-    }
-    reader.status = "active"
-    reader.update()
-    source_tests._prepare(reader)
-    with contexts.Context().session_manager():
-        models.ZulipMessageState.reconcile_batch(100)
-    reconcile()
-    state = v2_models.WorkspaceUserMessageState.objects.get_one(
-        filters={
-            "project_id": filters.EQ(reader.project_id),
-            "user_uuid": filters.EQ(reader.owner_user_uuid),
-        }
-    )
-    api.project_id, api.user_uuid = reader.project_id, reader.owner_user_uuid
-    response = api.post(f"{MESSAGES}{state.placement_uuid}/actions/unstar/invoke")
-    assert response.status_code == 200, response.text
-    reconcile()
-    (task,) = pending(reader)
-    with contexts.Context().session_manager():
-        task.execute()
-    zulip.update_message_flags.assert_called_once_with([42], "starred", False)
-    assert constructor.call_args.args[0].uuid == reader.uuid
-    author_state = v2_models.WorkspaceUserMessageState.objects.get_one(
-        filters={
-            "project_id": filters.EQ(reader.project_id),
-            "user_uuid": filters.EQ(author.owner_user_uuid),
-        }
-    )
-    assert author_state.starred
-
-
-def test_account_changes_cancel_old_flag_tasks(imported, api):
-    account, _source, state, _subscription, zulip, _constructor = imported
-    api.project_id, api.user_uuid = account.project_id, account.owner_user_uuid
-    api.post(f"{MESSAGES}{state.placement_uuid}/actions/unstar/invoke")
-    reconcile()
-    (old,) = pending(account)
-    account.settings = {**account.settings, "api_key": "rotated-key"}
-    account.update()
-    with contexts.Context().session_manager():
-        old.execute()
-    assert old.status == "cancel"
-    zulip.update_message_flags.assert_not_called()
-    # Direct unverified credential changes do not scan old message states.
-    reconcile()
-    assert pending(account) == []
-
-
 def test_a_slow_history_snapshot_cannot_undo_a_newer_flag_event(imported):
     account, source, state, _subscription, _zulip, _constructor = imported
     snapshot_started = datetime.datetime.now(datetime.timezone.utc)
@@ -561,7 +349,7 @@ def test_reconnect_refreshes_native_deliveries_without_imported_observations(out
         message = v2_models.WorkspaceMessage.objects.get_one(
             filters={"uuid": filters.EQ(placement.message_uuid)}
         )
-        delivery = models.MessageDelivery.route(account.project_id, placement, message)
+        delivery = outgoing_tests.seed_delivery(account, placement, message)
         delivery.zulip_message_id = remote["id"]
         delivery.update()
         task = models.Task(
@@ -601,7 +389,7 @@ def test_flag_migration_round_trip(_database):
             migration.migration_step.upgrade(connection)
 
 
-@pytest.mark.isolated_schema
+@pytest.mark.pre_outgoing_schema
 def test_flag_migration_preserves_existing_local_changes(imported, db):
     account, _source, state, _subscription, _zulip, _constructor = imported
     account_trigger = db.execute(
@@ -647,7 +435,9 @@ def test_flag_migration_preserves_existing_local_changes(imported, db):
     reconcile()
     current = reload(state)
     assert current.read_at is None and not current.starred
-    assert {task.content.flag for task in pending(account)} == {"read", "starred"}
+    assert (
+        current.read_updated_at is not None and current.starred_updated_at is not None
+    )
 
 
 def test_historical_flag_probe_keeps_the_shared_history_trigger(db):
@@ -694,23 +484,14 @@ def test_delivered_native_message_flags_use_the_same_projection(outgoing):
         placement = v2_models.WorkspaceMessagePlacement.objects.get_one(
             filters={"project_id": filters.EQ(account.project_id)}
         )
-        delivery = models.MessageDelivery.route(
-            account.project_id, placement, canonical
-        )
+        delivery = outgoing_tests.seed_delivery(account, placement, canonical)
         delivery.zulip_message_id = remote["id"]
         delivery.delivered_at = datetime.datetime.now(datetime.timezone.utc)
         delivery.update()
     response = api.post(f"{MESSAGES}{public['uuid']}/actions/star/invoke")
     assert response.status_code == 200, response.text
     reconcile()
-    (task,) = pending(account)
-    zulip.update_message_flags.return_value = {
-        "result": "success",
-        "messages": [remote["id"]],
-    }
-    with contexts.Context().session_manager():
-        task.execute()
-    zulip.update_message_flags.assert_called_once_with([remote["id"]], "starred", True)
+    assert len(pending(account)) == 1
     subscription = models.RealtimeSubscription.for_account(account)
     receive(
         (account, None, None, subscription, zulip, None),

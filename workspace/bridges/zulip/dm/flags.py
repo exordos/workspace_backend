@@ -21,100 +21,13 @@ from workspace.services.messenger_workers import owned_projection
 
 from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.dm import v2_models
-from workspace.bridges.zulip import client
 
 
 if typing.TYPE_CHECKING:
-    from workspace.bridges.zulip.dm import models as zulip_models
+    pass
 
 
 FLAGS = ("read", "starred")
-
-
-def prepare_outgoing(
-    task: "zulip_models.Task",
-) -> (
-    tuple[external_models.ExternalAccount, list[dict[str, typing.Any]], str, bool]
-    | None
-):
-    """Read a versioned intent without holding application rows over HTTP."""
-    from workspace.bridges.zulip.dm import models as zulip_models
-
-    content = task.content
-    account = external_models.ExternalAccount.objects.get_one(
-        filters={
-            "uuid": filters.EQ(task.external_account_uuid),
-            "project_id": filters.EQ(task.project_id),
-        }
-    )
-    if (
-        not account.can_stream()
-        or account.realtime_revision() != content.account_revision
-    ):
-        raise zulip_models.SubscriptionChangedError()
-    targets = flag_states(
-        task.project_id, content.state_uuid, account.uuid, content.flag
-    )
-    if not targets:
-        return None
-    target = targets[0]
-    changed_at = content.changed_at.replace(tzinfo=None)
-    if (
-        target["local_updated_at"] != changed_at
-        or target["local_value"] != content.value
-        or (
-            target["remote_updated_at"] is not None
-            and target["remote_updated_at"] >= changed_at
-        )
-    ):
-        return None
-    batch = outgoing_batch(
-        task.project_id, account.uuid, content.state_uuid, content.flag, content.value
-    )
-    return (account, batch, content.flag, content.value) if batch else None
-
-
-def send_prepared(
-    prepared: tuple[
-        external_models.ExternalAccount, list[dict[str, typing.Any]], str, bool
-    ],
-) -> None:
-    account, batch, flag, value = prepared
-    if mutation_journal_opts.enabled():
-        from workspace.bridges.zulip.dm import models as zulip_models
-
-        zulip_models.validate_outgoing_account(account)
-    zulip = client.ZulipClient(account)
-    try:
-        result = zulip.update_message_flags(
-            sorted({row["message_id"] for row in batch}, reverse=True), flag, value
-        )
-        if result.get("ignored_because_not_subscribed_channels"):
-            raise client.ZulipApiError(
-                "NOT_SUBSCRIBED",
-                "Cannot mark messages in unsubscribed Zulip channels as unread",
-            )
-    finally:
-        zulip.close()
-
-
-def confirm_prepared(
-    prepared: tuple[
-        external_models.ExternalAccount, list[dict[str, typing.Any]], str, bool
-    ],
-) -> None:
-    account, batch, flag, value = prepared
-    by_time: dict[datetime.datetime, set[int]] = {}
-    for row in batch:
-        by_time.setdefault(row["local_updated_at"], set()).add(row["message_id"])
-    for observed_at, ids in sorted(by_time.items()):
-        record(
-            account,
-            sorted(ids),
-            flag,
-            value,
-            observed_at.replace(tzinfo=datetime.timezone.utc),
-        )
 
 
 def record(
@@ -359,47 +272,6 @@ def lock_state(
     )
 
 
-def outgoing_batch(
-    project_id: uuid.UUID,
-    account_uuid: uuid.UUID,
-    state_uuid: uuid.UUID,
-    flag: str,
-    value: bool,
-) -> list[dict[str, typing.Any]]:
-    candidates = (
-        contexts.Context()
-        .get_session()
-        .execute(
-            """SELECT DISTINCT flag_state_uuid AS state_uuid,message_created_at,message_sequence
-           FROM bridge_zulip_v5_tasks
-           WHERE project_id=%s AND external_account_uuid=%s
-             AND content->>'kind'='update_message_flags' AND status IN ('new', 'retry')
-             AND content->>'flag'=%s AND (content->>'value')::boolean=%s
-           ORDER BY message_created_at DESC,message_sequence DESC,flag_state_uuid LIMIT 100""",
-            (project_id, account_uuid, flag, value),
-        )
-        .fetchall()
-    )
-    result = []
-    for candidate_uuid in sorted(
-        {state_uuid, *(row["state_uuid"] for row in candidates)}
-    ):
-        if not mutation_journal_opts.enabled():
-            lock_state(project_id, candidate_uuid, account_uuid)
-        for target in flag_states(project_id, candidate_uuid, account_uuid, flag):
-            if (
-                target["local_value"] == value
-                and target["local_updated_at"] is not None
-                and (
-                    target["remote_updated_at"] is None
-                    or target["local_updated_at"] > target["remote_updated_at"]
-                )
-                and target["remote_value"] != value
-            ):
-                result.append(target)
-    return result
-
-
 def publish(
     state: v2_models.WorkspaceUserMessageState, target: typing.Mapping[str, typing.Any]
 ) -> None:
@@ -487,7 +359,6 @@ class FlagChange(models.ModelWithID, models.ModelWithProject, orm.SQLStorableMix
     def reconcile_batch(
         cls, limit: int, *, state_ids: list[uuid.UUID] | None = None
     ) -> int:
-        from workspace.bridges.zulip.dm import models as zulip_models
 
         if mutation_journal_opts.enabled() and owned_projection.CURRENT.get() is None:
             return 0
@@ -576,48 +447,6 @@ class FlagChange(models.ModelWithID, models.ModelWithProject, orm.SQLStorableMix
                         )
                     if changed and (changed_target is None or flag == "read"):
                         changed_target = target
-                elif (
-                    local_time is not None
-                    and target["local_value"] != target["remote_value"]
-                ):
-                    account = external_models.ExternalAccount.objects.get_one(
-                        filters={
-                            "uuid": filters.EQ(target["external_account_uuid"]),
-                            "project_id": filters.EQ(change.project_id),
-                        }
-                    )
-                    if not account.can_stream():
-                        verifying_account |= (
-                            account.status
-                            == external_models.ExternalAccountStatus.NEW.value
-                            and bool(account.settings.get("api_key"))
-                        )
-                        continue
-                    account_revision = account.realtime_revision()
-                    changed_at = local_time.replace(tzinfo=datetime.timezone.utc)
-                    task_uuid = uuid.uuid5(
-                        state.uuid,
-                        f"zulip-flags:{target['external_account_uuid']}:{flag}:{changed_at.isoformat()}:{account_revision}",
-                    )
-                    if (
-                        zulip_models.Task.objects.get_one_or_none(
-                            filters={"uuid": filters.EQ(task_uuid)}
-                        )
-                        is None
-                    ):
-                        zulip_models.Task(
-                            uuid=task_uuid,
-                            project_id=change.project_id,
-                            external_account_uuid=target["external_account_uuid"],
-                            priority=zulip_models.TASK_PRIORITY_REALTIME_FLAGS,
-                            content=zulip_models.UpdateMessageFlagsContent(
-                                state_uuid=state.uuid,
-                                flag=flag,
-                                value=target["local_value"],
-                                changed_at=changed_at,
-                                account_revision=account_revision,
-                            ),
-                        ).insert()
             if changed_target is not None:
                 publish(state, changed_target)
             if verifying_account:

@@ -2,43 +2,10 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
-from unittest import mock
 
 import pytest
 
-from workspace.bridges.zulip import client
-from workspace.bridges.zulip.dm import reactions
 from workspace.common import emoji
-
-
-@pytest.mark.parametrize("present,method", [(True, "POST"), (False, "DELETE")])
-def test_reaction_requests_preserve_the_exact_remote_emoji_identity(present, method):
-    account = mock.Mock(
-        settings={
-            "server_url": "https://zulip.example.com/",
-            "email": "reader@example.com",
-            "api_key": "reader-key",
-        }
-    )
-    session = mock.Mock()
-    session.request.return_value.json.return_value = {"result": "success"}
-    with mock.patch.object(client.requests, "Session", return_value=session):
-        zulip = client.ZulipClient(account)
-        try:
-            zulip.update_reaction(42, "old_name", "1f44d", "unicode_emoji", present)
-        finally:
-            zulip.close()
-    assert session.auth == ("reader@example.com", "reader-key")
-    session.request.assert_called_once_with(
-        method,
-        "https://zulip.example.com/api/v1/messages/42/reactions",
-        timeout=(5, 30),
-        data={
-            "emoji_name": "old_name",
-            "emoji_code": "1f44d",
-            "reaction_type": "unicode_emoji",
-        },
-    )
 
 
 def test_unicode_aliases_preserve_workspace_canonical_shortcodes():
@@ -120,7 +87,7 @@ def test_existing_remote_reaction_keeps_its_exact_identity():
             "emoji_name": "old_alias",
         }
     ]
-    assert reactions._unicode_identity("thumbs_up", observed) == (
+    assert emoji.zulip_identity("thumbs_up", observed) == (
         "1F44D-FE0F",
         "old_alias",
     )
@@ -128,7 +95,7 @@ def test_existing_remote_reaction_keeps_its_exact_identity():
 
 def test_extended_unicode_does_not_claim_unsupported_zulip_names():
     assert emoji.code_for_name("👍🏻") == "1f44d-1f3fb"
-    assert reactions._unicode_identity("+1_tone1", []) is None
+    assert emoji.zulip_identity("+1_tone1", []) is None
     observed = [
         {
             "reaction_type": "unicode_emoji",
@@ -136,12 +103,12 @@ def test_extended_unicode_does_not_claim_unsupported_zulip_names():
             "emoji_name": "remote_skin_tone_alias",
         }
     ]
-    assert reactions._unicode_identity("+1_tone1", observed) == (
+    assert emoji.zulip_identity("+1_tone1", observed) == (
         "1f44d-1f3fb",
         "remote_skin_tone_alias",
     )
     assert (
-        reactions._unicode_identity(
+        emoji.zulip_identity(
             "custom_emoji",
             [
                 {
@@ -167,5 +134,5 @@ def test_unknown_provider_code_cannot_reuse_another_emojis_shortcode():
             "emoji_name": "thumbs_up",
         }
     ]
-    assert reactions._unicode_identity(symbol, observed) == (code, "thumbs_up")
-    assert reactions._unicode_identity("thumbs_up", observed) == ("1f44d", "+1")
+    assert emoji.zulip_identity(symbol, observed) == (code, "thumbs_up")
+    assert emoji.zulip_identity("thumbs_up", observed) == ("1f44d", "+1")

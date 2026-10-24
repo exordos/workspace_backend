@@ -39,40 +39,47 @@ Direct local services:
 - Messenger worker: `workspace-messenger-worker`
 - History import service: `workspace-history-import`
 - Zulip realtime service: `workspace-zulip-realtime`
-- Zulip realtime task worker: `workspace-zulip-task-worker`
+- Zulip outgoing intent worker: `workspace-zulip-outgoing`
 - Workspace OpenAPI spec: `http://127.0.0.1:21084/specifications/3.0.3`
 
 The single `workspace-api` process serves all REST resources, including Messenger,
 with sixteen HTTP workers by default.
 
-The history import service executes the `background` queue with a bounded thread
-pool (`[history_import] workers`, default: four). Run `workspace-zulip-task-worker`
-as a separate process for the `realtime` queue, in addition to the realtime event
-receiver. It has a dedicated execution thread and checks for work every 100 ms.
-The equivalent module command is `python -m workspace.cmd.zulip_task_worker`.
-Each task-worker process sizes its PostgreSQL pool to its worker count plus one
-dispatcher connection: five for the default background pool, two for realtime.
-This overrides `[db] connection_pool_max_size` only in these task-worker processes.
+The history import service consumes both inbound task queues (`[history_import]
+queue = all`) with a bounded thread pool (four workers by default). The realtime
+service receives provider events and reconciles personal flags and reactions.
 
-Migration 0243 adds explicit task queues and classifies pending tasks by origin.
-Live message imports, edits, sends, reactions and flag updates use `realtime`;
-backfills, catalog polling, stored-content conversion and historical flag repair
-use `background`. Both queues preserve the existing numeric priorities. Stop old
-history workers before applying the migration and start both task workers after
-updating: older workers do not filter by queue.
+Run `workspace-zulip-outgoing --config-file /etc/workspace/workspace.conf` as a
+separate, single process. It uses asyncio, direct PostgreSQL statements and a
+persistent aiohttp connection pool. API mutations record `zulip_outgoing_intents`
+in the same transaction as their domain changes. Importer writes never set the
+API mutation marker and do not create outgoing work. Independent entities run
+concurrently; each entity's intentions execute in insertion order. An error
+blocks later intentions for that entity until it is resolved.
 
-Dispatchers reserve only as many tasks as there are free execution slots. Claims
-commit before execution and use `FOR UPDATE SKIP LOCKED` and recoverable leases.
-Each queue has its own dispatcher lock and an explicit indexed queue filter,
-including when PostgreSQL reuses a generic prepared plan. Migration 0244 adds a
-small partial index for pending reconciliation and counter-refresh tasks; looking
-for these recurring tasks does not scan the history backlog or completed tasks.
-Each execution has its own database session. Tasks for the same account within a
-queue are serialized; global maintenance and conversion chains each have their
-own execution key. Catalog refreshes for a project share a key across both queues.
-Transaction advisory locks fence overlapping execution even
-after a lease expires. Outbound sends retain their committed attempt marker, so
-an ambiguous HTTP result waits for the echo rather than repeating the POST.
+The sender uses no explicit database/application locks, revisions or leases.
+Each SQL statement commits before HTTP or a dependency wait. Missing parent IDs
+are reread after 10 ms. `LISTEN workspace_zulip_outgoing` wakes the dispatcher;
+a one-second poll recovers missed notifications. Native rows keep empty
+`provider_identity`; external copies are recorded in `zulip_entity_links`.
+
+`[zulip_outgoing] concurrency` and `connections` default to 128. The HTTP connector
+opens connections on demand, reuses them and closes connections idle for 15 seconds.
+Zulip rate-limit responses delay retries. A prepared request is durable before
+HTTP; after an uncertain result or restart, GET verifies the operation. Unknown
+message sends await their correlated event receipt; unknown uploads use a stable
+UUID-prefixed filename. If GET cannot establish the outcome, the intention stays
+`checking` instead of risking a duplicate. Deletes contain their required
+snapshots and treat 404 as success.
+
+Zulip topics are created by their first message. Stream deletion archives the
+channel. Workspace-only attributes (colors, pins, summaries and Workspace roles)
+stay local. Exported attachments retain their blob until queued uploads finish.
+
+Migration 0265 moves pending old outgoing tasks/events into intentions and removes
+the old outgoing dispatch path. Stop the previous sender and import processes
+before upgrading; then start the new sender, realtime receiver and history importer.
+This cutover is forward-only; rollback requires the previous database backup.
 
 Realtime imports schedule bounded reconciliation of only their affected messages,
 streams and topics, so publishing them does not wait for the global history
@@ -148,7 +155,7 @@ Zulip latency; database operations use PostgreSQL. No live Zulip requests are ma
 
 Migration 0238 adds nullable `execution_time` and `queue_wait_time` fields in
 seconds. They accumulate execution and ready-queue waiting across attempts,
-including send preparation. Scheduled delays, retry delays, and active leases
+for inbound processing. Scheduled delays, retry delays, and active leases
 do not count as queue waiting. Existing tasks retain `NULL` until measured.
 
 Message reconciliation acknowledges the revisions it read before processing.
@@ -203,24 +210,15 @@ notifications. Saved queues resume after a service restart; an expired Zulip
 queue is registered again and schedules a new backfill. Run one realtime service
 instance for this database.
 
-The same realtime service independently subscribes to new message creation and
-edit records in `messenger_domain_outbox_events`, using the existing
-`workspace_projection_tasks` notification channel. Subscriber receipts and
-history tasks commit together; Messenger projection processing remains independent.
-Migration 0233 starts this subscription with new events, without sending retained
-outbox history. The history service executes `send_message` and `edit_message`
-tasks using the author's verified external account for the destination channel
-or direct conversation. Markdown content is converted in both directions through
-`workspace/bridges/zulip/content_conversion.py`. Its context resolves the current
-external-account owner, channels, topics, and public message placement UUIDs from
-persisted data in the request project and Zulip server. Outgoing references use
-the destination server's identifiers. References to messages awaiting delivery
-retry until their Zulip IDs are known; unsupported outgoing identities fail
-before a send attempt is marked. Zulip messages use `read_by_sender=true`.
+API changes enqueue outbound intentions directly; the realtime receiver only
+consumes provider events. The two directions share persisted identity/content
+observations for local-echo matching.
+Outgoing Markdown uses the pure converter in `workspace/bridges/zulip/message_conversion.py`;
+provider references are resolved through direct SQL before sending.
 
 Uploaded Zulip attachments are copied into Workspace file storage with the
-destination stream's access rules. Workspace attachments are uploaded to Zulip
-once per destination stream, with persisted file mappings for retries and echoes.
+destination stream's access rules. Workspace attachments are uploaded through file intentions, with persisted mappings
+for retries and echoes.
 Temporary download URLs are fetched without forwarding Zulip API credentials.
 Externally hosted media retain their original URLs.
 Attachments returning HTTP 404 or 410 are replaced with their caption or filename

@@ -614,14 +614,15 @@ def test_file_download_and_delete_use_store_authorization(
 
     with (
         mock.patch.object(
-            controllers.contexts.Context, "get_session", return_value=object()
-        ),
-        mock.patch.object(
-            controllers.models.WorkspaceFile,
-            "objects",
-            types.SimpleNamespace(
-                get_all=mock.Mock(
-                    return_value=[object()] if has_other_references else []
+            controllers.contexts.Context,
+            "get_session",
+            return_value=mock.Mock(
+                execute=mock.Mock(
+                    return_value=mock.Mock(
+                        fetchone=mock.Mock(
+                            return_value=(1,) if has_other_references else None
+                        )
+                    )
                 )
             ),
         ),

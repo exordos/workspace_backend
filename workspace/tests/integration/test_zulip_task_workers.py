@@ -5,10 +5,6 @@
 import concurrent.futures
 import datetime
 import json
-import os
-import signal
-import subprocess
-import sys
 import threading
 import time
 from unittest import mock
@@ -20,7 +16,6 @@ import requests
 from restalchemy.common import contexts
 from restalchemy.dm import filters
 from restalchemy.storage import exceptions as storage_exceptions
-from restalchemy.storage.sql import migrations
 
 from workspace.bridges.zulip import client
 from workspace.bridges.zulip.dm import models
@@ -58,6 +53,7 @@ def _until(service, predicate, timeout=10):
     pytest.fail("Task worker did not reach the expected state")
 
 
+@pytest.mark.isolated_schema
 def test_migration_routes_existing_tasks_by_origin_and_round_trips(account, db):
     subscription = realtime_tests.register(account)
     with contexts.Context().session_manager():
@@ -69,8 +65,8 @@ def test_migration_routes_existing_tasks_by_origin_and_round_trips(account, db):
             ],
         )
     internal, remote = realtime_tests.events(account)
-    engine = migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
     migration = next(conftest.MIGRATIONS_DIR.glob("0243-*.py")).name
+    engine = conftest.DataMigration(migration)
     tasks = []
     try:
         for event, backfill, kind in (
@@ -357,24 +353,6 @@ def test_cancelled_or_reassigned_claim_cannot_execute(account, db, monkeypatch):
     service._run_task(task_uuid, owner)
     execute.assert_not_called()
     assert _stored(task).lease_owner != owner
-
-
-def test_realtime_send_keeps_committed_attempt_and_does_not_repeat_post(outgoing):
-    _api, account, _channel, _remote, zulip, _constructor = outgoing
-    outgoing_tests.create(outgoing)
-    outgoing_tests.dispatch()
-    service = history_import.HistoryImportService(queue="realtime")
-    try:
-        _until(service, lambda: zulip.send_message.called)
-        service.stop()
-        task = outgoing_tests.tasks(account)[0]
-        assert _stored(task).status == "retry"
-        outgoing_tests.ready(task)
-        service._iteration()
-        _until(service, lambda: _stored(task).status == "done")
-        zulip.send_message.assert_called_once()
-    finally:
-        service.stop()
 
 
 def test_slow_backfill_http_does_not_lock_out_realtime_on_the_same_account(
@@ -754,63 +732,6 @@ def test_parallel_account_imports_preserve_shared_message_identities(
         other.delete()
 
 
-def test_realtime_worker_entrypoint_consumes_only_realtime(
-    history_account, db, monkeypatch, tmp_path
-):
-    account = history_account
-    zulip = mock.Mock()
-    zulip.get_messages.return_value = [message_tests._message_data(42)]
-    monkeypatch.setattr(client, "ZulipClient", lambda account: zulip)
-    assert message_tests._import_history(account).status == "done"
-    task = models.Task(
-        project_id=account.project_id,
-        external_account_uuid=account.uuid,
-        content=models.ReconcileRealtimeContent(message_ids=[42]),
-    )
-    task.insert()
-    background = models.Task(priority=900000, content=models.ConvertMessageContent())
-    background.insert()
-    config = tmp_path / "worker.conf"
-    config.write_text(f"[db]\nconnection_url = {conftest.TEST_DB_URL}\n")
-    try:
-        with (tmp_path / "worker.log").open("w+") as log:
-            process = subprocess.Popen(
-                [
-                    sys.executable,
-                    "-m",
-                    "workspace.cmd.zulip_task_worker",
-                    "--config-file",
-                    str(config),
-                ],
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-            try:
-                deadline = time.monotonic() + 10
-                while time.monotonic() < deadline:
-                    assert process.poll() is None
-                    if db.execute(
-                        "SELECT 1 FROM messenger_api_user_messages_v1 WHERE project_id=%s AND user_uuid=%s AND visible",
-                        (account.project_id, account.owner_user_uuid),
-                    ).fetchone():
-                        break
-                    time.sleep(0.01)
-                else:
-                    pytest.fail("Realtime worker process did not publish the message")
-                assert _stored(background).status == "new"
-            finally:
-                os.killpg(process.pid, signal.SIGINT)
-                try:
-                    process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    process.wait(timeout=3)
-                    raise
-    finally:
-        background.delete()
-
-
 def test_catalog_updates_share_an_execution_key_across_queues(
     history_account, monkeypatch, scheduled_reconciliation
 ):
@@ -859,125 +780,3 @@ def test_catalog_updates_share_an_execution_key_across_queues(
         release.set()
         bg.stop()
         rt.stop()
-
-
-@pytest.mark.parametrize("claim_state", ["new", "unknown_http", "reclaimed"])
-def test_file_send_retries_when_account_is_locked_after_preparation(
-    outgoing, db, tmp_path, monkeypatch, claim_state
-):
-    api, account, channel, remote, zulip, _constructor = outgoing
-    monkeypatch.setenv(file_storage.ENV_STORAGE_PATH, str(tmp_path))
-    uploaded = api.post(
-        "/v1/messenger/files/",
-        data={"stream_uuid": str(channel.stream_uuid)},
-        files={"file": ("claim-race.txt", b"claim-race", "text/plain")},
-    )
-    assert uploaded.status_code == 201
-    remote["content"] = f"[claim-race](urn:file:{uploaded.json()['uuid']})"
-    zulip.upload_file.return_value = "/user_uploads/2/claim-race.txt"
-    outgoing_tests.create(outgoing)
-    outgoing_tests.dispatch()
-    (task,) = outgoing_tests.tasks(account)
-    if claim_state == "unknown_http":
-        db.execute(
-            "UPDATE bridge_zulip_v5_deliveries SET sending=TRUE WHERE uuid=%s",
-            (task.content.delivery_uuid,),
-        )
-    service = history_import.HistoryImportService(queue="realtime", workers=1)
-    with contexts.Context().session_manager():
-        [(task_uuid, owner)] = service._claim_tasks(1)
-    original = service._locked_task
-    calls = 0
-    blocker = psycopg.connect(conftest.TEST_DB_URL)
-
-    def lock_after_prepare(claimed_uuid, claimed_owner):
-        nonlocal calls
-        calls += 1
-        if calls == 2:
-            if claim_state == "reclaimed":
-                db.execute(
-                    "UPDATE bridge_zulip_v5_tasks SET lease_owner=%s WHERE uuid=%s",
-                    (uuid.uuid4(), task_uuid),
-                )
-            blocker.execute(
-                "SELECT uuid FROM m_external_accounts_v2 WHERE uuid=%s FOR UPDATE",
-                (account.uuid,),
-            )
-        return original(claimed_uuid, claimed_owner)
-
-    try:
-        with mock.patch.object(service, "_locked_task", side_effect=lock_after_prepare):
-            service._run_task(task_uuid, owner)
-    finally:
-        blocker.close()
-    assert zulip.upload_file.call_count == (0 if claim_state == "unknown_http" else 1)
-    zulip.send_message.assert_not_called()
-    (delivery,) = models.MessageDelivery.objects.get_all(
-        filters={"project_id": filters.EQ(account.project_id)}
-    )
-    # No POST started: this known local skip must not become an unknown send.
-    assert delivery.sending is (claim_state != "new")
-    if claim_state != "new":
-        return
-    outgoing_tests.ready(_stored(task))
-    with contexts.Context().session_manager():
-        [(task_uuid, owner)] = service._claim_tasks(1)
-    service._run_task(task_uuid, owner)
-    zulip.upload_file.assert_called_once()
-    zulip.send_message.assert_called_once()
-
-
-def test_realtime_send_rechecks_local_confirmation_within_250_milliseconds(outgoing):
-    _api, account, _channel, _remote, zulip, _constructor = outgoing
-    outgoing_tests.create(outgoing)
-    outgoing_tests.dispatch()
-    service = history_import.HistoryImportService(queue="realtime", workers=1)
-    with contexts.Context().session_manager():
-        [(task_uuid, owner)] = service._claim_tasks(1)
-    service._run_task(task_uuid, owner)
-    (task,) = outgoing_tests.tasks(account)
-    assert task.status == "retry"
-    assert (
-        datetime.timedelta(0)
-        < task.next_retry_at - task.updated_at
-        <= datetime.timedelta(milliseconds=250)
-    )
-    # An unacknowledged HTTP attempt may be checked quickly, never reposted.
-    outgoing_tests.ready(task)
-    with contexts.Context().session_manager():
-        [(task_uuid, owner)] = service._claim_tasks(1)
-    service._run_task(task_uuid, owner)
-    zulip.send_message.assert_called_once()
-    zulip.get_messages.assert_called_once()
-
-
-def test_send_lock_error_before_http_does_not_leave_an_unknown_attempt(outgoing):
-    _api, account, _channel, _remote, zulip, _constructor = outgoing
-    outgoing_tests.create(outgoing)
-    outgoing_tests.dispatch()
-    service = history_import.HistoryImportService(queue="realtime", workers=1)
-    with contexts.Context().session_manager():
-        [(task_uuid, owner)] = service._claim_tasks(1)
-    original = service._locked_task
-    calls = 0
-
-    def fail_second_lock(claimed_uuid, claimed_owner):
-        nonlocal calls
-        calls += 1
-        if calls == 2:
-            raise psycopg.errors.DeadlockDetected("deadlock before HTTP")
-        return original(claimed_uuid, claimed_owner)
-
-    with mock.patch.object(service, "_locked_task", side_effect=fail_second_lock):
-        with pytest.raises(psycopg.errors.DeadlockDetected):
-            service._run_task(task_uuid, owner)
-    zulip.send_message.assert_not_called()
-    task = models.Task.objects.get_one(filters={"uuid": filters.EQ(task_uuid)})
-    delivery = models.MessageDelivery.objects.get_one(
-        filters={"uuid": filters.EQ(task.content.delivery_uuid)}
-    )
-    assert not delivery.sending
-    with contexts.Context().session_manager():
-        [(task_uuid, owner)] = service._claim_tasks(1)
-    service._run_task(task_uuid, owner)
-    zulip.send_message.assert_called_once()

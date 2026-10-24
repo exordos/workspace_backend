@@ -23,8 +23,8 @@ DOMAIN = "history_import"
 history_import_opts = [
     cfg.StrOpt(
         "queue",
-        default="background",
-        choices=["background", "realtime"],
+        default="all",
+        choices=["all", "background", "realtime"],
         help="Durable task queue consumed by this process",
     ),
     cfg.IntOpt("workers", default=4, min=1, help="Maximum concurrent background tasks"),

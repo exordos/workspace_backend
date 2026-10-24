@@ -19,7 +19,6 @@ from workspace.bridges.zulip.dm import models
 from workspace.bridges.zulip.dm import reactions
 from workspace.messenger_api import file_storage
 from workspace.messenger_api.dm import v2_models
-from workspace.services import history_import
 from workspace.tests.integration import conftest
 from workspace.tests.integration import (
     test_zulip_content_conversion as conversion_tests,
@@ -253,58 +252,7 @@ def test_refreshes_flags_and_reactions_from_the_latest_known_range(
             task.delete()
 
 
-def test_worker_selects_queued_flag_tasks_newest_first(
-    history_account, db, monkeypatch, scheduled_reconciliation
-):
-    account = history_account
-    zulip = mock.Mock()
-    zulip.get_messages.return_value = _data()
-    monkeypatch.setattr(client, "ZulipClient", lambda account: zulip)
-    assert message_tests._import_history(account).status == "done"
-    conversion_tests._publish(account, db)
-    rows = db.execute(
-        """SELECT state.uuid, observed.message_id
-                         FROM messenger_user_message_states AS state
-                         JOIN messenger_message_placements AS placement
-                           ON placement.project_id=state.project_id AND placement.uuid=state.placement_uuid
-                         JOIN bridge_zulip_v5_messages AS observed
-                           ON observed.project_id=placement.project_id
-                          AND messenger_uuid_v5(observed.project_id,observed.message_uuid::text)=placement.message_uuid
-                         WHERE observed.project_id=%s ORDER BY observed.message_id""",
-        (account.project_id,),
-    ).fetchall()
-    tasks = []
-    try:
-        for state_uuid, message_id in rows:
-            task = models.Task(
-                project_id=account.project_id,
-                external_account_uuid=account.uuid,
-                priority=models.TASK_PRIORITY_REALTIME_FLAGS,
-                content=models.UpdateMessageFlagsContent(
-                    state_uuid=state_uuid,
-                    flag="read",
-                    value=True,
-                    changed_at=datetime.datetime.now(datetime.timezone.utc),
-                    account_revision=account.realtime_revision(),
-                ),
-            )
-            task.insert()
-            tasks.append(task)
-        seen = []
-        service = history_import.HistoryImportService()
-        for _ in tasks:
-            with contexts.Context().session_manager():
-                (task,) = service._get_tasks()
-                assert task.uuid in {item.uuid for item in tasks}
-                seen.append(task.message_sequence)
-                task.status = "cancel"
-                task.update()
-        assert seen == [43, 42, 41]
-    finally:
-        for task in tasks:
-            task.delete()
-
-
+@pytest.mark.pre_outgoing_schema
 def test_ordering_migration_backfills_existing_content_without_requeueing_it(
     history_account, db, monkeypatch
 ):
@@ -317,7 +265,7 @@ def test_ordering_migration_backfills_existing_content_without_requeueing_it(
     query = "SELECT message_uuid,revision FROM bridge_zulip_v5_message_changes WHERE project_id=%s ORDER BY message_uuid"
     before = db.execute(query, (account.project_id,)).fetchall()
     target = next(conftest.MIGRATIONS_DIR.glob("0242-*.py")).name
-    engine = migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    engine = conftest.DataMigration(target)
     engine.rollback_migration(target)
     engine.apply_migration(target)
     assert db.execute(query, (account.project_id,)).fetchall() == before

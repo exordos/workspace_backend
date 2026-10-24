@@ -476,6 +476,10 @@ def pytest_configure(config):
         raise pytest.UsageError("--integration-shard requires 0 <= INDEX < COUNT")
     config.addinivalue_line(
         "markers",
+        "pre_outgoing_schema: test published outgoing migrations before their removal",
+    )
+    config.addinivalue_line(
+        "markers",
         "pre_retirement_schema: verify a published migration before compatibility retirement",
     )
     config.addinivalue_line(
@@ -501,6 +505,20 @@ def pytest_collection_modifyitems(config, items):
 
 @pytest.fixture(autouse=True)
 def _test_database_url(_database, request, monkeypatch):
+    if request.node.get_closest_marker("pre_outgoing_schema") is not None:
+        with isolated_migration_database(
+            "0264-Add-synchronization-status-to-provider-entities-ca9efd.py"
+        ) as database_url:
+            path = next(MIGRATIONS_DIR.glob("0265-*.py"))
+            spec = importlib.util.spec_from_file_location("outgoing_test_schema", path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            # Current incoming code reads intentions; the historical migration
+            # under test still owns the old outbound tables and triggers.
+            with psycopg.connect(database_url, autocommit=True) as connection:
+                connection.execute(module.SCHEMA)
+            yield database_url
+        return
     if request.node.get_closest_marker("isolated_schema") is not None:
         engine = ra_migrations.MigrationEngine(migrations_path=str(MIGRATIONS_DIR))
         with isolated_migration_database(engine.get_latest_migration()) as database_url:

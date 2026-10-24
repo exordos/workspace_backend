@@ -25,11 +25,12 @@ from workspace.messenger_api.dm import v2_models
 from workspace.tests.integration import conftest
 
 
-def _channel(account, stream_id=42, connection=None):
+def _channel(account, stream_id=42, connection=None, hostname=None):
     channel = models.ZulipChannel(
         external_account_uuid=account.uuid,
         stream_uuid=uuid.uuid5(
-            uuid.uuid5(uuid.NAMESPACE_DNS, account.get_host()), str(stream_id)
+            uuid.uuid5(uuid.NAMESPACE_DNS, hostname or account.get_host()),
+            str(stream_id),
         ),
         stream_id=stream_id,
         name=f"Channel {stream_id}",
@@ -88,6 +89,8 @@ def _message_data(message_id=42, **values):
         "type": "stream",
         "stream_id": 42,
         "subject": "General",
+        "display_recipient": f"Channel {values.get('stream_id', 42)}",
+        "sender_full_name": f"User {values.get('sender_id', 7)}",
         "content": f"Message **{message_id}**",
         "sender_id": 7,
         "timestamp": 1691057093,
@@ -359,9 +362,11 @@ def test_topic_identity_migration_merges_accounts_and_preserves_messages(_databa
                 provider="zulip",
                 settings={"server_url": "https://zulip.example.com"},
             )
-            account.insert()
             with psycopg.connect(database_url, autocommit=True) as connection:
-                channel = _channel(account, connection=connection)
+                conftest.seed_legacy_external_account(connection, account)
+                channel = _channel(
+                    account, connection=connection, hostname="zulip.example.com"
+                )
             for message_id, subject in enumerate(("Planning", "", "General Topic"), 42):
                 canonical_uuid = uuid.uuid5(channel.stream_uuid, subject)
                 topic = models.ZulipTopic(

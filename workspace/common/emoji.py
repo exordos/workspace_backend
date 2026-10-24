@@ -11,6 +11,7 @@ mean different emoji in Workspace, so only Unicode codes cross that boundary.
 import importlib.resources
 import json
 import re
+import typing
 
 
 CATALOG = json.loads(
@@ -59,3 +60,20 @@ def name_for_code(code: str, name: str) -> str:
         return names[0]
     # Keep an unknown provider code distinct from known Workspace shortcodes.
     return "".join(chr(int(point, 16)) for point in code.split("-"))
+
+
+def zulip_identity(
+    name: str, observations: list[dict[str, typing.Any]]
+) -> tuple[str, str] | None:
+    code = code_for_name(name)
+    for row in observations:
+        if row["reaction_type"] == "unicode_emoji" and (
+            (code is not None and normalize_code(row["emoji_code"]) == code)
+            or name_for_code(row["emoji_code"], row["emoji_name"]) == name
+        ):
+            # Existing reactions retain the exact code and alias the server
+            # supplied, including emoji introduced after our pinned catalog.
+            return row["emoji_code"], row["emoji_name"]
+    if code is not None and code in ZULIP_NAME_BY_CODE:
+        return code, ZULIP_NAME_BY_CODE[code]
+    return None

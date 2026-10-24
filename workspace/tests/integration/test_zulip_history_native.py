@@ -50,9 +50,7 @@ def test_shared_native_observation_updates_canonical_without_invalidating_peer_s
             canonical = v2_models.WorkspaceMessage.objects.get_one(
                 filters={"project_id": filters.EQ(account.project_id)}
             )
-            delivery = models.MessageDelivery.route(
-                account.project_id, placement, canonical
-            )
+            delivery = outgoing_tests.seed_delivery(account, placement, canonical)
             delivery.zulip_message_id = remote["id"]
             delivery.update()
             data = {**remote, "reactions": []}
@@ -113,9 +111,7 @@ def test_native_delivery_hashes_skip_unchanged_and_unrelated_conversion(
         canonical = v2_models.WorkspaceMessage.objects.get_one(
             filters={"project_id": filters.EQ(account.project_id)}
         )
-        delivery = models.MessageDelivery.route(
-            account.project_id, placement, canonical
-        )
+        delivery = outgoing_tests.seed_delivery(account, placement, canonical)
         delivery.zulip_message_id = remote["id"]
         delivery.update()
         history_tests.scan(account, [data], monkeypatch, last_id=remote["id"])
@@ -178,9 +174,7 @@ def test_global_read_all_respects_equal_snapshot_barriers_and_later_snapshot_cha
         canonical = v2_models.WorkspaceMessage.objects.get_one(
             filters={"project_id": filters.EQ(account.project_id)}
         )
-        delivery = models.MessageDelivery.route(
-            account.project_id, placement, canonical
-        )
+        delivery = outgoing_tests.seed_delivery(account, placement, canonical)
         delivery.zulip_message_id = remote["id"]
         delivery.update()
         history_tests.scan(account, [data], monkeypatch, last_id=remote["id"])

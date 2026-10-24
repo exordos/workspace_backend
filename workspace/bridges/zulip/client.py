@@ -50,48 +50,6 @@ class ZulipClient:
     def check_connection(self) -> dict:
         return self._get("/users/me")
 
-    def send_message(
-        self,
-        recipient: int | list[int],
-        content: str,
-        topic: str | None,
-        queue_id: str,
-        local_id: str,
-    ) -> int:
-        data = {
-            "type": "direct" if topic is None else "channel",
-            "to": json.dumps(recipient),
-            "content": content,
-            "read_by_sender": "true",
-            "queue_id": queue_id,
-            "local_id": local_id,
-        }
-        if topic is not None:
-            data["topic"] = topic
-        return self._request("POST", "/messages", data=data)["id"]
-
-    def edit_message(self, message_id: int, content: str) -> None:
-        self._request("PATCH", f"/messages/{message_id}", data={"content": content})
-
-    def delete_message(self, message_id: int) -> None:
-        try:
-            self._request("DELETE", f"/messages/{message_id}")
-        except requests.HTTPError as error:
-            # Retrying a DELETE after a lost response is safe. Zulip reports an
-            # already absent message as BAD_REQUEST, distinct from permission errors.
-            if error.response.status_code == 400 and error.response.json() == {
-                "result": "error",
-                "code": "BAD_REQUEST",
-                "msg": "Invalid message(s)",
-            }:
-                return
-            raise
-
-    def upload_file(self, name: str, data: bytes, content_type: str) -> str:
-        return self._request(
-            "POST", "/user_uploads", files={"filename": (name, data, content_type)}
-        )["url"]
-
     def download_file(self, path: str) -> tuple[bytes, str]:
         temporary = self._get(path)["url"]
         url = urllib.parse.urljoin(
@@ -103,37 +61,6 @@ class ZulipClient:
             response = session.get(url, timeout=(5, 30))
             response.raise_for_status()
             return response.content, response.headers["Content-Type"].split(";", 1)[0]
-
-    def update_message_flags(
-        self, message_ids: list[int], flag: str, value: bool
-    ) -> dict:
-        return self._request(
-            "POST",
-            "/messages/flags",
-            data={
-                "messages": json.dumps(message_ids),
-                "flag": flag,
-                "op": "add" if value else "remove",
-            },
-        )
-
-    def update_reaction(
-        self,
-        message_id: int,
-        emoji_name: str,
-        emoji_code: str,
-        reaction_type: str,
-        present: bool,
-    ) -> dict:
-        return self._request(
-            "POST" if present else "DELETE",
-            f"/messages/{message_id}/reactions",
-            data={
-                "emoji_name": emoji_name,
-                "emoji_code": emoji_code,
-                "reaction_type": reaction_type,
-            },
-        )
 
     def get_users(self) -> list[dict]:
         # Unlike /users, registration also includes cross-realm system bots.
@@ -221,36 +148,6 @@ class ZulipClient:
             return data["user_topics"]
         finally:
             self._request("DELETE", "/events", data={"queue_id": data["queue_id"]})
-
-    def update_stream_notifications(self, stream_id: int, is_muted: bool) -> None:
-        self._request(
-            "POST",
-            "/users/me/subscriptions/properties",
-            data={
-                "subscription_data": json.dumps(
-                    [
-                        {
-                            "stream_id": stream_id,
-                            "property": "is_muted",
-                            "value": is_muted,
-                        }
-                    ]
-                )
-            },
-        )
-
-    def update_topic_notifications(
-        self, stream_id: int, topic: str, visibility_policy: int
-    ) -> None:
-        self._request(
-            "POST",
-            "/user_topics",
-            data={
-                "stream_id": stream_id,
-                "topic": topic,
-                "visibility_policy": visibility_policy,
-            },
-        )
 
     def get_messages(self, first_message_id: int, last_message_id: int) -> list[dict]:
         messages = self._get(
