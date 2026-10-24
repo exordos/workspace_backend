@@ -1410,3 +1410,55 @@ def test_empty_flag_list_only_applies_globally_with_explicit_all(
             ).fetchone()[0]
             == before
         )
+
+
+def test_ready_incoming_event_reaches_clients_without_projection_drain(incoming):
+    api, db, account, _http, _url = incoming
+    apply(incoming, event())
+    events = api.get("/v1/events/").json()
+    assert any(
+        row["payload"]["kind"] == "message.created"
+        and row["payload"]["payload"]["content"] == "Hello"
+        for row in events
+    )
+    assert (
+        db.execute(
+            "SELECT count(*) FROM messenger_projection_tasks WHERE project_id=%s "
+            "AND task_kind='delivery_snapshot_event'",
+            (account["project_id"],),
+        ).fetchone()[0]
+        == 0
+    )
+
+
+def test_incoming_publication_lock_contention_rolls_back_and_retries(incoming):
+    api, db, account, _http, url = incoming
+    with psycopg.connect(url, autocommit=True) as locker:
+        locker.execute(
+            "SELECT pg_advisory_lock(hashtextextended(%s::text,0))",
+            (account["project_id"],),
+        )
+        try:
+            with pytest.raises(incoming_operations.outgoing_operations.Pending):
+                apply(incoming, event())
+            assert (
+                db.execute(
+                    "SELECT count(*) FROM messenger_messages WHERE project_id=%s",
+                    (account["project_id"],),
+                ).fetchone()[0]
+                == 0
+            )
+            assert not api.get("/v1/events/").json()
+        finally:
+            locker.execute(
+                "SELECT pg_advisory_unlock(hashtextextended(%s::text,0))",
+                (account["project_id"],),
+            )
+    apply(incoming, event())
+    assert (
+        sum(
+            row["payload"]["kind"] == "message.created"
+            for row in api.get("/v1/events/").json()
+        )
+        == 1
+    )

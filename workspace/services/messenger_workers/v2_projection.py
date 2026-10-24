@@ -212,13 +212,8 @@ def _lane_predicate(alias: str, kind_column: str, lane: str) -> str:
             'message.read', 'messages.read', 'stream.read', 'topic.read'
         )
     """
-    live_delivery = f"""
-        {alias}.{kind_column} = 'delivery_snapshot_event'
-        AND COALESCE({alias}.payload->>'source_kind' = 'zulip.incoming', FALSE)
-        AND {alias}.payload->>'kind' IS DISTINCT FROM 'message.read'
-    """
     predicates = {
-        "fanout": f"({alias}.{kind_column} = 'fanout' OR ({live_delivery}))",
+        "fanout": f"{alias}.{kind_column} = 'fanout'",
         "interactive_read": interactive_read,
         "reaction_snapshot": f"{alias}.{kind_column} = 'reaction_snapshot'",
         "read_state": (
@@ -228,7 +223,7 @@ def _lane_predicate(alias: str, kind_column: str, lane: str) -> str:
             f"{alias}.{kind_column} IN ("
             "'content_mentions', 'folder_projection', "
             "'delivery_snapshot_event', 'topic_state_projection', "
-            f"'topic_membership_policy_rebuild') AND NOT ({live_delivery})"
+            "'topic_membership_policy_rebuild')"
         ),
     }
     return predicates[lane]
@@ -2778,26 +2773,6 @@ def _deliver_snapshot_batch(
         if len(placement_payload.get("recipients") or []) > MAX_FANOUT_BATCH_SIZE:
             raise ValueError("delivery recipient batch exceeds the hard maximum")
     expected_generations = payload.get("membership_generations") or {}
-    if source_kind == "zulip.incoming":
-        emitted = messenger_events.create_broadcast_event(
-            task["project_id"],
-            _uuid(payload["entity_uuid"]),
-            [_uuid(user) for user in payload["recipients"]],
-            payload["kind"],
-            payload["snapshot"],
-            recipient_payloads=payload["recipient_payloads"],
-            session=session,
-        )
-        if payload["stream_uuid"] is not None:
-            _guard_emitted_events(
-                session,
-                emitted,
-                project_id=task["project_id"],
-                stream_uuid=_uuid(payload["stream_uuid"]),
-                membership_generations=payload["membership_generations"],
-                control_effect=payload["control_effect"],
-            )
-        return
     if source_kind in {
         "stream_bindings.created",
         "stream_binding.updated",

@@ -685,6 +685,12 @@ class MutationRuntime:
             ).folders[(project_id, row["user_uuid"], row["folder_uuid"])] = True
 
     def _publish(self, session: sessions.PgSQLSession, project_id: uuid.UUID) -> None:
+        locked = session.execute(
+            "SELECT pg_try_advisory_xact_lock(hashtextextended(%s::text, 0)) AS locked",
+            (project_id,),
+        ).fetchone()["locked"]
+        if not locked:
+            return
         for row in session.execute(
             "SELECT * FROM messenger_publication_outbox WHERE project_id=%s ORDER BY sequence LIMIT 256",
             (project_id,),

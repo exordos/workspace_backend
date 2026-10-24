@@ -12,11 +12,13 @@ import time
 import uuid
 
 import pytest
+import psycopg
 from restalchemy.common import contexts
 from oslo_config import cfg
 
 from workspace.common import mutation_journal_opts
 from workspace.messenger_api import exceptions as messenger_exceptions
+from workspace.messenger_api import publication
 from workspace.messenger_api.api import journal_store
 from workspace.services.messenger_workers import keyed_dispatcher
 from workspace.services.messenger_workers import mutation_runtime
@@ -25,11 +27,9 @@ from workspace.tests.integration import conftest
 from workspace.tests.integration import test_messenger_v2 as native
 
 
-
-
-
-
 conversation = journal_tests.conversation
+
+
 @pytest.fixture
 def journal(conversation, db):
     runtime = mutation_runtime.MutationRuntime()
@@ -38,10 +38,6 @@ def journal(conversation, db):
         yield runtime
     finally:
         runtime.close()
-
-
-
-
 
 
 def test_read_up_to_leaves_hidden_personal_states_unchanged(
@@ -117,8 +113,6 @@ def test_terminal_non_delete_receipts_are_not_retained_forever(
     assert retained < counts[-1], (
         "No terminal receipt was collected, including receipts dated over 25 years ago"
     )
-
-
 
 
 def test_deferred_message_publication_hides_revoked_membership(
@@ -447,3 +441,47 @@ def test_multi_topic_admission_rolls_back_when_queue_capacity_is_exhausted(
             "max_pending_per_user", group=mutation_journal_opts.DOMAIN
         )
         runtime.close()
+
+
+def test_native_publisher_yields_to_an_incoming_epoch_writer(
+    journal, api, db, _test_database_url
+):
+    entity = uuid.uuid4()
+    with contexts.Context().session_manager() as session:
+        pending = publication.enqueue(
+            session,
+            uuid.UUID(api.project_id),
+            entity,
+            [uuid.UUID(api.user_uuid)],
+            "message.updated",
+            {"uuid": str(entity)},
+        )
+    with psycopg.connect(_test_database_url, autocommit=True) as locker:
+        locker.execute(
+            "SELECT pg_advisory_lock(hashtextextended(%s::text,0))", (api.project_id,)
+        )
+        try:
+            with contexts.Context().session_manager() as session:
+                journal._publish(session, uuid.UUID(api.project_id))
+            assert (
+                db.execute(
+                    "SELECT count(*) FROM messenger_publication_outbox WHERE uuid=%s",
+                    (pending[0].uuid,),
+                ).fetchone()[0]
+                == 1
+            )
+        finally:
+            locker.execute(
+                "SELECT pg_advisory_unlock(hashtextextended(%s::text,0))",
+                (api.project_id,),
+            )
+    with contexts.Context().session_manager() as session:
+        journal._publish(session, uuid.UUID(api.project_id))
+    assert (
+        db.execute(
+            "SELECT count(*) FROM m_workspace_broadcast_message_events_v1 "
+            "WHERE uuid=%s",
+            (pending[0].uuid,),
+        ).fetchone()[0]
+        == 1
+    )

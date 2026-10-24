@@ -18,6 +18,8 @@ from workspace.bridges.zulip import message_conversion
 from workspace.bridges.zulip import outgoing_operations
 from workspace.common import emoji
 from workspace.messenger_api import file_storage
+from workspace.messenger_api import events as messenger_events
+from workspace.messenger_api.dm import models
 
 
 SELECT_ROW_SQL = "SELECT * FROM {table} WHERE project_id = %s AND uuid = %s"
@@ -171,11 +173,6 @@ SELECT_SNAPSHOT_SQL = """
 """
 SELECT_PROJECT_USERS_SQL = """
     SELECT user_uuid FROM messenger_project_users WHERE project_id = %s
-"""
-ENQUEUE_EVENT_SQL = """
-    INSERT INTO messenger_domain_outbox_events (
-        uuid, project_id, event_kind, scope_kind, scope_key, payload
-    ) VALUES (%s, %s, 'delivery_snapshot_event', 'resource', %s, %s)
 """
 ENQUEUE_COUNTERS_SQL = """
     INSERT INTO messenger_domain_outbox_events (
@@ -576,29 +573,90 @@ class Operations:
                     ),
                 )
             }
-        event_uuid = uuid.uuid4()
+        locked = await rows(
+            connection,
+            "SELECT pg_try_advisory_xact_lock(hashtextextended(%s::text, 0)) AS locked",
+            (account["project_id"],),
+        )
+        if not locked[0]["locked"]:
+            raise outgoing_operations.Pending("Waiting for the client event writer")
+        recipients = sorted(set(recipients), key=str)
+        digest = hashlib.sha256(
+            "\n".join(map(str, recipients)).encode("ascii")
+        ).hexdigest()
+        audience_uuid = uuid.uuid5(account["project_id"], digest)
         await connection.execute(
-            ENQUEUE_EVENT_SQL,
+            """INSERT INTO m_workspace_event_audience_snapshots_v1
+                (uuid, project_id, membership_digest) VALUES (%s,%s,%s)
+                ON CONFLICT (project_id,membership_digest) DO NOTHING""",
+            (audience_uuid, account["project_id"], digest),
+        )
+        await connection.execute(
+            """INSERT INTO m_workspace_event_audience_members_v1
+                (audience_snapshot_uuid,user_uuid)
+                SELECT %s,unnest(%s::uuid[])
+                ON CONFLICT (audience_snapshot_uuid,user_uuid) DO NOTHING""",
+            (audience_uuid, recipients),
+        )
+        object_type, action = messenger_events._event_metadata_for_kind(kind)
+        event_uuid = uuid.uuid4()
+        saved = await rows(
+            connection,
+            """INSERT INTO m_workspace_broadcast_message_events_v1
+                (uuid,project_id,entity_uuid,audience_snapshot_uuid,
+                 schema_version,object_type,action,payload)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING epoch_version""",
             (
                 event_uuid,
                 account["project_id"],
-                f"{account['project_id']}:incoming:{entity_uuid}",
-                json_value(
-                    {
-                        "source_kind": "zulip.incoming",
-                        "resource_uuid": entity_uuid,
-                        "kind": kind,
-                        "entity_uuid": entity_uuid,
-                        "snapshot": common,
-                        "recipient_payloads": overrides,
-                        "recipients": recipients,
-                        "stream_uuid": stream_uuid,
-                        "membership_generations": generations,
-                        "control_effect": control_effect,
-                    }
-                ),
+                entity_uuid,
+                audience_uuid,
+                models.WORKSPACE_EVENT_SCHEMA_VERSION,
+                object_type,
+                action,
+                json_value(messenger_events._payload_with_kind(kind, common)),
             ),
         )
+        await connection.execute(
+            """INSERT INTO m_workspace_event_recipient_payloads_v1
+                (event_uuid,user_uuid,payload)
+                SELECT %s,item.key::uuid,item.value
+                FROM jsonb_each(%s::jsonb) AS item""",
+            (event_uuid, json_value(overrides)),
+        )
+        await connection.execute(
+            """UPDATE m_workspace_event_audience_snapshots_v1
+                SET current_epoch_version=GREATEST(current_epoch_version,%s)
+                WHERE uuid=%s""",
+            (saved[0]["epoch_version"], audience_uuid),
+        )
+        if stream_uuid is not None:
+            if control_effect:
+                for user in recipients:
+                    generations.setdefault(str(user), 1)
+                exists = await rows(
+                    connection,
+                    "SELECT 1 FROM messenger_streams WHERE project_id=%s AND uuid=%s",
+                    (account["project_id"], stream_uuid),
+                )
+                if not exists:
+                    stream_uuid = None
+            await connection.execute(
+                """INSERT INTO messenger_event_membership_guards
+                    (event_uuid,project_id,user_uuid,stream_uuid,
+                     membership_generation,control_effect)
+                    SELECT %s,%s,input.user_uuid,%s,input.generation,%s
+                    FROM unnest(%s::uuid[],%s::integer[]) AS input(user_uuid,generation)
+                    ON CONFLICT (event_uuid,user_uuid) DO NOTHING""",
+                (
+                    event_uuid,
+                    account["project_id"],
+                    stream_uuid,
+                    control_effect,
+                    recipients,
+                    [generations[str(user)] for user in recipients],
+                ),
+            )
 
     async def snapshot(
         self,
