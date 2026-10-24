@@ -141,6 +141,34 @@ def test_message_create_edit_delete_produces_client_events(incoming):
     )
 
 
+@pytest.mark.parametrize("newer_snapshot", [False, True])
+def test_edit_event_wins_over_stale_message_detail(incoming, newer_snapshot):
+    api, _db, _account, http, _url = incoming
+    original = event()
+    apply(incoming, original)
+    stamp = original["message"]["timestamp"]
+    http.request.return_value = {
+        "message": {
+            **original["message"],
+            "content": "Newer detail" if newer_snapshot else "Hello",
+            "last_edit_timestamp": stamp + 20 if newer_snapshot else stamp,
+        }
+    }
+    apply(
+        incoming,
+        {
+            "type": "update_message",
+            "message_id": 101,
+            "content": "Edited event",
+            "edit_timestamp": stamp + 10,
+        },
+    )
+    drain()
+    assert api.get("/v1/messenger/messages/").json()[0]["payload"]["content"] == (
+        "Newer detail" if newer_snapshot else "Edited event"
+    )
+
+
 def client_events(incoming):
     _api, db, account, _http, _url = incoming
     return [

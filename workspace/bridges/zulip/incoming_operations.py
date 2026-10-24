@@ -849,7 +849,20 @@ class Operations:
                     raise
                 prepared.setdefault("deleted", []).append(identifier)
             else:
-                prepared["messages"].append(data["message"])
+                message = dict(data["message"])
+                if (
+                    kind == "update_message"
+                    and "edit_timestamp" in event
+                    and event["edit_timestamp"]
+                    >= (message.get("last_edit_timestamp") or message["timestamp"])
+                ):
+                    for field in ("content", "subject"):
+                        if field in event:
+                            message[field] = event[field]
+                    if "new_stream_id" in event:
+                        message["stream_id"] = event["new_stream_id"]
+                    message["last_edit_timestamp"] = event["edit_timestamp"]
+                prepared["messages"].append(message)
         people = {
             channel["creator_id"]
             for channel in prepared["channels"].values()
