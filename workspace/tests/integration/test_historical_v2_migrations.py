@@ -17,7 +17,7 @@ from workspace.tests.integration import legacy_store
 from workspace.messenger_api.api import store as api_store
 from workspace.tests.integration.legacy_messenger import helpers as legacy_helpers
 from workspace.tests.integration.legacy_messenger import store_factory
-from workspace.services.messenger_workers import v2_projection
+from workspace.tests.integration.legacy_messenger import v2_projection
 from workspace.tests.integration import conftest
 
 pytestmark = pytest.mark.pre_retirement_schema
@@ -292,7 +292,6 @@ def test_native_read_repair_migration_preserves_compact_reads(api, db):
                 "name": "Compact native read migration",
                 "description": "",
                 "source_name": "native",
-                "source": {"kind": "native"},
             },
         ).json()
         _drain()
@@ -442,7 +441,6 @@ def test_v2_compatibility_read_repair_restores_all_canonical_reads(api, db):
                 "name": "Compatibility read repair",
                 "description": "",
                 "source_name": "native",
-                "source": {"kind": "native"},
             },
         ).json()
         _drain()

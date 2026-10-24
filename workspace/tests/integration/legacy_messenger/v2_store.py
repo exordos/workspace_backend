@@ -22,7 +22,7 @@ from workspace.tests.integration.legacy_messenger import base
 from workspace.tests.integration.legacy_messenger import helpers
 from workspace.messenger_api.dm import message_payloads
 from migrations import legacy_messenger_read_state as read_state
-from workspace.messenger_api.dm import v2_models
+from workspace.tests.integration.legacy_messenger import v2_models
 
 
 CORE_RESOURCE_MODELS: dict[str, typing.Any] = {
