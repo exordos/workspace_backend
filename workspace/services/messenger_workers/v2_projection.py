@@ -212,8 +212,13 @@ def _lane_predicate(alias: str, kind_column: str, lane: str) -> str:
             'message.read', 'messages.read', 'stream.read', 'topic.read'
         )
     """
+    live_delivery = f"""
+        {alias}.{kind_column} = 'delivery_snapshot_event'
+        AND COALESCE({alias}.payload->>'source_kind' = 'zulip.incoming', FALSE)
+        AND {alias}.payload->>'kind' IS DISTINCT FROM 'message.read'
+    """
     predicates = {
-        "fanout": f"{alias}.{kind_column} = 'fanout'",
+        "fanout": f"({alias}.{kind_column} = 'fanout' OR ({live_delivery}))",
         "interactive_read": interactive_read,
         "reaction_snapshot": f"{alias}.{kind_column} = 'reaction_snapshot'",
         "read_state": (
@@ -223,7 +228,7 @@ def _lane_predicate(alias: str, kind_column: str, lane: str) -> str:
             f"{alias}.{kind_column} IN ("
             "'content_mentions', 'folder_projection', "
             "'delivery_snapshot_event', 'topic_state_projection', "
-            "'topic_membership_policy_rebuild')"
+            f"'topic_membership_policy_rebuild') AND NOT ({live_delivery})"
         ),
     }
     return predicates[lane]

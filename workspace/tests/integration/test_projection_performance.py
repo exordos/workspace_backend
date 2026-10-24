@@ -2773,3 +2773,133 @@ def test_fair_scheduler_filters_blocked_rows_before_candidate_limit(
 
         assert claimed is not None
         assert claimed["scope_key"] == available_scope_key
+
+
+def test_zulip_message_delivery_overtakes_unrelated_read_snapshot_backlog(api):
+    old, fresh = sys_uuid.uuid4(), sys_uuid.uuid4()
+    ids = _seed_partition_claim_tasks(
+        api,
+        [
+            {
+                "task_kind": "delivery_snapshot_event",
+                "scope_kind": "resource",
+                "scope_key": f"{api.project_id}:incoming:{entity}",
+                "payload": {
+                    "source_kind": "zulip.incoming",
+                    "kind": kind,
+                    "entity_uuid": str(entity),
+                    "resource_uuid": str(entity),
+                },
+            }
+            for entity, kind in [(old, "message.read"), (fresh, "message.created")]
+        ],
+    )
+    with contexts.Context().session_manager() as session:
+        task, _scan, _deferred = v2_projection._claim_task_for_lane(
+            session,
+            "cassi-zulip-delivery-priority",
+            30,
+            "fanout",
+            v2_projection._lane_predicate("candidate", "task_kind", "fanout"),
+            v2_projection._lane_predicate("task", "task_kind", "fanout"),
+            None,
+            (None, None, None),
+        )
+        assert task is not None
+        assert task["outbox_event_uuid"] == ids[1]
+
+
+def test_zulip_delivery_priority_keeps_same_entity_events_in_order(api, db):
+    entity = sys_uuid.uuid4()
+    ids = _seed_partition_claim_tasks(
+        api,
+        [
+            {
+                "task_kind": "delivery_snapshot_event",
+                "scope_kind": "resource",
+                "scope_key": f"{api.project_id}:incoming:{entity}",
+                "payload": {
+                    "source_kind": "zulip.incoming",
+                    "kind": kind,
+                    "entity_uuid": str(entity),
+                    "resource_uuid": str(entity),
+                },
+            }
+            for kind in ("message.read", "message.updated")
+        ],
+    )
+    with contexts.Context().session_manager() as session:
+        task, _scan, _deferred = v2_projection._claim_task_for_lane(
+            session,
+            "cassi-zulip-delivery-order",
+            30,
+            "fanout",
+            v2_projection._lane_predicate("candidate", "task_kind", "fanout"),
+            v2_projection._lane_predicate("task", "task_kind", "fanout"),
+            None,
+            (None, None, None),
+        )
+        assert task is None
+    db.execute(
+        "UPDATE messenger_projection_tasks SET status='completed' "
+        "WHERE project_id=%s AND outbox_event_uuid=%s",
+        (api.project_id, ids[0]),
+    )
+    with contexts.Context().session_manager() as session:
+        task, _scan, _deferred = v2_projection._claim_task_for_lane(
+            session,
+            "cassi-zulip-delivery-order",
+            30,
+            "fanout",
+            v2_projection._lane_predicate("candidate", "task_kind", "fanout"),
+            v2_projection._lane_predicate("task", "task_kind", "fanout"),
+            None,
+            (None, None, None),
+        )
+        assert task is not None
+        assert task["outbox_event_uuid"] == ids[1]
+
+
+def test_zulip_delivery_cutover_normalizes_pending_entity_order_only(api, db):
+    entity = sys_uuid.uuid4()
+    old_keys = [str(sys_uuid.uuid4()) for _ in range(3)]
+    ids = _seed_partition_claim_tasks(
+        api,
+        [
+            {
+                "task_kind": "delivery_snapshot_event",
+                "scope_kind": "resource",
+                "scope_key": key,
+                "payload": {
+                    "source_kind": "zulip.incoming",
+                    "kind": "message.read",
+                    "entity_uuid": str(entity),
+                },
+            }
+            for key in old_keys
+        ],
+    )
+    db.execute(
+        "UPDATE messenger_projection_tasks SET status='completed' "
+        "WHERE outbox_event_uuid=%s",
+        (ids[-1],),
+    )
+    path = next(conftest.MIGRATIONS_DIR.glob("0268-*.py"))
+    spec = importlib.util.spec_from_file_location("zulip_delivery_order", path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    with contexts.Context().session_manager() as session:
+        migration.migration_step.upgrade(session)
+        migration.migration_step.upgrade(session)
+    rows = db.execute(
+        "SELECT task.scope_key,task.ordering_key,task.payload->>'resource_uuid',"
+        "event.scope_key,event.payload->>'resource_uuid' "
+        "FROM messenger_projection_tasks task JOIN messenger_domain_outbox_events event "
+        "ON event.project_id=task.project_id AND event.uuid=task.outbox_event_uuid "
+        "WHERE task.outbox_event_uuid=ANY(%s) ORDER BY event.created_at",
+        (ids,),
+    ).fetchall()
+    key = f"{api.project_id}:incoming:{entity}"
+    assert rows[:2] == [(key, str(entity), str(entity), key, str(entity))] * 2
+    assert rows[-1][0] == rows[-1][3] == old_keys[-1]
+    assert rows[-1][2] is rows[-1][4] is None

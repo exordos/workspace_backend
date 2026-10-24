@@ -582,10 +582,11 @@ class Operations:
             (
                 event_uuid,
                 account["project_id"],
-                f"{account['project_id']}:incoming:{event_uuid}",
+                f"{account['project_id']}:incoming:{entity_uuid}",
                 json_value(
                     {
                         "source_kind": "zulip.incoming",
+                        "resource_uuid": entity_uuid,
                         "kind": kind,
                         "entity_uuid": entity_uuid,
                         "snapshot": common,
