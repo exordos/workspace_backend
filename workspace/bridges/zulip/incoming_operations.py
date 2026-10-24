@@ -1976,7 +1976,7 @@ class Operations:
             )
             if pending:
                 continue
-            values = {"uuid": state["uuid"], "project_id": account["project_id"]}
+            values = {}
             for flag, field in (("read", "read_at"), ("starred", "starred")):
                 if snapshot or flag in flags:
                     value = flag in flags if snapshot else present
@@ -1990,8 +1990,19 @@ class Operations:
                         if flag == "read"
                         else value
                     )
-            changed = await self.save(connection, TABLES["message_state"], values)
-            if changed:
+            if all(state[key] == value for key, value in values.items()):
+                continue
+            values["updated_at"] = datetime.datetime.now(datetime.timezone.utc)
+            saved = await rows(
+                connection,
+                UPDATE_ROW_SQL.format(
+                    table=TABLES["message_state"],
+                    assignments=", ".join(f"{key} = %s" for key in values),
+                ),
+                (*values.values(), account["project_id"], state["uuid"]),
+            )
+            if saved:
+                changed = saved[0]
                 snapshots = await rows(
                     connection,
                     SELECT_SNAPSHOT_SQL.format(view=VIEWS["message"]),

@@ -3,9 +3,12 @@
 
 import asyncio
 import datetime
+import concurrent.futures
+import time
 import uuid
 from unittest import mock
 
+import psycopg
 from psycopg import rows
 import pytest
 from restalchemy.common import contexts
@@ -1274,3 +1277,66 @@ def test_journal_read_enqueues_the_provider_flag_change(incoming):
     finally:
         runtime.close()
         cfg.CONF.clear_override("enabled", group=mutation_journal_opts.DOMAIN)
+
+
+def test_flags_do_not_recreate_a_state_deleted_with_its_message(incoming):
+    api, db, account, _http, database_url = incoming
+    apply(incoming, event())
+    drain()
+    message = api.get("/v1/messenger/messages/").json()[0]
+    canonical = db.execute(
+        "SELECT message_uuid FROM messenger_message_placements WHERE uuid=%s",
+        (message["uuid"],),
+    ).fetchone()[0]
+    original_rows = incoming_operations.rows
+    deleted = None
+
+    def delete_message():
+        with psycopg.connect(database_url, autocommit=True) as connection:
+            connection.execute(
+                "DELETE FROM messenger_messages WHERE uuid=%s", (canonical,)
+            )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+
+        async def rows_during_delete(connection, query, parameters):
+            nonlocal deleted
+            result = await original_rows(connection, query, parameters)
+            if query == incoming_operations.SELECT_STATES_SQL:
+                deleted = pool.submit(delete_message)
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    if (
+                        deleted.done()
+                        or db.execute(
+                            "SELECT EXISTS(SELECT 1 FROM pg_stat_activity "
+                            "WHERE datname=current_database() AND wait_event_type='Lock' "
+                            "AND query LIKE 'DELETE FROM messenger_messages WHERE uuid=%')"
+                        ).fetchone()[0]
+                    ):
+                        break
+                    await asyncio.sleep(0.01)
+                else:
+                    pytest.fail("Concurrent deletion did not start")
+            return result
+
+        with mock.patch.object(incoming_operations, "rows", rows_during_delete):
+            apply(
+                incoming,
+                {
+                    "type": "update_message_flags",
+                    "messages": [101],
+                    "flag": "read",
+                    "op": "add",
+                },
+            )
+        assert deleted is not None
+        deleted.result(timeout=5)
+    assert api.get("/v1/messenger/messages/" + message["uuid"]).status_code == 404
+    assert (
+        db.execute(
+            "SELECT count(*) FROM messenger_user_message_states WHERE project_id=%s",
+            (account["project_id"],),
+        ).fetchone()[0]
+        == 0
+    )
