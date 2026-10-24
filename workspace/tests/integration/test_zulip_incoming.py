@@ -2359,9 +2359,11 @@ def test_ready_message_does_not_write_locked_topic_binding(incoming):
     assert len(api.get("/v1/messenger/messages/").json()) == 2
 
 
-def test_incoming_message_does_not_lock_the_legacy_counter_scope(incoming):
+@pytest.mark.parametrize("subject", ["", "General"])
+def test_incoming_message_does_not_lock_the_legacy_counter_scope(incoming, subject):
     api, db, account, http, url = incoming
     first = event(identifier=100)
+    first["message"]["subject"] = subject
     first["message"]["timestamp"] += 2
     apply(incoming, first)
     stream = api.get("/v1/messenger/streams/").json()[0]
@@ -2383,6 +2385,7 @@ def test_incoming_message_does_not_lock_the_legacy_counter_scope(incoming):
         operations = incoming_operations.Operations(database, http)
         try:
             second = event(identifier=101)
+            second["message"]["subject"] = subject
             second["message"]["timestamp"] += 2
             prepared = await prepare_dependencies(operations, database, account, second)
             with psycopg.connect(url) as locker:
@@ -2405,7 +2408,16 @@ def test_incoming_message_does_not_lock_the_legacy_counter_scope(incoming):
 
     asyncio.run(run())
     drain()
-    topic = api.get("/v1/messenger/stream_topics/").json()[0]
+    messages = api.get("/v1/messenger/messages/").json()
+    assert {message["provider_identity"] for message in messages} == {"100", "101"}
+    topic_uuids = {message["topic_uuid"] for message in messages}
+    assert len(topic_uuids) == 1
+    # The empty Zulip topic and the literal General topic share a display name.
+    # Their UUID order must not decide which counter this regression checks.
+    topic_uuid = topic_uuids.pop()
+    response = api.get(f"/v1/messenger/stream_topics/{topic_uuid}")
+    assert response.status_code == 200, response.text
+    topic = response.json()
     assert topic["unread_count"] == 2
 
 
