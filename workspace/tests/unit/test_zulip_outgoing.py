@@ -32,7 +32,7 @@ def test_ambiguous_send_without_a_receipt_is_never_reposted():
         "send",
         "POST",
         "/messages",
-        {"queue_id": "queue"},
+        {"queue_id": "queue", "local_id": "workspace-message"},
         delivery_uuid="receipt",
         last_event_id=0,
     )
