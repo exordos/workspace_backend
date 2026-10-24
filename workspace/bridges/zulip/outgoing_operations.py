@@ -372,15 +372,7 @@ class Operations:
             )
             if operation == "delete":
                 return request("delete", "DELETE", f"/messages/{remote}")
-            current = await self.db.sql(
-                "SELECT content_updated_at FROM messenger_messages WHERE project_id=%s AND uuid=%s AND provider_uuid=%s",
-                (intent["project_id"], intent["entity_uuid"], account["provider_uuid"]),
-            )
-            if current and current[0]["content_updated_at"].replace(
-                tzinfo=None
-            ) > datetime.datetime.fromisoformat(data["content_updated_at"]).replace(
-                tzinfo=None
-            ):
+            if await self.outdated_edit(intent, account):
                 return request("noop", "", "", identity=remote)
             text = await self.convert(intent, account)
             await self.content_snapshot(intent, account, text, remote)
@@ -1092,10 +1084,23 @@ class Operations:
             and error.data.get("msg") in ("Invalid message(s)", "Invalid message ID")
         )
 
+    async def outdated_edit(self, intent: dict, account: dict) -> bool:
+        current = await self.db.sql(
+            "SELECT content_updated_at FROM messenger_messages WHERE project_id=%s AND uuid=%s AND provider_uuid=%s",
+            (intent["project_id"], intent["entity_uuid"], account["provider_uuid"]),
+        )
+        return bool(current) and current[0]["content_updated_at"].replace(
+            tzinfo=None
+        ) > datetime.datetime.fromisoformat(
+            intent["data"]["content_updated_at"]
+        ).replace(tzinfo=None)
+
     async def execute(
         self, intent: dict, account: dict, prepared: dict, checking: bool
     ) -> dict:
         kind = prepared["kind"]
+        if kind == "edit" and await self.outdated_edit(intent, account):
+            return {"identity": prepared["identity"]}
         if checking or kind in ("noop", "stream_create"):
             done, result = await self.verify(intent, account, prepared)
             if done:

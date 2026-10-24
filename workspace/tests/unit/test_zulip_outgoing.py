@@ -2,6 +2,7 @@
 # Licensed under the Apache License, Version 2.0 (the "License").
 
 import asyncio
+import datetime
 from unittest import mock
 
 import pytest
@@ -45,15 +46,22 @@ def test_retry_verifies_edit_before_repeating_the_write():
     http = mock.Mock(
         request=mock.AsyncMock(return_value={"message": {"content": "already updated"}})
     )
-    operations = outgoing_operations.Operations(mock.Mock(), http)
+    operations = outgoing_operations.Operations(
+        mock.Mock(sql=mock.AsyncMock(return_value=[])), http
+    )
     prepared = outgoing_operations.request(
         "edit", "PATCH", "/messages/123", {"content": "already updated"}
     )
-    assert asyncio.run(operations.execute({}, {}, prepared, True)) == {
-        "identity": "123"
-    }
+    assert asyncio.run(
+        operations.execute(
+            {"project_id": "project", "entity_uuid": "message"},
+            {"provider_uuid": "provider"},
+            prepared,
+            True,
+        )
+    ) == {"identity": "123"}
     http.request.assert_awaited_once_with(
-        {}, "GET", "/messages/123", {"apply_markdown": False}
+        {"provider_uuid": "provider"}, "GET", "/messages/123", {"apply_markdown": False}
     )
 
 
@@ -107,3 +115,34 @@ def test_reaction_retry_verifies_the_prepared_reaction_type(
     }
     done, _ = asyncio.run(operations.verify({}, {}, prepared))
     assert done is (present == remote_present)
+
+
+@pytest.mark.parametrize("checking", [False, True])
+def test_saved_edit_never_overwrites_a_newer_provider_change(checking):
+    database = mock.Mock(
+        sql=mock.AsyncMock(
+            return_value=[
+                {
+                    "content_updated_at": datetime.datetime(
+                        2026, 10, 24, 12, 0, 0, 900000
+                    )
+                }
+            ]
+        )
+    )
+    http = mock.Mock(
+        request=mock.AsyncMock(return_value={"message": {"content": "newer"}})
+    )
+    operations = outgoing_operations.Operations(database, http)
+    prepared = outgoing_operations.request(
+        "edit", "PATCH", "/messages/123", {"content": "stale"}, identity="123"
+    )
+    intent = {
+        "project_id": "project",
+        "entity_uuid": "message",
+        "data": {"content_updated_at": "2026-10-24T12:00:00.800000"},
+    }
+    assert asyncio.run(
+        operations.execute(intent, {"provider_uuid": "provider"}, prepared, checking)
+    ) == {"identity": "123"}
+    http.request.assert_not_called()
