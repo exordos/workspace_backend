@@ -390,30 +390,6 @@ class JournalStore(v2_store.MessengerV2Store):
             response,
         )
 
-    def update_resource(
-        self, resource: str, resource_uuid: uuid.UUID, values: dict[str, typing.Any]
-    ) -> dict[str, typing.Any]:
-        if resource != "message_reactions":
-            return super().update_resource(resource, resource_uuid, values)
-        reaction = self.get_resource(resource, resource_uuid)
-        if uuid.UUID(str(reaction["user_uuid"])) != self.user_uuid:
-            raise exceptions.ValidationErrorException()
-        old_message = self._message(reaction["message_uuid"])
-        message = self._message(values.get("message_uuid", reaction["message_uuid"]))
-        if "emoji_name" in values:
-            values = {
-                **values,
-                "emoji_name": emoji.normalize_name(values["emoji_name"]),
-            }
-        return self._admit(
-            "reaction_update",
-            resource_uuid,
-            values,
-            f"{self.project_uuid}:message:{old_message.canonical_message_uuid}",
-            self._topics(old_message) + self._topics(message),
-            {**reaction, **values},
-        )
-
     def delete_resource(
         self, resource: str, resource_uuid: uuid.UUID
     ) -> dict[str, typing.Any] | None:

@@ -396,8 +396,6 @@ class MutationRuntime:
             return store.delete_message(resource_uuid)
         if operation == "reaction_create":
             return store.create_resource("message_reactions", values)
-        if operation == "reaction_update":
-            return store.update_resource("message_reactions", resource_uuid, values)
         if operation == "reaction_delete":
             return store.delete_resource("message_reactions", resource_uuid)
         if operation in {"read", "read_up_to"}:

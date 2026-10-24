@@ -1638,3 +1638,31 @@ def test_missing_dependency_does_not_block_another_message_in_the_same_chat(inco
             await service.db.close()
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("move", [False, True])
+def test_reactions_are_add_remove_only(incoming, move):
+    api, _db, _account, _http, _url = incoming
+    apply(incoming, event(), event(identifier=102))
+    messages = api.get("/v1/messenger/messages/").json()
+    reaction = api.post(
+        "/v1/messenger/message_reactions/",
+        json={
+            "message_uuid": messages[0]["uuid"],
+            "emoji_name": "thumbs_up",
+        },
+    )
+    assert reaction.status_code == 201, reaction.text
+    path = "/v1/messenger/message_reactions/" + reaction.json()["uuid"]
+    values = {"message_uuid": messages[1]["uuid"]} if move else {"emoji_name": "heart"}
+    assert api.put(path, json=values).status_code == 405
+    assert api.get(path).json()["emoji_name"] == "thumbs_up"
+    assert api.delete(path).status_code == 204
+    replacement = api.post(
+        "/v1/messenger/message_reactions/",
+        json={
+            "message_uuid": messages[0]["uuid"],
+            "emoji_name": "heart",
+        },
+    )
+    assert replacement.status_code == 201, replacement.text

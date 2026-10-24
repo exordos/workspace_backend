@@ -1491,7 +1491,6 @@ RestAlchemy 任何一个原始事实
 | 列表 | `GET /api/workspace/v1/messenger/message_reactions/` | 提供有关领域的反应 | 没有体;支持`message_uuid`/`user_uuid`过器和页面 | `200`, `REACTION_LIST_RESPONSE` |
 | 建立 | `POST /api/workspace/v1/messenger/message_reactions/` | placement UUID -> access check -> 对于规范信息的反应的一个初始事实 | `REACTION_CREATE_REQUEST` | `201`, `REACTION_RESPONSE` |
 | 获得 | `GET /api/workspace/v1/messenger/message_reactions/{reaction_uuid}` | 提供有关领域的反应 | 没有身体 | `200`, `REACTION_RESPONSE` |
-| 更新 | `PUT /api/workspace/v1/messenger/message_reactions/{reaction_uuid}` | 一个属于用户的原始事实 | `REACTION_UPDATE_REQUEST` | `200`, `REACTION_UPDATE_RESPONSE` |
 | 删除 | `DELETE /api/workspace/v1/messenger/message_reactions/{reaction_uuid}` | 一个属于用户的原始事实 | 没有身体 | `204`, 没有一个 |
 
 列表示例:
@@ -1500,20 +1499,14 @@ RestAlchemy 任何一个原始事实
 GET /api/workspace/v1/messenger/message_reactions/?message_uuid=a93dca35-3061-4748-bda4-7f6f8c660ea5&page_limit=100
 ```
 
+反应仅支持创建和删除。更改表情时，请删除旧反应后创建新反应。PUT 返回 405。
+
 `REACTION_CREATE_REQUEST`:
 
 ```json
 {
   "message_uuid": "a93dca35-3061-4748-bda4-7f6f8c660ea5",
   "emoji_name": "thumbs_up"
-}
-```
-
-`REACTION_UPDATE_REQUEST`:
-
-```json
-{
-  "emoji_name": "heart"
 }
 ```
 
@@ -1530,22 +1523,6 @@ GET /api/workspace/v1/messenger/message_reactions/?message_uuid=a93dca35-3061-47
   "delivery": null,
   "created_at": "2026-06-22T10:12:00Z",
   "updated_at": "2026-06-22T10:12:00Z"
-}
-```
-
-`REACTION_UPDATE_RESPONSE`:
-
-```json
-{
-  "uuid": "bd4b7632-8788-435a-93cc-6873657335c6",
-  "project_id": "22222222-2222-2222-2222-222222222222",
-  "message_uuid": "a93dca35-3061-4748-bda4-7f6f8c660ea5",
-  "user_uuid": "11111111-1111-1111-1111-111111111111",
-  "emoji_name": "heart",
-  "provider": null,
-  "delivery": null,
-  "created_at": "2026-06-22T10:12:00Z",
-  "updated_at": "2026-06-22T10:13:00Z"
 }
 ```
 

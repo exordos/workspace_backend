@@ -1491,7 +1491,6 @@ The common lease/fencing protocol remains open implementation detail.
 | List of | `GET /api/workspace/v1/messenger/message_reactions/` | The Committee will be presenting reactions in the field of | without body; filters `message_uuid`/`user_uuid` and pagination are supported | `200`, `REACTION_LIST_RESPONSE` |
 | The creation | `POST /api/workspace/v1/messenger/message_reactions/` | placement UUID -> access check -> One initial fact of reaction to the canonical message | `REACTION_CREATE_REQUEST` | `201`, `REACTION_RESPONSE` |
 | - Get it . | `GET /api/workspace/v1/messenger/message_reactions/{reaction_uuid}` | The Committee will be presenting reactions in the field of | Without a body. | `200`, `REACTION_RESPONSE` |
-| I 'm going to update | `PUT /api/workspace/v1/messenger/message_reactions/{reaction_uuid}` | One user-owned fact | `REACTION_UPDATE_REQUEST` | `200`, `REACTION_UPDATE_RESPONSE` |
 | I 'm going to delete it . | `DELETE /api/workspace/v1/messenger/message_reactions/{reaction_uuid}` | One user-owned fact | Without a body. | `204`, The empty body . |
 
 Example list:
@@ -1500,20 +1499,14 @@ Example list:
 GET /api/workspace/v1/messenger/message_reactions/?message_uuid=a93dca35-3061-4748-bda4-7f6f8c660ea5&page_limit=100
 ```
 
+Reactions are immutable: create or delete them. To change an emoji, delete the old reaction and create a new one. PUT returns 405.
+
 `REACTION_CREATE_REQUEST`:
 
 ```json
 {
   "message_uuid": "a93dca35-3061-4748-bda4-7f6f8c660ea5",
   "emoji_name": "thumbs_up"
-}
-```
-
-`REACTION_UPDATE_REQUEST`:
-
-```json
-{
-  "emoji_name": "heart"
 }
 ```
 
@@ -1530,22 +1523,6 @@ GET /api/workspace/v1/messenger/message_reactions/?message_uuid=a93dca35-3061-47
   "delivery": null,
   "created_at": "2026-06-22T10:12:00Z",
   "updated_at": "2026-06-22T10:12:00Z"
-}
-```
-
-`REACTION_UPDATE_RESPONSE`:
-
-```json
-{
-  "uuid": "bd4b7632-8788-435a-93cc-6873657335c6",
-  "project_id": "22222222-2222-2222-2222-222222222222",
-  "message_uuid": "a93dca35-3061-4748-bda4-7f6f8c660ea5",
-  "user_uuid": "11111111-1111-1111-1111-111111111111",
-  "emoji_name": "heart",
-  "provider": null,
-  "delivery": null,
-  "created_at": "2026-06-22T10:12:00Z",
-  "updated_at": "2026-06-22T10:13:00Z"
 }
 ```
 

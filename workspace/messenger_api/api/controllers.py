@@ -1044,9 +1044,6 @@ class WorkspaceMessageReactionController(StoreResourceController):
     def create(self, **kwargs: typing.Any) -> typing.Any:
         return super().create(**kwargs)
 
-    def update(self, uuid: object, **kwargs: typing.Any) -> typing.Any:
-        return super().update(uuid, **kwargs)
-
 
 class WorkspaceEventController(StoreResourceController):
     resource_name = "events"

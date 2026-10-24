@@ -1491,7 +1491,6 @@ wird geändert und topic lock wird nicht verwendet; spezifisches storage/claim p
 | Liste | `GET /api/workspace/v1/messenger/message_reactions/` | Reaktionen im Bereich | ohne Körper; Filter `message_uuid`/`user_uuid` und Pagination werden unterstützt | `200`, `REACTION_LIST_RESPONSE` |
 | Gründung | `POST /api/workspace/v1/messenger/message_reactions/` | placement UUID -> access check -> ein Ausgangsfall der Reaktion auf die kanonische Nachricht | `REACTION_CREATE_REQUEST` | `201`, `REACTION_RESPONSE` |
 | - Erhalten | `GET /api/workspace/v1/messenger/message_reactions/{reaction_uuid}` | Reaktionen im Bereich | Ohne Körper | `200`, `REACTION_RESPONSE` |
-| Erneuerung | `PUT /api/workspace/v1/messenger/message_reactions/{reaction_uuid}` | ein Benutzer-Besitzungs-Faktor | `REACTION_UPDATE_REQUEST` | `200`, `REACTION_UPDATE_RESPONSE` |
 | Löschen | `DELETE /api/workspace/v1/messenger/message_reactions/{reaction_uuid}` | ein Benutzer-Besitzungs-Faktor | Ohne Körper | `204`, Leerkörper |
 
 Beispiel für eine Liste:
@@ -1500,20 +1499,14 @@ Beispiel für eine Liste:
 GET /api/workspace/v1/messenger/message_reactions/?message_uuid=a93dca35-3061-4748-bda4-7f6f8c660ea5&page_limit=100
 ```
 
+Reaktionen sind unveränderlich: nur Erstellen und Löschen sind erlaubt. Zum Ändern eines Emojis die alte Reaktion löschen und eine neue erstellen. PUT liefert 405.
+
 `REACTION_CREATE_REQUEST`:
 
 ```json
 {
   "message_uuid": "a93dca35-3061-4748-bda4-7f6f8c660ea5",
   "emoji_name": "thumbs_up"
-}
-```
-
-`REACTION_UPDATE_REQUEST`:
-
-```json
-{
-  "emoji_name": "heart"
 }
 ```
 
@@ -1530,22 +1523,6 @@ GET /api/workspace/v1/messenger/message_reactions/?message_uuid=a93dca35-3061-47
   "delivery": null,
   "created_at": "2026-06-22T10:12:00Z",
   "updated_at": "2026-06-22T10:12:00Z"
-}
-```
-
-`REACTION_UPDATE_RESPONSE`:
-
-```json
-{
-  "uuid": "bd4b7632-8788-435a-93cc-6873657335c6",
-  "project_id": "22222222-2222-2222-2222-222222222222",
-  "message_uuid": "a93dca35-3061-4748-bda4-7f6f8c660ea5",
-  "user_uuid": "11111111-1111-1111-1111-111111111111",
-  "emoji_name": "heart",
-  "provider": null,
-  "delivery": null,
-  "created_at": "2026-06-22T10:12:00Z",
-  "updated_at": "2026-06-22T10:13:00Z"
 }
 ```
 
