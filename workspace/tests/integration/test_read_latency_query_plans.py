@@ -62,7 +62,10 @@ def test_unread_existence_probe_does_not_order_candidates(db, monkeypatch, has_u
         assert sum(node["Actual Rows"] * node["Actual Loops"] for node in scanned) <= 1
 
 
+@pytest.mark.isolated_schema
 def test_summary_boundary_probes_do_not_scan_unrelated_topics(api, db):
+    # The global summary claim must use this test's controlled population;
+    # unrelated modules otherwise change the planner and measured row counts.
     response = api.post(
         "/v1/messenger/streams/",
         json={"name": "Summary query scale", "source_name": "native"},
