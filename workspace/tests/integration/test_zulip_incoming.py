@@ -3209,3 +3209,70 @@ def test_shared_retry_keeps_intention_and_accepts_the_senders_late_receipt(incom
         ).fetchone() == (2,)
     finally:
         linked.delete()
+
+
+def test_shared_content_edits_refresh_each_recipients_mention_state(incoming):
+    api, db, account, http, url = incoming
+    original = event(identifier=201)
+    apply(incoming, original)
+    linked, peer = peer_account(incoming)
+    apply(peer, original)
+
+    async def run():
+        service = zulip_incoming.ZulipIncomingService(url)
+        await service.db.open()
+        service.operations = incoming_operations.Operations(service.db, http)
+        try:
+            for step, content in enumerate(
+                (
+                    "Hello @**peer|8**",
+                    "Mention removed",
+                ),
+                1,
+            ):
+                message = {
+                    **original["message"],
+                    "content": content,
+                    "last_edit_timestamp": original["message"]["timestamp"] + step,
+                }
+                http.request.return_value = {"message": message}
+                for owner_index, owner in enumerate((account, peer[2])):
+                    async with service.admission() as (connection, stage):
+                        await service.append(
+                            connection,
+                            owner,
+                            {"queue_id": f"mentions-{owner_index}"},
+                            [
+                                {
+                                    "id": step,
+                                    "type": "update_message",
+                                    "message_id": 201,
+                                    "edit_timestamp": message["last_edit_timestamp"],
+                                    "content": content,
+                                    "flags": ["starred"],
+                                }
+                            ],
+                            stage,
+                        )
+                await drain_incoming(service)
+                states = await service.db.sql(
+                    "SELECT user_uuid,mentioned,starred FROM messenger_user_message_states WHERE project_id=%s",
+                    (account["project_id"],),
+                )
+                assert {row["user_uuid"]: row["mentioned"] for row in states} == {
+                    account["owner_user_uuid"]: False,
+                    peer[2]["owner_user_uuid"]: step == 1,
+                }
+                assert all(row["starred"] for row in states)
+                frames = await service.db.sql(
+                    "SELECT payload FROM m_workspace_visible_events WHERE project_id=%s AND user_uuid=%s AND payload->>'kind'='message.updated' ORDER BY epoch_version DESC LIMIT 1",
+                    (account["project_id"], peer[2]["owner_user_uuid"]),
+                )
+                assert frames[0]["payload"]["mentioned"] == (step == 1)
+        finally:
+            await service.db.close()
+
+    try:
+        asyncio.run(run())
+    finally:
+        linked.delete()

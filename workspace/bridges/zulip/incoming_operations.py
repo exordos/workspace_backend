@@ -329,6 +329,8 @@ ENSURE_MESSAGE_STATES_SQL = """
         provider_identity=EXCLUDED.provider_identity,status=EXCLUDED.status,updated_at=now()
     WHERE messenger_user_message_states.membership_generation <> EXCLUDED.membership_generation
        OR messenger_user_message_states.provider_identity IS DISTINCT FROM EXCLUDED.provider_identity
+       OR messenger_user_message_states.mentioned IS DISTINCT FROM EXCLUDED.mentioned
+    RETURNING *
 """
 ENSURE_TOPIC_BINDINGS_SQL = """
     INSERT INTO messenger_user_topic_bindings (
@@ -2222,7 +2224,12 @@ class Operations:
         await connection.execute(
             ENSURE_MESSAGE_STATES_SQL,
             (
-                payload["content"].lower(),
+                (
+                    old[0]["payload"]
+                    if old
+                    and edited < old[0]["content_updated_at"].replace(tzinfo=None)
+                    else payload
+                )["content"].lower(),
                 str(data["id"]),
                 account["provider_uuid"],
                 account["project_id"],
@@ -2698,7 +2705,7 @@ class Operations:
             ),
         )
         fresh = await cursor.fetchall()
-        await connection.execute(
+        state_cursor = await connection.execute(
             ENSURE_MESSAGE_STATES_SQL,
             (
                 message["payload"]["content"].lower(),
@@ -2709,10 +2716,11 @@ class Operations:
                 account["owner_user_uuid"],
             ),
         )
+        changed_states = await state_cursor.fetchall()
         flags = event.get("flags", data.get("flags"))
         if flags is not None:
             await self.flags(connection, account, [identifier], flags, snapshot=True)
-        if fresh:
+        if fresh or changed_states:
             snapshots = await rows(
                 connection,
                 SELECT_SNAPSHOT_SQL.format(view=VIEWS["message"]),
@@ -2721,7 +2729,7 @@ class Operations:
             await self.publish(
                 connection,
                 account,
-                "message.created",
+                "message.created" if fresh else "message.updated",
                 placement["uuid"],
                 [
                     row
