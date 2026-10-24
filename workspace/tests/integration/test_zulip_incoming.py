@@ -2105,6 +2105,56 @@ def test_ready_message_does_not_write_locked_topic_binding(incoming):
     assert len(api.get("/v1/messenger/messages/").json()) == 2
 
 
+def test_incoming_message_does_not_lock_the_legacy_counter_scope(incoming):
+    api, db, account, http, url = incoming
+    first = event(identifier=100)
+    first["message"]["timestamp"] += 2
+    apply(incoming, first)
+    stream = api.get("/v1/messenger/streams/").json()[0]
+    db.execute(
+        """INSERT INTO bridge_zulip_v5_message_counter_changes
+        (project_id,user_uuid,scope_kind,scope_uuid,stream_uuid)
+        VALUES (%s,%s,'user-stream',%s,%s) ON CONFLICT DO NOTHING""",
+        (
+            account["project_id"],
+            account["owner_user_uuid"],
+            stream["uuid"],
+            stream["uuid"],
+        ),
+    )
+
+    async def run():
+        database = zulip_outgoing.Database(url)
+        await database.open()
+        operations = incoming_operations.Operations(database, http)
+        try:
+            second = event(identifier=101)
+            second["message"]["timestamp"] += 2
+            prepared = await prepare_dependencies(operations, database, account, second)
+            with psycopg.connect(url) as locker:
+                assert locker.execute(
+                    """SELECT 1 FROM bridge_zulip_v5_message_counter_changes
+                    WHERE project_id=%s AND user_uuid=%s
+                      AND scope_kind='user-stream' AND scope_uuid=%s FOR UPDATE""",
+                    (
+                        account["project_id"],
+                        account["owner_user_uuid"],
+                        stream["uuid"],
+                    ),
+                ).fetchone()
+                async with database.transaction() as connection:
+                    await connection.execute("SET LOCAL lock_timeout='200ms'")
+                    await connection.execute(zulip_incoming.INCOMING_TRANSACTION_SQL)
+                    await operations.apply(connection, account, prepared)
+        finally:
+            await database.close()
+
+    asyncio.run(run())
+    drain()
+    topic = api.get("/v1/messenger/stream_topics/").json()[0]
+    assert topic["unread_count"] == 2
+
+
 def test_missing_topic_burst_shares_one_intention_and_removes_it_on_success(incoming):
     api, db, account, http, url = incoming
     apply(incoming, event(identifier=100))
