@@ -1209,3 +1209,92 @@ def test_provenance_migration_converts_legacy_children_and_retires_root_links(
     assert not db.execute(
         "SELECT 1 FROM zulip_entity_links WHERE entity_type IN('stream','topic','message')"
     ).fetchone()
+
+
+def test_send_uses_workspace_entity_uuid_as_local_id(outgoing, db, _test_database_url):
+    _api, account, *_ = outgoing
+    public = create(outgoing)
+    canonical = db.execute(
+        "SELECT message_uuid FROM messenger_message_placements WHERE uuid=%s",
+        (uuid.UUID(public["uuid"]),),
+    ).fetchone()[0]
+
+    async def run():
+        async with sender(account, _test_database_url) as (service, server):
+            await drain(service)
+            sent = [
+                data
+                for method, path, data in server.calls
+                if method == "POST" and path == "/api/v1/messages"
+            ]
+            assert len(sent) == 1
+            assert sent[0]["local_id"] == str(canonical)
+            assert sent[0]["queue_id"] == "sender-queue"
+
+    asyncio.run(run())
+
+
+def test_retained_local_receipt_resolves_lost_response_after_queue_expiry(
+    outgoing, db, _test_database_url
+):
+    _api, account, *_ = outgoing
+    public = create(outgoing)
+    canonical = db.execute(
+        "SELECT message_uuid FROM messenger_message_placements WHERE uuid=%s",
+        (uuid.UUID(public["uuid"]),),
+    ).fetchone()[0]
+
+    async def run():
+        async with sender(account, _test_database_url) as (service, server):
+            server.lose_response = True
+            original = service.http.request
+
+            async def expired_queue(account, method, path, data=None, **kwargs):
+                if method == "GET" and path == "/events":
+                    raise outgoing_operations.ApiError(
+                        400, {"code": "BAD_EVENT_QUEUE_ID"}, "GET"
+                    )
+                return await original(account, method, path, data, **kwargs)
+
+            service.http.request = expired_queue
+            await service.dispatch()
+            await asyncio.gather(*list(service.tasks.values()))
+            await asyncio.sleep(0)
+            await service.db.sql(
+                "UPDATE zulip_outgoing_intents SET next_attempt_at=now()"
+            )
+            await service.dispatch()
+            await asyncio.gather(*list(service.tasks.values()))
+            await asyncio.sleep(0)
+            pending = await service.db.sql(
+                "SELECT status,error FROM zulip_outgoing_intents WHERE entity_uuid=%s",
+                (canonical,),
+            )
+            assert pending[0]["status"] == "checking"
+            assert "queue expiry" in pending[0]["error"]
+            # The original receiver had durably stored this event before its queue expired.
+            receipt = {**server.events[0], "local_message_id": str(canonical)}
+            await service.db.sql(
+                "INSERT INTO zulip_incoming_events(external_account_uuid,project_id,provider_uuid,owner_user_uuid,account_identity,queue_id,event_id,payload) VALUES(%s,%s,%s,%s,%s,'sender-queue',1,%s)",
+                (
+                    account.uuid,
+                    account.project_id,
+                    account.provider_uuid,
+                    account.owner_user_uuid,
+                    account.external_account_id,
+                    pg_json.Jsonb(receipt),
+                ),
+            )
+            await drain(service)
+            sent = [
+                data
+                for method, path, data in server.calls
+                if method == "POST" and path == "/api/v1/messages"
+            ]
+            assert len(sent) == 1
+            assert sent[0]["local_id"] == str(canonical)
+
+    asyncio.run(run())
+    assert db.execute(
+        "SELECT provider_identity FROM messenger_messages WHERE uuid=%s", (canonical,)
+    ).fetchone() == ("101",)

@@ -768,7 +768,7 @@ class Operations:
             "content": text,
             "read_by_sender": True,
             "queue_id": subscription["queue_id"],
-            "local_id": delivery_uuid,
+            "local_id": str(intent["entity_uuid"]),
         }
         if topic is not None:
             values["topic"] = topic
@@ -929,6 +929,7 @@ class Operations:
             return True, {"identity": prepared.get("identity")}
         if kind == "send":
             delivery_uuid = prepared["delivery_uuid"]
+            local_id = prepared["data"]["local_id"]
             deliveries = await self.db.sql(
                 SELECT_DELIVERY_MESSAGE_SQL,
                 (delivery_uuid,),
@@ -937,7 +938,7 @@ class Operations:
             if remote is None:
                 events = await self.db.sql(
                     SELECT_MESSAGE_RECEIPT_SQL,
-                    (account["uuid"], delivery_uuid),
+                    (account["uuid"], local_id),
                 )
                 if not events and "data" in prepared:
                     try:
@@ -960,7 +961,7 @@ class Operations:
                     events = [
                         {"payload": event}
                         for event in response["events"]
-                        if event.get("local_message_id") == delivery_uuid
+                        if event.get("local_message_id") == local_id
                     ]
                 if events:
                     remote = events[0]["payload"]["message"]["id"]

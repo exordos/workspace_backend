@@ -452,7 +452,7 @@ def test_pending_zulip_echo_reuses_root_and_fills_canonical_identity(incoming):
         (account["project_id"],),
     )
     echo = event("*Original*", 202)
-    echo["local_message_id"] = str(delivery)
+    echo["local_message_id"] = str(canonical)
     echo["message"]["timestamp"] += 5
     apply(incoming, echo)
     drain()

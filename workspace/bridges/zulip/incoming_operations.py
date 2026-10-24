@@ -91,7 +91,7 @@ SELECT_DELIVERY_SQL = """
     LEFT JOIN messenger_messages message ON message.project_id=delivery.project_id AND message.uuid=delivery.message_uuid
     WHERE (message.uuid IS NULL OR (message.source_name='zulip' AND message.provider_uuid=provider.uuid))
       AND delivery.project_id = %s AND provider.uuid = %s
-      AND (delivery.zulip_message_id = %s OR delivery.uuid = %s)
+      AND (delivery.zulip_message_id = %s OR delivery.message_uuid::text = %s)
     LIMIT 1
 """
 SELECT_PENDING_SEND_SQL = """
