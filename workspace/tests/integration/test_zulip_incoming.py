@@ -1666,3 +1666,102 @@ def test_reactions_are_add_remove_only(incoming, move):
         },
     )
     assert replacement.status_code == 201, replacement.text
+
+
+@pytest.mark.parametrize("newer_remote", [False, True])
+def test_message_conflicts_use_full_precision_update_time(incoming, newer_remote):
+    api, db, account, http, _url = incoming
+    original = event()
+    apply(incoming, original)
+    message = api.get("/v1/messenger/messages/").json()[0]
+    updated = api.put(
+        "/v1/messenger/messages/" + message["uuid"],
+        json={
+            "payload": {"kind": "markdown", "content": "Local edit"},
+        },
+    )
+    assert updated.status_code == 200, updated.text
+    local_time = datetime.datetime.fromtimestamp(
+        original["message"]["timestamp"] + 2, datetime.timezone.utc
+    ).replace(tzinfo=None, microsecond=500000)
+    db.execute(
+        "UPDATE messenger_messages SET content_updated_at=%s WHERE project_id=%s",
+        (local_time, account["project_id"]),
+    )
+    assert (
+        db.execute(
+            "SELECT count(*) FROM zulip_outgoing_intents WHERE project_id=%s AND entity_type='message' AND status<>'done'",
+            (account["project_id"],),
+        ).fetchone()[0]
+        > 0
+    )
+    remote_time = original["message"]["timestamp"] + (3 if newer_remote else 2)
+    http.request.reset_mock()
+    http.request.return_value = {
+        "message": {
+            **original["message"],
+            "content": "Remote edit",
+            "last_edit_timestamp": remote_time,
+        }
+    }
+    apply(
+        incoming,
+        {
+            "type": "update_message",
+            "message_id": 101,
+            "content": "Remote edit",
+            "edit_timestamp": remote_time,
+        },
+    )
+    actual = api.get("/v1/messenger/messages/" + message["uuid"]).json()["payload"][
+        "content"
+    ]
+    assert actual == ("Remote edit" if newer_remote else "Local edit")
+    if not newer_remote:
+        http.request.assert_not_called()
+
+
+def test_stale_queued_edit_cannot_replace_a_newer_provider_update(incoming):
+    api, db, account, http, url = incoming
+    original = event()
+    apply(incoming, original)
+    message = api.get("/v1/messenger/messages/").json()[0]
+    assert (
+        api.put(
+            "/v1/messenger/messages/" + message["uuid"],
+            json={
+                "payload": {"kind": "markdown", "content": "Old pending edit"},
+            },
+        ).status_code
+        == 200
+    )
+    with db.cursor(row_factory=rows.dict_row) as cursor:
+        cursor.execute(
+            "SELECT * FROM zulip_outgoing_intents WHERE project_id=%s AND entity_type='message' AND operation='update'",
+            (account["project_id"],),
+        )
+        intent = cursor.fetchone()
+    assert intent
+    future = datetime.datetime.now(datetime.timezone.utc).replace(
+        tzinfo=None
+    ) + datetime.timedelta(seconds=10)
+    with db.transaction():
+        db.execute("SELECT set_config('workspace.zulip_incoming','on',true)")
+        db.execute(
+            "UPDATE messenger_messages SET payload='{"
+            + '"kind":"markdown","content":"New provider edit"'
+            + "}',content_updated_at=%s WHERE project_id=%s",
+            (future, account["project_id"]),
+        )
+
+    async def prepare():
+        database = zulip_outgoing.Database(url)
+        await database.open()
+        try:
+            return await incoming_operations.outgoing_operations.Operations(
+                database, http
+            ).prepare(intent, account)
+        finally:
+            await database.close()
+
+    assert asyncio.run(prepare())["kind"] == "noop"

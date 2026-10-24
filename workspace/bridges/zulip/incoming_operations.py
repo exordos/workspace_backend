@@ -117,11 +117,10 @@ OBSERVE_DELIVERY_SQL = """
         content_observed_at = %s
     WHERE uuid = %s
 """
-SELECT_PENDING_EDIT_SQL = """
-    SELECT 1 FROM zulip_outgoing_intents
-    WHERE project_id = %s AND entity_type = 'message' AND entity_uuid = %s
-      AND operation IN ('insert', 'update', 'delete') AND status <> 'done'
-    LIMIT 1
+SELECT_MESSAGE_CLOCKS_SQL = """
+    SELECT provider_identity,content_updated_at FROM messenger_messages
+    WHERE project_id=%s AND provider_uuid=%s AND source_name='zulip'
+      AND provider_identity=ANY(%s::text[])
 """
 SELECT_CATALOG_SQL = """
     SELECT account.external_account_id, account.owner_user_uuid, users.first_name
@@ -874,6 +873,28 @@ class Operations:
                 )
                 if not known:
                     message_ids.append(identifier)
+        if kind == "update_message" and "edit_timestamp" in event:
+            clocks = await self.db.sql(
+                SELECT_MESSAGE_CLOCKS_SQL,
+                (
+                    account["project_id"],
+                    account["provider_uuid"],
+                    list(map(str, message_ids)),
+                ),
+            )
+            edited = datetime.datetime.fromtimestamp(
+                event["edit_timestamp"], datetime.timezone.utc
+            ).replace(tzinfo=None)
+            newer_local = {
+                row["provider_identity"]
+                for row in clocks
+                if row["content_updated_at"].replace(tzinfo=None) > edited
+            }
+            message_ids = [
+                identifier
+                for identifier in message_ids
+                if str(identifier) not in newer_local
+            ]
         for identifier in message_ids:
             try:
                 data = await self.http.request(
@@ -1853,9 +1874,6 @@ class Operations:
         edited = datetime.datetime.fromtimestamp(
             data.get("last_edit_timestamp") or data["timestamp"], datetime.timezone.utc
         ).replace(tzinfo=None)
-        pending = await rows(
-            connection, SELECT_PENDING_EDIT_SQL, (account["project_id"], identifier)
-        )
         if old:
             await connection.execute(
                 outgoing_operations.UPDATE_ENTITY_IDENTITY_SQL.format(
@@ -1870,10 +1888,7 @@ class Operations:
                 ),
             )
         changed = None
-        if not old or (
-            not pending
-            and edited >= old[0]["content_updated_at"].replace(microsecond=0)
-        ):
+        if not old or edited >= old[0]["content_updated_at"].replace(tzinfo=None):
             changed = await self.save(
                 connection,
                 TABLES["message"],

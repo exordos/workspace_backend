@@ -4,6 +4,7 @@
 """Translate durable API intentions to Zulip requests using plain SQL."""
 
 import asyncio
+import datetime
 import typing
 import urllib.parse
 import uuid
@@ -372,6 +373,16 @@ class Operations:
             )
             if operation == "delete":
                 return request("delete", "DELETE", f"/messages/{remote}")
+            current = await self.db.sql(
+                "SELECT content_updated_at FROM messenger_messages WHERE project_id=%s AND uuid=%s AND provider_uuid=%s",
+                (intent["project_id"], intent["entity_uuid"], account["provider_uuid"]),
+            )
+            if current and current[0]["content_updated_at"].replace(
+                tzinfo=None
+            ) > datetime.datetime.fromisoformat(data["content_updated_at"]).replace(
+                tzinfo=None
+            ):
+                return request("noop", "", "", identity=remote)
             text = await self.convert(intent, account)
             await self.content_snapshot(intent, account, text, remote)
             return request(
