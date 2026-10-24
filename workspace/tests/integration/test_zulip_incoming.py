@@ -1377,3 +1377,36 @@ def test_topic_merge_uses_existing_destination_without_duplicate_identity(incomi
     assert len(messages) == 2
     assert all(message["topic_uuid"] == str(target) for message in messages)
     assert len({message["uuid"] for message in messages}) == 2
+
+
+@pytest.mark.parametrize("flag", ["read", "starred"])
+@pytest.mark.parametrize("all_messages", [None, False, True])
+def test_empty_flag_list_only_applies_globally_with_explicit_all(
+    incoming, flag, all_messages
+):
+    _api, db, account, _http, _url = incoming
+    apply(incoming, event(), event(identifier=102))
+    values = {"type": "update_message_flags", "messages": [], "flag": flag, "op": "add"}
+    if all_messages is not None:
+        values["all"] = all_messages
+    before = db.execute(
+        "SELECT count(*) FROM messenger_domain_outbox_events WHERE project_id=%s",
+        (account["project_id"],),
+    ).fetchone()[0]
+    apply(incoming, values)
+    states = db.execute(
+        "SELECT read_at IS NOT NULL,starred FROM messenger_user_message_states "
+        "WHERE project_id=%s",
+        (account["project_id"],),
+    ).fetchall()
+    expected = all_messages is True
+    assert len(states) == 2
+    assert all(row[0 if flag == "read" else 1] is expected for row in states)
+    if not expected:
+        assert (
+            db.execute(
+                "SELECT count(*) FROM messenger_domain_outbox_events WHERE project_id=%s",
+                (account["project_id"],),
+            ).fetchone()[0]
+            == before
+        )

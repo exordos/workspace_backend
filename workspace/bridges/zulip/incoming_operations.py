@@ -1938,7 +1938,7 @@ class Operations:
         self,
         connection: typing.Any,
         account: dict,
-        identifiers: list,
+        identifiers: list | None,
         flags: list[str],
         *,
         snapshot: bool = False,
@@ -1949,7 +1949,7 @@ class Operations:
                 await self.identity(account, "message", remote, connection=connection)
                 for remote in identifiers
             ]
-            if identifiers
+            if identifiers is not None
             else None
         )
         states = await rows(
@@ -2281,7 +2281,7 @@ class Operations:
             await self.flags(
                 connection,
                 account,
-                [] if event.get("all") else event["messages"],
+                None if event.get("all") else event["messages"],
                 [event["flag"]],
                 present=event["op"] == "add",
             )
