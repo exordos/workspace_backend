@@ -385,7 +385,6 @@ def test_route_permissions_and_action_owners_are_preserved():
         ra_routes.CREATE,
         ra_routes.FILTER,
         ra_routes.GET,
-        ra_routes.UPDATE,
         ra_routes.DELETE,
     }
     assert ra_routes.CREATE not in (

@@ -1413,11 +1413,9 @@ REACTION_FIELDS = field_permissions.FieldsPermissions(
     fields={
         "message_uuid": {
             constants.CREATE: field_permissions.Permissions.RW,
-            constants.UPDATE: field_permissions.Permissions.RW,
         },
         "emoji_name": {
             constants.CREATE: field_permissions.Permissions.RW,
-            constants.UPDATE: field_permissions.Permissions.RW,
         },
     },
 )
@@ -1450,12 +1448,6 @@ class WorkspaceMessageReactionController(
     def filter(self, **filters):
         return reaction_queries.visible_facts(
             context=self.get_context(), filters=filters, session=self.session,
-        )
-
-    def update(self, uuid, **values):
-        return reaction_fact_commands.update_one_owned(
-            context=self.get_context(), reaction_uuid=uuid,
-            values=values, session=self.session,
         )
 
     def delete(self, uuid):

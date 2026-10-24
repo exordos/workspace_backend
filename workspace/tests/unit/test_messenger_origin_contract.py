@@ -135,7 +135,6 @@ ROUTE_MANIFEST = {
             ra_routes.CREATE,
             ra_routes.FILTER,
             ra_routes.GET,
-            ra_routes.UPDATE,
             ra_routes.DELETE,
         },
     ),
