@@ -1431,6 +1431,132 @@ def test_ready_incoming_event_reaches_clients_without_projection_drain(incoming)
     )
 
 
+def test_thousand_read_flags_use_one_exact_batch_and_one_counter_scope(incoming):
+    api, db, account, _http, _url = incoming
+    apply(incoming, *(event(identifier=value) for value in range(1, 1002)))
+    before_events = len(client_events(incoming))
+    before_counters = db.execute(
+        "SELECT count(*) FROM messenger_domain_outbox_events WHERE project_id=%s",
+        (account["project_id"],),
+    ).fetchone()[0]
+    with mock.patch.object(
+        incoming_operations, "rows", wraps=incoming_operations.rows
+    ) as queries:
+        apply(
+            incoming,
+            {
+                "type": "update_message_flags",
+                "messages": list(range(1, 1001)),
+                "flag": "read",
+                "op": "add",
+                "all": False,
+            },
+        )
+    states = db.execute(
+        "SELECT message.provider_identity,state.read_at IS NOT NULL "
+        "FROM messenger_user_message_states state "
+        "JOIN messenger_message_placements place ON place.uuid=state.placement_uuid "
+        "JOIN messenger_messages message ON message.uuid=place.message_uuid "
+        "WHERE state.project_id=%s",
+        (account["project_id"],),
+    ).fetchall()
+    assert len(states) == 1001
+    assert all(read == (identity != "1001") for identity, read in states)
+    frames = client_events(incoming)[before_events:]
+    assert len(frames) == 1
+    assert frames[0]["kind"] == "messages.read"
+    expected = {
+        str(row[0])
+        for row in db.execute(
+            "SELECT placement_uuid FROM messenger_user_message_states "
+            "WHERE project_id=%s AND read_at IS NOT NULL",
+            (account["project_id"],),
+        )
+    }
+    assert set(frames[0]["message_uuids"]) == expected
+    assert queries.call_count <= 10
+    assert (
+        db.execute(
+            "SELECT count(*) FROM messenger_domain_outbox_events WHERE project_id=%s",
+            (account["project_id"],),
+        ).fetchone()[0]
+        == before_counters + 1
+    )
+    assert api.get("/v1/events/").status_code == 200
+
+
+def test_unknown_flag_targets_do_not_fetch_or_import_history(incoming):
+    api, _db, _account, http, _url = incoming
+    apply(incoming, event())
+    http.request.reset_mock()
+    apply(
+        incoming,
+        {
+            "type": "update_message_flags",
+            "messages": [999999],
+            "flag": "read",
+            "op": "add",
+        },
+    )
+    http.request.assert_not_called()
+    assert len(api.get("/v1/messenger/messages/").json()) == 1
+
+
+@pytest.mark.parametrize(
+    "flag,present",
+    [("read", True), ("read", False), ("starred", True), ("starred", False)],
+)
+def test_batched_flags_preserve_pending_personal_changes_and_exact_scope(
+    incoming, flag, present
+):
+    _api, db, account, _http, _url = incoming
+    initial = [] if present else [flag]
+    apply(
+        incoming,
+        *({**event(identifier=value), "flags": initial} for value in (101, 102, 103)),
+    )
+    pending = db.execute(
+        "SELECT uuid FROM messenger_messages WHERE project_id=%s AND provider_identity='101'",
+        (account["project_id"],),
+    ).fetchone()[0]
+    db.execute(
+        "INSERT INTO zulip_outgoing_intents(project_id,entity_type,entity_uuid,ordering_key,external_account_uuid,operation,data) "
+        "VALUES (%s,'message_state',%s,'pending',%s,'update',%s)",
+        (
+            account["project_id"],
+            uuid.uuid4(),
+            account["uuid"],
+            incoming_operations.json_value(
+                {
+                    "message_uuid": str(pending),
+                    "user_uuid": str(account["owner_user_uuid"]),
+                }
+            ),
+        ),
+    )
+    apply(
+        incoming,
+        {
+            "type": "update_message_flags",
+            "messages": [101, 102],
+            "flag": flag,
+            "op": "add" if present else "remove",
+        },
+    )
+    states = db.execute(
+        "SELECT message.provider_identity,state.read_at IS NOT NULL,state.starred "
+        "FROM messenger_user_message_states state "
+        "JOIN messenger_message_placements place ON place.uuid=state.placement_uuid "
+        "JOIN messenger_messages message ON message.uuid=place.message_uuid "
+        "WHERE state.project_id=%s",
+        (account["project_id"],),
+    ).fetchall()
+    assert all(
+        row[1 if flag == "read" else 2] == (present if row[0] == "102" else not present)
+        for row in states
+    )
+
+
 def test_incoming_publication_lock_contention_rolls_back_and_retries(incoming):
     api, db, account, _http, url = incoming
     with psycopg.connect(url, autocommit=True) as locker:

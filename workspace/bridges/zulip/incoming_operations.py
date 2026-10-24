@@ -195,9 +195,34 @@ SELECT_STATES_SQL = """
       ON placement.project_id = state.project_id AND placement.uuid = state.placement_uuid
     JOIN messenger_streams stream
       ON stream.project_id = placement.project_id AND stream.uuid = placement.stream_uuid
+    JOIN messenger_messages message
+      ON message.project_id = placement.project_id AND message.uuid = placement.message_uuid
     WHERE state.project_id = %s AND state.user_uuid = %s
-      AND (%s::uuid[] IS NULL OR placement.message_uuid = ANY(%s::uuid[]))
+      AND (%s::text[] IS NULL OR message.provider_identity = ANY(%s::text[]))
       AND stream.source_name='zulip' AND stream.provider_uuid=%s
+      AND message.source_name='zulip' AND message.provider_uuid=stream.provider_uuid
+      AND NOT EXISTS (
+          SELECT 1 FROM zulip_outgoing_intents intent
+          WHERE intent.project_id=state.project_id AND intent.entity_type='message_state'
+            AND intent.status<>'done'
+            AND intent.data->>'message_uuid'=placement.message_uuid::text
+            AND intent.data->>'user_uuid'=state.user_uuid::text
+      )
+"""
+UPDATE_FLAGS_SQL = """
+    UPDATE messenger_user_message_states
+    SET read_at=CASE WHEN %s THEN
+            CASE WHEN %s THEN COALESCE(read_at,now()) ELSE NULL END ELSE read_at END,
+        starred=CASE WHEN %s THEN %s ELSE starred END,
+        updated_at=now()
+    WHERE project_id=%s AND uuid=ANY(%s::uuid[])
+      AND ((%s AND (read_at IS NOT NULL) IS DISTINCT FROM %s)
+           OR (%s AND starred IS DISTINCT FROM %s))
+    RETURNING *
+"""
+SELECT_FLAG_SNAPSHOTS_SQL = """
+    SELECT * FROM messenger_api_user_messages_v1
+    WHERE project_id=%s AND user_uuid=%s AND uuid=ANY(%s::uuid[])
 """
 SELECT_FILE_RECIPIENTS_SQL = """
     SELECT * FROM m_workspace_visible_files_v1 WHERE uuid = %s
@@ -837,13 +862,8 @@ class Operations:
                 prepared["messages"][0]["flags"] = event["flags"]
         elif kind == "update_message":
             message_ids = event.get("message_ids", [event.get("message_id")])
-        elif kind in ("reaction", "update_message_flags"):
-            candidates = (
-                [event["message_id"]]
-                if kind == "reaction"
-                else event.get("messages", [])
-            )
-            for identifier in candidates:
+        elif kind == "reaction":
+            for identifier in [event["message_id"]]:
                 message_uuid = await self.identity(account, "message", identifier)
                 known = await self.db.sql(
                     SELECT_ROW_SQL.format(table=TABLES["message"]),
@@ -2002,13 +2022,10 @@ class Operations:
         snapshot: bool = False,
         present: bool = True,
     ) -> None:
+        if identifiers == []:
+            return
         messages = (
-            [
-                await self.identity(account, "message", remote, connection=connection)
-                for remote in identifiers
-            ]
-            if identifiers is not None
-            else None
+            [str(remote) for remote in identifiers] if identifiers is not None else None
         )
         states = await rows(
             connection,
@@ -2021,82 +2038,100 @@ class Operations:
                 account["provider_uuid"],
             ),
         )
-        for state in states:
-            pending = await rows(
-                connection,
-                SELECT_PENDING_PERSONAL_SQL,
-                (
-                    account["project_id"],
-                    "message_state",
-                    str(state["message_uuid"]),
-                    str(account["owner_user_uuid"]),
-                    "",
-                ),
-            )
-            if pending:
-                continue
-            values = {}
-            for flag, field in (("read", "read_at"), ("starred", "starred")):
-                if snapshot or flag in flags:
-                    value = flag in flags if snapshot else present
-                    values[field] = (
-                        (
-                            state["read_at"]
-                            or datetime.datetime.now(datetime.timezone.utc)
-                            if value
-                            else None
-                        )
-                        if flag == "read"
-                        else value
+        if not states:
+            return
+        read_set, star_set = snapshot or "read" in flags, snapshot or "starred" in flags
+        read_value = "read" in flags if snapshot else present
+        star_value = "starred" in flags if snapshot else present
+        saved = await rows(
+            connection,
+            UPDATE_FLAGS_SQL,
+            (
+                read_set,
+                read_value,
+                star_set,
+                star_value,
+                account["project_id"],
+                [state["uuid"] for state in states],
+                read_set,
+                read_value,
+                star_set,
+                star_value,
+            ),
+        )
+        if not saved:
+            return
+        changed = {state["uuid"]: state for state in saved}
+        states = [state for state in states if state["uuid"] in changed]
+        snapshots = await rows(
+            connection,
+            SELECT_FLAG_SNAPSHOTS_SQL,
+            (
+                account["project_id"],
+                account["owner_user_uuid"],
+                [state["placement_uuid"] for state in states],
+            ),
+        )
+        visible = {item["uuid"]: item for item in snapshots}
+        if not snapshot and flags == ["read"] and present and len(states) > 1:
+            streams: dict[uuid.UUID, list] = {}
+            for state in states:
+                if state["placement_uuid"] in visible:
+                    streams.setdefault(state["stream_uuid"], []).append(
+                        state["placement_uuid"]
                     )
-            if all(state[key] == value for key, value in values.items()):
-                continue
-            values["updated_at"] = datetime.datetime.now(datetime.timezone.utc)
-            saved = await rows(
-                connection,
-                UPDATE_ROW_SQL.format(
-                    table=TABLES["message_state"],
-                    assignments=", ".join(f"{key} = %s" for key in values),
-                ),
-                (*values.values(), account["project_id"], state["uuid"]),
-            )
-            if saved:
-                changed = saved[0]
-                snapshots = await rows(
-                    connection,
-                    SELECT_SNAPSHOT_SQL.format(view=VIEWS["message"]),
-                    (
-                        account["project_id"],
+            for stream, identifiers in streams.items():
+                for offset in range(0, len(identifiers), 1000):
+                    await self.publish(
+                        connection,
+                        account,
+                        "messages.read",
+                        identifiers[offset],
+                        [
+                            {
+                                "user_uuid": account["owner_user_uuid"],
+                                "project_id": account["project_id"],
+                                "message_uuids": identifiers[offset : offset + 1000],
+                            }
+                        ],
+                        stream,
+                    )
+        else:
+            for state in states:
+                item = visible.get(state["placement_uuid"])
+                if item is not None:
+                    kind = (
+                        "message.read"
+                        if state["read_at"] != changed[state["uuid"]]["read_at"]
+                        else "message.updated"
+                    )
+                    await self.publish(
+                        connection,
+                        account,
+                        kind,
                         state["placement_uuid"],
+                        [item],
+                        state["stream_uuid"],
+                    )
+        topics = {state["topic_uuid"]: state for state in states}
+        for state in topics.values():
+            await connection.execute(
+                ENQUEUE_COUNTERS_SQL,
+                (
+                    uuid.uuid4(),
+                    account["project_id"],
+                    f"{account['project_id']}:{account['owner_user_uuid']}:{state['topic_uuid']}",
+                    json_value(
+                        {
+                            "source_kind": "zulip.incoming",
+                            "user_uuid": account["owner_user_uuid"],
+                            "stream_uuid": state["stream_uuid"],
+                            "topic_uuid": state["topic_uuid"],
+                            "placement_uuid": state["placement_uuid"],
+                        }
                     ),
-                )
-                snapshots = [
-                    item
-                    for item in snapshots
-                    if item["user_uuid"] == account["owner_user_uuid"]
-                ]
-                kind = (
-                    "message.read"
-                    if state["read_at"] != changed["read_at"]
-                    else "message.updated"
-                )
-                await self.publish(
-                    connection,
-                    account,
-                    kind,
-                    state["placement_uuid"],
-                    snapshots,
-                    state["stream_uuid"],
-                )
-                await self.counters(
-                    connection,
-                    account,
-                    {
-                        "uuid": state["placement_uuid"],
-                        "stream_uuid": state["stream_uuid"],
-                        "topic_uuid": state["topic_uuid"],
-                    },
-                )
+                ),
+            )
 
     async def reaction(
         self, connection: typing.Any, account: dict, event: dict
