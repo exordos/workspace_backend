@@ -520,7 +520,11 @@ def _test_database_url(_database, request, monkeypatch):
     if request.node.get_closest_marker("isolated_schema") is not None:
         engine = ra_migrations.MigrationEngine(migrations_path=str(MIGRATIONS_DIR))
         with isolated_migration_database(engine.get_latest_migration()) as database_url:
-            yield database_url
+            api_store.configure_store_factory(store_factory.build_store_factory())
+            try:
+                yield database_url
+            finally:
+                api_store.configure_store_factory(store_factory.build_store_factory())
         return
     if request.node.get_closest_marker("pre_retirement_schema") is None:
         with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
