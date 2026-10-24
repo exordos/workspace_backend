@@ -18,8 +18,7 @@ from workspace.bridges.zulip import message_conversion
 from workspace.bridges.zulip import outgoing_operations
 from workspace.common import emoji
 from workspace.messenger_api import file_storage
-from workspace.messenger_api import events as messenger_events
-from workspace.messenger_api.dm import models
+from workspace.messenger_api import publication
 
 
 ENQUEUE_FILE_CLEANUP_SQL = """
@@ -622,62 +621,19 @@ class Operations:
                     ),
                 )
             }
-        locked = await rows(
-            connection,
-            "SELECT pg_try_advisory_xact_lock(hashtextextended(%s::text, 0)) AS locked",
-            (account["project_id"],),
-        )
-        if not locked[0]["locked"]:
-            raise outgoing_operations.Pending("Waiting for the client event writer")
         recipients = sorted(set(recipients), key=str)
-        digest = hashlib.sha256(
-            "\n".join(map(str, recipients)).encode("ascii")
-        ).hexdigest()
-        audience_uuid = uuid.uuid5(account["project_id"], digest)
-        await connection.execute(
-            """INSERT INTO m_workspace_event_audience_snapshots_v1
-                (uuid, project_id, membership_digest) VALUES (%s,%s,%s)
-                ON CONFLICT (project_id,membership_digest) DO NOTHING""",
-            (audience_uuid, account["project_id"], digest),
-        )
-        await connection.execute(
-            """INSERT INTO m_workspace_event_audience_members_v1
-                (audience_snapshot_uuid,user_uuid)
-                SELECT %s,unnest(%s::uuid[])
-                ON CONFLICT (audience_snapshot_uuid,user_uuid) DO NOTHING""",
-            (audience_uuid, recipients),
-        )
-        object_type, action = messenger_events._event_metadata_for_kind(kind)
         event_uuid = uuid.uuid4()
-        saved = await rows(
-            connection,
-            """INSERT INTO m_workspace_broadcast_message_events_v1
-                (uuid,project_id,entity_uuid,audience_snapshot_uuid,
-                 schema_version,object_type,action,payload)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING epoch_version""",
+        await connection.execute(
+            publication.ENQUEUE_SQL,
             (
                 event_uuid,
                 account["project_id"],
                 entity_uuid,
-                audience_uuid,
-                models.WORKSPACE_EVENT_SCHEMA_VERSION,
-                object_type,
-                action,
-                json_value(messenger_events._payload_with_kind(kind, common)),
+                kind,
+                recipients,
+                json_value(common),
+                json_value(overrides),
             ),
-        )
-        await connection.execute(
-            """INSERT INTO m_workspace_event_recipient_payloads_v1
-                (event_uuid,user_uuid,payload)
-                SELECT %s,item.key::uuid,item.value
-                FROM jsonb_each(%s::jsonb) AS item""",
-            (event_uuid, json_value(overrides)),
-        )
-        await connection.execute(
-            """UPDATE m_workspace_event_audience_snapshots_v1
-                SET current_epoch_version=GREATEST(current_epoch_version,%s)
-                WHERE uuid=%s""",
-            (saved[0]["epoch_version"], audience_uuid),
         )
         if stream_uuid is not None:
             if control_effect:

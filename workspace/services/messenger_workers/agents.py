@@ -32,6 +32,7 @@ from workspace.messenger_api.dm import helpers as messenger_dm_helpers
 from workspace.messenger_api.dm import schema
 from workspace.messenger_api.api import sql_canonical_store
 from workspace.messenger_api import topic_summarization
+from workspace.messenger_api import publication
 from workspace.services.messenger_workers import projection_wakeup
 from workspace.services.messenger_workers import v2_projection
 
@@ -196,6 +197,8 @@ class MessengerWorkerAgent(basic.BasicService):
             return self._mutation_runtime.tick()
         metrics: dict[str, float] = {}
         processed_any = False
+        with database_session_context() as session:
+            processed_any = bool(publication.publish_pending(session))
         deferred = False
         scan_continued = False
         for task_index in range(self._v2_projection_max_tasks_per_iteration):

@@ -24,6 +24,7 @@ from restalchemy.dm import filters as dm_filters
 from restalchemy.storage.sql import sessions
 
 from workspace.messenger_api import events
+from workspace.messenger_api import publication
 from workspace.messenger_api.api import v2_store
 from workspace.messenger_api.dm import message_payloads
 from workspace.messenger_api.dm import synchronization
@@ -683,31 +684,7 @@ class MutationRuntime:
             ).folders[(project_id, row["user_uuid"], row["folder_uuid"])] = True
 
     def _publish(self, session: sessions.PgSQLSession, project_id: uuid.UUID) -> None:
-        locked = session.execute(
-            "SELECT pg_try_advisory_xact_lock(hashtextextended(%s::text, 0)) AS locked",
-            (project_id,),
-        ).fetchone()["locked"]
-        if not locked:
-            return
-        for row in session.execute(
-            "SELECT * FROM messenger_publication_outbox WHERE project_id=%s ORDER BY sequence LIMIT 256",
-            (project_id,),
-        ).fetchall():
-            events.create_broadcast_event(
-                project_id,
-                row["entity_uuid"],
-                row["recipients"],
-                row["kind"],
-                row["payload"],
-                recipient_payloads=row["recipient_payloads"],
-                session=session,
-                event_uuid=row["uuid"],
-                created_at=row["created_at"],
-                owned_publication=True,
-            )
-            session.execute(
-                "DELETE FROM messenger_publication_outbox WHERE uuid=%s", (row["uuid"],)
-            )
+        publication.publish(session, project_id)
 
     def _execute(self, work: keyed_dispatcher.Work) -> owned_projection.Changes:
         try:

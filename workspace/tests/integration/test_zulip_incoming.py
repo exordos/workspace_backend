@@ -19,6 +19,7 @@ from restalchemy.common import contexts
 
 from workspace.bridges.zulip import incoming_operations
 from workspace.messenger_api import file_storage
+from workspace.messenger_api import publication
 from workspace.messenger_api.dm import external_models
 from workspace.services import zulip_incoming
 from workspace.services import zulip_outgoing
@@ -92,6 +93,20 @@ def apply(incoming, *events):
             await database.close()
 
     asyncio.run(run())
+    publish()
+
+
+def publish():
+    with contexts.Context().session_manager() as session:
+        projects = session.execute(
+            "SELECT DISTINCT project_id FROM messenger_publication_outbox", ()
+        ).fetchall()
+    for row in projects:
+        while True:
+            with contexts.Context().session_manager() as session:
+                count = publication.publish(session, row["project_id"])
+            if count < 256:
+                break
 
 
 async def prepare_dependencies(operations, database, account, value):
@@ -1599,7 +1614,7 @@ def test_batched_flags_preserve_pending_personal_changes_and_exact_scope(
     )
 
 
-def test_incoming_publication_lock_contention_rolls_back_and_retries(incoming):
+def test_incoming_commits_once_while_the_publication_writer_is_busy(incoming):
     api, db, account, _http, url = incoming
     with psycopg.connect(url, autocommit=True) as locker:
         locker.execute(
@@ -1607,14 +1622,20 @@ def test_incoming_publication_lock_contention_rolls_back_and_retries(incoming):
             (account["project_id"],),
         )
         try:
-            with pytest.raises(incoming_operations.outgoing_operations.Pending):
-                apply(incoming, event())
+            apply(incoming, event())
             assert (
                 db.execute(
                     "SELECT count(*) FROM messenger_messages WHERE project_id=%s",
                     (account["project_id"],),
                 ).fetchone()[0]
-                == 0
+                == 1
+            )
+            assert (
+                db.execute(
+                    "SELECT count(*) FROM messenger_publication_outbox WHERE project_id=%s",
+                    (account["project_id"],),
+                ).fetchone()[0]
+                > 0
             )
             assert not api.get("/v1/events/").json()
         finally:
@@ -1622,7 +1643,7 @@ def test_incoming_publication_lock_contention_rolls_back_and_retries(incoming):
                 "SELECT pg_advisory_unlock(hashtextextended(%s::text,0))",
                 (account["project_id"],),
             )
-    apply(incoming, event())
+    drain()
     assert (
         sum(
             row["payload"]["kind"] == "message.created"
@@ -1685,6 +1706,7 @@ def test_missing_dependency_does_not_block_another_message_in_the_same_chat(inco
             await asyncio.gather(*(service.process(row) for row in ready))
             rows = api.get("/v1/messenger/messages/").json()
             assert [row["payload"]["content"] for row in rows] == ["Independent"]
+            publish()
             assert any(
                 row["payload"]["kind"] == "message.created"
                 for row in api.get("/v1/events/").json()
@@ -2058,6 +2080,7 @@ async def drain_incoming(service, limit=100):
             if not await service.db.sql(
                 "SELECT 1 FROM zulip_incoming_events WHERE processed_at IS NULL"
             ):
+                publish()
                 return
             await service.db.sql(
                 "UPDATE zulip_incoming_events SET next_retry_at=now() WHERE processed_at IS NULL"

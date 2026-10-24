@@ -36,9 +36,10 @@ $$;
 
 
 class MigrationStep(migrations.AbstractMigrationStep):
-
     def __init__(self):
-        self._depends = ["0271-Deduplicate-incoming-Zulip-dependency-intentions-ef4242.py"]
+        self._depends = [
+            "0271-Deduplicate-incoming-Zulip-dependency-intentions-ef4242.py"
+        ]
 
     @property
     def migration_id(self):
