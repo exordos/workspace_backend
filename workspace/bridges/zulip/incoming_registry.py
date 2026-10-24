@@ -8,6 +8,7 @@ import dataclasses
 import hashlib
 import json
 import time
+import typing
 
 
 @dataclasses.dataclass
@@ -75,7 +76,9 @@ def change(account: dict, event: dict) -> tuple[str, str, bool] | None:
 
 
 class Registry:
-    def __init__(self, ttl: float = 1800, clock=time.monotonic):
+    def __init__(
+        self, ttl: float = 1800, clock: typing.Callable[[], float] = time.monotonic
+    ):
         self.lock = asyncio.Lock()
         self.entries: dict[str, Intention] = {}
         self.by_signature: dict[str, list[str]] = {}

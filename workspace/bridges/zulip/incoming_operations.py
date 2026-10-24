@@ -870,8 +870,10 @@ class Operations:
             if changed:
                 await self.account_snapshot(connection, {**account, **changed})
 
-    async def dependency(self, account: dict, spec: dict, connection=None) -> dict:
-        async def query(sql, parameters):
+    async def dependency(
+        self, account: dict, spec: dict, connection: typing.Any | None = None
+    ) -> dict:
+        async def query(sql: str, parameters: tuple) -> list[dict]:
             return (
                 await self.db.sql(sql, parameters)
                 if connection is None
@@ -965,7 +967,11 @@ class Operations:
         return found[0]
 
     async def message_dependencies(
-        self, account: dict, messages: list, connection=None, event=None
+        self,
+        account: dict,
+        messages: list,
+        connection: typing.Any | None = None,
+        event: dict | None = None,
     ) -> None:
         for message in messages:
             people = {
@@ -1058,7 +1064,7 @@ class Operations:
         return prepared
 
     async def ensure_dependency(
-        self, connection, account: dict, prepared: dict
+        self, connection: typing.Any, account: dict, prepared: dict
     ) -> None:
         spec = prepared["event"]["dependency"]
         try:
@@ -1815,7 +1821,12 @@ class Operations:
         return stream
 
     async def counters(
-        self, connection: typing.Any, account: dict, placement: dict, *, user=None
+        self,
+        connection: typing.Any,
+        account: dict,
+        placement: dict,
+        *,
+        user: object | None = None,
     ) -> None:
         members = (
             [{"user_uuid": user}]
@@ -2564,7 +2575,9 @@ class Operations:
                 placement["stream_uuid"],
             )
 
-    async def personal(self, connection, account: dict, event: dict) -> None:
+    async def personal(
+        self, connection: typing.Any, account: dict, event: dict
+    ) -> None:
         kind = event["type"]
         if kind not in ("message", "update_message"):
             return

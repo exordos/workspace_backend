@@ -408,7 +408,7 @@ class ZulipIncomingService:
                 delay = min(delay * 2, 60)
 
     @contextlib.asynccontextmanager
-    async def admission(self):
+    async def admission(self) -> typing.AsyncIterator[tuple[typing.Any, Admission]]:
         stage = Admission()
         try:
             async with self.db.transaction() as connection:
@@ -427,7 +427,7 @@ class ZulipIncomingService:
             if stage.locked:
                 self.registry.lock.release()
 
-    async def clean_registry(self):
+    async def clean_registry(self) -> None:
         while not self.stopping.is_set():
             try:
                 await asyncio.wait_for(self.stopping.wait(), 60)
@@ -480,9 +480,8 @@ class ZulipIncomingService:
                         source_key, self.registry.seen.get(source_key)
                     )
                     entry, duplicate = self.registry.admit(account, event, saved["id"])
-                    metadata = dataclasses.asdict(
-                        typing.cast(incoming_registry.Intention, entry)
-                    )
+                    entry = typing.cast(incoming_registry.Intention, entry)
+                    metadata = dataclasses.asdict(entry)
                     metadata.pop("completed_at")
                     event["_shared_key"] = metadata
                     if duplicate:
@@ -578,7 +577,7 @@ class ZulipIncomingService:
             LOG.error("Incoming event %s failed", key, exc_info=task.exception())
         self.ready.set()
 
-    async def finish_registry(self, event: dict, successful: bool):
+    async def finish_registry(self, event: dict, successful: bool) -> None:
         metadata = event["payload"].get("_shared_key")
         if metadata and not event["payload"].get("_personal_only"):
             async with self.registry.lock:
@@ -587,7 +586,7 @@ class ZulipIncomingService:
                 else:
                     self.registry.remove(metadata["key"])
 
-    async def recover_shared_message(self, event: dict, account: dict):
+    async def recover_shared_message(self, event: dict, account: dict) -> None:
         source = event["payload"]
         remote = (
             source["message"]["id"]
@@ -703,7 +702,9 @@ class ZulipIncomingService:
         except Exception as error:
             await self.failure(event, account, error)
 
-    async def failure(self, event: dict, account: dict | None, error: Exception):
+    async def failure(
+        self, event: dict, account: dict | None, error: Exception
+    ) -> None:
         LOG.exception("Cannot apply Zulip event %s", event["id"])
         permanent = isinstance(
             error,
