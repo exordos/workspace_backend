@@ -167,7 +167,8 @@ class ZulipIncomingService:
             loop.add_signal_handler(sig, self.stopping.set)
         self.registry.restore(
             await self.db.sql(
-                "SELECT * FROM zulip_incoming_events WHERE processed_at IS NULL AND payload ? '_shared_key' ORDER BY id"
+                "SELECT * FROM zulip_incoming_events WHERE processed_at IS NULL AND payload ? '_shared_key' ORDER BY id LIMIT %s",
+                (self.registry.limit,),
             )
         )
         listener = asyncio.create_task(self.listen())
@@ -480,7 +481,11 @@ class ZulipIncomingService:
                         source_key, self.registry.seen.get(source_key)
                     )
                     entry, duplicate = self.registry.admit(account, event, saved["id"])
-                    entry = typing.cast(incoming_registry.Intention, entry)
+                    if entry is None:
+                        await connection.execute(
+                            "RELEASE SAVEPOINT zulip_shared_admission"
+                        )
+                        continue
                     metadata = dataclasses.asdict(entry)
                     metadata.pop("completed_at")
                     event["_shared_key"] = metadata

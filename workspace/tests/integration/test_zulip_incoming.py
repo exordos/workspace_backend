@@ -3301,3 +3301,43 @@ def test_personal_copy_does_not_lock_an_unchanged_message_binding(incoming):
                 await database.close()
 
         asyncio.run(run())
+
+
+def test_registry_capacity_falls_back_to_durable_application_without_losing_events(
+    incoming,
+):
+    api, db, account, http, url = incoming
+    apply(incoming, event(identifier=100))
+
+    async def run():
+        service = zulip_incoming.ZulipIncomingService(url)
+        await service.db.open()
+        service.registry.limit = 1
+        service.operations = incoming_operations.Operations(service.db, http)
+        try:
+            async with service.admission() as (connection, stage):
+                await service.append(
+                    connection,
+                    account,
+                    {"queue_id": "capacity-fallback"},
+                    [{"id": i, **event(identifier=200 + i)} for i in (1, 2)],
+                    stage,
+                )
+            saved = await service.db.sql(
+                "SELECT payload FROM zulip_incoming_events ORDER BY id"
+            )
+            assert len(saved) == 2
+            assert "_shared_key" in saved[0]["payload"]
+            assert "_shared_key" not in saved[1]["payload"]
+            await drain_incoming(service)
+            assert len(service.registry.entries) == 1
+            assert not await service.db.sql(
+                "SELECT 1 FROM zulip_incoming_events WHERE processed_at IS NULL"
+            )
+        finally:
+            await service.db.close()
+
+    asyncio.run(run())
+    assert {
+        row["provider_identity"] for row in api.get("/v1/messenger/messages/").json()
+    } == {"100", "201", "202"}

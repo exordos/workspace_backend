@@ -153,3 +153,47 @@ def test_topic_rename_events_keep_the_existing_path():
         "content": "Changed",
     }
     assert incoming_registry.change(account(), event) is None
+
+
+def test_full_registry_falls_back_without_dropping_or_expiring_pending_work():
+    registry = incoming_registry.Registry()
+    registry.limit = 2
+    first, _ = registry.admit(account(), message(), 1)
+    for identifier in range(102, 106):
+        value = message()
+        value["message"]["id"] = identifier
+        admitted, duplicate = registry.admit(account(), value, identifier)
+        if identifier > 102:
+            assert admitted is None and not duplicate
+    assert len(registry.entries) == 2
+    assert registry.admit(account("late"), message(), 200)[0] is first
+    registry.clock = lambda: 1000000000
+    registry.clean()
+    assert len(registry.entries) == 2
+
+
+def test_restart_rebuilds_a_bounded_cache_without_expiring_pending_entries():
+    original = incoming_registry.Registry()
+    events = []
+    for identifier in range(1, 6):
+        value = message()
+        value["message"]["id"] = identifier
+        entry, _ = original.admit(account(), value, identifier)
+        events.append(
+            {
+                "external_account_uuid": "first",
+                "payload": {"_shared_key": dataclasses.asdict(entry)},
+            }
+        )
+    restored = incoming_registry.Registry()
+    restored.limit = 2
+    restored.restore(events)
+    assert len(restored.entries) == 2
+    assert all(entry.completed_at is None for entry in restored.entries.values())
+
+
+def test_account_observation_bookkeeping_is_also_bounded():
+    registry = incoming_registry.Registry(limit=2)
+    for identifier in range(10):
+        registry.admit(account(str(identifier)), message(), identifier + 1)
+    assert len(registry.seen) <= 2

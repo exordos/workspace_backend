@@ -77,7 +77,10 @@ def change(account: dict, event: dict) -> tuple[str, str, bool] | None:
 
 class Registry:
     def __init__(
-        self, ttl: float = 1800, clock: typing.Callable[[], float] = time.monotonic
+        self,
+        ttl: float = 1800,
+        clock: typing.Callable[[], float] = time.monotonic,
+        limit: int = 100000,
     ):
         self.lock = asyncio.Lock()
         self.entries: dict[str, Intention] = {}
@@ -86,6 +89,7 @@ class Registry:
         self.versions: dict[str, int] = {}
         self.seen: dict[tuple[str, str], int] = {}
         self.ttl, self.clock = ttl, clock
+        self.limit = limit
 
     def admit(
         self, account: dict, event: dict, identifier: int
@@ -95,6 +99,8 @@ class Registry:
             return None, False
         signature, entity, immutable = identity
         source = (entity, str(account["uuid"]))
+        if not immutable and source not in self.seen and len(self.seen) >= self.limit:
+            return None, False
         previous = self.seen.get(source, 0)
         candidates = [
             self.entries[key]
@@ -116,6 +122,10 @@ class Registry:
             entry = min(candidates, key=lambda x: x.identifier)
             duplicate = True
         else:
+            if len(self.entries) >= self.limit:
+                # The durable inbox remains authoritative. At capacity new
+                # changes use ordinary idempotent application without caching.
+                return None, False
             entry = Intention(
                 f"{signature}:{identifier}", signature, entity, identifier, version
             )
@@ -125,7 +135,8 @@ class Registry:
             if version is not None:
                 self.versions[entity] = max(self.versions.get(entity, version), version)
             duplicate = False
-        self.seen[source] = max(previous, entry.identifier)
+        if source in self.seen or len(self.seen) < self.limit:
+            self.seen[source] = max(previous, entry.identifier)
         return entry, duplicate
 
     def complete(self, key: str) -> None:
@@ -169,6 +180,8 @@ class Registry:
                 continue
             metadata = payload["_shared_key"]
             if not payload.get("_personal_only"):
+                if len(self.entries) >= self.limit:
+                    continue
                 self.entries[metadata["key"]] = Intention(
                     metadata["key"],
                     metadata["signature"],
@@ -176,6 +189,11 @@ class Registry:
                     metadata["identifier"],
                     metadata.get("version"),
                 )
+            if metadata["key"] not in self.entries:
+                continue
             source = (metadata["entity"], str(event["external_account_uuid"]))
-            self.seen[source] = max(self.seen.get(source, 0), metadata["identifier"])
+            if source in self.seen or len(self.seen) < self.limit:
+                self.seen[source] = max(
+                    self.seen.get(source, 0), metadata["identifier"]
+                )
         self.reindex()
