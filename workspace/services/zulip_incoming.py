@@ -86,6 +86,11 @@ RETRY_EVENT_SQL = """
         next_retry_at = now() + %s * interval '1 second'
     WHERE id = %s
 """
+FAIL_EVENT_SQL = """
+    UPDATE zulip_incoming_events
+    SET processed_at=now(), error=%s, attempts=attempts+1
+    WHERE id=%s
+"""
 CURRENT_ACCOUNT_SQL = """
     SELECT 1 FROM m_external_accounts_v2
     WHERE uuid = %s AND project_id = %s AND provider_uuid = %s
@@ -443,6 +448,7 @@ class ZulipIncomingService:
         self.ready.set()
 
     async def process(self, event: dict) -> None:
+        account = None
         try:
             accounts = await self.db.sql(
                 SELECT_ACCOUNT_SQL, (event["external_account_uuid"],)
@@ -471,5 +477,17 @@ class ZulipIncomingService:
             await asyncio.sleep(self.dependency_delay)
         except Exception as error:
             LOG.exception("Cannot apply Zulip event %s", event["id"])
-            delay = min(2 ** min(event["attempts"], 6), 60)
-            await self.db.sql(RETRY_EVENT_SQL, (str(error), delay, event["id"]))
+            permanent = isinstance(error, (ValueError, KeyError, TypeError)) or (
+                isinstance(error, outgoing_operations.ApiError)
+                and 400 <= error.status < 500
+                and error.status not in (408, 429)
+            )
+            if permanent:
+                if account is not None:
+                    await self.operations.account_error(
+                        account, f"Incoming event {event['id']}: {error}"
+                    )
+                await self.db.sql(FAIL_EVENT_SQL, (str(error), event["id"]))
+            else:
+                delay = min(2 ** min(event["attempts"], 6), 60)
+                await self.db.sql(RETRY_EVENT_SQL, (str(error), delay, event["id"]))

@@ -1765,3 +1765,90 @@ def test_stale_queued_edit_cannot_replace_a_newer_provider_update(incoming):
             await database.close()
 
     assert asyncio.run(prepare())["kind"] == "noop"
+
+
+@pytest.mark.parametrize(
+    "error,terminal",
+    [
+        (ValueError("Invalid event data"), True),
+        (
+            incoming_operations.outgoing_operations.ApiError(
+                422, {"msg": "Invalid data"}
+            ),
+            True,
+        ),
+        (
+            incoming_operations.outgoing_operations.ApiError(500, {"msg": "Try later"}),
+            False,
+        ),
+        (
+            incoming_operations.outgoing_operations.ApiError(
+                429, {"msg": "Rate limited"}
+            ),
+            False,
+        ),
+        (incoming_operations.outgoing_operations.Pending("Missing dependency"), False),
+    ],
+)
+def test_permanent_event_failure_does_not_block_the_next_event(
+    incoming, error, terminal
+):
+    api, _db, account, http, url = incoming
+
+    async def run():
+        service = zulip_incoming.ZulipIncomingService(url)
+        await service.db.open()
+        service.operations = incoming_operations.Operations(service.db, http)
+        prepare = service.operations.prepare
+
+        async def poison(account, payload):
+            if payload.get("invalid"):
+                raise error
+            return await prepare(account, payload)
+
+        service.operations.prepare = poison
+        try:
+            async with service.db.transaction() as connection:
+                await service.append(
+                    connection,
+                    account,
+                    {"queue_id": "permanent"},
+                    [
+                        {"id": 1, **event(), "invalid": True},
+                        {"id": 2, **event("Valid following event")},
+                    ],
+                )
+            ready = await service.db.sql(zulip_incoming.SELECT_EVENT_SQL, ([], 10))
+            assert [row["event_id"] for row in ready] == [1]
+            await service.process(ready[0])
+            saved = (
+                await service.db.sql(
+                    "SELECT processed_at,error FROM zulip_incoming_events WHERE id=%s",
+                    (ready[0]["id"],),
+                )
+            )[0]
+            assert (saved["processed_at"] is not None) is terminal
+            assert saved["error"]
+            next_events = await service.db.sql(
+                zulip_incoming.SELECT_EVENT_SQL, ([], 10)
+            )
+            if terminal:
+                assert (
+                    _db.execute(
+                        "SELECT status FROM m_external_accounts_v2 WHERE uuid=%s",
+                        (account["uuid"],),
+                    ).fetchone()[0]
+                    == "error"
+                )
+                assert [row["event_id"] for row in next_events] == [2]
+                await service.process(next_events[0])
+                assert (
+                    api.get("/v1/messenger/messages/").json()[0]["payload"]["content"]
+                    == "Valid following event"
+                )
+            else:
+                assert not any(row["event_id"] == 2 for row in next_events)
+        finally:
+            await service.db.close()
+
+    asyncio.run(run())
