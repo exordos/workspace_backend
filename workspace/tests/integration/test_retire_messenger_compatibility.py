@@ -269,6 +269,11 @@ def test_cutover_preserves_bitmap_reads_after_legacy_flags_were_cleaned(before_c
         (ids["user"], sequence // 4096, sequence % 4096),
     )
     _upgrade()
+    # This cutover predates the publication journal. Draining its projection
+    # work must not require later publication tables or process that queue.
+    assert connection.execute(
+        "SELECT to_regclass('messenger_publication_outbox')"
+    ).fetchone() == (None,)
     with contexts.Context().session_manager() as session:
         assert (
             v2_projection.drain_projection_queue(

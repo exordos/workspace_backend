@@ -136,6 +136,8 @@ def drain():
             "SELECT task_kind,last_error FROM messenger_projection_tasks WHERE status IN ('failed','dead_letter')"
         ).fetchall()
         assert not failures, failures
+    # The real worker publishes in a separate committed transaction.
+    publish()
 
 
 def test_message_create_edit_delete_produces_client_events(incoming):

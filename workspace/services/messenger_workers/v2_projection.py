@@ -32,7 +32,6 @@ from restalchemy.dm import filters as dm_filters
 
 from workspace.common import messenger_reaction_opts
 from workspace.messenger_api import events as messenger_events
-from workspace.messenger_api import publication
 from workspace.messenger_api.api import resource_projection
 from workspace.messenger_api.dm import message_payloads
 from workspace.messenger_api.dm import synchronization
@@ -3688,5 +3687,4 @@ def drain_projection_queue(
                 continue
             break
         processed += 1
-    publication.publish_pending(session)
     return processed
