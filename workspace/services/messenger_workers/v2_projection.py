@@ -1697,8 +1697,8 @@ def _process_fanout(
             INSERT INTO messenger_user_message_states (
                 uuid, project_id, placement_uuid, user_uuid,
                 membership_generation, read_at, mentioned,
-                created_at, updated_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                created_at, updated_at, source_name, provider_uuid, status
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (project_id, user_uuid, placement_uuid) DO UPDATE
             SET membership_generation = EXCLUDED.membership_generation,
                 read_at = EXCLUDED.read_at,
@@ -1719,6 +1719,9 @@ def _process_fanout(
                 f"](urn:user:{str(user_uuid).lower()})" in content,
                 now,
                 now,
+                message.source_name,
+                message.provider_uuid,
+                "active" if message.source_name == "native" else "new",
             ),
         )
     recipient_uuids = accepted_recipients
@@ -2632,7 +2635,7 @@ def _process_topic_membership_policy_rebuild(
     rows = session.execute(
         """
         SELECT placement.uuid, message.author_uuid, message.payload,
-               message.created_at
+               message.created_at, message.source_name, message.provider_uuid
         FROM messenger_message_placements AS placement
         JOIN messenger_messages AS message
           ON message.project_id = placement.project_id
@@ -2702,8 +2705,8 @@ def _process_topic_membership_policy_rebuild(
             INSERT INTO messenger_user_message_states (
                 uuid, project_id, placement_uuid, user_uuid,
                 membership_generation, read_at, mentioned,
-                created_at, updated_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                created_at, updated_at, source_name, provider_uuid, status
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (project_id, user_uuid, placement_uuid) DO UPDATE
             SET membership_generation = EXCLUDED.membership_generation,
                 read_at = EXCLUDED.read_at,
@@ -2724,6 +2727,9 @@ def _process_topic_membership_policy_rebuild(
                 f"](urn:user:{str(user_uuid).lower()})" in content,
                 now,
                 now,
+                row["source_name"],
+                row["provider_uuid"],
+                "active" if row["source_name"] == "native" else "new",
             ),
         )
     if rows:

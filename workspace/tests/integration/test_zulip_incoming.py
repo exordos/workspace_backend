@@ -11,7 +11,6 @@ import pytest
 from restalchemy.common import contexts
 
 from workspace.bridges.zulip import incoming_operations
-from workspace.bridges.zulip import outgoing_operations
 from workspace.messenger_api.dm import external_models
 from workspace.services import zulip_incoming
 from workspace.services import zulip_outgoing
@@ -411,7 +410,7 @@ def test_failed_application_keeps_domain_and_client_events_unchanged(incoming):
     )
 
 
-def test_native_echo_reuses_root_and_keeps_its_identity_empty(incoming):
+def test_pending_zulip_echo_reuses_root_and_fills_canonical_identity(incoming):
     api, db, account, _http, _url = incoming
     apply(incoming, event())
     drain()
@@ -462,9 +461,9 @@ def test_native_echo_reuses_root_and_keeps_its_identity_empty(incoming):
         (account["project_id"], canonical),
     ).fetchone()
     assert root == (
-        "native",
-        None,
-        None,
+        "zulip",
+        account["provider_uuid"],
+        "202",
         {"kind": "markdown", "content": "**Original**"},
     )
     assert (
@@ -474,41 +473,20 @@ def test_native_echo_reuses_root_and_keeps_its_identity_empty(incoming):
         ).fetchone()[0]
         == 2
     )
-    assert (
-        db.execute(
-            "SELECT provider_identity FROM zulip_entity_links WHERE project_id=%s AND entity_uuid=%s",
-            (account["project_id"], canonical),
-        ).fetchone()[0]
-        == "202"
-    )
+    assert not db.execute(
+        "SELECT 1 FROM zulip_entity_links WHERE project_id=%s AND entity_uuid=%s",
+        (account["project_id"], canonical),
+    ).fetchone()
 
 
-@pytest.mark.parametrize("native_stream", [False, True])
 @pytest.mark.parametrize("missing_binding", [False, True])
-def test_user_topic_and_message_echo_keep_native_topic_identity(
-    incoming, native_stream, missing_binding
+def test_user_topic_and_message_echo_complete_pending_topic_identity(
+    incoming, missing_binding
 ):
     api, db, account, _http, _url = incoming
     apply(incoming, event())
     drain()
     stream = api.get("/v1/messenger/streams/").json()[0]
-    if native_stream:
-        db.execute(
-            "UPDATE messenger_streams SET source_name='native',provider_uuid=NULL,"
-            "provider_identity=NULL WHERE project_id=%s AND uuid=%s",
-            (account["project_id"], uuid.UUID(stream["uuid"])),
-        )
-        db.execute(
-            outgoing_operations.UPSERT_ENTITY_LINK_SQL,
-            (
-                account["project_id"],
-                "stream",
-                uuid.UUID(stream["uuid"]),
-                account["provider_uuid"],
-                account["uuid"],
-                "42",
-            ),
-        )
     response = api.post(
         "/v1/messenger/stream_topics/",
         json={"stream_uuid": stream["uuid"], "name": "Native topic"},
@@ -521,17 +499,6 @@ def test_user_topic_and_message_echo_keep_native_topic_identity(
             "WHERE project_id=%s AND topic_uuid=%s",
             (account["project_id"], uuid.UUID(topic["uuid"])),
         )
-    db.execute(
-        outgoing_operations.UPSERT_ENTITY_LINK_SQL,
-        (
-            account["project_id"],
-            "topic",
-            uuid.UUID(topic["uuid"]),
-            account["provider_uuid"],
-            account["uuid"],
-            "42:Native topic",
-        ),
-    )
     apply(
         incoming,
         {
@@ -549,17 +516,13 @@ def test_user_topic_and_message_echo_keep_native_topic_identity(
         "SELECT source_name,provider_uuid,provider_identity FROM messenger_topics "
         "WHERE project_id=%s AND uuid=%s",
         (account["project_id"], uuid.UUID(topic["uuid"])),
-    ).fetchone() == ("native", None, None)
+    ).fetchone() == ("zulip", account["provider_uuid"], "42:Native topic")
     binding = db.execute(
         "SELECT source_name,provider_uuid,provider_identity "
         "FROM messenger_user_topic_bindings WHERE project_id=%s AND topic_uuid=%s",
         (account["project_id"], uuid.UUID(topic["uuid"])),
     ).fetchone()
-    assert binding == (
-        ("zulip", account["provider_uuid"], "42:Native topic:7")
-        if missing_binding
-        else ("native", None, None)
-    )
+    assert binding == ("zulip", account["provider_uuid"], "42:Native topic:7")
     received = api.get(
         "/v1/messenger/messages/", params={"topic_uuid": topic["uuid"]}
     ).json()
@@ -568,18 +531,13 @@ def test_user_topic_and_message_echo_keep_native_topic_identity(
     ]
 
 
-def test_native_default_topic_binding_uses_empty_remote_subject(incoming):
+def test_default_topic_binding_uses_empty_remote_subject(incoming):
     api, db, account, _http, _url = incoming
     apply(incoming, event())
     topic_uuid = db.execute(
         "SELECT default_topic_uuid FROM messenger_streams WHERE project_id=%s",
         (account["project_id"],),
     ).fetchone()[0]
-    db.execute(
-        "UPDATE messenger_topics SET source_name='native',provider_uuid=NULL,"
-        "provider_identity=NULL WHERE project_id=%s AND uuid=%s",
-        (account["project_id"], topic_uuid),
-    )
     db.execute(
         "DELETE FROM messenger_user_topic_bindings WHERE project_id=%s AND topic_uuid=%s",
         (account["project_id"], topic_uuid),
@@ -899,33 +857,13 @@ def test_reaction_payload_preserves_its_actor_for_other_recipients(incoming):
         linked.delete()
 
 
-@pytest.mark.parametrize("native", [False, True])
-def test_topic_rename_preserves_identity_and_last_delete_removes_topic(
-    incoming, native
-):
+def test_topic_rename_preserves_identity_and_last_delete_removes_topic(incoming):
     api, db, account, http, _url = incoming
     apply(incoming, event())
     topic = db.execute(
         "SELECT uuid FROM messenger_topics WHERE project_id=%s AND provider_identity='42:General'",
         (account["project_id"],),
     ).fetchone()[0]
-    if native:
-        db.execute(
-            "UPDATE messenger_topics SET source_name='native',provider_uuid=NULL,"
-            "provider_identity=NULL WHERE project_id=%s AND uuid=%s",
-            (account["project_id"], topic),
-        )
-        db.execute(
-            outgoing_operations.UPSERT_ENTITY_LINK_SQL,
-            (
-                account["project_id"],
-                "topic",
-                topic,
-                account["provider_uuid"],
-                account["uuid"],
-                "42:General",
-            ),
-        )
     message = {**event()["message"], "subject": "Renamed topic"}
     http.request.return_value = {"message": message}
     apply(

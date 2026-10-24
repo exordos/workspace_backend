@@ -34,11 +34,7 @@ DELETE_ROW_SQL = "DELETE FROM {table} WHERE project_id = %s AND uuid = %s RETURN
 SELECT_IDENTITY_SQL = """
     SELECT uuid FROM {table}
     WHERE project_id = %s AND provider_uuid = %s AND provider_identity = %s
-    UNION ALL
-    SELECT entity_uuid AS uuid FROM zulip_entity_links
-    WHERE project_id = %s AND provider_uuid = %s
-      AND entity_type = %s AND provider_identity = %s
-    LIMIT 1
+      AND source_name = 'zulip'
 """
 SELECT_USER_SQL = """
     SELECT account.*, users.source AS user_source
@@ -87,16 +83,14 @@ SELECT_PREVIOUS_PLACEMENTS_SQL = """
       ON stream.project_id = placement.project_id AND stream.uuid = placement.stream_uuid
     WHERE placement.project_id = %s AND placement.message_uuid = %s
       AND placement.stream_uuid <> %s
-      AND (stream.provider_uuid = %s OR EXISTS (
-          SELECT 1 FROM zulip_entity_links link
-          WHERE link.project_id = stream.project_id AND link.entity_type = 'stream'
-            AND link.entity_uuid = stream.uuid AND link.provider_uuid = %s
-      ))
+      AND stream.source_name='zulip' AND stream.provider_uuid=%s
 """
 SELECT_DELIVERY_SQL = """
     SELECT delivery.* FROM bridge_zulip_v5_deliveries delivery
     JOIN messenger_providers provider ON provider.hostname = delivery.hostname
-    WHERE delivery.project_id = %s AND provider.uuid = %s
+    LEFT JOIN messenger_messages message ON message.project_id=delivery.project_id AND message.uuid=delivery.message_uuid
+    WHERE (message.uuid IS NULL OR (message.source_name='zulip' AND message.provider_uuid=provider.uuid))
+      AND delivery.project_id = %s AND provider.uuid = %s
       AND (delivery.zulip_message_id = %s OR delivery.uuid = %s)
     LIMIT 1
 """
@@ -155,26 +149,17 @@ SELECT_TOPIC_REFERENCES_SQL = """
       AND topic.deleted_at IS NULL AND stream.deleted_at IS NULL
 """
 SELECT_MESSAGE_REFERENCES_SQL = """
-    SELECT visible.uuid, COALESCE(message.provider_identity, link.provider_identity) AS remote_id
+    SELECT visible.uuid, message.provider_identity AS remote_id
     FROM messenger_api_user_messages_v1 visible
     JOIN messenger_messages message
-      ON message.project_id = visible.project_id AND message.uuid = visible.canonical_message_uuid
-    LEFT JOIN zulip_entity_links link
-      ON link.project_id = message.project_id AND link.entity_type = 'message'
-     AND link.entity_uuid = message.uuid AND link.provider_uuid = %s
-    WHERE visible.project_id = %s AND visible.user_uuid = %s AND visible.visible
-      AND COALESCE(message.provider_identity, link.provider_identity) = ANY(%s::text[])
-      AND (message.provider_uuid = %s OR link.provider_uuid = %s)
+      ON message.project_id=visible.project_id AND message.uuid=visible.canonical_message_uuid
+    WHERE visible.project_id=%s AND visible.user_uuid=%s AND visible.visible
+      AND message.provider_identity=ANY(%s::text[]) AND message.provider_uuid=%s
 """
 SELECT_SCOPED_FILE_SQL = """
     SELECT file.* FROM m_workspace_files file
-    WHERE file.project_id = %s AND (file.stream_uuid = %s OR file.acl_mode = 'public')
-      AND ((file.provider_uuid = %s AND file.provider_identity = %s) OR EXISTS (
-          SELECT 1 FROM zulip_entity_links link
-          WHERE link.project_id = file.project_id AND link.entity_type = 'file'
-            AND link.entity_uuid = file.uuid AND link.provider_uuid = %s
-            AND link.provider_identity = %s
-      )) LIMIT 1
+    WHERE file.project_id=%s AND (file.stream_uuid=%s OR file.acl_mode='public')
+      AND file.provider_uuid=%s AND file.provider_identity=%s LIMIT 1
 """
 
 SELECT_FILE_SQL = """
@@ -199,7 +184,9 @@ ENQUEUE_COUNTERS_SQL = """
 """
 SELECT_TOPIC_SQL = """
     SELECT * FROM messenger_topics
-    WHERE project_id = %s AND stream_uuid = %s AND provider_identity = %s
+    WHERE project_id = %s AND stream_uuid = %s
+      AND (provider_identity = %s OR (provider_identity IS NULL AND name=%s AND is_done=%s))
+    ORDER BY provider_identity NULLS LAST LIMIT 1
 """
 SELECT_STREAM_TOPICS_SQL = """
     SELECT * FROM messenger_topics WHERE project_id = %s AND stream_uuid = %s
@@ -213,11 +200,7 @@ SELECT_STATES_SQL = """
       ON stream.project_id = placement.project_id AND stream.uuid = placement.stream_uuid
     WHERE state.project_id = %s AND state.user_uuid = %s
       AND (%s::uuid[] IS NULL OR placement.message_uuid = ANY(%s::uuid[]))
-      AND (stream.provider_uuid = %s OR EXISTS (
-          SELECT 1 FROM zulip_entity_links link
-          WHERE link.project_id = stream.project_id AND link.entity_type = 'stream'
-            AND link.entity_uuid = stream.uuid AND link.provider_uuid = %s
-      ))
+      AND stream.source_name='zulip' AND stream.provider_uuid=%s
 """
 SELECT_FILE_RECIPIENTS_SQL = """
     SELECT * FROM m_workspace_visible_files_v1 WHERE uuid = %s
@@ -296,9 +279,11 @@ ENSURE_MESSAGE_STATES_SQL = """
            access.project_id, access.placement_uuid, access.user_uuid,
            access.membership_generation, access.uuid,
            position('](urn:user:' || access.user_uuid::text || ')' in %s) > 0,
-           CASE WHEN actor.external_account_id IS NULL THEN 'native' ELSE 'zulip' END,
-           actor.provider_uuid, %s || ':' || actor.external_account_id, 'active'
+           'zulip', parent.provider_uuid, %s || ':' || actor.external_account_id,
+           CASE WHEN actor.external_account_id IS NULL THEN 'new' ELSE 'active' END
     FROM messenger_user_message_bindings access
+    JOIN messenger_message_placements placement ON placement.project_id=access.project_id AND placement.uuid=access.placement_uuid
+    JOIN messenger_messages parent ON parent.project_id=placement.project_id AND parent.uuid=placement.message_uuid
     LEFT JOIN LATERAL (
         SELECT provider_uuid, external_account_id FROM m_external_accounts_v2
         WHERE project_id = access.project_id AND owner_user_uuid = access.user_uuid
@@ -308,10 +293,14 @@ ENSURE_MESSAGE_STATES_SQL = """
     WHERE access.project_id = %s AND access.placement_uuid = %s
     ON CONFLICT (project_id, user_uuid, placement_uuid) DO UPDATE SET
         membership_generation = EXCLUDED.membership_generation,
-        binding_uuid = EXCLUDED.binding_uuid, read_at = NULL,
-        mentioned = EXCLUDED.mentioned, starred = false, updated_at = now()
-    WHERE messenger_user_message_states.membership_generation
-          <> EXCLUDED.membership_generation
+        binding_uuid = EXCLUDED.binding_uuid,
+        read_at = CASE WHEN messenger_user_message_states.membership_generation <> EXCLUDED.membership_generation THEN NULL ELSE messenger_user_message_states.read_at END,
+        mentioned = EXCLUDED.mentioned,
+        starred = CASE WHEN messenger_user_message_states.membership_generation <> EXCLUDED.membership_generation THEN false ELSE messenger_user_message_states.starred END,
+        source_name=EXCLUDED.source_name,provider_uuid=EXCLUDED.provider_uuid,
+        provider_identity=EXCLUDED.provider_identity,status=EXCLUDED.status,updated_at=now()
+    WHERE messenger_user_message_states.membership_generation <> EXCLUDED.membership_generation
+       OR messenger_user_message_states.provider_identity IS DISTINCT FROM EXCLUDED.provider_identity
 """
 ENSURE_TOPIC_BINDINGS_SQL = """
     INSERT INTO messenger_user_topic_bindings (
@@ -320,9 +309,10 @@ ENSURE_TOPIC_BINDINGS_SQL = """
     )
     SELECT messenger_uuid_v5(%s, member.user_uuid::text), member.project_id,
            %s, member.user_uuid,
-           CASE WHEN actor.external_account_id IS NULL THEN 'native' ELSE 'zulip' END,
-           actor.provider_uuid, %s || ':' || actor.external_account_id, 'active'
+           'zulip', parent.provider_uuid, %s || ':' || actor.external_account_id,
+           CASE WHEN actor.external_account_id IS NULL THEN 'new' ELSE 'active' END
     FROM messenger_stream_bindings member
+    JOIN messenger_streams parent ON parent.project_id=member.project_id AND parent.uuid=member.stream_uuid
     LEFT JOIN LATERAL (
         SELECT provider_uuid, external_account_id FROM m_external_accounts_v2
         WHERE project_id = member.project_id AND owner_user_uuid = member.user_uuid
@@ -331,7 +321,10 @@ ENSURE_TOPIC_BINDINGS_SQL = """
     ) actor ON true
     WHERE member.project_id = %s AND member.stream_uuid = %s AND member.active
       AND member.user_uuid = %s
-    ON CONFLICT (project_id, user_uuid, topic_uuid) DO NOTHING
+    ON CONFLICT (project_id, user_uuid, topic_uuid) DO UPDATE SET
+        source_name=EXCLUDED.source_name,provider_uuid=EXCLUDED.provider_uuid,
+        provider_identity=EXCLUDED.provider_identity,status=EXCLUDED.status
+    WHERE messenger_user_topic_bindings.provider_identity IS DISTINCT FROM EXCLUDED.provider_identity
     RETURNING user_uuid
 """
 
@@ -430,26 +423,6 @@ class Operations:
         self.db, self.http = db, http
         self.reaction_user_limit = reaction_user_limit
 
-    async def provider_identity(
-        self, connection: typing.Any, account: dict, kind: str, entity: dict
-    ) -> str:
-        if entity["provider_uuid"] == account["provider_uuid"]:
-            return entity["provider_identity"]
-        found = await rows(
-            connection,
-            outgoing_operations.SELECT_ENTITY_IDENTITY_SQL.format(table=TABLES[kind]),
-            (
-                account["project_id"],
-                entity["uuid"],
-                account["provider_uuid"],
-                account["project_id"],
-                kind,
-                entity["uuid"],
-                account["provider_uuid"],
-            ),
-        )
-        return found[0]["provider_identity"]
-
     async def identity(
         self,
         account: dict,
@@ -463,10 +436,6 @@ class Operations:
         parameters = (
             account["project_id"],
             account["provider_uuid"],
-            remote,
-            account["project_id"],
-            account["provider_uuid"],
-            kind,
             remote,
         )
         found = (
@@ -503,14 +472,6 @@ class Operations:
         values = dict(values)
         if old:
             values.pop("created_at", None)
-            if old[0].get("source_name") == "native":
-                for key in (
-                    "source_name",
-                    "provider_uuid",
-                    "provider_identity",
-                    "status",
-                ):
-                    values.pop(key, None)
             if all(
                 (
                     old[0][key].replace(tzinfo=None) == value.replace(tzinfo=None)
@@ -943,8 +904,6 @@ class Operations:
                         file_stream,
                         account["provider_uuid"],
                         path,
-                        account["provider_uuid"],
-                        path,
                     ),
                 )
                 if existing:
@@ -1041,11 +1000,9 @@ class Operations:
             await self.db.sql(
                 SELECT_MESSAGE_REFERENCES_SQL,
                 (
-                    account["provider_uuid"],
                     account["project_id"],
                     account["owner_user_uuid"],
                     list(referenced),
-                    account["provider_uuid"],
                     account["provider_uuid"],
                 ),
             )
@@ -1182,7 +1139,7 @@ class Operations:
             "active": active,
             **origin(
                 account,
-                f"{await self.provider_identity(connection, account, 'stream', stream)}:{remote}",
+                f"{stream['provider_identity']}:{remote}",
             ),
         }
         if mode is not None:
@@ -1255,9 +1212,7 @@ class Operations:
         )
         for topic in topics:
             if active and changed and topic["uuid"] == stream["default_topic_uuid"]:
-                identity = await self.provider_identity(
-                    connection, account, "stream", stream
-                )
+                identity = stream["provider_identity"]
                 await self.topic_binding(
                     connection, account, topic, user, remote, f"{identity}:"
                 )
@@ -1316,9 +1271,7 @@ class Operations:
         stream: dict,
         name: str,
     ) -> dict:
-        stream_identity = await self.provider_identity(
-            connection, account, "stream", stream
-        )
+        stream_identity = stream["provider_identity"]
         identity = f"{stream_identity}:{name}"
         old = await rows(
             connection,
@@ -1327,35 +1280,11 @@ class Operations:
                 account["project_id"],
                 stream["uuid"],
                 identity,
+                name.removeprefix("✔ ") or "General",
+                name.startswith("✔ "),
             ),
         )
-        linked_uuid = await self.identity(
-            account, "topic", identity, connection=connection
-        )
-        linked = await rows(
-            connection,
-            SELECT_ROW_SQL.format(table=TABLES["topic"]),
-            (
-                account["project_id"],
-                linked_uuid,
-            ),
-        )
-        identifier = (
-            linked[0]["uuid"]
-            if linked
-            else old[0]["uuid"]
-            if old
-            else uuid.uuid5(stream["uuid"], name.lower())
-        )
-        if not old:
-            old = await rows(
-                connection,
-                SELECT_ROW_SQL.format(table=TABLES["topic"]),
-                (
-                    account["project_id"],
-                    identifier,
-                ),
-            )
+        identifier = old[0]["uuid"] if old else uuid.uuid5(stream["uuid"], name.lower())
         changed = await self.save(
             connection,
             TABLES["topic"],
@@ -1622,7 +1551,7 @@ class Operations:
             (account["project_id"], identifier),
         )
         if deliveries and not old:
-            # A pending native create/delete may finish after its root was removed.
+            # A pending create/delete may finish after its root was removed.
             await connection.execute(
                 OBSERVE_DELIVERY_SQL,
                 (
@@ -1845,6 +1774,19 @@ class Operations:
         pending = await rows(
             connection, SELECT_PENDING_EDIT_SQL, (account["project_id"], identifier)
         )
+        if old:
+            await connection.execute(
+                outgoing_operations.UPDATE_ENTITY_IDENTITY_SQL.format(
+                    table=TABLES["message"]
+                ),
+                (
+                    str(data["id"]),
+                    account["project_id"],
+                    identifier,
+                    account["provider_uuid"],
+                    str(data["id"]),
+                ),
+            )
         changed = None
         if not old or (
             not pending
@@ -1867,17 +1809,6 @@ class Operations:
             await connection.execute(
                 OBSERVE_DELIVERY_SQL, (data["id"], edited, deliveries[0]["uuid"])
             )
-        await connection.execute(
-            outgoing_operations.UPSERT_ENTITY_LINK_SQL,
-            (
-                account["project_id"],
-                "message",
-                identifier,
-                account["provider_uuid"],
-                account["uuid"],
-                str(data["id"]),
-            ),
-        )
         previous_placements = await rows(
             connection,
             SELECT_PREVIOUS_PLACEMENTS_SQL,
@@ -1885,7 +1816,6 @@ class Operations:
                 account["project_id"],
                 identifier,
                 stream_uuid,
-                account["provider_uuid"],
                 account["provider_uuid"],
             ),
         )
@@ -2026,7 +1956,6 @@ class Operations:
                 account["owner_user_uuid"],
                 messages,
                 messages,
-                account["provider_uuid"],
                 account["provider_uuid"],
             ),
         )
@@ -2314,17 +2243,6 @@ class Operations:
                         "is_done": event["subject"].startswith("✔ "),
                         "provider_identity": identity,
                     },
-                )
-                await connection.execute(
-                    outgoing_operations.UPSERT_ENTITY_LINK_SQL,
-                    (
-                        account["project_id"],
-                        "topic",
-                        topic["uuid"],
-                        account["provider_uuid"],
-                        account["uuid"],
-                        identity,
-                    ),
                 )
                 if changed:
                     await self.snapshot(

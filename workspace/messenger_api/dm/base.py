@@ -107,12 +107,23 @@ class WorkspaceProviderBase(WorkspaceSyncStatusBase):
 
     def validate(self) -> None:
         super().validate()
-        if (self.provider_uuid is None) != (self.provider_identity is None):
+        if self.source_name == "native" and (
+            self.provider_uuid is not None
+            or self.provider_identity is not None
+            or self.status != "active"
+        ):
             raise ra_exc.ValidationErrorException()
-        if self.source_name == "native" and self.provider_uuid is not None:
+        if self.source_name == "zulip" and self.provider_uuid is None:
             raise ra_exc.ValidationErrorException()
-        if self.source_name == "native" and self.status != "active":
-            raise ra_exc.ValidationErrorException()
+
+    @staticmethod
+    def creation_from(parent: typing.Any) -> dict[str, typing.Any]:
+        return {
+            "source_name": parent.source_name,
+            "provider_uuid": parent.provider_uuid,
+            "provider_identity": None,
+            "status": "active" if parent.source_name == "native" else "new",
+        }
 
     @staticmethod
     def validate_native_creation(values: dict[str, typing.Any]) -> None:

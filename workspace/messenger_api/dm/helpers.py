@@ -31,7 +31,7 @@ from workspace.services.messenger_workers import owned_projection
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api import exceptions as messenger_exc
 from workspace.messenger_api import file_storage
-from workspace.messenger_api.dm import message_payloads, models, schema, v2_models
+from workspace.messenger_api.dm import base, message_payloads, models, schema, v2_models
 
 ALL_CHATS_FOLDER_UUID = sys_uuid.UUID("00000000-0000-0000-0000-000000000000")
 PERSONAL_FOLDER_UUID = sys_uuid.UUID("00000000-0000-0000-0000-000000000001")
@@ -747,6 +747,16 @@ def create_workspace_file(
         values.setdefault("storage_id", storage_info.storage_id)
         values.setdefault("storage_object_id", storage_info.storage_object_id)
 
+    if values.get("stream_uuid") is not None:
+        stream = v2_models.WorkspaceStream.objects.get_one(
+            filters={
+                "project_id": dm_filters.EQ(project_id),
+                "uuid": dm_filters.EQ(values["stream_uuid"]),
+            },
+            session=session,
+        )
+        values.update(base.WorkspaceProviderBase.creation_from(stream))
+
     file = models.WorkspaceFile(
         uuid=uuid,
         project_id=project_id,
@@ -1002,6 +1012,13 @@ def get_or_create_workspace_stream_bindings(
     with _workspace_session(session) as current_session:
         _lock_workspace_project_event_writes(project_id, current_session)
         _lock_workspace_stream(project_id, stream_uuid, current_session)
+        stream = v2_models.WorkspaceStream.objects.get_one(
+            filters={
+                "project_id": dm_filters.EQ(project_id),
+                "uuid": dm_filters.EQ(stream_uuid),
+            },
+            session=current_session,
+        )
         now = current_session.execute("SELECT NOW() AS value").fetchone()["value"]
         bindings = []
         created = []
@@ -1031,6 +1048,7 @@ def get_or_create_workspace_stream_bindings(
                         who_uuid=who_uuid,
                         role=role,
                         notification_updated_at=now.astimezone(datetime.timezone.utc),
+                        **base.WorkspaceProviderBase.creation_from(stream),
                     )
                     binding.insert(session=current_session)
                 elif not binding.active:
@@ -1054,8 +1072,9 @@ def get_or_create_workspace_stream_bindings(
                 created.append(binding)
                 current_session.execute(
                     "INSERT INTO messenger_user_topic_bindings "
-                    "(uuid, project_id, user_uuid, topic_uuid, notification_mode) "
-                    "SELECT messenger_uuid_v5(uuid, %s), project_id, %s, uuid, 'default' "
+                    "(uuid, project_id, user_uuid, topic_uuid, notification_mode, source_name, provider_uuid, status) "
+                    "SELECT messenger_uuid_v5(uuid, %s), project_id, %s, uuid, 'default', "
+                    "source_name, provider_uuid, CASE WHEN source_name='native' THEN 'active' ELSE 'new' END "
                     "FROM messenger_topics WHERE project_id=%s AND stream_uuid=%s AND deleted_at IS NULL "
                     "ON CONFLICT (project_id, user_uuid, topic_uuid) DO NOTHING",
                     (str(user_uuid), user_uuid, project_id, stream_uuid),

@@ -35,10 +35,6 @@ def outgoing(api, db, monkeypatch):
     stream_uuid = uuid.UUID(
         conftest.seed_user_stream(db, api.project_id, api.user_uuid, "Channel")
     )
-    db.execute(
-        "UPDATE messenger_streams SET source_name='zulip' WHERE project_id=%s AND uuid=%s",
-        (api.project_id, stream_uuid),
-    )
     topic = v2_models.WorkspaceStreamTopic(
         project_id=api.project_id, stream_uuid=stream_uuid, name="General"
     )
@@ -64,8 +60,17 @@ def outgoing(api, db, monkeypatch):
     )
     account.insert()
     db.execute(
-        "UPDATE messenger_streams SET provider_uuid=%s,provider_identity='42' WHERE project_id=%s AND uuid=%s",
+        "UPDATE messenger_streams SET source_name='zulip',provider_uuid=%s,provider_identity='42' WHERE project_id=%s AND uuid=%s",
         (account.provider_uuid, api.project_id, stream_uuid),
+    )
+    for table in ("messenger_topics", "messenger_stream_bindings"):
+        db.execute(
+            f"UPDATE {table} SET source_name='zulip',provider_uuid=%s,provider_identity='42:General' WHERE project_id=%s AND stream_uuid=%s",
+            (account.provider_uuid, api.project_id, stream_uuid),
+        )
+    db.execute(
+        "UPDATE messenger_user_topic_bindings SET source_name='zulip',provider_uuid=%s,provider_identity='42:General:7' WHERE project_id=%s AND topic_uuid=%s",
+        (account.provider_uuid, api.project_id, topic.uuid),
     )
     channel = types.SimpleNamespace(
         uuid=uuid.uuid4(),
@@ -322,7 +327,7 @@ def intents(db, account):
     ).fetchall()
 
 
-def test_api_intent_is_atomic_native_identity_stays_empty(
+def test_api_intent_is_atomic_and_receipt_updates_canonical_identity(
     outgoing, db, _test_database_url
 ):
     api, account, channel, *_ = outgoing
@@ -357,9 +362,9 @@ def test_api_intent_is_atomic_native_identity_stays_empty(
             (public["uuid"],),
         ).fetchone()
     )
-    assert canonical == ("native", None)
-    assert db.execute(
-        "SELECT provider_identity FROM zulip_entity_links WHERE entity_type='message'"
+    assert canonical == ("zulip", "101")
+    assert not db.execute(
+        "SELECT 1 FROM zulip_entity_links WHERE entity_type='message'"
     ).fetchone()
 
 
@@ -678,12 +683,12 @@ def test_attachment_dependency_added_after_message_does_not_starve(
     monkeypatch.setenv("WORKSPACE_FILE_STORAGE_PATH", str(tmp_path))
     response = api.post(
         "/v1/messenger/files/",
-        data={"acl": '{"mode":"public"}'},
+        data={"stream_uuid": str(channel.stream_uuid)},
         files={"file": ("example.txt", b"content", "text/plain")},
     )
     assert response.status_code == 201, response.text
     file = response.json()
-    assert not intents(db, account)
+    assert [row[0] for row in intents(db, account)] == ["file"]
     for _ in range(2):
         response = api.post(
             "/v1/messenger/messages/",
@@ -841,8 +846,52 @@ def export(account, payload, stream_uuid, zulip):
 @pytest.mark.pre_outgoing_schema
 def test_cutover_preserves_queued_and_unscheduled_changes(outgoing, db):
     api, account, channel, *_ = outgoing
-    first = create(outgoing)
-    second = create(outgoing)
+    seeded = []
+    for _ in range(2):
+        message_uuid, placement_uuid = uuid.uuid4(), uuid.uuid4()
+        topic_uuid = db.execute(
+            "SELECT default_topic_uuid FROM messenger_streams WHERE uuid=%s",
+            (channel.stream_uuid,),
+        ).fetchone()[0]
+        db.execute(
+            "INSERT INTO messenger_messages(uuid,project_id,author_uuid,payload) VALUES(%s,%s,%s,%s)",
+            (
+                message_uuid,
+                account.project_id,
+                api.user_uuid,
+                pg_json.Jsonb({"kind": "markdown", "content": "Before cutover"}),
+            ),
+        )
+        db.execute(
+            "INSERT INTO messenger_message_placements(uuid,project_id,message_uuid,stream_uuid,topic_uuid) VALUES(%s,%s,%s,%s,%s)",
+            (
+                placement_uuid,
+                account.project_id,
+                message_uuid,
+                channel.stream_uuid,
+                topic_uuid,
+            ),
+        )
+        db.execute(
+            "INSERT INTO messenger_user_message_bindings(uuid,project_id,placement_uuid,user_uuid,membership_generation,relation_role,visibility,permissions) VALUES(%s,%s,%s,%s,1,'author','visible',jsonb_build_object('read',true,'react',true,'star',true,'pin',true))",
+            (
+                uuid.uuid5(placement_uuid, str(api.user_uuid)),
+                account.project_id,
+                placement_uuid,
+                api.user_uuid,
+            ),
+        )
+        db.execute(
+            "INSERT INTO messenger_user_message_states(uuid,project_id,placement_uuid,user_uuid,starred,membership_generation) VALUES(%s,%s,%s,%s,false,1)",
+            (
+                uuid.uuid5(placement_uuid, str(api.user_uuid)),
+                account.project_id,
+                placement_uuid,
+                api.user_uuid,
+            ),
+        )
+        seeded.append({"uuid": str(placement_uuid)})
+    first, second = seeded
     with contexts.Context().session_manager():
         copies = []
         for public in (first, second):
@@ -974,3 +1023,189 @@ def test_copy_identity_stays_with_the_original_provider(
                 )
 
     asyncio.run(run())
+
+
+def test_zulip_children_inherit_provider_before_receipt(
+    outgoing, db, monkeypatch, tmp_path
+):
+    api, account, channel, *_ = outgoing
+    monkeypatch.setenv("WORKSPACE_FILE_STORAGE_PATH", str(tmp_path))
+    response = api.post(
+        "/v1/messenger/stream_topics/",
+        json={
+            "stream_uuid": str(channel.stream_uuid),
+            "name": "Pending topic",
+        },
+    )
+    assert response.status_code == 201, response.text
+    topic = response.json()
+    response = api.post(
+        "/v1/messenger/messages/",
+        json={
+            "stream_uuid": str(channel.stream_uuid),
+            "topic_uuid": topic["uuid"],
+            "payload": {"kind": "markdown", "content": "Pending message"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    message = response.json()
+    reaction = api.post(
+        "/v1/messenger/message_reactions/",
+        json={
+            "message_uuid": message["uuid"],
+            "emoji_name": "thumbs_up",
+        },
+    )
+    assert reaction.status_code == 201, reaction.text
+    file = api.post(
+        "/v1/messenger/files/",
+        data={"stream_uuid": str(channel.stream_uuid)},
+        files={"file": ("pending.txt", b"pending", "text/plain")},
+    )
+    assert file.status_code == 201, file.text
+    for entity in (topic, message, reaction.json(), file.json()):
+        assert entity["source_name"] == "zulip"
+        assert entity["provider_uuid"] == str(account.provider_uuid)
+        assert entity["provider_identity"] is None
+        assert entity["status"] == "new"
+    for table, predicate, identifier in (
+        ("messenger_user_topic_bindings", "topic_uuid", topic["uuid"]),
+        ("messenger_user_message_states", "placement_uuid", message["uuid"]),
+    ):
+        assert db.execute(
+            f"SELECT source_name,provider_uuid FROM {table} WHERE {predicate}=%s",
+            (uuid.UUID(identifier),),
+        ).fetchone() == ("zulip", account.provider_uuid)
+    assert all(row[3]["source_name"] == "zulip" for row in intents(db, account))
+
+
+def test_native_entities_never_enter_outbox_with_an_old_stream_link(
+    outgoing, db, tmp_path, monkeypatch
+):
+    api, account, channel, *_ = outgoing
+    db.execute(
+        "UPDATE messenger_streams SET source_name='native',provider_uuid=NULL,provider_identity=NULL WHERE uuid=%s",
+        (channel.stream_uuid,),
+    )
+    db.execute(
+        """INSERT INTO zulip_entity_links(project_id,entity_type,entity_uuid,provider_uuid,external_account_uuid,provider_identity)
+        VALUES(%s,%s,%s,%s,%s,%s)""",
+        (
+            account.project_id,
+            "stream",
+            channel.stream_uuid,
+            account.provider_uuid,
+            account.uuid,
+            "42",
+        ),
+    )
+    for table, where in (
+        ("messenger_topics", "stream_uuid"),
+        ("messenger_stream_bindings", "stream_uuid"),
+    ):
+        db.execute(
+            f"UPDATE {table} SET source_name='native',provider_uuid=NULL,provider_identity=NULL,status='active' WHERE {where}=%s",
+            (channel.stream_uuid,),
+        )
+    db.execute(
+        "UPDATE messenger_user_topic_bindings SET source_name='native',provider_uuid=NULL,provider_identity=NULL,status='active' WHERE project_id=%s",
+        (account.project_id,),
+    )
+    public = create(outgoing)
+    assert public["source_name"] == "native"
+    reaction = api.post(
+        "/v1/messenger/message_reactions/",
+        json={"message_uuid": public["uuid"], "emoji_name": "thumbs_up"},
+    )
+    assert reaction.status_code == 201, reaction.text
+    assert reaction.json()["source_name"] == "native"
+    assert (
+        api.post(
+            f"/v1/messenger/messages/{public['uuid']}/actions/star/invoke"
+        ).status_code
+        == 200
+    )
+    topic = api.post(
+        "/v1/messenger/stream_topics/",
+        json={"stream_uuid": str(channel.stream_uuid), "name": "Local topic"},
+    )
+    assert topic.status_code == 201, topic.text
+    assert topic.json()["source_name"] == "native"
+    monkeypatch.setenv("WORKSPACE_FILE_STORAGE_PATH", str(tmp_path))
+    file = api.post(
+        "/v1/messenger/files/",
+        data={"stream_uuid": str(channel.stream_uuid)},
+        files={"file": ("local.txt", b"local", "text/plain")},
+    )
+    assert file.status_code == 201, file.text
+    assert file.json()["source_name"] == "native"
+    assert (
+        api.put(
+            f"/v1/messenger/streams/{channel.stream_uuid}",
+            json={"description": "Local only"},
+        ).status_code
+        == 200
+    )
+    assert intents(db, account) == []
+
+
+def test_native_file_reference_never_schedules_an_upload(
+    outgoing, db, tmp_path, monkeypatch
+):
+    api, account, channel, *_ = outgoing
+    monkeypatch.setenv("WORKSPACE_FILE_STORAGE_PATH", str(tmp_path))
+    file = api.post(
+        "/v1/messenger/files/",
+        data={"acl": '{"mode":"public"}'},
+        files={"file": ("local.txt", b"local", "text/plain")},
+    )
+    assert file.status_code == 201, file.text
+    assert file.json()["source_name"] == "native"
+    with contexts.Context().session_manager():
+        with pytest.raises(ValueError, match="different source"):
+            export(
+                account,
+                {
+                    "kind": "markdown",
+                    "content": f"[file](urn:file:{file.json()['uuid']})",
+                },
+                channel.stream_uuid,
+                outgoing[4],
+            )
+    assert not intents(db, account)
+
+
+def test_provenance_migration_converts_legacy_children_and_retires_root_links(
+    outgoing, db
+):
+    api, account, channel, *_ = outgoing
+    public = create(outgoing)
+    identifier = db.execute(
+        "SELECT message_uuid FROM messenger_message_placements WHERE uuid=%s",
+        (uuid.UUID(public["uuid"]),),
+    ).fetchone()[0]
+    db.execute(
+        "UPDATE messenger_messages SET source_name='native',provider_uuid=NULL,provider_identity=NULL,status='active' WHERE uuid=%s",
+        (identifier,),
+    )
+    db.execute(
+        "INSERT INTO zulip_entity_links(project_id,entity_type,entity_uuid,provider_uuid,external_account_uuid,provider_identity) VALUES(%s,'message',%s,%s,%s,'987')",
+        (account.project_id, identifier, account.provider_uuid, account.uuid),
+    )
+    db.execute(
+        'UPDATE zulip_outgoing_intents SET data=data||\'{"source_name":"native"}\'::jsonb WHERE entity_uuid=%s',
+        (identifier,),
+    )
+    filename = next(conftest.MIGRATIONS_DIR.glob("0267-*.py")).name
+    conftest.DataMigration(filename)._run(filename, "upgrade")
+    assert db.execute(
+        "SELECT source_name,provider_uuid,provider_identity FROM messenger_messages WHERE uuid=%s",
+        (identifier,),
+    ).fetchone() == ("zulip", account.provider_uuid, "987")
+    assert db.execute(
+        "SELECT data->>'source_name',data->>'provider_identity' FROM zulip_outgoing_intents WHERE entity_uuid=%s",
+        (identifier,),
+    ).fetchone() == ("zulip", "987")
+    assert not db.execute(
+        "SELECT 1 FROM zulip_entity_links WHERE entity_type IN('stream','topic','message')"
+    ).fetchone()

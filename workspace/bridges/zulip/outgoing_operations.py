@@ -47,51 +47,29 @@ UPDATE_ENTITY_STATUS_SQL = """
 """
 
 SELECT_ENTITY_IDENTITY_SQL = """
-    SELECT provider_identity
-    FROM {table}
-    WHERE project_id = %s
-      AND uuid = %s
-      AND provider_uuid = %s
-      AND provider_identity IS NOT NULL
-    UNION ALL
-    SELECT link.provider_identity
-    FROM zulip_entity_links link
-    WHERE link.project_id = %s
-      AND link.entity_type = %s
-      AND link.entity_uuid = %s
-      AND link.provider_uuid = %s
-    LIMIT 1
+    SELECT provider_identity FROM {table}
+    WHERE project_id = %s AND uuid = %s AND provider_uuid = %s
+      AND source_name = 'zulip' AND provider_identity IS NOT NULL
 """
 
-SELECT_FILE_IDENTITY_SQL = """
-    SELECT link.zulip_url AS provider_identity
-    FROM bridge_zulip_v5_file_links link
-    JOIN messenger_providers provider ON provider.hostname = link.hostname
-    WHERE link.project_id = %s
-      AND link.file_uuid = %s
-      AND provider.uuid = %s
-    LIMIT 1
+UPDATE_ENTITY_IDENTITY_SQL = """
+    UPDATE {table} SET provider_identity = %s
+    WHERE project_id = %s AND uuid = %s AND provider_uuid = %s
+      AND source_name = 'zulip' AND provider_identity IS DISTINCT FROM %s
 """
 
-SELECT_MESSAGE_IDENTITY_SQL = """
-    SELECT delivery.zulip_message_id::text AS provider_identity
-    FROM bridge_zulip_v5_deliveries delivery
-    JOIN messenger_providers provider ON provider.hostname = delivery.hostname
-    WHERE delivery.project_id = %s
-      AND delivery.message_uuid = %s
-      AND provider.uuid = %s
-      AND delivery.zulip_message_id IS NOT NULL
-    LIMIT 1
+SAVE_RECEIPT_SQL = """
+    UPDATE zulip_outgoing_intents SET data=data || jsonb_build_object('remote_identity',%s::text)
+    WHERE project_id=%s AND entity_type=%s AND entity_uuid=%s
+      AND external_account_uuid=%s AND id>%s AND status<>'done'
 """
-
-SELECT_STREAM_LINK_SQL = """
-    SELECT provider_identity
-    FROM zulip_entity_links
-    WHERE project_id = %s
-      AND entity_type = 'stream'
-      AND entity_uuid = %s
-      AND provider_uuid = %s
-      AND external_account_uuid = %s
+SAVE_FILE_ACCESS_SQL = """
+    INSERT INTO zulip_entity_links(project_id,entity_type,entity_uuid,provider_uuid,
+        external_account_uuid,provider_identity,data)
+    VALUES(%s,'file',%s,%s,%s,%s,%s)
+    ON CONFLICT(entity_type,entity_uuid,provider_uuid,external_account_uuid)
+    DO UPDATE SET provider_identity=EXCLUDED.provider_identity,
+                  data=zulip_entity_links.data || EXCLUDED.data
 """
 
 SELECT_CHANNEL_SQL = """
@@ -249,15 +227,6 @@ SELECT_VISIBLE_FILE_SQL = """
     LIMIT 1
 """
 
-INSERT_FILE_INTENT_SQL = """
-    INSERT INTO zulip_outgoing_intents (
-        project_id, entity_type, entity_uuid, ordering_key,
-        external_account_uuid, operation, data
-    )
-    VALUES (%s, 'file', %s, %s, %s, 'insert', %s)
-    ON CONFLICT DO NOTHING
-"""
-
 SELECT_VISIBLE_STREAM_SQL = """
     SELECT 1
     FROM messenger_api_user_streams_v1
@@ -283,15 +252,6 @@ SELECT_MESSAGE_RECEIPT_SQL = """
     LIMIT 1
 """
 
-UPSERT_ENTITY_LINK_SQL = """
-    INSERT INTO zulip_entity_links (
-        project_id, entity_type, entity_uuid, provider_uuid,
-        external_account_uuid, provider_identity
-    )
-    VALUES (%s, %s, %s, %s, %s, %s)
-    ON CONFLICT (entity_type, entity_uuid, provider_uuid, external_account_uuid)
-    DO UPDATE SET provider_identity = EXCLUDED.provider_identity
-"""
 
 INSERT_FILE_LINK_SQL = """
     INSERT INTO bridge_zulip_v5_file_links (
@@ -378,49 +338,16 @@ class Operations:
     async def identity(
         self, intent: dict, account: dict, kind: str, entity_uuid: object
     ) -> str:
-        table = TABLES[kind]
         identities = await self.db.sql(
-            SELECT_ENTITY_IDENTITY_SQL.format(table=table),
-            (
-                intent["project_id"],
-                entity_uuid,
-                account["provider_uuid"],
-                intent["project_id"],
-                kind,
-                entity_uuid,
-                account["provider_uuid"],
-            ),
+            SELECT_ENTITY_IDENTITY_SQL.format(table=TABLES[kind]),
+            (intent["project_id"], entity_uuid, account["provider_uuid"]),
         )
-        if not identities and kind == "file":
-            identities = await self.db.sql(
-                SELECT_FILE_IDENTITY_SQL,
-                (intent["project_id"], entity_uuid, account["provider_uuid"]),
-            )
-        if not identities and kind == "message":
-            identities = await self.db.sql(
-                SELECT_MESSAGE_IDENTITY_SQL,
-                (intent["project_id"], entity_uuid, account["provider_uuid"]),
-            )
         if not identities:
             raise Pending(f"Waiting for {kind} {entity_uuid}")
         return identities[0]["provider_identity"]
 
     async def route(self, intent: dict, account: dict) -> dict:
         data = intent["data"]
-        links = await self.db.sql(
-            SELECT_STREAM_LINK_SQL,
-            (
-                intent["project_id"],
-                data["stream_uuid"],
-                account["provider_uuid"],
-                account["uuid"],
-            ),
-        )
-        if links:
-            return {
-                "stream_id": int(links[0]["provider_identity"]),
-                "channel_type": "channel",
-            }
         channels = await self.db.sql(
             SELECT_CHANNEL_SQL,
             (
@@ -511,6 +438,7 @@ class Operations:
                         "DELETE" if operation == "delete" else "POST",
                         f"/messages/{remote}/reactions",
                         custom,
+                        identity=f"{remote}:{account['external_account_id']}:{custom['reaction_type']}:{custom['emoji_code']}",
                         message_id=int(remote),
                         present=operation != "delete",
                         user_id=int(account["external_account_id"]),
@@ -528,6 +456,7 @@ class Operations:
                         "emoji_code": code,
                         "reaction_type": "unicode_emoji",
                     },
+                    identity=f"{remote}:{account['external_account_id']}:unicode_emoji:{code}",
                     message_id=int(remote),
                     present=operation != "delete",
                     user_id=int(account["external_account_id"]),
@@ -548,6 +477,7 @@ class Operations:
                 "flags",
                 "POST",
                 "/messages/flags",
+                identity=f"{remote}:{account['external_account_id']}",
                 message_id=int(remote),
                 flags=changed,
             )
@@ -709,6 +639,7 @@ class Operations:
                         "subscriptions": [{"name": name}] if present else [name],
                         "principals": [principal],
                     },
+                    identity=f"{stream_id}:{principal}",
                     stream_id=stream_id,
                     user_id=principal,
                     present=present,
@@ -726,6 +657,7 @@ class Operations:
                         }
                     ]
                 },
+                identity=f"{stream_id}:{account['external_account_id']}",
                 stream_id=stream_id,
             )
         if kind == "topic_binding":
@@ -741,6 +673,7 @@ class Operations:
                     "topic": data["topic_name"],
                     "visibility_policy": policy,
                 },
+                identity=f"{stream_id}:{data['topic_name']}:{account['external_account_id']}",
             )
         raise ValueError(f"Unsupported outgoing entity: {kind}")
 
@@ -948,35 +881,14 @@ class Operations:
                     raise ValueError(
                         f"Workspace attachment is not accessible: {identifier}"
                     )
-                try:
-                    remote = await self.identity(intent, account, "file", identifier)
-                except Pending:
-                    file = files[0]
-                    snapshot = {
-                        key: str(value)
-                        if isinstance(value, uuid.UUID)
-                        else value.isoformat()
-                        if hasattr(value, "isoformat")
-                        else value
-                        for key, value in file.items()
-                    }
-                    snapshot["stream_uuid"] = str(intent["data"]["stream_uuid"])
-                    snapshot.update(
-                        actor_uuid=str(account["owner_user_uuid"]),
-                        account_identity=account["external_account_id"],
-                        account_provider_uuid=str(account["provider_uuid"]),
+                file = files[0]
+                if file["source_name"] != "zulip" or str(file["provider_uuid"]) != str(
+                    account["provider_uuid"]
+                ):
+                    raise ValueError(
+                        f"Attachment belongs to a different source: {identifier}"
                     )
-                    await self.db.sql(
-                        INSERT_FILE_INTENT_SQL,
-                        (
-                            intent["project_id"],
-                            identifier,
-                            f"file:{identifier}",
-                            account["uuid"],
-                            pg_json.Jsonb(snapshot),
-                        ),
-                    )
-                    raise Pending(f"Waiting for attachment {identifier}")
+                remote = await self.identity(intent, account, "file", identifier)
                 context["files"][remote] = f"urn:{kind}:{identifier}"
             elif kind in ("stream", "topic"):
                 if kind == "stream":
@@ -1262,18 +1174,39 @@ class Operations:
         identity = result.get("identity")
         if identity is not None:
             await self.db.sql(
-                UPSERT_ENTITY_LINK_SQL,
+                UPDATE_ENTITY_IDENTITY_SQL.format(table=TABLES[intent["entity_type"]]),
                 (
+                    identity,
+                    intent["project_id"],
+                    intent["entity_uuid"],
+                    account["provider_uuid"],
+                    identity,
+                ),
+            )
+            await self.db.sql(
+                SAVE_RECEIPT_SQL,
+                (
+                    identity,
                     intent["project_id"],
                     intent["entity_type"],
                     intent["entity_uuid"],
-                    account["provider_uuid"],
                     account["uuid"],
-                    identity,
+                    intent["id"],
                 ),
             )
         if intent["entity_type"] == "file" and identity is not None:
             data = intent["data"]
+            await self.db.sql(
+                SAVE_FILE_ACCESS_SQL,
+                (
+                    intent["project_id"],
+                    intent["entity_uuid"],
+                    account["provider_uuid"],
+                    account["uuid"],
+                    identity,
+                    pg_json.Jsonb({"account_identity": account["external_account_id"]}),
+                ),
+            )
             await self.db.sql(
                 INSERT_FILE_LINK_SQL,
                 (
