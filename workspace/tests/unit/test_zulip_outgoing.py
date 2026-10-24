@@ -72,3 +72,38 @@ def test_flags_are_sent_as_personal_idempotent_operations():
         {"messages": [123], "flag": "read", "op": "add"},
         {"messages": [123], "flag": "starred", "op": "remove"},
     ]
+
+
+@pytest.mark.parametrize("present", [False, True])
+@pytest.mark.parametrize("remote_present", [False, True])
+@pytest.mark.parametrize("reaction_type", ["unicode_emoji", "realm_emoji"])
+def test_reaction_retry_verifies_the_prepared_reaction_type(
+    present, remote_present, reaction_type
+):
+    http = mock.Mock(
+        request=mock.AsyncMock(
+            return_value={
+                "message": {
+                    "reactions": [
+                        {
+                            "user_id": 7,
+                            "emoji_code": "42",
+                            "reaction_type": reaction_type,
+                        }
+                    ]
+                    if remote_present
+                    else []
+                }
+            }
+        )
+    )
+    operations = outgoing_operations.Operations(mock.Mock(), http)
+    prepared = {
+        "kind": "reaction",
+        "path": "/messages/101/reactions",
+        "user_id": 7,
+        "present": present,
+        "data": {"emoji_code": "42", "reaction_type": reaction_type},
+    }
+    done, _ = asyncio.run(operations.verify({}, {}, prepared))
+    assert done is (present == remote_present)

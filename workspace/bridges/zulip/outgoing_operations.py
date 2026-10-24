@@ -1013,7 +1013,7 @@ class Operations:
             present = any(
                 row["user_id"] == prepared["user_id"]
                 and row["emoji_code"] == prepared["data"]["emoji_code"]
-                and row["reaction_type"] == "unicode_emoji"
+                and row["reaction_type"] == prepared["data"]["reaction_type"]
                 for row in message["reactions"]
             )
             return present == prepared["present"], {}
