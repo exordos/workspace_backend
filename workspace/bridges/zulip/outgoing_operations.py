@@ -72,22 +72,6 @@ SAVE_FILE_ACCESS_SQL = """
                   data=zulip_entity_links.data || EXCLUDED.data
 """
 
-SELECT_CHANNEL_SQL = """
-    SELECT channel.stream_id, channel.channel_type, channel.direct_user_uuid
-    FROM bridge_zulip_v5_channels channel
-    JOIN messenger_streams stream
-      ON stream.uuid = channel.stream_uuid AND stream.project_id = %s
-    WHERE channel.external_account_uuid = %s
-      AND channel.stream_uuid = %s
-      AND stream.provider_uuid = %s
-"""
-
-SELECT_STREAM_PRIVACY_SQL = """
-    SELECT private, provider_identity
-    FROM messenger_streams
-    WHERE project_id = %s AND uuid = %s
-"""
-
 SELECT_REACTION_COPY_SQL = """
     SELECT data->>'emoji_name' AS emoji_name, data->>'emoji_code' AS emoji_code,
            data->>'reaction_type' AS reaction_type
@@ -348,30 +332,24 @@ class Operations:
 
     async def route(self, intent: dict, account: dict) -> dict:
         data = intent["data"]
-        channels = await self.db.sql(
-            SELECT_CHANNEL_SQL,
-            (
-                intent["project_id"],
-                account["uuid"],
-                data["stream_uuid"],
-                account["provider_uuid"],
-            ),
-        )
-        if channels:
-            return channels[0]
         if data.get("channel_type"):
             return data
         streams = await self.db.sql(
-            SELECT_STREAM_PRIVACY_SQL,
-            (intent["project_id"], data["stream_uuid"]),
+            "SELECT private,direct_user_uuid,provider_identity FROM messenger_streams "
+            "WHERE project_id=%s AND uuid=%s AND source_name='zulip' AND provider_uuid=%s",
+            (intent["project_id"], data["stream_uuid"], account["provider_uuid"]),
         )
-        if streams and (
-            streams[0]["private"]
-            or (streams[0]["provider_identity"] or "").startswith("dm:")
-        ):
-            return {"channel_type": "group"}
+        if not streams:
+            raise Pending("Waiting for the provider stream")
+        stream = streams[0]
+        if stream["private"] or (stream["provider_identity"] or "").startswith("dm:"):
+            return {
+                "channel_type": "private"
+                if stream["direct_user_uuid"] is not None
+                else "group"
+            }
         identity = await self.identity(intent, account, "stream", data["stream_uuid"])
-        return {"stream_id": int(typing.cast(str, identity)), "channel_type": "channel"}
+        return {"stream_id": int(identity), "channel_type": "channel"}
 
     async def prepare(self, intent: dict, account: dict) -> dict:
         await self.status(intent, "syncing")

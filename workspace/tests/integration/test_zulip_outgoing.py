@@ -1298,3 +1298,25 @@ def test_retained_local_receipt_resolves_lost_response_after_queue_expiry(
     assert db.execute(
         "SELECT provider_identity FROM messenger_messages WHERE uuid=%s", (canonical,)
     ).fetchone() == ("101",)
+
+
+@pytest.mark.isolated_schema
+def test_capture_and_send_do_not_depend_on_retired_channel_routes(
+    outgoing, db, _test_database_url
+):
+    _api, account, *_ = outgoing
+    db.execute("DROP TABLE bridge_zulip_v5_channels CASCADE")
+    create(outgoing)
+
+    async def run():
+        async with sender(account, _test_database_url) as (service, server):
+            await drain(service)
+            sent = [
+                data
+                for method, path, data in server.calls
+                if method == "POST" and path == "/api/v1/messages"
+            ]
+            assert len(sent) == 1
+            assert sent[0]["to"] == "42"
+
+    asyncio.run(run())

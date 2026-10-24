@@ -109,35 +109,40 @@ BEGIN
               'before','{}'::jsonb,'account_identity',account.external_account_id,'account_provider_uuid',account.provider_uuid,
               'actor_uuid',actor,'remote_message_identity',message.provider_identity)
         FROM messenger_message_placements placement JOIN messenger_messages message ON message.project_id=placement.project_id AND message.uuid=placement.message_uuid
-        JOIN bridge_zulip_v5_channels channel ON channel.stream_uuid=placement.stream_uuid
-        JOIN m_external_accounts_v2 account ON account.uuid=channel.external_account_uuid AND account.project_id=placement.project_id
-        WHERE placement.uuid=(old_->>'placement_uuid')::uuid AND placement.project_id=(old_->>'project_id')::uuid AND account.owner_user_uuid=actor AND NOT account.disabled;
+        JOIN messenger_streams stream ON stream.project_id=placement.project_id AND stream.uuid=placement.stream_uuid
+        JOIN m_external_accounts_v2 account ON account.provider_uuid=stream.provider_uuid AND account.project_id=placement.project_id
+        WHERE placement.uuid=(old_->>'placement_uuid')::uuid AND placement.project_id=(old_->>'project_id')::uuid AND account.owner_user_uuid=actor AND NOT account.disabled
+          AND old_->>'source_name'='zulip' AND (old_->>'provider_uuid')::uuid=account.provider_uuid;
     END IF;
     FOR target_ IN
-        SELECT account.uuid, account.provider_uuid, account.external_account_id, channel.uuid AS channel_uuid, CASE WHEN stream.private OR stream.provider_identity LIKE 'dm:%' THEN NULL ELSE stream.provider_identity::bigint END AS stream_id, coalesce(channel.channel_type,CASE WHEN stream.private THEN 'group' ELSE 'channel' END) AS channel_type, channel.direct_user_uuid
+        SELECT account.uuid, account.provider_uuid, account.external_account_id,
+               CASE WHEN stream.provider_identity ~ '^[0-9]+$'
+                    THEN stream.provider_identity::bigint END AS stream_id,
+               CASE WHEN stream.private AND stream.direct_user_uuid IS NOT NULL THEN 'private'
+                    WHEN stream.private OR stream.provider_identity LIKE 'dm:%' THEN 'group'
+                    ELSE 'channel' END AS channel_type,
+               stream.direct_user_uuid
         FROM m_external_accounts_v2 account
-        LEFT JOIN bridge_zulip_v5_channels channel ON channel.external_account_uuid=account.uuid AND channel.stream_uuid=stream_
         JOIN messenger_streams stream ON stream.project_id=account.project_id AND stream.uuid=stream_
-        WHERE account.project_id=(row_->>'project_id')::uuid AND account.owner_user_uuid=actor AND account.provider='zulip'
-        AND NOT account.disabled AND account.status<>'new' AND account.settings->>'api_key' IS NOT NULL
-        AND stream.source_name='zulip' AND stream.provider_uuid=account.provider_uuid
-        AND (row_->>'provider_uuid')::uuid=account.provider_uuid
+        WHERE account.project_id=(row_->>'project_id')::uuid AND account.owner_user_uuid=actor
+          AND account.provider='zulip' AND NOT account.disabled AND account.status<>'new'
+          AND account.settings->>'api_key' IS NOT NULL AND stream.source_name='zulip'
+          AND stream.provider_uuid=account.provider_uuid
+          AND (row_->>'provider_uuid')::uuid=account.provider_uuid
     LOOP
-        data_ := row_ || jsonb_build_object('before',old_,'actor_uuid',actor,'account_identity',target_.external_account_id,'account_provider_uuid',target_.provider_uuid,'stream_id',target_.stream_id,'channel_type',target_.channel_type,'direct_user_uuid',target_.direct_user_uuid);
+        data_ := row_ || jsonb_build_object('before',old_,'actor_uuid',actor,'account_identity',target_.external_account_id,'account_provider_uuid',target_.provider_uuid,'stream_id',target_.stream_id,'channel_type',target_.channel_type,'direct_user_uuid',target_.direct_user_uuid,
+            'recipient_ids',(SELECT jsonb_agg(DISTINCT peer.external_account_id::bigint)
+                FROM messenger_stream_bindings member JOIN m_external_accounts_v2 peer
+                  ON peer.project_id=member.project_id AND peer.owner_user_uuid=member.user_uuid
+                WHERE member.project_id=(row_->>'project_id')::uuid AND member.stream_uuid=stream_
+                  AND member.active AND peer.provider_uuid=target_.provider_uuid
+                  AND peer.external_account_id IS NOT NULL));
         IF kind_='reaction' THEN
             SELECT data_ || jsonb_build_object('remote_message_identity',(SELECT provider_identity FROM messenger_messages WHERE project_id=(row_->>'project_id')::uuid AND uuid=message_ AND provider_uuid=target_.provider_uuid),
                 'emoji_observations',(SELECT coalesce(jsonb_agg(jsonb_build_object('emoji_name',r.emoji_name,'emoji_code',r.emoji_code,'reaction_type',r.reaction_type)),'[]'::jsonb)
                     FROM bridge_zulip_v5_reactions r JOIN bridge_zulip_v5_reaction_messages m ON m.uuid=r.reaction_message_uuid WHERE m.project_id=(row_->>'project_id')::uuid AND m.canonical_message_uuid=message_)) INTO data_;
         END IF;
-        IF kind_='stream_binding' AND row_->'notification_mode' IS DISTINCT FROM old_->'notification_mode' THEN
-            UPDATE bridge_zulip_v5_channels SET notification_mode=row_->>'notification_mode' WHERE uuid=target_.channel_uuid;
-        ELSIF kind_='topic_binding' THEN
-            INSERT INTO bridge_zulip_v5_topic_notifications(uuid,channel_uuid,topic_name,visibility_policy,last_updated)
-            SELECT gen_random_uuid(),target_.channel_uuid,lower(row_->>'topic_name'),
-                CASE row_->>'notification_mode' WHEN 'default' THEN 0 WHEN 'mute' THEN 1 WHEN 'unmute' THEN 2 WHEN 'follow' THEN 3 END,0
-            WHERE target_.channel_uuid IS NOT NULL
-            ON CONFLICT(channel_uuid,topic_name) DO UPDATE SET visibility_policy=EXCLUDED.visibility_policy,last_updated=0;
-        END IF;
+
         -- Save known provider IDs now, so deletes never depend on a surviving row.
         data_ := data_ || jsonb_build_object('remote_identity',row_->>'provider_identity');
         INSERT INTO zulip_outgoing_intents(project_id,entity_type,entity_uuid,ordering_key,external_account_uuid,operation,data)
