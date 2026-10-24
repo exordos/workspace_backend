@@ -11,6 +11,7 @@ import pytest
 from restalchemy.common import contexts
 
 from workspace.bridges.zulip import incoming_operations
+from workspace.bridges.zulip import outgoing_operations
 from workspace.messenger_api.dm import external_models
 from workspace.services import zulip_incoming
 from workspace.services import zulip_outgoing
@@ -452,6 +453,124 @@ def test_native_echo_reuses_root_and_keeps_its_identity_empty(incoming):
         ).fetchone()[0]
         == "202"
     )
+
+
+@pytest.mark.parametrize("native_stream", [False, True])
+@pytest.mark.parametrize("missing_binding", [False, True])
+def test_user_topic_and_message_echo_keep_native_topic_identity(
+    incoming, native_stream, missing_binding
+):
+    api, db, account, _http, _url = incoming
+    apply(incoming, event())
+    drain()
+    stream = api.get("/v1/messenger/streams/").json()[0]
+    if native_stream:
+        db.execute(
+            "UPDATE messenger_streams SET source_name='native',provider_uuid=NULL,"
+            "provider_identity=NULL WHERE project_id=%s AND uuid=%s",
+            (account["project_id"], uuid.UUID(stream["uuid"])),
+        )
+        db.execute(
+            outgoing_operations.UPSERT_ENTITY_LINK_SQL,
+            (
+                account["project_id"],
+                "stream",
+                uuid.UUID(stream["uuid"]),
+                account["provider_uuid"],
+                account["uuid"],
+                "42",
+            ),
+        )
+    response = api.post(
+        "/v1/messenger/stream_topics/",
+        json={"stream_uuid": stream["uuid"], "name": "Native topic"},
+    )
+    assert response.status_code == 201, response.text
+    topic = response.json()
+    if missing_binding:
+        db.execute(
+            "DELETE FROM messenger_user_topic_bindings "
+            "WHERE project_id=%s AND topic_uuid=%s",
+            (account["project_id"], uuid.UUID(topic["uuid"])),
+        )
+    db.execute(
+        outgoing_operations.UPSERT_ENTITY_LINK_SQL,
+        (
+            account["project_id"],
+            "topic",
+            uuid.UUID(topic["uuid"]),
+            account["provider_uuid"],
+            account["uuid"],
+            "42:Native topic",
+        ),
+    )
+    apply(
+        incoming,
+        {
+            "type": "user_topic",
+            "stream_id": 42,
+            "topic_name": "Native topic",
+            "visibility_policy": 0,
+        },
+    )
+    following = event("Following native-topic message", 202)
+    following["message"]["subject"] = "Native topic"
+    apply(incoming, following)
+    drain()
+    assert db.execute(
+        "SELECT source_name,provider_uuid,provider_identity FROM messenger_topics "
+        "WHERE project_id=%s AND uuid=%s",
+        (account["project_id"], uuid.UUID(topic["uuid"])),
+    ).fetchone() == ("native", None, None)
+    binding = db.execute(
+        "SELECT source_name,provider_uuid,provider_identity "
+        "FROM messenger_user_topic_bindings WHERE project_id=%s AND topic_uuid=%s",
+        (account["project_id"], uuid.UUID(topic["uuid"])),
+    ).fetchone()
+    assert binding == (
+        ("zulip", account["provider_uuid"], "42:Native topic:7")
+        if missing_binding
+        else ("native", None, None)
+    )
+    received = api.get(
+        "/v1/messenger/messages/", params={"topic_uuid": topic["uuid"]}
+    ).json()
+    assert [item["payload"]["content"] for item in received] == [
+        "Following native-topic message"
+    ]
+
+
+def test_native_default_topic_binding_uses_empty_remote_subject(incoming):
+    api, db, account, _http, _url = incoming
+    apply(incoming, event())
+    topic_uuid = db.execute(
+        "SELECT default_topic_uuid FROM messenger_streams WHERE project_id=%s",
+        (account["project_id"],),
+    ).fetchone()[0]
+    db.execute(
+        "UPDATE messenger_topics SET source_name='native',provider_uuid=NULL,"
+        "provider_identity=NULL WHERE project_id=%s AND uuid=%s",
+        (account["project_id"], topic_uuid),
+    )
+    db.execute(
+        "DELETE FROM messenger_user_topic_bindings WHERE project_id=%s AND topic_uuid=%s",
+        (account["project_id"], topic_uuid),
+    )
+    apply(
+        incoming,
+        {
+            "type": "subscription",
+            "op": "update",
+            "stream_id": 42,
+            "property": "is_muted",
+            "value": True,
+        },
+    )
+    assert db.execute(
+        "SELECT provider_identity FROM messenger_user_topic_bindings "
+        "WHERE project_id=%s AND topic_uuid=%s",
+        (account["project_id"], topic_uuid),
+    ).fetchone() == ("42::7",)
 
 
 @pytest.mark.isolated_schema

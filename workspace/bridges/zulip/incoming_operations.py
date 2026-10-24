@@ -430,6 +430,26 @@ class Operations:
         self.db, self.http = db, http
         self.reaction_user_limit = reaction_user_limit
 
+    async def provider_identity(
+        self, connection: typing.Any, account: dict, kind: str, entity: dict
+    ) -> str:
+        if entity["provider_uuid"] == account["provider_uuid"]:
+            return entity["provider_identity"]
+        found = await rows(
+            connection,
+            outgoing_operations.SELECT_ENTITY_IDENTITY_SQL.format(table=TABLES[kind]),
+            (
+                account["project_id"],
+                entity["uuid"],
+                account["provider_uuid"],
+                account["project_id"],
+                kind,
+                entity["uuid"],
+                account["provider_uuid"],
+            ),
+        )
+        return found[0]["provider_identity"]
+
     async def identity(
         self,
         account: dict,
@@ -1147,7 +1167,10 @@ class Operations:
             "user_uuid": user,
             "who_uuid": old[0]["who_uuid"] if old else stream["owner_uuid"],
             "active": active,
-            **origin(account, f"{stream['provider_identity']}:{remote}"),
+            **origin(
+                account,
+                f"{await self.provider_identity(connection, account, 'stream', stream)}:{remote}",
+            ),
         }
         if mode is not None:
             values["notification_mode"] = mode
@@ -1219,7 +1242,12 @@ class Operations:
         )
         for topic in topics:
             if active and changed and topic["uuid"] == stream["default_topic_uuid"]:
-                await self.topic_binding(connection, account, topic, user, remote)
+                identity = await self.provider_identity(
+                    connection, account, "stream", stream
+                )
+                await self.topic_binding(
+                    connection, account, topic, user, remote, f"{identity}:"
+                )
 
     async def topic_binding(
         self,
@@ -1228,6 +1256,7 @@ class Operations:
         topic: dict,
         user: object,
         remote: object,
+        identity: str,
         mode: str | None = None,
     ) -> None:
         old = await rows(
@@ -1244,7 +1273,7 @@ class Operations:
             "project_id": account["project_id"],
             "topic_uuid": topic["uuid"],
             "user_uuid": user,
-            **origin(account, f"{topic['provider_identity']}:{remote}"),
+            **origin(account, f"{identity}:{remote}"),
         }
         if mode is not None:
             values["notification_mode"] = mode
@@ -1274,7 +1303,10 @@ class Operations:
         stream: dict,
         name: str,
     ) -> dict:
-        identity = f"{stream['provider_identity']}:{name}"
+        stream_identity = await self.provider_identity(
+            connection, account, "stream", stream
+        )
+        identity = f"{stream_identity}:{name}"
         old = await rows(
             connection,
             SELECT_TOPIC_SQL,
@@ -1330,7 +1362,7 @@ class Operations:
             (
                 topic["uuid"],
                 topic["uuid"],
-                topic["provider_identity"],
+                identity,
                 account["provider_uuid"],
                 account["project_id"],
                 stream["uuid"],
@@ -2345,6 +2377,7 @@ class Operations:
                     topic,
                     account["owner_user_uuid"],
                     account["external_account_id"],
+                    f"{event['stream_id']}:{event['topic_name']}",
                     mode,
                 )
         elif kind == "attachment":
