@@ -1151,6 +1151,20 @@ class Operations:
         self, intent: dict, account: dict, prepared: dict, result: dict
     ) -> None:
         identity = result.get("identity")
+        if intent["entity_type"] == "file" and identity is not None:
+            # Publish the access receipt before the identity makes the file
+            # leave the pending-upload visibility branch.
+            await self.db.sql(
+                SAVE_FILE_ACCESS_SQL,
+                (
+                    intent["project_id"],
+                    intent["entity_uuid"],
+                    account["provider_uuid"],
+                    account["uuid"],
+                    identity,
+                    pg_json.Jsonb({"account_identity": account["external_account_id"]}),
+                ),
+            )
         if identity is not None:
             await self.db.sql(
                 UPDATE_ENTITY_IDENTITY_SQL.format(table=TABLES[intent["entity_type"]]),
@@ -1175,17 +1189,6 @@ class Operations:
             )
         if intent["entity_type"] == "file" and identity is not None:
             data = intent["data"]
-            await self.db.sql(
-                SAVE_FILE_ACCESS_SQL,
-                (
-                    intent["project_id"],
-                    intent["entity_uuid"],
-                    account["provider_uuid"],
-                    account["uuid"],
-                    identity,
-                    pg_json.Jsonb({"account_identity": account["external_account_id"]}),
-                ),
-            )
             await self.db.sql(
                 INSERT_FILE_LINK_SQL,
                 (

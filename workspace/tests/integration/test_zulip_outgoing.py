@@ -1339,3 +1339,62 @@ def test_capture_and_send_do_not_depend_on_retired_channel_routes(
             assert sent[0]["to"] == "42"
 
     asyncio.run(run())
+
+
+def test_file_receipt_never_temporarily_revokes_the_uploaders_access(
+    outgoing, db, _test_database_url, tmp_path, monkeypatch
+):
+    api, account, channel, *_ = outgoing
+    monkeypatch.setenv("WORKSPACE_FILE_STORAGE_PATH", str(tmp_path))
+    response = api.post(
+        "/v1/messenger/files/",
+        data={"stream_uuid": str(channel.stream_uuid)},
+        files={"file": ("receipt.png", b"receipt", "image/png")},
+    )
+    assert response.status_code == 201, response.text
+    identifier = uuid.UUID(response.json()["uuid"])
+
+    async def run():
+        database = zulip_outgoing.Database(_test_database_url)
+        await database.open()
+        try:
+            intent = (
+                await database.sql(
+                    "SELECT * FROM zulip_outgoing_intents WHERE entity_type='file' AND entity_uuid=%s",
+                    (identifier,),
+                )
+            )[0]
+            account_data = (
+                await database.sql(
+                    zulip_outgoing.SELECT_ACCOUNT_SQL,
+                    (
+                        account.uuid,
+                        account.project_id,
+                    ),
+                )
+            )[0]
+            original_sql = database.sql
+
+            async def observe_committed_step(query, parameters=()):
+                result = await original_sql(query, parameters)
+                visible = db.execute(
+                    "SELECT 1 FROM m_workspace_visible_files_v1 WHERE uuid=%s AND viewer_user_uuid=%s",
+                    (identifier, account.owner_user_uuid),
+                ).fetchall()
+                assert visible, (
+                    "A concurrent message converter loses file access after a receipt commit"
+                )
+                return result
+
+            database.sql = observe_committed_step
+            operations = outgoing_operations.Operations(database, mock.Mock())
+            await operations.finish(
+                intent,
+                account_data,
+                {"kind": "upload"},
+                {"identity": "/user_uploads/2/example/receipt.png"},
+            )
+        finally:
+            await database.close()
+
+    asyncio.run(run())
