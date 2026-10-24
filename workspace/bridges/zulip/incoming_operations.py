@@ -937,7 +937,18 @@ class Operations:
                     )
                 else:
                     raise ValueError("Unknown incoming dependency type")
-        if not found:
+        if (
+            not found
+            or (
+                kind in ("topic", "stream_binding", "topic_binding")
+                and found[0]["provider_identity"] is None
+            )
+            or (
+                kind == "topic"
+                and not spec["subject"]
+                and stream["default_topic_uuid"] is None
+            )
+        ):
             raise MissingDependency(spec)
         return found[0]
 

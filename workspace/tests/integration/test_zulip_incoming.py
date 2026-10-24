@@ -502,8 +502,9 @@ def test_pending_zulip_echo_reuses_root_and_fills_canonical_identity(incoming):
 
 
 @pytest.mark.parametrize("missing_binding", [False, True])
+@pytest.mark.parametrize("catalog_event", [False, True])
 def test_user_topic_and_message_echo_complete_pending_topic_identity(
-    incoming, missing_binding
+    incoming, missing_binding, catalog_event
 ):
     api, db, account, _http, _url = incoming
     apply(incoming, event())
@@ -521,15 +522,16 @@ def test_user_topic_and_message_echo_complete_pending_topic_identity(
             "WHERE project_id=%s AND topic_uuid=%s",
             (account["project_id"], uuid.UUID(topic["uuid"])),
         )
-    apply(
-        incoming,
-        {
-            "type": "user_topic",
-            "stream_id": 42,
-            "topic_name": "Native topic",
-            "visibility_policy": 0,
-        },
-    )
+    if catalog_event:
+        apply(
+            incoming,
+            {
+                "type": "user_topic",
+                "stream_id": 42,
+                "topic_name": "Native topic",
+                "visibility_policy": 0,
+            },
+        )
     following = event("Following native-topic message", 202)
     following["message"]["subject"] = "Native topic"
     apply(incoming, following)
