@@ -514,7 +514,17 @@ class ZulipIncomingService:
             await asyncio.sleep(self.dependency_delay)
         except Exception as error:
             LOG.exception("Cannot apply Zulip event %s", event["id"])
-            permanent = isinstance(error, (ValueError, KeyError, TypeError)) or (
+            permanent = isinstance(
+                error,
+                (
+                    ValueError,
+                    KeyError,
+                    TypeError,
+                    psycopg.DataError,
+                    psycopg.errors.NotNullViolation,
+                    psycopg.errors.CheckViolation,
+                ),
+            ) or (
                 isinstance(error, outgoing_operations.ApiError)
                 and 400 <= error.status < 500
                 and error.status not in (408, 429)

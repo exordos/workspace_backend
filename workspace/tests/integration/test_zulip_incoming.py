@@ -1825,6 +1825,9 @@ def test_stale_queued_edit_cannot_replace_a_newer_provider_update(incoming):
     "error,terminal",
     [
         (ValueError("Invalid event data"), True),
+        (psycopg.DataError("Invalid provider value"), True),
+        (psycopg.errors.NotNullViolation("Missing required provider value"), True),
+        (psycopg.errors.CheckViolation("Invalid provider state"), True),
         (
             incoming_operations.outgoing_operations.ApiError(
                 422, {"msg": "Invalid data"}
@@ -2383,3 +2386,55 @@ def test_permanent_dependency_failure_is_visible_without_retry_amplification(inc
     assert {
         row["payload"]["content"] for row in api.get("/v1/messenger/messages/").json()
     } == {"Hello", "Valid event"}
+
+
+def test_permanent_non_message_failure_releases_the_account_lane(incoming):
+    api, db, account, http, url = incoming
+
+    async def run():
+        service = zulip_incoming.ZulipIncomingService(url)
+        await service.db.open()
+        service.operations = incoming_operations.Operations(service.db, http)
+        original = service.operations.prepare
+
+        async def prepare(account, payload):
+            if payload["type"] == "stream":
+                raise ValueError("Invalid catalog event")
+            return await original(account, payload)
+
+        service.operations.prepare = prepare
+        try:
+            async with service.db.transaction() as connection:
+                await service.append(
+                    connection,
+                    account,
+                    {"queue_id": "non-message-error"},
+                    [
+                        {"id": 1, "type": "stream", "op": "invalid"},
+                        {
+                            "id": 2,
+                            "type": "subscription",
+                            "op": "add",
+                            "subscriptions": [
+                                {"stream_id": 42, "name": "Valid catalog event"}
+                            ],
+                        },
+                    ],
+                )
+            ready = await service.db.sql(zulip_incoming.SELECT_EVENT_SQL, ([], 10))
+            assert [row["event_id"] for row in ready] == [1]
+            await service.process(ready[0])
+            ready = await service.db.sql(zulip_incoming.SELECT_EVENT_SQL, ([], 10))
+            assert [row["event_id"] for row in ready] == [2]
+            await service.process(ready[0])
+            assert await service.db.sql(
+                "SELECT 1 FROM zulip_incoming_events WHERE event_id=1 AND processed_at IS NOT NULL AND error IS NOT NULL"
+            )
+            assert await service.db.sql(
+                "SELECT 1 FROM zulip_incoming_events WHERE event_id=2 AND processed_at IS NOT NULL AND error IS NULL"
+            )
+        finally:
+            await service.db.close()
+
+    asyncio.run(run())
+    assert api.get("/v1/messenger/streams/").json()[0]["name"] == "Valid catalog event"
