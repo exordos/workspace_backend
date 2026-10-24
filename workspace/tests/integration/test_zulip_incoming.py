@@ -1930,7 +1930,9 @@ def test_permanent_event_failure_does_not_block_the_next_event(
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("reference", ["none", "file", "upload", "failure"])
+@pytest.mark.parametrize(
+    "reference", ["none", "file", "same_file", "upload", "failure"]
+)
 def test_incoming_file_removal_cleans_storage_after_commit(
     incoming, monkeypatch, tmp_path, reference
 ):
@@ -1978,6 +1980,13 @@ def test_incoming_file_removal_cleans_storage_after_commit(
             ),
         )
     apply(incoming, {"type": "attachment", "op": "remove", "attachment": {"id": 55}})
+    if reference == "same_file":
+        with db.transaction():
+            db.execute("SELECT set_config('workspace.zulip_incoming','on',true)")
+            db.execute(
+                "INSERT INTO m_workspace_files SELECT (jsonb_populate_record(NULL::m_workspace_files,%s)).*",
+                (incoming_operations.json_value(file),),
+            )
     # The blob is still present immediately after the database deletion commits.
     assert blob.exists()
     with db.cursor(row_factory=rows.dict_row) as cursor:
@@ -2033,8 +2042,8 @@ def test_incoming_file_removal_cleans_storage_after_commit(
             != "done"
         )
     asyncio.run(finish())
-    assert blob.exists() is (reference == "file")
-    assert not sidecar.exists()
+    assert blob.exists() is (reference in ("file", "same_file"))
+    assert sidecar.exists() is (reference == "same_file")
     http.request.assert_not_called()
 
 

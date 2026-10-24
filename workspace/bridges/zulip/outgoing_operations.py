@@ -266,11 +266,11 @@ COMPLETE_INTENT_SQL = """
 """
 
 SELECT_FILE_REFERENCES_SQL = """
-    SELECT 'file' AS kind
+    SELECT 'file' AS kind, uuid
     FROM m_workspace_files
     WHERE storage_type = %s AND storage_id = %s AND storage_object_id = %s
     UNION ALL
-    SELECT 'upload' AS kind
+    SELECT 'upload' AS kind, entity_uuid AS uuid
     FROM zulip_outgoing_intents
     WHERE entity_type = 'file'
       AND operation = 'insert'
@@ -1248,11 +1248,15 @@ class Operations:
                     storage_type=data["storage_type"],
                     storage_object_id=data["storage_object_id"],
                 )
-            await asyncio.to_thread(
-                file_storage.delete_workspace_file_metadata,
-                uuid.UUID(data["uuid"]),
-                storage_type=data["storage_type"],
-            )
+            if not any(
+                row["kind"] == "file" and str(row["uuid"]) == data["uuid"]
+                for row in references
+            ):
+                await asyncio.to_thread(
+                    file_storage.delete_workspace_file_metadata,
+                    uuid.UUID(data["uuid"]),
+                    storage_type=data["storage_type"],
+                )
             if references and not any(row["kind"] == "file" for row in references):
                 raise Pending("Waiting for unfinished uploads before deleting storage")
         await self.db.sql(COMPLETE_INTENT_SQL, (intent["id"],))
