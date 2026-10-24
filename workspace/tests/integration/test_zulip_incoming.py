@@ -3645,3 +3645,66 @@ def test_registry_capacity_falls_back_to_durable_application_without_losing_even
     assert {
         row["provider_identity"] for row in api.get("/v1/messenger/messages/").json()
     } == {"100", "201", "202"}
+
+
+def test_initial_message_does_not_rewrite_a_peers_pending_topic_binding(incoming):
+    api, db, account, http, url = incoming
+    linked, peer = peer_account(incoming)
+    subscription = {
+        "type": "subscription",
+        "op": "add",
+        "subscriptions": [{"stream_id": 42, "name": "Channel"}],
+    }
+    try:
+        apply(incoming, subscription)
+        apply(peer, subscription)
+        apply(incoming, event(identifier=301))
+        own = api.get("/v1/messenger/messages/").json()[0]
+        db.execute(
+            "UPDATE messenger_user_topic_bindings SET provider_identity=NULL,status='new' "
+            "WHERE project_id=%s AND topic_uuid=%s AND user_uuid=%s",
+            (account["project_id"], own["topic_uuid"], linked.owner_user_uuid),
+        )
+
+        async def run():
+            database = zulip_outgoing.Database(url)
+            await database.open()
+            operations = incoming_operations.Operations(database, http)
+            try:
+                prepared = await prepare_dependencies(
+                    operations, database, account, event(identifier=302)
+                )
+                with psycopg.connect(url) as counter:
+                    # A concurrent counter refresh owns the peer's existing row.
+                    assert counter.execute(
+                        "SELECT 1 FROM messenger_user_topic_bindings "
+                        "WHERE project_id=%s AND topic_uuid=%s AND user_uuid=%s FOR UPDATE",
+                        (
+                            account["project_id"],
+                            own["topic_uuid"],
+                            linked.owner_user_uuid,
+                        ),
+                    ).fetchone()
+                    async with database.transaction() as connection:
+                        await connection.execute("SET LOCAL lock_timeout='200ms'")
+                        await connection.execute(
+                            zulip_incoming.INCOMING_TRANSACTION_SQL
+                        )
+                        await operations.apply(connection, account, prepared)
+            finally:
+                await database.close()
+
+        asyncio.run(run())
+        assert (
+            len(api.get("/v1/messenger/messages/", user=linked.owner_user_uuid).json())
+            == 2
+        )
+        # Its own provider packet can complete that personal identity later.
+        apply(peer, event(identifier=302))
+        assert db.execute(
+            "SELECT provider_identity FROM messenger_user_topic_bindings "
+            "WHERE project_id=%s AND topic_uuid=%s AND user_uuid=%s",
+            (account["project_id"], own["topic_uuid"], linked.owner_user_uuid),
+        ).fetchone() == ("42:General:8",)
+    finally:
+        linked.delete()

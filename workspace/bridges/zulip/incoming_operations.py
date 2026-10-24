@@ -400,6 +400,34 @@ ENSURE_TOPIC_BINDINGS_SQL = """
     RETURNING user_uuid
 """
 
+INSERT_MISSING_TOPIC_BINDINGS_SQL = """
+    INSERT INTO messenger_user_topic_bindings (
+        uuid, project_id, topic_uuid, user_uuid,
+        source_name, provider_uuid, provider_identity, status
+    )
+    SELECT messenger_uuid_v5(%s, member.user_uuid::text), member.project_id,
+           %s, member.user_uuid,
+           'zulip', parent.provider_uuid, %s || ':' || actor.external_account_id,
+           CASE WHEN actor.external_account_id IS NULL THEN 'new' ELSE 'active' END
+    FROM messenger_stream_bindings member
+    JOIN messenger_streams parent ON parent.project_id=member.project_id AND parent.uuid=member.stream_uuid
+    LEFT JOIN LATERAL (
+        SELECT provider_uuid, external_account_id FROM m_external_accounts_v2
+        WHERE project_id = member.project_id AND owner_user_uuid = member.user_uuid
+          AND provider_uuid = %s AND external_account_id IS NOT NULL
+        ORDER BY uuid LIMIT 1
+    ) actor ON true
+    WHERE member.project_id = %s AND member.stream_uuid = %s AND member.active
+      AND member.user_uuid = ANY(%s::uuid[])
+      AND NOT EXISTS (
+          SELECT 1 FROM messenger_user_topic_bindings existing
+          WHERE existing.project_id=member.project_id AND existing.topic_uuid=%s
+            AND existing.user_uuid=member.user_uuid
+      )
+    ON CONFLICT (project_id, user_uuid, topic_uuid) DO NOTHING
+    RETURNING user_uuid
+"""
+
 SAVE_ATTACHMENT_SQL = """
     INSERT INTO zulip_incoming_attachments
         (project_id, provider_uuid, attachment_id, path, name)
@@ -2251,7 +2279,7 @@ class Operations:
         )
         new_access = await access_cursor.fetchall()
         topic_cursor = await connection.execute(
-            ENSURE_TOPIC_BINDINGS_SQL,
+            INSERT_MISSING_TOPIC_BINDINGS_SQL,
             (
                 topic["uuid"],
                 topic["uuid"],
@@ -2261,7 +2289,6 @@ class Operations:
                 stream_uuid,
                 [item["user_uuid"] for item in new_access],
                 topic["uuid"],
-                topic["provider_identity"],
             ),
         )
         new_topics = {item["user_uuid"] for item in await topic_cursor.fetchall()}
