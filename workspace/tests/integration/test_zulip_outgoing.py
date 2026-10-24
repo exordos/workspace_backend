@@ -368,7 +368,9 @@ def test_api_intent_is_atomic_and_receipt_updates_canonical_identity(
     ).fetchone()
 
 
-def test_every_edit_is_sent_in_order(outgoing, db, _test_database_url):
+def test_superseded_edits_finish_without_replacing_the_latest_content(
+    outgoing, db, _test_database_url
+):
     api, account, *_ = outgoing
     public = create(outgoing)
     for content in ("second", "third"):
@@ -385,7 +387,7 @@ def test_every_edit_is_sent_in_order(outgoing, db, _test_database_url):
                 data["content"]
                 for method, path, data in server.calls
                 if method in ("POST", "PATCH")
-            ] == ["Raw **message**", "second", "third"]
+            ] == ["Raw **message**", "third"]
 
     asyncio.run(run())
 
