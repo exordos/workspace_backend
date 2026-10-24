@@ -319,6 +319,15 @@ class ZulipOutgoingService:
         self.ready.set()
 
     async def process(self, intent: dict) -> None:
+        try:
+            await self._process(intent)
+        except psycopg.Error:
+            # A failed retry write cannot carry its durable deadline. Keep
+            # this dispatcher slot briefly instead of hammering a recovering DB.
+            await asyncio.sleep(max(self.poll_interval, 1))
+            raise
+
+    async def _process(self, intent: dict) -> None:
         checking = intent["request"] is not None
         try:
             accounts = await self.db.sql(
@@ -372,6 +381,7 @@ class ZulipOutgoingService:
             aiohttp.ClientError,
             asyncio.TimeoutError,
             psycopg.OperationalError,
+            psycopg.errors.ReadOnlySqlTransaction,
         ) as error:
             await self.retry(intent, type(error).__name__, 1)
         except outgoing_operations.ApiError as error:

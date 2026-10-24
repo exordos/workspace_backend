@@ -637,6 +637,15 @@ class ZulipIncomingService:
         self.ready.set()
 
     async def process(self, event: dict) -> None:
+        try:
+            await self._process(event)
+        except psycopg.Error:
+            # The database may reject the retry update during recovery. Pause
+            # this coroutine before releasing its existing dispatcher slot.
+            await asyncio.sleep(max(self.poll_interval, 1))
+            raise
+
+    async def _process(self, event: dict) -> None:
         account = None
         try:
             accounts = await self.db.sql(
