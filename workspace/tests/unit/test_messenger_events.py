@@ -369,7 +369,8 @@ class MessengerEventsTestCase(unittest.TestCase):
             "user_uuid": str(user_uuid),
             "emoji_name": "thumbs_up",
             "source_name": "native",
-            "source": {"kind": "native"},
+            "provider_uuid": None,
+            "provider_identity": None,
         }
         row = self._workspace_event_row(
             payload=payload,
@@ -629,7 +630,8 @@ class MessengerEventsTestCase(unittest.TestCase):
                 "color": 1122867,
                 "last_message_uuid": None,
                 "source_name": "native",
-                "source": {"kind": "native"},
+                "provider_uuid": None,
+                "provider_identity": None,
                 "invite_only": False,
                 "announce": False,
                 "private": False,
@@ -1023,7 +1025,8 @@ class MessengerEventsTestCase(unittest.TestCase):
             unread_count=0,
             color=1122867,
             source_name="native",
-            source=models.NativeSource(),
+            provider_uuid=None,
+            provider_identity=None,
             invite_only=False,
             announce=False,
             private=False,
@@ -1077,7 +1080,7 @@ class MessengerEventsTestCase(unittest.TestCase):
             created_events[1], "stream", "created", "stream.created"
         )
         self.assertEqual("Engineering", created_events[1]["payload"]["name"])
-        self.assertEqual({"kind": "native"}, created_events[1]["payload"]["source"])
+        self.assertIsNone(created_events[1]["payload"].get("provider_uuid"))
         self._assert_created_event_contract(
             created_events[2], "stream", "read", "stream.read"
         )
@@ -1269,7 +1272,8 @@ class MessengerEventsTestCase(unittest.TestCase):
                     user_uuid=user_uuid,
                     stream_uuid=stream_uuid,
                     source_name="native",
-                    source=models.NativeSource(),
+                    provider_uuid=None,
+                    provider_identity=None,
                 ),
                 events.create_topic_deleted_event(
                     project_id=project_id,
@@ -1277,7 +1281,8 @@ class MessengerEventsTestCase(unittest.TestCase):
                     topic_uuid=topic_uuid,
                     stream_uuid=stream_uuid,
                     source_name="native",
-                    source=models.NativeSource(),
+                    provider_uuid=None,
+                    provider_identity=None,
                 ),
                 events.create_message_deleted_event(
                     project_id=project_id,
@@ -1287,7 +1292,8 @@ class MessengerEventsTestCase(unittest.TestCase):
                     topic_uuid=topic_uuid,
                     author_uuid=user_uuid,
                     source_name="native",
-                    source=models.NativeSource(),
+                    provider_uuid=None,
+                    provider_identity=None,
                 ),
                 events.create_folder_deleted_event(
                     project_id=project_id,
@@ -1310,7 +1316,8 @@ class MessengerEventsTestCase(unittest.TestCase):
                 "kind": "stream.deleted",
                 "uuid": str(stream_uuid),
                 "source_name": "native",
-                "source": {"kind": "native"},
+                "provider_uuid": None,
+                "provider_identity": None,
             },
             created_events[0]["payload"],
         )
@@ -1320,7 +1327,7 @@ class MessengerEventsTestCase(unittest.TestCase):
         self.assertEqual(str(topic_uuid), created_events[1]["payload"]["uuid"])
         self.assertEqual(str(stream_uuid), created_events[1]["payload"]["stream_uuid"])
         self.assertEqual("native", created_events[1]["payload"]["source_name"])
-        self.assertEqual({"kind": "native"}, created_events[1]["payload"]["source"])
+        self.assertIsNone(created_events[1]["payload"].get("provider_uuid"))
         self._assert_created_event_contract(
             created_events[2], "message", "deleted", "message.deleted"
         )
@@ -1328,12 +1335,7 @@ class MessengerEventsTestCase(unittest.TestCase):
         self.assertEqual(str(topic_uuid), created_events[2]["payload"]["topic_uuid"])
         self.assertEqual(str(user_uuid), created_events[2]["payload"]["author_uuid"])
         self.assertEqual("native", created_events[2]["payload"]["source_name"])
-        self.assertEqual(
-            {
-                "kind": "native",
-            },
-            created_events[2]["payload"]["source"],
-        )
+        self.assertIsNone(created_events[2]["payload"].get("provider_uuid"))
         self._assert_created_event_contract(
             created_events[3], "folder", "deleted", "folder.deleted"
         )

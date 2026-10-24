@@ -38,9 +38,8 @@ HTTP `200`:
   "active_unread_count": 0,
   "passive_unread_count": 0,
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "invite_only": false,
   "announce": false,
   "private": false,

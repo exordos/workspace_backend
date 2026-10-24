@@ -157,7 +157,6 @@ class StoreResourceController(ra_controllers.BaseResourceControllerPaginated):
         result["user_uuid"] = self._get_user_uuid()
         result.setdefault("uuid", sys_uuid.uuid4())
         result.setdefault("source_name", "native")
-        result.setdefault("source", {"kind": "native"})
         return result
 
     @classmethod
@@ -609,13 +608,23 @@ class WorkspaceFileController(StoreResourceController):
             resource_uuid = typing.cast(sys_uuid.UUID, uuid)
             file = db.get_resource(self.resource_name, resource_uuid)
             result = db.delete_resource(self.resource_name, resource_uuid)
-        references = models.WorkspaceFile.objects.get_all(
-            filters={
-                "storage_type": dm_filters.EQ(file["storage_type"]),
-                "storage_id": dm_filters.EQ(file["storage_id"]),
-                "storage_object_id": dm_filters.EQ(file["storage_object_id"]),
-            },
-            session=contexts.Context().get_session(),
+        references = (
+            contexts.Context()
+            .get_session()
+            .execute(
+                """SELECT 1 FROM m_workspace_files WHERE storage_type=%s AND storage_id=%s AND storage_object_id=%s
+            UNION ALL SELECT 1 FROM zulip_outgoing_intents WHERE entity_type='file' AND operation='insert' AND status<>'done'
+              AND data->>'storage_type'=%s AND data->>'storage_id'=%s AND data->>'storage_object_id'=%s LIMIT 1""",
+                (
+                    file["storage_type"],
+                    file["storage_id"],
+                    file["storage_object_id"],
+                    file["storage_type"],
+                    file["storage_id"],
+                    file["storage_object_id"],
+                ),
+            )
+            .fetchone()
         )
         if not references:
             file_storage.delete_workspace_file(

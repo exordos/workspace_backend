@@ -6,38 +6,34 @@ import asyncio
 import contextlib
 import datetime
 import importlib.util
-import threading
-import time
 from unittest import mock
+
+import aiohttp
+from aiohttp import web
+from psycopg.types import json as pg_json
+
+from workspace.services import zulip_outgoing
+from workspace.bridges.zulip import outgoing_operations
+from workspace.bridges.zulip import message_conversion
 import uuid
+import types
 
 import pytest
 import psycopg
-import requests
 from restalchemy.common import contexts
 from restalchemy.dm import filters
 
-from workspace.bridges.zulip import client
-from workspace.bridges.zulip.dm import flags
-from workspace.bridges.zulip.dm import models
-from workspace.bridges.zulip.dm import reactions
 from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.dm import v2_models
-from workspace.services import history_import
-from workspace.services import zulip_realtime
 from workspace.tests.integration import conftest
 
 
 @pytest.fixture
-def outgoing(api, db, scheduled_reconciliation, monkeypatch):
+def outgoing(api, db, monkeypatch):
     api.project_id = uuid.UUID(api.project_id)
     api.user_uuid = uuid.UUID(api.user_uuid)
     stream_uuid = uuid.UUID(
         conftest.seed_user_stream(db, api.project_id, api.user_uuid, "Channel")
-    )
-    db.execute(
-        "UPDATE messenger_streams SET source_name='zulip', source='{\"kind\":\"zulip\"}' WHERE project_id=%s AND uuid=%s",
-        (api.project_id, stream_uuid),
     )
     topic = v2_models.WorkspaceStreamTopic(
         project_id=api.project_id, stream_uuid=stream_uuid, name="General"
@@ -54,7 +50,7 @@ def outgoing(api, db, scheduled_reconciliation, monkeypatch):
         project_id=api.project_id,
         owner_user_uuid=api.user_uuid,
         provider="zulip",
-        external_account_id="zulip.example.com:7",
+        external_account_id="7",
         status="active",
         settings={
             "server_url": "https://zulip.example.com",
@@ -63,7 +59,24 @@ def outgoing(api, db, scheduled_reconciliation, monkeypatch):
         },
     )
     account.insert()
-    channel = models.ZulipChannel(
+    db.execute(
+        "UPDATE messenger_streams SET source_name='zulip',provider_uuid=%s,provider_identity='42' WHERE project_id=%s AND uuid=%s",
+        (account.provider_uuid, api.project_id, stream_uuid),
+    )
+    for table in ("messenger_topics", "messenger_stream_bindings"):
+        db.execute(
+            f"UPDATE {table} SET source_name='zulip',provider_uuid=%s,provider_identity='42:General' WHERE project_id=%s AND stream_uuid=%s",
+            (account.provider_uuid, api.project_id, stream_uuid),
+        )
+    db.execute(
+        "UPDATE messenger_user_topic_bindings SET source_name='zulip',provider_uuid=%s,provider_identity='42:General:7' WHERE project_id=%s AND topic_uuid=%s",
+        (account.provider_uuid, api.project_id, topic.uuid),
+    )
+    channel = types.SimpleNamespace(
+        uuid=uuid.uuid4(),
+        date_created=None,
+        creator_id=None,
+        message_retention_days=None,
         external_account_uuid=account.uuid,
         stream_uuid=stream_uuid,
         stream_id=42,
@@ -75,17 +88,28 @@ def outgoing(api, db, scheduled_reconciliation, monkeypatch):
         history_public_to_subscribers=True,
         is_archived=False,
     )
-    channel.insert()
-    subscription = models.RealtimeSubscription(
-        project_id=api.project_id,
-        external_account_uuid=account.uuid,
-        generation=uuid.uuid4(),
-        queue_id="sender-queue",
-        last_event_id=-1,
-        account_revision=account.subscription_revision(),
-        longpoll_timeout=90,
-    )
-    subscription.insert()
+    conftest.seed_legacy_zulip_channel(db, channel)
+    if db.execute("SELECT to_regclass('zulip_incoming_subscriptions')").fetchone()[0]:
+        db.execute(
+            """INSERT INTO zulip_incoming_subscriptions
+            (external_account_uuid,project_id,provider_uuid,owner_user_uuid,account_identity,
+             server_url,queue_id,last_event_id,longpoll_timeout)
+            VALUES (%s,%s,%s,%s,'7',%s,'sender-queue',-1,90)""",
+            (
+                account.uuid,
+                account.project_id,
+                account.provider_uuid,
+                account.owner_user_uuid,
+                account.settings["server_url"],
+            ),
+        )
+    else:
+        db.execute(
+            """INSERT INTO bridge_zulip_v5_subscriptions
+            (uuid,project_id,external_account_uuid,generation,queue_id,last_event_id,account_revision,longpoll_timeout)
+            VALUES (%s,%s,%s,%s,'sender-queue',-1,'published-schema-test',90)""",
+            (uuid.uuid4(), account.project_id, account.uuid, uuid.uuid4()),
+        )
     remote = {
         "id": 12345,
         "sender_id": 7,
@@ -101,7 +125,6 @@ def outgoing(api, db, scheduled_reconciliation, monkeypatch):
     zulip.send_message.return_value = remote["id"]
     zulip.get_messages.side_effect = lambda first, last: [dict(remote)]
     constructor = mock.Mock(return_value=zulip)
-    monkeypatch.setattr(client, "ZulipClient", constructor)
     yield api, account, channel, remote, zulip, constructor
     for message in v2_models.WorkspaceMessage.objects.get_all(
         filters={"project_id": filters.EQ(api.project_id)}
@@ -112,17 +135,15 @@ def outgoing(api, db, scheduled_reconciliation, monkeypatch):
         filters={"project_id": filters.EQ(api.project_id)}
     ):
         stream.delete()
-    for model in (
-        models.ZulipTopicChange,
-        models.ZulipMessageChange,
-        models.ZulipMessageCounterChange,
-        v2_models.WorkspaceMessageChange,
-        v2_models.WorkspaceMessageCounterChange,
+    for table in (
+        "bridge_zulip_v5_topic_changes",
+        "bridge_zulip_v5_message_changes",
+        "bridge_zulip_v5_message_counter_changes",
+        "messenger_message_changes",
+        "messenger_user_message_counter_changes",
     ):
-        for change in model.objects.get_all(
-            filters={"project_id": filters.EQ(api.project_id)}
-        ):
-            change.delete()
+        if db.execute("SELECT to_regclass(%s)", (table,)).fetchone()[0]:
+            db.execute(f"DELETE FROM {table} WHERE project_id=%s", (api.project_id,))
 
 
 def create(outgoing, canonical_uuid=None):
@@ -141,734 +162,1180 @@ def create(outgoing, canonical_uuid=None):
     return response.json()
 
 
-def dispatch():
-    with contexts.Context().session_manager():
-        while models.WorkspaceEvent.dispatch_one():
-            pass
+class Server:
+    def __init__(self, db_url):
+        self.db_url = db_url
+        self.calls = []
+        self.messages = {}
+        self.attachments = []
+        self.events = []
+        self.next_id = 100
+        self.lose_response = False
+        self.gate = None
+        self.active = 0
+        self.maximum = 0
+        self.transports = set()
 
-
-def tasks(account):
-    return models.Task.objects.get_all(
-        filters={"project_id": filters.EQ(account.project_id)},
-        order_by={"created_at": "asc"},
-    )
-
-
-def ready(task):
-    task.next_retry_at = None
-    task.update()
-
-
-def test_outbox_send_uses_author_and_server_date_without_echo_duplicate(outgoing):
-    api, account, _channel, remote, zulip, constructor = outgoing
-    public = create(outgoing)
-    dispatch()
-    (send,) = tasks(account)
-    assert send.content.kind == "send_message"
-    service = history_import.HistoryImportService()
-    service._iteration()
-    constructor.assert_called_with(mock.ANY)
-    assert constructor.call_args.args[0].uuid == account.uuid
-    (delivery,) = models.MessageDelivery.objects.get_all(
-        filters={"project_id": filters.EQ(account.project_id)}
-    )
-    zulip.send_message.assert_called_once_with(
-        42, remote["content"], "General", "sender-queue", str(delivery.uuid)
-    )
-    assert tasks(account)[0].status == "retry"
-    first_attempt = tasks(account)[0]
-    assert first_attempt.execution_time > 0
-    assert first_attempt.queue_wait_time >= 0
-    ready(tasks(account)[0])
-    service._iteration()
-    assert tasks(account)[0].status == "done"
-    assert tasks(account)[0].execution_time > first_attempt.execution_time
-    canonical = v2_models.WorkspaceMessage.objects.get_one(
-        filters={"project_id": filters.EQ(account.project_id)}
-    )
-    assert canonical.created_at == datetime.datetime.fromtimestamp(
-        remote["timestamp"], datetime.timezone.utc
-    )
-    placement = v2_models.WorkspaceMessagePlacement.objects.get_one(
-        filters={"project_id": filters.EQ(account.project_id)}
-    )
-    assert placement.created_at == canonical.created_at
-    assert str(placement.uuid) == public["uuid"]
-    # The event comes back through the same persisted inbox as every Zulip event.
-    subscription = models.RealtimeSubscription.for_account(account)
-    with contexts.Context().session_manager():
-        models.RealtimeSubscription.append_events(
-            account,
-            subscription.generation,
-            [
-                {
-                    "id": 0,
-                    "type": "message",
-                    "local_message_id": str(delivery.uuid),
-                    "message": dict(remote),
+    async def handle(self, http):
+        data = dict(http.query) if http.method == "GET" else dict(await http.post())
+        self.calls.append((http.method, http.path, data))
+        self.transports.add(http.transport)
+        assert (
+            http.headers["Authorization"]
+            == aiohttp.BasicAuth("sender@example.com", "sender-key").encode()
+        )
+        with psycopg.connect(self.db_url) as connection:
+            assert not connection.execute(
+                "SELECT 1 FROM pg_stat_activity WHERE application_name='workspace-zulip-outgoing' AND state='idle in transaction'"
+            ).fetchall()
+        self.active += 1
+        self.maximum = max(self.maximum, self.active)
+        try:
+            if self.gate is not None:
+                await self.gate.wait()
+            path = http.path.removeprefix("/api/v1")
+            if path == "/attachments":
+                return web.json_response(
+                    {"result": "success", "attachments": self.attachments}
+                )
+            if path.startswith("/attachments/"):
+                self.attachments = []
+                return web.json_response({"result": "success"})
+            if path == "/user_uploads":
+                upload = data["file"]
+                attachment = {
+                    "id": len(self.attachments) + 1,
+                    "name": upload.filename,
+                    "path_id": f"1/abc/{upload.filename}",
                 }
-            ],
-        )
-        assert models.RealtimeEvent.dispatch_one()
-    service._iteration()
-    assert (
-        len(
-            v2_models.WorkspaceMessage.objects.get_all(
-                filters={"project_id": filters.EQ(account.project_id)}
-            )
-        )
-        == 1
-    )
-    assert (
-        models.ZulipMessage.objects.get_all(
-            filters={"project_id": filters.EQ(account.project_id)}
-        )
-        == []
-    )
-    dispatch()
-    assert (
-        len([task for task in tasks(account) if task.content.kind == "send_message"])
-        == 1
-    )
-    zulip.send_message.assert_called_once()
-    state = v2_models.WorkspaceUserMessageState.objects.get_one(
-        filters={
-            "project_id": filters.EQ(account.project_id),
-            "user_uuid": filters.EQ(account.owner_user_uuid),
-        }
-    )
-    assert state.read_at is not None
-
-
-def test_edit_retries_until_send_then_uses_the_same_account_and_id(outgoing):
-    api, account, _channel, remote, zulip, constructor = outgoing
-    public = create(outgoing)
-    response = api.put(
-        f"/v1/messenger/messages/{public['uuid']}",
-        json={"payload": {"kind": "markdown", "content": "Edited as-is"}},
-    )
-    assert response.status_code == 200, response.text
-    dispatch()
-    send, edit = tasks(account)
-    assert send.content.kind == "send_message" and edit.content.kind == "edit_message"
-    assert (
-        models.TASK_PRIORITY_IMPORT_CHANNELS
-        > send.priority
-        > edit.priority
-        > models.TASK_PRIORITY_IMPORT_HISTORY
-    )
-    with contexts.Context().session_manager():
-        edit.execute()
-    assert tasks(account)[1].status == "retry"
-    zulip.edit_message.assert_not_called()
-    remote["content"] = "Edited as-is"
-    service = history_import.HistoryImportService()
-    service._iteration()
-    ready(tasks(account)[0])
-    service._iteration()
-    ready(tasks(account)[1])
-    service._iteration()
-    zulip.edit_message.assert_called_once_with(remote["id"], "Edited as-is")
-    assert tasks(account)[1].status == "done"
-    assert all(call.args[0].uuid == account.uuid for call in constructor.call_args_list)
-
-
-def test_missing_sender_does_not_use_another_observers_credentials(outgoing, db):
-    api, account, channel, _remote, zulip, _constructor = outgoing
-    observer = uuid.uuid4()
-    conftest.seed_workspace_user(db, observer, f"observer-{observer}")
-    account.disabled = True
-    account.update()
-    other = external_models.ExternalAccount(
-        project_id=api.project_id,
-        owner_user_uuid=observer,
-        provider="zulip",
-        external_account_id="zulip.example.com:8",
-        status="active",
-        settings={
-            "server_url": "https://zulip.example.com",
-            "email": "observer@example.com",
-            "api_key": "observer-key",
-        },
-    )
-    other.insert()
-    models.ZulipChannel(
-        external_account_uuid=other.uuid,
-        stream_uuid=channel.stream_uuid,
-        stream_id=42,
-        name="Channel",
-        description="",
-        rendered_description="",
-        invite_only=False,
-        is_web_public=False,
-        history_public_to_subscribers=True,
-        is_archived=False,
-    ).insert()
-    try:
-        create(outgoing)
-        dispatch()
-        assert tasks(account) == []
-        (event,) = models.WorkspaceEvent.objects.get_all(
-            filters={"project_id": filters.EQ(account.project_id)}
-        )
-        assert event.processed_at is None and event.next_retry_at is not None
-        zulip.send_message.assert_not_called()
-    finally:
-        other.delete()
-
-
-def test_lost_send_response_recovers_from_echo_without_reposting(outgoing):
-    _api, account, _channel, remote, zulip, _constructor = outgoing
-    create(outgoing)
-    dispatch()
-    zulip.send_message.side_effect = requests.Timeout("response lost")
-    service = history_import.HistoryImportService()
-    service._iteration()
-    ready(tasks(account)[0])
-    service._iteration()
-    zulip.send_message.assert_called_once()
-
-    (delivery,) = models.MessageDelivery.objects.get_all(
-        filters={"project_id": filters.EQ(account.project_id)}
-    )
-    subscription = models.RealtimeSubscription.for_account(account)
-    with contexts.Context().session_manager():
-        models.RealtimeSubscription.append_events(
-            account,
-            subscription.generation,
-            [
-                {
-                    "id": 0,
-                    "type": "message",
-                    "local_message_id": str(delivery.uuid),
-                    "message": dict(remote),
-                }
-            ],
-        )
-        models.RealtimeEvent.dispatch_one()
-    service._iteration()
-    assert tasks(account)[0].status == "done"
-    zulip.send_message.assert_called_once()
-
-
-@pytest.mark.parametrize("candidate", [False, True])
-def test_unknown_send_blocks_only_matching_unedited_history(outgoing, candidate):
-    _api, account, _channel, remote, zulip, _constructor = outgoing
-    create(outgoing)
-    dispatch()
-    zulip.send_message.side_effect = requests.Timeout("response lost")
-    service = history_import.HistoryImportService()
-    service._iteration()
-    if not candidate:
-        remote["content"] = "Unrelated history from the same sender"
-    task = models.Task(
-        project_id=account.project_id,
-        external_account_uuid=account.uuid,
-        content=models.ImportHistoryContent(
-            first_message_id=remote["id"], last_message_id=remote["id"]
-        ),
-    )
-    task.insert()
-    with contexts.Context().session_manager():
-        task.execute()
-    assert task.status == ("retry" if candidate else "done")
-    imported = models.ZulipMessage.objects.get_all(
-        filters={"project_id": filters.EQ(account.project_id)}
-    )
-    assert len(imported) == (0 if candidate else 1)
-    zulip.send_message.assert_called_once()
-
-
-@pytest.mark.parametrize("with_backfill", [False, True])
-def test_pending_identity_does_not_roll_back_or_starve_the_rest_of_a_history_page(
-    outgoing, with_backfill
-):
-    _api, account, _channel, remote, zulip, _constructor = outgoing
-    create(outgoing)
-    dispatch()
-    zulip.send_message.side_effect = requests.Timeout("response lost")
-    history_import.HistoryImportService()._iteration()
-    unrelated = {**remote, "id": remote["id"] - 1, "content": "Unrelated history"}
-    zulip.get_messages.side_effect = lambda first, last: [
-        dict(data) for data in (remote, unrelated) if first <= data["id"] <= last
-    ]
-    event_uuid = None
-    subscription = models.RealtimeSubscription.for_account(account)
-    if with_backfill:
-        event = models.RealtimeEvent(
-            uuid=uuid.uuid5(subscription.generation, "backfill"),
-            project_id=account.project_id,
-            external_account_uuid=account.uuid,
-            generation=subscription.generation,
-            queue_id=subscription.queue_id,
-            source="internal",
-            payload={"type": "full_backfill", "last_message_id": remote["id"]},
-            processed_at=datetime.datetime.now(datetime.timezone.utc),
-        )
-        event.insert()
-        event_uuid = event.uuid
-        with contexts.Context().session_manager():
-            account.update_status("backfill")
-    task = models.Task(
-        project_id=account.project_id,
-        external_account_uuid=account.uuid,
-        priority=models.TASK_PRIORITY_IMPORT_HISTORY + 100,
-        backfill_uuid=event_uuid,
-        realtime_event_uuid=event_uuid,
-        content=models.ImportHistoryContent(
-            first_message_id=unrelated["id"], last_message_id=remote["id"]
-        ),
-    )
-    task.insert()
-    with contexts.Context().session_manager():
-        task.execute()
-    assert task.status == "done"
-    imported = models.ZulipMessage.objects.get_all(
-        filters={"project_id": filters.EQ(account.project_id)}
-    )
-    assert [message.message_id for message in imported] == [unrelated["id"]]
-    children = [
-        item
-        for item in tasks(account)
-        if item.uuid != task.uuid and item.content.kind == "import_history"
-    ]
-    assert len(children) == 1
-    assert children[0].priority < models.TASK_PRIORITY_IMPORT_HISTORY
-    assert children[0].not_before_at > task.updated_at
-    assert children[0].backfill_uuid == children[0].realtime_event_uuid == event_uuid
-    assert (
-        children[0].content.first_message_id
-        == children[0].content.last_message_id
-        == remote["id"]
-    )
-    zulip.send_message.assert_called_once()
-    if with_backfill:
-        account = external_models.ExternalAccount.objects.get_one(
-            filters={"uuid": filters.EQ(account.uuid)}
-        )
-        assert account.status == "backfill"
-        (delivery,) = models.MessageDelivery.objects.get_all(
-            filters={"project_id": filters.EQ(account.project_id)}
-        )
-        with contexts.Context().session_manager():
-            models.RealtimeSubscription.append_events(
-                account,
-                subscription.generation,
-                [
+                self.attachments.append(attachment)
+                return web.json_response(
                     {
-                        "id": 0,
-                        "type": "message",
-                        "local_message_id": str(delivery.uuid),
-                        "message": dict(remote),
+                        "result": "success",
+                        "uri": "/user_uploads/" + attachment["path_id"],
                     }
-                ],
-            )
-            assert models.RealtimeEvent.dispatch_one()
-        with contexts.Context().session_manager():
-            children[0].execute()
-        assert children[0].status == "done"
-        account = external_models.ExternalAccount.objects.get_one(
-            filters={"uuid": filters.EQ(account.uuid)}
+                )
+            if path == "/messages" and http.method == "GET":
+                return web.json_response(
+                    {"result": "success", "messages": list(self.messages.values())}
+                )
+            if path == "/messages/flags":
+                return web.json_response({"result": "success"})
+            if path == "/events":
+                return web.json_response({"result": "success", "events": self.events})
+            if path == "/messages" and http.method == "POST":
+                self.next_id += 1
+                remote = self.next_id
+                self.messages[remote] = {
+                    "id": remote,
+                    "content": data["content"],
+                    "flags": [],
+                    "reactions": [],
+                }
+                self.events.append(
+                    {
+                        "id": len(self.events),
+                        "type": "message",
+                        "local_message_id": data["local_id"],
+                        "message": self.messages[remote],
+                    }
+                )
+                if self.lose_response:
+                    http.transport.close()
+                    return web.Response()
+                return web.json_response({"result": "success", "id": remote})
+            if path.startswith("/messages/"):
+                remote = int(path.split("/")[2])
+                if remote not in self.messages:
+                    return web.json_response(
+                        {"result": "error", "msg": "Not found"}, status=404
+                    )
+                if path.endswith("/reactions"):
+                    reaction = {**data, "user_id": 7}
+                    if http.method == "POST":
+                        self.messages[remote]["reactions"].append(reaction)
+                    else:
+                        self.messages[remote]["reactions"] = []
+                elif http.method == "DELETE":
+                    del self.messages[remote]
+                elif http.method == "PATCH":
+                    self.messages[remote].update(data)
+                return web.json_response(
+                    {"result": "success", "message": self.messages.get(remote)}
+                )
+            if path == "/messages/flags":
+                return web.json_response({"result": "success"})
+            return web.json_response({"result": "success"})
+        finally:
+            self.active -= 1
+
+
+@contextlib.asynccontextmanager
+async def sender(account, db_url, **options):
+    server = Server(db_url)
+    app = web.Application()
+    app.router.add_route("*", "/api/v1/{path:.*}", server.handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    with psycopg.connect(db_url, autocommit=True) as connection:
+        connection.execute(
+            "UPDATE m_external_accounts_v2 SET settings=jsonb_set(settings,'{server_url}',%s) WHERE uuid=%s",
+            (pg_json.Jsonb(f"http://127.0.0.1:{port}"), account.uuid),
         )
-        assert account.status == "active"
-        zulip.send_message.assert_called_once()
-
-
-def test_direct_message_routes_to_the_peer_without_a_channel_topic(outgoing, db):
-    api, account, channel, remote, zulip, _constructor = outgoing
-    owner = uuid.uuid4()
-    conftest.seed_workspace_user(db, owner, f"peer-{owner}")
-    peer = external_models.ExternalAccount(
-        project_id=account.project_id,
-        owner_user_uuid=owner,
-        provider="zulip",
-        external_account_id="zulip.example.com:8",
-        settings={
-            "server_url": "https://zulip.example.com",
-            "email": "peer@example.com",
-        },
-    )
-    peer.insert()
+    service = zulip_outgoing.ZulipOutgoingService(db_url, **options)
+    await service.db.open()
+    service.http = zulip_outgoing.Http(options.get("connections", 128), keepalive=0.05)
+    service.operations = outgoing_operations.Operations(service.db, service.http)
     try:
-        channel.channel_type = "private"
-        channel.stream_id = None
-        channel.direct_user_uuid = peer.uuid
-        channel.update()
-        create(outgoing)
-        dispatch()
-        history_import.HistoryImportService()._iteration()
-        (delivery,) = models.MessageDelivery.objects.get_all(
-            filters={"project_id": filters.EQ(account.project_id)}
-        )
-        zulip.send_message.assert_called_once_with(
-            [8], remote["content"], None, "sender-queue", str(delivery.uuid)
-        )
+        yield service, server
     finally:
-        peer.delete()
+        if server.gate is not None:
+            server.gate.set()
+        for task in list(service.tasks.values()):
+            task.cancel()
+        await asyncio.gather(*service.tasks.values(), return_exceptions=True)
+        await service.http.close()
+        await service.db.close()
+        await runner.cleanup()
 
 
-def test_old_edit_retry_cannot_overwrite_a_newer_edit(outgoing):
-    api, account, _channel, remote, zulip, _constructor = outgoing
+async def drain(service):
+    for _ in range(100):
+        await service.dispatch()
+        if service.tasks:
+            await asyncio.wait_for(asyncio.gather(*list(service.tasks.values())), 2)
+            await asyncio.sleep(0)
+        rows = await service.db.sql(
+            "SELECT status,error FROM zulip_outgoing_intents WHERE status<>'done'"
+        )
+        if not rows:
+            return
+        assert not any(row["status"] == "error" for row in rows), rows
+        await service.db.sql(
+            "UPDATE zulip_outgoing_intents SET next_attempt_at=now() WHERE next_attempt_at>now()"
+        )
+    pytest.fail(f"Outgoing intents did not drain: {rows}")
+
+
+def intents(db, account):
+    return db.execute(
+        "SELECT entity_type,operation,status,data FROM zulip_outgoing_intents WHERE external_account_uuid=%s ORDER BY id",
+        (account.uuid,),
+    ).fetchall()
+
+
+def test_api_intent_is_atomic_and_receipt_updates_canonical_identity(
+    outgoing, db, _test_database_url
+):
+    api, account, channel, *_ = outgoing
     public = create(outgoing)
-    dispatch()
-    service = history_import.HistoryImportService()
-    service._iteration()
-    ready(tasks(account)[0])
-    service._iteration()
-    for content in ("First edit", "Latest edit"):
+    rows = intents(db, account)
+    assert [(row[0], row[1]) for row in rows] == [("message", "insert")]
+    assert rows[0][3]["topic_name"] == "General"
+
+    async def run():
+        async with sender(account, _test_database_url) as (service, server):
+            await drain(service)
+            assert (
+                len(
+                    [
+                        call
+                        for call in server.calls
+                        if call[:2] == ("POST", "/api/v1/messages")
+                    ]
+                )
+                == 1
+            )
+
+    asyncio.run(run())
+    canonical = (
+        db.execute(
+            "SELECT source_name,provider_identity FROM messenger_messages WHERE uuid=%s",
+            (public["canonical_message_uuid"],),
+        ).fetchone()
+        if "canonical_message_uuid" in public
+        else db.execute(
+            "SELECT message.source_name,message.provider_identity FROM messenger_messages message JOIN messenger_message_placements placement ON placement.message_uuid=message.uuid WHERE placement.uuid=%s",
+            (public["uuid"],),
+        ).fetchone()
+    )
+    assert canonical == ("zulip", "101")
+    assert not db.execute(
+        "SELECT 1 FROM zulip_entity_links WHERE entity_type='message'"
+    ).fetchone()
+
+
+def test_every_edit_is_sent_in_order(outgoing, db, _test_database_url):
+    api, account, *_ = outgoing
+    public = create(outgoing)
+    for content in ("second", "third"):
         response = api.put(
             f"/v1/messenger/messages/{public['uuid']}",
             json={"payload": {"kind": "markdown", "content": content}},
         )
         assert response.status_code == 200, response.text
-        dispatch()
-    send, old, latest = tasks(account)
-    remote["content"] = "Latest edit"
-    remote["last_edit_timestamp"] = remote["timestamp"] + 1
-    with contexts.Context().session_manager():
-        latest.execute()
-        old.execute()
-    zulip.edit_message.assert_called_once_with(remote["id"], "Latest edit")
-    assert all(task.status == "done" for task in tasks(account))
+
+    async def run():
+        async with sender(account, _test_database_url) as (service, server):
+            await drain(service)
+            assert [
+                data["content"]
+                for method, path, data in server.calls
+                if method in ("POST", "PATCH")
+            ] == ["Raw **message**", "second", "third"]
+
+    asyncio.run(run())
 
 
-def test_metadata_retry_does_not_resend_and_credentials_can_rotate(outgoing):
-    api, account, _channel, remote, zulip, constructor = outgoing
+def test_reaction_waits_for_message_id(outgoing, db, _test_database_url):
+    api, account, *_ = outgoing
     public = create(outgoing)
-    dispatch()
-    service = history_import.HistoryImportService()
-    service._iteration()
-    zulip.get_messages.side_effect = requests.Timeout("metadata unavailable")
-    ready(tasks(account)[0])
-    service._iteration()
-    assert tasks(account)[0].status == "retry"
-    zulip.send_message.assert_called_once()
-    zulip.get_messages.side_effect = lambda first, last: [dict(remote)]
-    ready(tasks(account)[0])
-    service._iteration()
-    account.settings = {**account.settings, "api_key": "rotated-key"}
-    account.update()
-    response = api.put(
-        f"/v1/messenger/messages/{public['uuid']}",
-        json={"payload": {"kind": "markdown", "content": "After credential rotation"}},
+    response = api.post(
+        "/v1/messenger/message_reactions/",
+        json={"message_uuid": public["uuid"], "emoji_name": "thumbs_up"},
     )
-    assert response.status_code == 200
-    remote["content"] = "After credential rotation"
-    dispatch()
-    service._iteration()
-    assert tasks(account)[-1].status == "done"
-    assert constructor.call_args.args[0].settings["api_key"] == "rotated-key"
-    zulip.edit_message.assert_called_once_with(remote["id"], remote["content"])
+    assert response.status_code == 201, response.text
+
+    async def run():
+        async with sender(account, _test_database_url) as (service, server):
+            server.gate = asyncio.Event()
+            await service.dispatch()
+            await asyncio.sleep(0.04)
+            assert service.tasks
+            assert not any(path.endswith("/reactions") for _, path, _ in server.calls)
+            server.gate.set()
+            await drain(service)
+            assert server.calls[-1][1].endswith("/101/reactions")
+
+    asyncio.run(run())
 
 
-def test_rebound_identity_cannot_execute_an_old_send(outgoing):
-    _api, account, _channel, _remote, zulip, _constructor = outgoing
-    create(outgoing)
-    dispatch()
-    account.properties["external_account_id"].set_value_force("zulip.example.com:99")
-    account.update()
-    history_import.HistoryImportService()._iteration()
-    assert tasks(account)[0].status == "cancel"
-    zulip.send_message.assert_not_called()
-
-
-def test_edit_of_previously_imported_message_uses_its_existing_remote_id(outgoing, db):
-    api, account, channel, remote, zulip, _constructor = outgoing
-    namespace = uuid.uuid5(uuid.NAMESPACE_DNS, account.get_host())
-    remote_uuid = uuid.uuid5(namespace, str(remote["id"]))
-    canonical_uuid = uuid.uuid5(account.project_id, str(remote_uuid))
-    public = create(outgoing, canonical_uuid)
-    # Seed an already imported message and acknowledge its fixture creation.
-    for event in models.WorkspaceEvent.objects.get_all(
-        filters={"project_id": filters.EQ(account.project_id)}
-    ):
-        event.processed_at = datetime.datetime.now(datetime.timezone.utc)
-        event.update()
-    db.execute(
-        "UPDATE messenger_messages SET source_name='zulip', source='{\"kind\":\"zulip\"}' WHERE project_id=%s AND uuid=%s",
-        (account.project_id, canonical_uuid),
-    )
-    topic = models.ZulipTopic(
-        uuid=uuid.uuid4(), stream_id=42, name="General", max_id=remote["id"]
-    )
-    topic.insert()
-    content = models.MessageContent(
-        zulip_content=remote["content"],
-        workspace_content=remote["content"],
-        zulip_content_hash="seed",
-        workspace_content_hash="seed",
-        zulip_content_updated_at=datetime.datetime.now(datetime.timezone.utc),
-        workspace_content_updated_at=datetime.datetime.now(datetime.timezone.utc),
-    )
-    content.insert()
-    observed = models.ZulipMessage(
-        project_id=account.project_id,
-        external_account_uuid=account.uuid,
-        message_uuid=remote_uuid,
-        message_id=remote["id"],
-        sender_id=7,
-        timestamp=remote["timestamp"],
-        channel=channel,
-        topic=topic,
-        content=content,
-        read=True,
-    )
-    observed.insert()
-    response = api.put(
-        f"/v1/messenger/messages/{public['uuid']}",
-        json={"payload": {"kind": "markdown", "content": "Imported edit"}},
-    )
-    assert response.status_code == 200, response.text
-    remote["content"] = "Imported edit"
-    dispatch()
-    (edit,) = tasks(account)
-    assert edit.content.kind == "edit_message"
-    history_import.HistoryImportService()._iteration()
-    assert tasks(account)[0].status == "done"
-    zulip.send_message.assert_not_called()
-    zulip.edit_message.assert_called_once_with(remote["id"], "Imported edit")
-    observed.delete()
-    topic.delete()
-    content.delete()
-
-
-def test_subscriber_rolls_back_task_and_delivery_together(outgoing, monkeypatch):
-    _api, account, _channel, _remote, zulip, _constructor = outgoing
-    create(outgoing)
-    insert = models.Task.insert
-
-    def fail_after_insert(task, **kwargs):
-        insert(task, **kwargs)
-        raise RuntimeError("transaction failed")
-
-    with monkeypatch.context() as patch:
-        patch.setattr(models.Task, "insert", fail_after_insert)
-        dispatch()
-    assert tasks(account) == []
-    assert (
-        models.MessageDelivery.objects.get_all(
-            filters={"project_id": filters.EQ(account.project_id)}
-        )
-        == []
-    )
-    (event,) = models.WorkspaceEvent.objects.get_all(
-        filters={"project_id": filters.EQ(account.project_id)}
-    )
-    assert event.attempts == 1 and event.processed_at is None
-    event.next_retry_at = None
-    event.update()
-    dispatch()
-    assert len(tasks(account)) == 1
-    zulip.send_message.assert_not_called()
-
-
-def test_prepared_send_is_not_claimed_again_or_reposted_after_restart(outgoing):
-    _api, account, _channel, _remote, zulip, _constructor = outgoing
-    create(outgoing)
-    dispatch()
-    (task,) = tasks(account)
-    with contexts.Context().session_manager():
-        assert task.content.prepare(task)
-    (restored,) = tasks(account)
-    with contexts.Context().session_manager():
-        assert not restored.content.prepare(restored)
-    restored.lease_expires_at = datetime.datetime.now(
-        datetime.timezone.utc
-    ) - datetime.timedelta(seconds=1)
-    restored.update()
-    history_import.HistoryImportService()._iteration()
-    assert tasks(account)[0].status == "retry"
-    zulip.send_message.assert_not_called()
-
-
-def test_deleting_a_pending_message_cascades_its_delivery_and_tasks(outgoing):
-    _api, account, _channel, _remote, zulip, _constructor = outgoing
-    create(outgoing)
-    dispatch()
-    (message,) = v2_models.WorkspaceMessage.objects.get_all(
-        filters={"project_id": filters.EQ(account.project_id)}
-    )
-    message.delete()
-    assert tasks(account) == []
-    assert (
-        models.MessageDelivery.objects.get_all(
-            filters={"project_id": filters.EQ(account.project_id)}
-        )
-        == []
-    )
-    zulip.send_message.assert_not_called()
-
-
-def test_realtime_listens_to_the_existing_workspace_notification_channel(_database):
-    async def scenario():
-        service = zulip_realtime.ZulipRealtimeService(conftest.TEST_DB_URL)
-        listener = asyncio.create_task(service._listen_notifications())
-        try:
-            async with await psycopg.AsyncConnection.connect(
-                conftest.TEST_DB_URL, autocommit=True
-            ) as connection:
-                async with asyncio.timeout(3):
-                    while not service._workspace_events_ready.is_set():
-                        await connection.execute(
-                            "SELECT pg_notify(%s,'1')",
-                            (zulip_realtime.WORKSPACE_EVENTS_CHANNEL,),
-                        )
-                        await asyncio.sleep(0.01)
-        finally:
-            listener.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await listener
-            service._executor.shutdown(wait=True)
-
-    asyncio.run(scenario())
-
-
-def test_outgoing_migration_starts_with_new_events_and_round_trips(_database):
-    with conftest.isolated_migration_database(
-        "0232-Add-durable-Zulip-realtime-subscriptions-and-backfill-tracking-9ac2f0.py"
-    ) as url:
-        path = (
-            conftest.MIGRATIONS_DIR
-            / "0233-Add-outgoing-Zulip-message-tasks-and-Workspace-outbox-subscription-23c3f1.py"
-        )
-        spec = importlib.util.spec_from_file_location("outgoing_migration", path)
-        migration = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(migration)
-        with psycopg.connect(url, autocommit=True) as connection:
-            old, new, project = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
-            sql = "INSERT INTO messenger_domain_outbox_events(uuid,project_id,event_kind,scope_kind,scope_key,payload) VALUES(%s,%s,'fanout','topic','test','{\"source_kind\":\"message.created\"}'::jsonb)"
-            connection.execute(sql, (old, project))
-            migration.migration_step.upgrade(connection)
-            connection.execute(sql, (new, project))
-            assert connection.execute(
-                "SELECT uuid FROM bridge_zulip_v5_workspace_events"
-            ).fetchall() == [(new,)]
-            migration.migration_step.downgrade(connection)
-            assert connection.execute(
-                "SELECT to_regclass('bridge_zulip_v5_workspace_events')"
-            ).fetchone() == (None,)
-            migration.migration_step.upgrade(connection)
-
-
-@pytest.mark.parametrize("purge_before_dispatch", [False, True])
-def test_deleting_delivered_workspace_message_deletes_its_zulip_copy(
-    outgoing, purge_before_dispatch
+def test_independent_messages_run_concurrently_and_reuse_connections(
+    outgoing, db, _test_database_url
 ):
-    api, account, _channel, remote, zulip, _constructor = outgoing
-    public = create(outgoing)
-    dispatch()
-    service = history_import.HistoryImportService()
-    service._iteration()
-    ready(tasks(account)[0])
-    service._iteration()
-    assert tasks(account)[0].status == "done"
-    response = api.delete("/v1/messenger/messages/" + public["uuid"])
-    assert response.status_code == 204
-    if purge_before_dispatch:
-        (message,) = v2_models.WorkspaceMessage.objects.get_all(
-            filters={"project_id": filters.EQ(account.project_id)}
-        )
-        message.delete()
-    dispatch()
-    service._iteration()
-    zulip.delete_message.assert_called_once_with(remote["id"])
-    (delete,) = [
-        task for task in tasks(account) if task.content.kind == "delete_message"
-    ]
-    assert delete.status == "done" and delete.queue == "realtime"
+    _api, account, *_ = outgoing
+    for _ in range(4):
+        create(outgoing)
 
-
-@pytest.mark.parametrize("changed", ["account", "imported", "unacknowledged"])
-def test_deletion_does_not_use_a_rebound_account_or_invent_a_remote_id(
-    outgoing, db, changed
-):
-    api, account, _channel, _remote, zulip, _constructor = outgoing
-    public = create(outgoing)
-    dispatch()
-    service = history_import.HistoryImportService()
-    if changed != "unacknowledged":
-        service._iteration()
-        ready(tasks(account)[0])
-        service._iteration()
-    if changed == "imported":
-        db.execute(
-            "UPDATE messenger_messages SET source_name='zulip' WHERE project_id=%s",
-            (account.project_id,),
-        )
-    assert api.delete("/v1/messenger/messages/" + public["uuid"]).status_code == 204
-    if changed == "account":
-        db.execute(
-            "UPDATE m_external_accounts_v2 SET external_account_id='zulip.example.com:99' WHERE uuid=%s",
-            (account.uuid,),
-        )
-    dispatch()
-    service._iteration()
-    zulip.delete_message.assert_not_called()
-    deletes = [task for task in tasks(account) if task.content.kind == "delete_message"]
-    assert [task.status for task in deletes] == (
-        ["cancel"] if changed == "account" else []
-    )
-
-
-def test_delete_retries_after_a_lost_response_without_needing_the_native_root(outgoing):
-    api, account, _channel, remote, zulip, _constructor = outgoing
-    public = create(outgoing)
-    dispatch()
-    service = history_import.HistoryImportService()
-    service._iteration()
-    ready(tasks(account)[0])
-    service._iteration()
-    assert api.delete("/v1/messenger/messages/" + public["uuid"]).status_code == 204
-    (message,) = v2_models.WorkspaceMessage.objects.get_all(
-        filters={"project_id": filters.EQ(account.project_id)}
-    )
-    message.delete()
-    dispatch()
-    zulip.delete_message.side_effect = [requests.Timeout("lost response"), None]
-    service._iteration()
-    (delete,) = tasks(account)
-    assert delete.status == "retry"
-    ready(delete)
-    history_import.HistoryImportService()._iteration()
-    assert tasks(account)[0].status == "done"
-    assert zulip.delete_message.call_args_list == [mock.call(remote["id"])] * 2
-
-
-@pytest.mark.parametrize("change_model", [flags.FlagChange, reactions.ReactionChange])
-def test_live_message_outbox_is_not_held_behind_a_reconciliation_batch(
-    outgoing, monkeypatch, change_model
-):
-    _api, account, _channel, _remote, _zulip, _constructor = outgoing
-
-    started = threading.Event()
-
-    def busy_changes(limit):
-        started.set()
-        # Bulk initial observation leaves many independent changes. Model
-        # their per-row work while the real HTTP and outbox dispatcher run.
-        time.sleep(0.06 * limit)
-        return limit
-
-    monkeypatch.setattr(flags.FlagChange, "reconcile_batch", lambda limit: 0)
-    monkeypatch.setattr(reactions.ReactionChange, "reconcile_batch", lambda limit: 0)
-    monkeypatch.setattr(change_model, "reconcile_batch", busy_changes)
-
-    async def scenario():
-        service = zulip_realtime.ZulipRealtimeService("unused-in-this-consumer")
-        consumer = asyncio.create_task(service._consume_workspace_events())
-        try:
-            assert await asyncio.to_thread(started.wait, 2)
-            public = await asyncio.to_thread(create, outgoing)
-            deadline = time.monotonic() + 0.5
-            while time.monotonic() < deadline:
-                if await asyncio.to_thread(tasks, account):
+    async def run():
+        async with sender(account, _test_database_url, connections=2) as (
+            service,
+            server,
+        ):
+            server.gate = asyncio.Event()
+            await service.dispatch()
+            for _ in range(100):
+                if server.active == 2:
                     break
                 await asyncio.sleep(0.01)
-            assert await asyncio.to_thread(tasks, account), public["uuid"]
-        finally:
-            consumer.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await consumer
-            service._executor.shutdown(wait=True)
+            assert server.active == 2
+            server.gate.set()
+            await drain(service)
+            assert server.maximum == 2
+            assert len(server.transports) == 2
+            await asyncio.sleep(0.15)
+            assert not service.http.connector._conns
 
-    asyncio.run(scenario())
+    asyncio.run(run())
+
+
+def test_lost_non_idempotent_response_is_verified_by_get(
+    outgoing, db, _test_database_url
+):
+    _api, account, *_ = outgoing
+    create(outgoing)
+
+    async def run():
+        async with sender(account, _test_database_url) as (service, server):
+            server.lose_response = True
+            await drain(service)
+            methods = [
+                method for method, path, _ in server.calls if path == "/api/v1/messages"
+            ]
+            assert methods == ["POST"]
+            assert any(
+                method == "GET" and path.endswith("/events")
+                for method, path, _ in server.calls
+            )
+            assert any(
+                method == "GET" and path.endswith("/messages/101")
+                for method, path, _ in server.calls
+            )
+
+    asyncio.run(run())
+
+
+def test_delete_404_uses_snapshot_after_local_root_is_removed(
+    outgoing, db, _test_database_url
+):
+    api, account, *_ = outgoing
+    public = create(outgoing)
+
+    async def run():
+        async with sender(account, _test_database_url) as (service, server):
+            await drain(service)
+            assert (
+                api.delete(f"/v1/messenger/messages/{public['uuid']}").status_code
+                == 204
+            )
+            with psycopg.connect(_test_database_url, autocommit=True) as connection:
+                connection.execute(
+                    "DELETE FROM messenger_messages WHERE project_id=%s",
+                    (account.project_id,),
+                )
+            server.messages.clear()
+            await drain(service)
+            assert server.calls[-1][:2] == ("DELETE", "/api/v1/messages/101")
+
+    asyncio.run(run())
+
+
+def test_import_writes_and_rolled_back_api_writes_do_not_enqueue(outgoing, db):
+    _api, account, channel, *_ = outgoing
+    with contexts.Context().session_manager() as session:
+        session.execute(
+            "UPDATE messenger_streams SET name='Imported rename' WHERE uuid=%s",
+            (channel.stream_uuid,),
+        )
+    assert intents(db, account) == []
+    with pytest.raises(RuntimeError):
+        with contexts.Context().session_manager() as session:
+            session.execute(
+                "SELECT set_config('workspace.outgoing_actor',%s,true)",
+                (str(account.owner_user_uuid),),
+            )
+            session.execute(
+                "UPDATE messenger_streams SET name='Local rename' WHERE uuid=%s",
+                (channel.stream_uuid,),
+            )
+            raise RuntimeError("rollback")
+    assert intents(db, account) == []
+
+
+def test_other_api_entities_capture_only_provider_operations(
+    outgoing, db, _test_database_url
+):
+    api, account, channel, *_ = outgoing
+    public = create(outgoing)
+    topics = api.get("/v1/messenger/stream_topics/").json()
+    topic = next(
+        row for row in topics if row["stream_uuid"] == str(channel.stream_uuid)
+    )
+    requests = [
+        ("put", f"/v1/messenger/streams/{channel.stream_uuid}", {"name": "Renamed"}),
+        (
+            "put",
+            f"/v1/messenger/stream_topics/{topic['uuid']}",
+            {"name": "Renamed topic"},
+        ),
+        (
+            "post",
+            f"/v1/messenger/streams/{channel.stream_uuid}/actions/notifications/invoke",
+            {"notification_mode": "muted"},
+        ),
+        (
+            "post",
+            f"/v1/messenger/stream_topics/{topic['uuid']}/actions/notifications/invoke",
+            {"notification_mode": "follow"},
+        ),
+        ("post", f"/v1/messenger/messages/{public['uuid']}/actions/star/invoke", {}),
+    ]
+    for method, path, data in requests:
+        response = getattr(api, method)(path, json=data)
+        assert response.status_code in (200, 201, 204), response.text
+    kinds = [row[0] for row in intents(db, account)]
+    assert kinds == [
+        "message",
+        "stream",
+        "topic",
+        "stream_binding",
+        "topic_binding",
+        "message_state",
+    ]
+    count = len(kinds)
+    response = api.put(
+        f"/v1/messenger/streams/{channel.stream_uuid}", json={"color": 123}
+    )
+    assert response.status_code == 200, response.text
+    assert len(intents(db, account)) == count
+    assert db.execute(
+        "SELECT notification_mode FROM messenger_stream_bindings WHERE project_id=%s AND stream_uuid=%s AND user_uuid=%s",
+        (account.project_id, channel.stream_uuid, account.owner_user_uuid),
+    ).fetchone() == ("muted",)
+
+    async def run():
+        async with sender(account, _test_database_url) as (service, server):
+            await drain(service)
+            sent = [
+                (method, path, data)
+                for method, path, data in server.calls
+                if method != "GET"
+            ]
+            assert any(
+                method == "PATCH" and path == "/api/v1/streams/42"
+                for method, path, _ in sent
+            )
+            assert any(
+                path == "/api/v1/user_topics" and data["visibility_policy"] == "3"
+                for _, path, data in sent
+            )
+            assert any(
+                path == "/api/v1/messages/flags" and data["flag"] == "starred"
+                for _, path, data in sent
+            )
+
+    asyncio.run(run())
+
+
+def test_pending_file_upload_survives_api_deletion(
+    outgoing, db, _test_database_url, tmp_path, monkeypatch
+):
+    api, account, channel, *_ = outgoing
+    monkeypatch.setenv("WORKSPACE_FILE_STORAGE_PATH", str(tmp_path))
+    response = api.post(
+        "/v1/messenger/files/",
+        data={"stream_uuid": str(channel.stream_uuid)},
+        files={"file": ("example.txt", b"content", "text/plain")},
+    )
+    assert response.status_code == 201, response.text
+    file = response.json()
+    assert api.delete(f"/v1/messenger/files/{file['uuid']}").status_code == 204
+    rows = [row for row in intents(db, account) if row[0] == "file"]
+    assert [row[1] for row in rows] == ["insert", "delete"]
+    from workspace.messenger_api import file_storage
+
+    assert (
+        file_storage.read_workspace_file(
+            uuid.UUID(file["uuid"]),
+            storage_type=rows[0][3]["storage_type"],
+            storage_object_id=rows[0][3]["storage_object_id"],
+        )
+        == b"content"
+    )
+
+    async def run():
+        async with sender(account, _test_database_url) as (service, server):
+            await drain(service)
+            assert [
+                method
+                for method, path, _ in server.calls
+                if path == "/api/v1/user_uploads"
+            ] == ["POST"]
+            assert server.attachments == []
+
+    asyncio.run(run())
+    with pytest.raises(FileNotFoundError):
+        file_storage.read_workspace_file(
+            uuid.UUID(file["uuid"]),
+            storage_type=rows[0][3]["storage_type"],
+            storage_object_id=rows[0][3]["storage_object_id"],
+        )
+
+
+def test_restart_verifies_prepared_request_and_keeps_following_changes_blocked(
+    outgoing, db, _test_database_url
+):
+    api, account, *_ = outgoing
+    public = create(outgoing)
+    assert (
+        api.put(
+            f"/v1/messenger/messages/{public['uuid']}",
+            json={"payload": {"kind": "markdown", "content": "later"}},
+        ).status_code
+        == 200
+    )
+
+    async def run():
+        async with sender(account, _test_database_url) as (service, server):
+            rows = await service.db.sql(
+                "SELECT * FROM zulip_outgoing_intents ORDER BY id"
+            )
+            account_row = (
+                await service.db.sql(
+                    "SELECT account.*,provider.hostname FROM m_external_accounts_v2 account JOIN messenger_providers provider ON provider.uuid=account.provider_uuid WHERE account.uuid=%s",
+                    (account.uuid,),
+                )
+            )[0]
+            prepared = await service.operations.prepare(rows[0], account_row)
+            await service.db.sql(
+                "UPDATE zulip_outgoing_intents SET request=%s,status='checking' WHERE id=%s",
+                (pg_json.Jsonb(prepared), rows[0]["id"]),
+            )
+            await service.dispatch()
+            await asyncio.gather(*list(service.tasks.values()))
+            assert not any(method == "POST" for method, _, _ in server.calls)
+            assert (
+                await service.db.sql(
+                    "SELECT status FROM zulip_outgoing_intents ORDER BY id"
+                )
+            ) == [{"status": "checking"}, {"status": "new"}]
+
+    asyncio.run(run())
+
+
+def test_attachment_dependency_added_after_message_does_not_starve(
+    outgoing, db, _test_database_url, tmp_path, monkeypatch
+):
+    api, account, channel, *_ = outgoing
+    monkeypatch.setenv("WORKSPACE_FILE_STORAGE_PATH", str(tmp_path))
+    response = api.post(
+        "/v1/messenger/files/",
+        data={"stream_uuid": str(channel.stream_uuid)},
+        files={"file": ("example.txt", b"content", "text/plain")},
+    )
+    assert response.status_code == 201, response.text
+    file = response.json()
+    assert [row[0] for row in intents(db, account)] == ["file"]
+    for _ in range(2):
+        response = api.post(
+            "/v1/messenger/messages/",
+            json={
+                "stream_uuid": str(channel.stream_uuid),
+                "payload": {
+                    "kind": "markdown",
+                    "content": f"[file](urn:file:{file['uuid']})",
+                },
+            },
+        )
+        assert response.status_code == 201, response.text
+
+    async def run():
+        async with sender(account, _test_database_url, concurrency=1) as (
+            service,
+            server,
+        ):
+            await drain(service)
+            assert (
+                len(
+                    [
+                        call
+                        for call in server.calls
+                        if call[:2] == ("POST", "/api/v1/user_uploads")
+                    ]
+                )
+                == 1
+            )
+            contents = [
+                data["content"]
+                for method, path, data in server.calls
+                if method == "POST" and path == "/api/v1/messages"
+            ]
+            assert len(contents) == 2 and all(
+                "/user_uploads/" in text and "urn:file:" not in text
+                for text in contents
+            )
+
+    asyncio.run(run())
+
+
+def test_create_then_delete_executes_from_snapshots_after_root_cleanup(
+    outgoing, db, _test_database_url
+):
+    api, account, *_ = outgoing
+    public = create(outgoing)
+    assert api.delete(f"/v1/messenger/messages/{public['uuid']}").status_code == 204
+    db.execute(
+        "DELETE FROM messenger_messages WHERE project_id=%s", (account.project_id,)
+    )
+
+    async def run():
+        async with sender(account, _test_database_url) as (service, server):
+            await drain(service)
+            assert [(method, path) for method, path, _ in server.calls] == [
+                ("POST", "/api/v1/messages"),
+                ("DELETE", "/api/v1/messages/101"),
+            ]
+
+    asyncio.run(run())
+
+
+def seed_delivery(account, placement, message):
+    """Persist a known copy when testing inbound observations without HTTP."""
+    topic = v2_models.WorkspaceStreamTopic.objects.get_one(
+        filters={
+            "project_id": filters.EQ(account.project_id),
+            "uuid": filters.EQ(placement.topic_uuid),
+        }
+    )
+    session = contexts.Context().get_session()
+    row = session.execute(
+        outgoing_operations.UPSERT_SENDING_MESSAGE_SQL,
+        (
+            uuid.uuid4(),
+            account.project_id,
+            message.uuid,
+            placement.stream_uuid,
+            account.uuid,
+            account.get_host(),
+            account.external_account_id,
+            pg_json.Jsonb({"to": 42}),
+            topic.name,
+        ),
+    ).fetchone()
+    delivery = types.SimpleNamespace(uuid=row["uuid"])
+    return delivery
+
+
+def export(account, payload, stream_uuid, zulip):
+    """Exercise SQL conversion inside a test's existing fixture transaction."""
+    session = contexts.Context().get_session()
+
+    class Database:
+        async def sql(self, query, parameters=()):
+            cursor = session.execute(query, parameters)
+            return cursor.fetchall() if cursor.description else []
+
+    class Http:
+        async def request(self, _account, method, path, data=None, *, file=None):
+            if path == "/attachments":
+                return {"attachments": []}
+            if path == "/user_uploads":
+                return {"uri": zulip.upload_file(*file)}
+            remote = int(path.rsplit("/", 1)[1])
+            messages = zulip.get_messages(remote, remote)
+            return {"message": next(row for row in messages if row["id"] == remote)}
+
+    async def run():
+        db = Database()
+        account_data = (
+            await db.sql(
+                "SELECT account.*,provider.hostname FROM m_external_accounts_v2 account JOIN messenger_providers provider ON provider.uuid=account.provider_uuid WHERE account.uuid=%s",
+                (account.uuid,),
+            )
+        )[0]
+        operations = outgoing_operations.Operations(db, Http())
+        intent = {
+            "id": 0,
+            "uuid": uuid.uuid4(),
+            "entity_uuid": uuid.uuid4(),
+            "entity_type": "message",
+            "project_id": account.project_id,
+            "data": {"payload": payload, "stream_uuid": stream_uuid},
+        }
+        for _ in range(10):
+            try:
+                return await operations.convert(intent, account_data)
+            except outgoing_operations.Pending:
+                files = await db.sql(
+                    "SELECT * FROM zulip_outgoing_intents WHERE entity_type='file' AND status='new' AND entity_uuid=ANY(%s)",
+                    (
+                        [
+                            uuid.UUID(urn.split(":", 2)[2].partition("?")[0])
+                            for urn in message_conversion.get_workspace_files(
+                                payload, include_quotes=True
+                            )
+                        ],
+                    ),
+                )
+                if not files:
+                    raise
+                for file_intent in files:
+                    prepared = await operations.prepare(file_intent, account_data)
+                    result = await operations.execute(
+                        file_intent, account_data, prepared, False
+                    )
+                    await operations.finish(file_intent, account_data, prepared, result)
+        pytest.fail("Export dependencies did not converge")
+
+    return asyncio.run(run())
+
+
+@pytest.mark.pre_outgoing_schema
+def test_cutover_preserves_queued_and_unscheduled_changes(outgoing, db):
+    api, account, channel, *_ = outgoing
+    seeded = []
+    for _ in range(2):
+        message_uuid, placement_uuid = uuid.uuid4(), uuid.uuid4()
+        topic_uuid = db.execute(
+            "SELECT default_topic_uuid FROM messenger_streams WHERE uuid=%s",
+            (channel.stream_uuid,),
+        ).fetchone()[0]
+        db.execute(
+            "INSERT INTO messenger_messages(uuid,project_id,author_uuid,payload) VALUES(%s,%s,%s,%s)",
+            (
+                message_uuid,
+                account.project_id,
+                api.user_uuid,
+                pg_json.Jsonb({"kind": "markdown", "content": "Before cutover"}),
+            ),
+        )
+        db.execute(
+            "INSERT INTO messenger_message_placements(uuid,project_id,message_uuid,stream_uuid,topic_uuid) VALUES(%s,%s,%s,%s,%s)",
+            (
+                placement_uuid,
+                account.project_id,
+                message_uuid,
+                channel.stream_uuid,
+                topic_uuid,
+            ),
+        )
+        db.execute(
+            "INSERT INTO messenger_user_message_bindings(uuid,project_id,placement_uuid,user_uuid,membership_generation,relation_role,visibility,permissions) VALUES(%s,%s,%s,%s,1,'author','visible',jsonb_build_object('read',true,'react',true,'star',true,'pin',true))",
+            (
+                uuid.uuid5(placement_uuid, str(api.user_uuid)),
+                account.project_id,
+                placement_uuid,
+                api.user_uuid,
+            ),
+        )
+        db.execute(
+            "INSERT INTO messenger_user_message_states(uuid,project_id,placement_uuid,user_uuid,starred,membership_generation) VALUES(%s,%s,%s,%s,false,1)",
+            (
+                uuid.uuid5(placement_uuid, str(api.user_uuid)),
+                account.project_id,
+                placement_uuid,
+                api.user_uuid,
+            ),
+        )
+        seeded.append({"uuid": str(placement_uuid)})
+    first, second = seeded
+    with contexts.Context().session_manager():
+        copies = []
+        for public in (first, second):
+            placement = v2_models.WorkspaceMessagePlacement.objects.get_one(
+                filters={
+                    "uuid": filters.EQ(uuid.UUID(public["uuid"])),
+                    "project_id": filters.EQ(account.project_id),
+                }
+            )
+            message = v2_models.WorkspaceMessage.objects.get_one(
+                filters={
+                    "uuid": filters.EQ(placement.message_uuid),
+                    "project_id": filters.EQ(account.project_id),
+                }
+            )
+            copies.append(seed_delivery(account, placement, message))
+        contexts.Context().get_session().execute(
+            "UPDATE bridge_zulip_v5_deliveries SET sending=true WHERE uuid=%s",
+            (copies[0].uuid,),
+        )
+        contexts.Context().get_session().execute(
+            "UPDATE bridge_zulip_v5_deliveries SET zulip_message_id=123 WHERE uuid=%s",
+            (copies[1].uuid,),
+        )
+    assert (
+        api.post(
+            f"/v1/messenger/messages/{second['uuid']}/actions/star/invoke"
+        ).status_code
+        == 200
+    )
+    reaction = api.post(
+        "/v1/messenger/message_reactions/",
+        json={"message_uuid": second["uuid"], "emoji_name": "thumbs_up"},
+    )
+    assert reaction.status_code == 201, reaction.text
+    old_uuid = uuid.uuid4()
+    for task_uuid, content in (
+        (
+            old_uuid,
+            {
+                "kind": "send_message",
+                "delivery_uuid": str(copies[0].uuid),
+                "content": "before cutover",
+            },
+        ),
+        (
+            uuid.uuid4(),
+            {
+                "kind": "delete_message",
+                "message_id": 999,
+                "hostname": account.get_host(),
+                "external_account_id": account.external_account_id,
+                "author_uuid": str(account.owner_user_uuid),
+            },
+        ),
+    ):
+        db.execute(
+            "INSERT INTO bridge_zulip_v5_tasks(uuid,project_id,external_account_uuid,priority,status,content) VALUES(%s,%s,%s,100,'new',%s)",
+            (task_uuid, account.project_id, account.uuid, pg_json.Jsonb(content)),
+        )
+    path = next(conftest.MIGRATIONS_DIR.glob("0265-*.py"))
+    spec = importlib.util.spec_from_file_location("outgoing_cutover", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    with db.transaction():
+        db.execute(module.CAPTURE)
+        db.execute(
+            "CREATE TEMP TABLE zulip_choice_codes(name text,code text) ON COMMIT DROP"
+        )
+        db.execute(module.CUTOVER)
+    assert db.execute(
+        "SELECT status,request->>'delivery_uuid',request->'data'->>'queue_id' FROM zulip_outgoing_intents WHERE uuid=%s",
+        (old_uuid,),
+    ).fetchone() == ("checking", str(copies[0].uuid), "sender-queue")
+    assert db.execute(
+        "SELECT 1 FROM zulip_outgoing_intents WHERE entity_type='message_state' AND data->>'starred'='true'"
+    ).fetchone()
+    assert db.execute(
+        "SELECT 1 FROM zulip_outgoing_intents WHERE entity_type='reaction' AND operation='insert'"
+    ).fetchone()
+    assert db.execute(
+        "SELECT 1 FROM zulip_outgoing_intents WHERE operation='delete' AND data->>'remote_identity'='999'"
+    ).fetchone()
+    assert db.execute(
+        "SELECT to_regclass('bridge_zulip_v5_workspace_events'),to_regclass('bridge_zulip_v5_reaction_intents')"
+    ).fetchone() == (None, None)
+    assert (
+        db.execute(
+            "SELECT 1 FROM bridge_zulip_v5_tasks WHERE content->>'kind' IN ('send_message','delete_message','update_message_flags','update_reaction')"
+        ).fetchone()
+        is None
+    )
+
+
+def test_copy_identity_stays_with_the_original_provider(
+    outgoing, db, _test_database_url
+):
+    _api, account, *_ = outgoing
+    public = create(outgoing)
+
+    async def run():
+        async with sender(account, _test_database_url) as (service, _server):
+            await drain(service)
+            provider_uuid = uuid.uuid4()
+            with psycopg.connect(_test_database_url, autocommit=True) as connection:
+                connection.execute(
+                    "INSERT INTO messenger_providers(uuid,hostname) VALUES(%s,%s)",
+                    (provider_uuid, f"{provider_uuid}.example.com"),
+                )
+                connection.execute(
+                    "UPDATE m_external_accounts_v2 SET provider_uuid=%s WHERE uuid=%s",
+                    (provider_uuid, account.uuid),
+                )
+            account_row = (
+                await service.db.sql(
+                    "SELECT * FROM m_external_accounts_v2 WHERE uuid=%s",
+                    (account.uuid,),
+                )
+            )[0]
+            message = (
+                await service.db.sql(
+                    "SELECT message_uuid FROM messenger_message_placements WHERE uuid=%s",
+                    (public["uuid"],),
+                )
+            )[0]["message_uuid"]
+            with pytest.raises(outgoing_operations.Pending):
+                await service.operations.identity(
+                    {"project_id": account.project_id}, account_row, "message", message
+                )
+
+    asyncio.run(run())
+
+
+def test_zulip_children_inherit_provider_before_receipt(
+    outgoing, db, monkeypatch, tmp_path
+):
+    api, account, channel, *_ = outgoing
+    monkeypatch.setenv("WORKSPACE_FILE_STORAGE_PATH", str(tmp_path))
+    response = api.post(
+        "/v1/messenger/stream_topics/",
+        json={
+            "stream_uuid": str(channel.stream_uuid),
+            "name": "Pending topic",
+        },
+    )
+    assert response.status_code == 201, response.text
+    topic = response.json()
+    response = api.post(
+        "/v1/messenger/messages/",
+        json={
+            "stream_uuid": str(channel.stream_uuid),
+            "topic_uuid": topic["uuid"],
+            "payload": {"kind": "markdown", "content": "Pending message"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    message = response.json()
+    reaction = api.post(
+        "/v1/messenger/message_reactions/",
+        json={
+            "message_uuid": message["uuid"],
+            "emoji_name": "thumbs_up",
+        },
+    )
+    assert reaction.status_code == 201, reaction.text
+    file = api.post(
+        "/v1/messenger/files/",
+        data={"stream_uuid": str(channel.stream_uuid)},
+        files={"file": ("pending.txt", b"pending", "text/plain")},
+    )
+    assert file.status_code == 201, file.text
+    for entity in (topic, message, reaction.json(), file.json()):
+        assert entity["source_name"] == "zulip"
+        assert entity["provider_uuid"] == str(account.provider_uuid)
+        assert entity["provider_identity"] is None
+        assert entity["status"] == "new"
+    for table, predicate, identifier in (
+        ("messenger_user_topic_bindings", "topic_uuid", topic["uuid"]),
+        ("messenger_user_message_states", "placement_uuid", message["uuid"]),
+    ):
+        assert db.execute(
+            f"SELECT source_name,provider_uuid FROM {table} WHERE {predicate}=%s",
+            (uuid.UUID(identifier),),
+        ).fetchone() == ("zulip", account.provider_uuid)
+    assert all(row[3]["source_name"] == "zulip" for row in intents(db, account))
+
+
+def test_native_entities_never_enter_outbox_with_an_old_stream_link(
+    outgoing, db, tmp_path, monkeypatch
+):
+    api, account, channel, *_ = outgoing
+    db.execute(
+        "UPDATE messenger_streams SET source_name='native',provider_uuid=NULL,provider_identity=NULL WHERE uuid=%s",
+        (channel.stream_uuid,),
+    )
+    db.execute(
+        """INSERT INTO zulip_entity_links(project_id,entity_type,entity_uuid,provider_uuid,external_account_uuid,provider_identity)
+        VALUES(%s,%s,%s,%s,%s,%s)""",
+        (
+            account.project_id,
+            "stream",
+            channel.stream_uuid,
+            account.provider_uuid,
+            account.uuid,
+            "42",
+        ),
+    )
+    for table, where in (
+        ("messenger_topics", "stream_uuid"),
+        ("messenger_stream_bindings", "stream_uuid"),
+    ):
+        db.execute(
+            f"UPDATE {table} SET source_name='native',provider_uuid=NULL,provider_identity=NULL,status='active' WHERE {where}=%s",
+            (channel.stream_uuid,),
+        )
+    db.execute(
+        "UPDATE messenger_user_topic_bindings SET source_name='native',provider_uuid=NULL,provider_identity=NULL,status='active' WHERE project_id=%s",
+        (account.project_id,),
+    )
+    public = create(outgoing)
+    assert public["source_name"] == "native"
+    reaction = api.post(
+        "/v1/messenger/message_reactions/",
+        json={"message_uuid": public["uuid"], "emoji_name": "thumbs_up"},
+    )
+    assert reaction.status_code == 201, reaction.text
+    assert reaction.json()["source_name"] == "native"
+    assert (
+        api.post(
+            f"/v1/messenger/messages/{public['uuid']}/actions/star/invoke"
+        ).status_code
+        == 200
+    )
+    topic = api.post(
+        "/v1/messenger/stream_topics/",
+        json={"stream_uuid": str(channel.stream_uuid), "name": "Local topic"},
+    )
+    assert topic.status_code == 201, topic.text
+    assert topic.json()["source_name"] == "native"
+    monkeypatch.setenv("WORKSPACE_FILE_STORAGE_PATH", str(tmp_path))
+    file = api.post(
+        "/v1/messenger/files/",
+        data={"stream_uuid": str(channel.stream_uuid)},
+        files={"file": ("local.txt", b"local", "text/plain")},
+    )
+    assert file.status_code == 201, file.text
+    assert file.json()["source_name"] == "native"
+    assert (
+        api.put(
+            f"/v1/messenger/streams/{channel.stream_uuid}",
+            json={"description": "Local only"},
+        ).status_code
+        == 200
+    )
+    assert intents(db, account) == []
+
+
+def test_native_file_reference_never_schedules_an_upload(
+    outgoing, db, tmp_path, monkeypatch
+):
+    api, account, channel, *_ = outgoing
+    monkeypatch.setenv("WORKSPACE_FILE_STORAGE_PATH", str(tmp_path))
+    file = api.post(
+        "/v1/messenger/files/",
+        data={"acl": '{"mode":"public"}'},
+        files={"file": ("local.txt", b"local", "text/plain")},
+    )
+    assert file.status_code == 201, file.text
+    assert file.json()["source_name"] == "native"
+    with contexts.Context().session_manager():
+        with pytest.raises(ValueError, match="different source"):
+            export(
+                account,
+                {
+                    "kind": "markdown",
+                    "content": f"[file](urn:file:{file.json()['uuid']})",
+                },
+                channel.stream_uuid,
+                outgoing[4],
+            )
+    assert not intents(db, account)
+
+
+def test_provenance_migration_converts_legacy_children_and_retires_root_links(
+    outgoing, db
+):
+    api, account, channel, *_ = outgoing
+    public = create(outgoing)
+    identifier = db.execute(
+        "SELECT message_uuid FROM messenger_message_placements WHERE uuid=%s",
+        (uuid.UUID(public["uuid"]),),
+    ).fetchone()[0]
+    db.execute(
+        "UPDATE messenger_messages SET source_name='native',provider_uuid=NULL,provider_identity=NULL,status='active' WHERE uuid=%s",
+        (identifier,),
+    )
+    db.execute(
+        "INSERT INTO zulip_entity_links(project_id,entity_type,entity_uuid,provider_uuid,external_account_uuid,provider_identity) VALUES(%s,'message',%s,%s,%s,'987')",
+        (account.project_id, identifier, account.provider_uuid, account.uuid),
+    )
+    db.execute(
+        'UPDATE zulip_outgoing_intents SET data=data||\'{"source_name":"native"}\'::jsonb WHERE entity_uuid=%s',
+        (identifier,),
+    )
+    filename = next(conftest.MIGRATIONS_DIR.glob("0267-*.py")).name
+    spec = importlib.util.spec_from_file_location(
+        "provenance_cutover", conftest.MIGRATIONS_DIR / filename
+    )
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    topic_uuid = db.execute(
+        "SELECT default_topic_uuid FROM messenger_streams WHERE uuid=%s",
+        (channel.stream_uuid,),
+    ).fetchone()[0]
+    with contexts.Context().session_manager() as session:
+        session.execute("SET CONSTRAINTS ALL DEFERRED")
+        session.execute(
+            "UPDATE messenger_streams SET default_topic_uuid=NULL WHERE uuid=%s",
+            (channel.stream_uuid,),
+        )
+        session.execute(
+            "UPDATE messenger_streams SET default_topic_uuid=%s WHERE uuid=%s",
+            (topic_uuid, channel.stream_uuid),
+        )
+        migration.migration_step.upgrade(session)
+    assert db.execute(
+        "SELECT source_name,provider_uuid,provider_identity FROM messenger_messages WHERE uuid=%s",
+        (identifier,),
+    ).fetchone() == ("zulip", account.provider_uuid, "987")
+    assert db.execute(
+        "SELECT data->>'source_name',data->>'provider_identity' FROM zulip_outgoing_intents WHERE entity_uuid=%s",
+        (identifier,),
+    ).fetchone() == ("zulip", "987")
+    assert not db.execute(
+        "SELECT 1 FROM zulip_entity_links WHERE entity_type IN('stream','topic','message')"
+    ).fetchone()
+
+
+def test_send_uses_workspace_entity_uuid_as_local_id(outgoing, db, _test_database_url):
+    _api, account, *_ = outgoing
+    public = create(outgoing)
+    canonical = db.execute(
+        "SELECT message_uuid FROM messenger_message_placements WHERE uuid=%s",
+        (uuid.UUID(public["uuid"]),),
+    ).fetchone()[0]
+
+    async def run():
+        async with sender(account, _test_database_url) as (service, server):
+            await drain(service)
+            sent = [
+                data
+                for method, path, data in server.calls
+                if method == "POST" and path == "/api/v1/messages"
+            ]
+            assert len(sent) == 1
+            assert sent[0]["local_id"] == str(canonical)
+            assert sent[0]["queue_id"] == "sender-queue"
+
+    asyncio.run(run())
+
+
+def test_retained_local_receipt_resolves_lost_response_after_queue_expiry(
+    outgoing, db, _test_database_url
+):
+    _api, account, *_ = outgoing
+    public = create(outgoing)
+    canonical = db.execute(
+        "SELECT message_uuid FROM messenger_message_placements WHERE uuid=%s",
+        (uuid.UUID(public["uuid"]),),
+    ).fetchone()[0]
+
+    async def run():
+        async with sender(account, _test_database_url) as (service, server):
+            server.lose_response = True
+            original = service.http.request
+
+            async def expired_queue(account, method, path, data=None, **kwargs):
+                if method == "GET" and path == "/events":
+                    raise outgoing_operations.ApiError(
+                        400, {"code": "BAD_EVENT_QUEUE_ID"}, "GET"
+                    )
+                return await original(account, method, path, data, **kwargs)
+
+            service.http.request = expired_queue
+            await service.dispatch()
+            await asyncio.gather(*list(service.tasks.values()))
+            await asyncio.sleep(0)
+            await service.db.sql(
+                "UPDATE zulip_outgoing_intents SET next_attempt_at=now()"
+            )
+            await service.dispatch()
+            await asyncio.gather(*list(service.tasks.values()))
+            await asyncio.sleep(0)
+            pending = await service.db.sql(
+                "SELECT status,error FROM zulip_outgoing_intents WHERE entity_uuid=%s",
+                (canonical,),
+            )
+            assert pending[0]["status"] == "checking"
+            assert "queue expiry" in pending[0]["error"]
+            # The original receiver had durably stored this event before its queue expired.
+            receipt = {**server.events[0], "local_message_id": str(canonical)}
+            await service.db.sql(
+                "INSERT INTO zulip_incoming_events(external_account_uuid,project_id,provider_uuid,owner_user_uuid,account_identity,queue_id,event_id,payload) VALUES(%s,%s,%s,%s,%s,'sender-queue',1,%s)",
+                (
+                    account.uuid,
+                    account.project_id,
+                    account.provider_uuid,
+                    account.owner_user_uuid,
+                    account.external_account_id,
+                    pg_json.Jsonb(receipt),
+                ),
+            )
+            await drain(service)
+            sent = [
+                data
+                for method, path, data in server.calls
+                if method == "POST" and path == "/api/v1/messages"
+            ]
+            assert len(sent) == 1
+            assert sent[0]["local_id"] == str(canonical)
+
+    asyncio.run(run())
+    assert db.execute(
+        "SELECT provider_identity FROM messenger_messages WHERE uuid=%s", (canonical,)
+    ).fetchone() == ("101",)
+
+
+@pytest.mark.isolated_schema
+def test_capture_and_send_do_not_depend_on_retired_channel_routes(
+    outgoing, db, _test_database_url
+):
+    _api, account, *_ = outgoing
+    db.execute("DROP TABLE bridge_zulip_v5_channels CASCADE")
+    create(outgoing)
+
+    async def run():
+        async with sender(account, _test_database_url) as (service, server):
+            await drain(service)
+            sent = [
+                data
+                for method, path, data in server.calls
+                if method == "POST" and path == "/api/v1/messages"
+            ]
+            assert len(sent) == 1
+            assert sent[0]["to"] == "42"
+
+    asyncio.run(run())

@@ -48,11 +48,11 @@
             "subProcess": true
         },
         {
-            "name": "Python Debugger: History Import",
+            "name": "Python Debugger: Zulip Outgoing",
             "type": "debugpy",
             "request": "launch",
             "python": "${workspaceFolder}/.tox/develop/bin/python",
-            "module": "workspace.cmd.history_import",
+            "module": "workspace.cmd.zulip_outgoing",
             "cwd": "${workspaceFolder}",
             "args": [
                 "--config-file",
@@ -63,26 +63,11 @@
             "subProcess": true
         },
         {
-            "name": "Python Debugger: Zulip Realtime Tasks",
+            "name": "Python Debugger: Zulip Incoming",
             "type": "debugpy",
             "request": "launch",
             "python": "${workspaceFolder}/.tox/develop/bin/python",
-            "module": "workspace.cmd.zulip_task_worker",
-            "cwd": "${workspaceFolder}",
-            "args": [
-                "--config-file",
-                "${workspaceFolder}/etc/workspace/workspace.local.conf"
-            ],
-            "console": "integratedTerminal",
-            "justMyCode": false,
-            "subProcess": true
-        },
-        {
-            "name": "Python Debugger: Zulip Realtime",
-            "type": "debugpy",
-            "request": "launch",
-            "python": "${workspaceFolder}/.tox/develop/bin/python",
-            "module": "workspace.cmd.zulip_realtime",
+            "module": "workspace.cmd.zulip_incoming",
             "cwd": "${workspaceFolder}",
             "args": [
                 "--config-file",
@@ -155,8 +140,8 @@
                 "Python Debugger: Workspace API",
                 "Python Debugger: Messenger Events",
                 "Python Debugger: Messenger Worker",
-                "Python Debugger: History Import",
-                "Python Debugger: Zulip Realtime"
+                "Python Debugger: Zulip Incoming",
+                "Python Debugger: Zulip Outgoing"
             ],
             "stopAll": true
         }

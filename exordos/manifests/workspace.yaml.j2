@@ -447,12 +447,18 @@ resources:
           poll_interval = 3
 
 
-          [history_import]
-          step_interval = 3
+          [zulip_outgoing]
+          concurrency = 128
+          connections = 128
+          dependency_delay = 0.01
+          poll_interval = 1
 
 
-          [zulip_realtime]
-          step_interval = 1
+          [zulip_incoming]
+          concurrency = 128
+          connections = 128
+          poll_interval = 1
+          dependency_delay = 0.01
 
 
           [messenger_worker_agent]
@@ -613,10 +619,10 @@ resources:
       before:
         - kind: shell
           command: /usr/local/bin/workspace-bootstrap
-    workspace_history_import:
+    workspace_zulip_incoming:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
-      name: workspace-history-import
-      path: /usr/bin/workspace-history-import --config-file /etc/workspace/workspace.conf
+      name: workspace-zulip-incoming
+      path: /usr/bin/workspace-zulip-incoming --config-file /etc/workspace/workspace.conf
       user: root
       target:
         kind: node
@@ -628,25 +634,10 @@ resources:
       before:
         - kind: shell
           command: /usr/local/bin/workspace-bootstrap
-    workspace_zulip_realtime:
+    workspace_zulip_outgoing:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
-      name: workspace-zulip-realtime
-      path: /usr/bin/workspace-zulip-realtime --config-file /etc/workspace/workspace.conf
-      user: root
-      target:
-        kind: node
-        node: $core.compute.nodes.$workspace_backend:uuid
-      service_type:
-        kind: simple
-        count: 1
-      target_status: enabled
-      before:
-        - kind: shell
-          command: /usr/local/bin/workspace-bootstrap
-    workspace_zulip_task_worker:
-      project_id: "12345678-c625-4fee-81d5-f691897b8142"
-      name: workspace-zulip-task-worker
-      path: /usr/bin/workspace-zulip-task-worker --config-file /etc/workspace/workspace.conf
+      name: workspace-zulip-outgoing
+      path: /usr/bin/workspace-zulip-outgoing --config-file /etc/workspace/workspace.conf
       user: root
       target:
         kind: node

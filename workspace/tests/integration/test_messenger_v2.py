@@ -144,7 +144,6 @@ def test_first_request_materializes_iam_user_before_native_write(http_server, db
             "name": "First request",
             "description": "",
             "source_name": "native",
-            "source": {"kind": "native"},
         },
     )
 
@@ -278,12 +277,11 @@ def test_native_v2_cutover_preserves_v1_http_and_event_contract(api, workspace_a
             "name": "Native v2",
             "description": "Canonical native Messenger",
             "source_name": "native",
-            "source": {"kind": "native"},
         },
     )
     assert response.status_code == 201, response.text
     stream = response.json()
-    assert stream["source"] == {"kind": "native"}
+    assert stream.get("provider_uuid") is None
     assert _drain() >= 3
 
     response = api.post(
@@ -299,7 +297,6 @@ def test_native_v2_cutover_preserves_v1_http_and_event_contract(api, workspace_a
         json={
             "stream_uuid": stream["uuid"],
             "name": "Architecture",
-            "source": {"kind": "native"},
         },
     )
     assert response.status_code == 201, response.text
@@ -514,7 +511,6 @@ def test_native_v2_deleted_message_supersedes_pending_projection_work(api, db):
             "name": "Deleted pending projection",
             "description": "",
             "source_name": "native",
-            "source": {"kind": "native"},
         },
     )
     assert stream_response.status_code == 201, stream_response.text
@@ -526,7 +522,6 @@ def test_native_v2_deleted_message_supersedes_pending_projection_work(api, db):
         json={
             "stream_uuid": stream["uuid"],
             "name": "Delete before fanout",
-            "source": {"kind": "native"},
         },
     )
     assert topic_response.status_code == 201, topic_response.text
@@ -576,7 +571,6 @@ def test_native_v2_direct_stream_is_idempotent_and_closed(api, db):
         "name": "Direct",
         "description": "",
         "source_name": "native",
-        "source": {"kind": "native"},
         "direct_user_uuid": str(peer_uuid),
     }
     first = api.post(STREAMS, json=body)
@@ -640,7 +634,6 @@ def test_native_v2_private_stream_requires_peer(api, db, peer):
         "description": "",
         "private": True,
         "source_name": "native",
-        "source": {"kind": "native"},
         **peer,
     }
     for _ in range(2):
@@ -737,7 +730,6 @@ def test_native_v2_fanout_is_bounded_and_outbox_is_one_to_one(api, db):
             "name": "Bounded fanout",
             "description": "",
             "source_name": "native",
-            "source": {"kind": "native"},
         },
     ).json()
     _drain()
@@ -809,7 +801,6 @@ def test_native_v2_membership_generation_fences_fanout_and_rebuilds_history(api,
             "name": "Membership generations",
             "description": "",
             "source_name": "native",
-            "source": {"kind": "native"},
         },
     ).json()
     _drain()
@@ -970,7 +961,6 @@ def test_native_v2_canonical_message_supports_multiple_placements(
             "name": "Canonical placements",
             "description": "",
             "source_name": "native",
-            "source": {"kind": "native"},
         },
     ).json()
     _drain()
@@ -1079,7 +1069,6 @@ def test_native_v2_actions_converge_counters_notifications_and_events(
             "name": "Actions and counters",
             "description": "",
             "source_name": "native",
-            "source": {"kind": "native"},
         },
     ).json()
     _drain()
@@ -1207,7 +1196,6 @@ def test_native_v2_idempotent_reads_repair_stale_counters(api, db):
             "name": "Idempotent read repair",
             "description": "",
             "source_name": "native",
-            "source": {"kind": "native"},
         },
     ).json()
     _drain()
@@ -1311,7 +1299,6 @@ def test_projection_claim_bounds_interactive_read_priority(
             "name": "Interactive read claim priority",
             "description": "",
             "source_name": "native",
-            "source": {"kind": "native"},
         },
     ).json()
     _drain()
@@ -1414,7 +1401,6 @@ def test_projection_claim_ignores_unclaimable_overdue_tasks(
                     "name": name,
                     "description": "",
                     "source_name": "native",
-                    "source": {"kind": "native"},
                 },
             ).json()
         )
@@ -1575,7 +1561,6 @@ def test_native_v2_keeps_folder_file_and_draft_contracts(api, db):
             "name": "Adjacent contracts",
             "description": "",
             "source_name": "native",
-            "source": {"kind": "native"},
         },
     ).json()
     _drain()
@@ -1730,7 +1715,6 @@ def test_native_v2_isolates_projects_and_rejects_non_members(api, workspace_api,
             "name": "Current project",
             "description": "",
             "source_name": "native",
-            "source": {"kind": "native"},
         },
     )
     assert current_stream.status_code == 201, current_stream.text
@@ -1745,7 +1729,6 @@ def test_native_v2_isolates_projects_and_rejects_non_members(api, workspace_api,
             "name": "Cross-project direct",
             "description": "",
             "source_name": "native",
-            "source": {"kind": "native"},
             "direct_user_uuid": str(other_user),
         },
     )
@@ -1757,7 +1740,6 @@ def test_native_v2_isolates_projects_and_rejects_non_members(api, workspace_api,
             "name": "Other project",
             "description": "",
             "source_name": "native",
-            "source": {"kind": "native"},
         },
     )
     assert other_stream.status_code == 201, other_stream.text
@@ -1799,7 +1781,6 @@ def test_native_v2_scheduler_preserves_fifo_within_fanout_lane(api, monkeypatch)
             "name": "Newest first",
             "description": "",
             "source_name": "native",
-            "source": {"kind": "native"},
         },
     ).json()
     _drain()
@@ -1870,7 +1851,6 @@ def test_native_v2_scheduler_drains_aged_tasks_before_fresh_fanout(api, monkeypa
             "name": "Aged before fresh",
             "description": "",
             "source_name": "native",
-            "source": {"kind": "native"},
         },
     ).json()
     _drain()
@@ -2031,7 +2011,6 @@ def test_native_v2_coalesces_legacy_folder_snapshot_bursts(api, db):
             "name": "Legacy folder snapshot burst",
             "description": "",
             "source_name": "native",
-            "source": {"kind": "native"},
         },
     )
     assert stream_response.status_code == 201, stream_response.text
@@ -2151,7 +2130,6 @@ def test_native_v2_coalesces_snapshot_only_read_counter_bursts(api, db):
             "name": "Read counter snapshot burst",
             "description": "",
             "source_name": "native",
-            "source": {"kind": "native"},
         },
     )
     assert stream_response.status_code == 201, stream_response.text
@@ -2326,7 +2304,6 @@ def test_native_v2_fanout_supports_more_than_five_thousand_recipients(api, db):
             "name": "Large native audience",
             "description": "",
             "source_name": "native",
-            "source": {"kind": "native"},
         },
     )
     assert stream_response.status_code == 201, stream_response.text

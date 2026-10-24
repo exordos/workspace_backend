@@ -1,0 +1,14 @@
+[Unit]
+Description=Workspace Zulip Outgoing Intents
+After=network-online.target
+
+[Service]
+TimeoutStopSec=40
+Restart=always
+RestartSec=5s
+KillSignal=SIGINT
+ExecStartPre=/bin/sleep 2
+ExecStart=workspace-zulip-outgoing --config-file /etc/workspace/workspace.conf
+
+[Install]
+WantedBy=multi-user.target

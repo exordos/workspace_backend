@@ -21,7 +21,7 @@ Messenger REST API:  http://127.0.0.1:21084/v1/messenger
 Events WebSocket:    ws://127.0.0.1:21082/v1/events/ws
 Workspace REST API:  http://127.0.0.1:21084/v1
 Worker:              workspace-messenger-worker
-History importer:    workspace-history-import
+Zulip incoming:      workspace-zulip-incoming
 Workspace OpenAPI:   http://127.0.0.1:21084/specifications/3.0.3
 ```
 
@@ -746,28 +746,20 @@ UUID 在 `direct_user_uuid` 中.重复或同时发送相同的请求
 ```json
 {
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  }
+  "provider_uuid": null,
+  "provider_identity": null
 }
 ```
 
 ```json
 {
   "source_name": "zulip",
-  "source": {
-    "kind": "zulip",
-    "stream_id": 123,
-    "server_url": "https://zulip.example.com",
-    "topic_name": null,
-    "message_id": null
-  }
+  "provider_uuid": "11111111-1111-5111-8111-111111111111",
+  "provider_identity": "123"
 }
 ```
 
-`zulip`有效载荷形状是提供商的来源. 一个注册的 Zulip运行时间
-通过私人提供商填写它 HTTP API;浏览器合同隐藏
-提供商协议的原始标识符,凭证和同步状态.
+Provider instances are stored once with their UUID and hostname. Public origins expose `source_name`, `provider_uuid`, and `provider_identity`; credentials and synchronization state remain private.
 
 | 场地 | 类型 | 创建时需要 | 仅供读取 | 描述 |
 | --- | --- | --- | --- | --- |
@@ -785,7 +777,8 @@ UUID 在 `direct_user_uuid` 中.重复或同时发送相同的请求
 | `active_unread_count` | 整数 | 不需要 | 是的 | 根据有效流/topic通知模式,当前用户的未读数值是符合条件的. |
 | `passive_unread_count` | 整数 | 不需要 | 是的 | 现在的用户未读的数量从默化的通知流量. |
 | `source_name` | `native`, `zulip` | 不需要 | 不需要 | 源名;默认为 `native`. |
-| `source` | 目标 | 不需要 | 不需要 | 源载荷;默认为 `{"kind": "native"}`. |
+| `provider_uuid` | UUID or `null` | no | yes | Provider instance UUID; `null` for native origins. |
+| `provider_identity` | string, max 255 or `null` | no | yes | Identity within that provider; `null` for native origins. |
 | `invite_only` | 布尔式 | 不需要 | 不需要 | 只有邀请者可以播放. |
 | `announce` | 布尔式 | 不需要 | 不需要 | 广告流旗. |
 | `direct_user_uuid` | UUID | 有条件 | 仅创建时 | 私有流必填。对方的 UUID；仅在自聊时等于当前用户 UUID。 |
@@ -806,9 +799,8 @@ UUID 在 `direct_user_uuid` 中.重复或同时发送相同的请求
   "name": "Engineering",
   "description": "Engineering workspace",
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "invite_only": false,
   "announce": false
 }
@@ -821,9 +813,8 @@ UUID 在 `direct_user_uuid` 中.重复或同时发送相同的请求
   "name": "Direct",
   "description": "Private workspace",
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "direct_user_uuid": "33333333-3333-3333-3333-333333333333"
 }
 ```
@@ -835,9 +826,8 @@ UUID 在 `direct_user_uuid` 中.重复或同时发送相同的请求
   "name": "Personal notes",
   "description": "",
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "direct_user_uuid": "11111111-1111-1111-1111-111111111111"
 }
 ```
@@ -849,14 +839,7 @@ UUID 在 `direct_user_uuid` 中.重复或同时发送相同的请求
 Native Workspace 不支持私有群聊：每个私有流都必须有非空的 `direct_user_uuid`。
 使用 `private: true` 但未指定对方的创建请求返回 HTTP `400`。
 
-直接会员是不可变的.
-身份对:一个约束自行聊天和两个普通直接
-添加或删除参与者,更新约束作用返回 HTTP
-`400`.删除自行聊天流也返回HTTP `400`所以消息历史记录
-通过删除和重建确定性身份来取代.
-创建流时，`source_name` 必须与 `source.kind` 一致。两个来源字段、
-`direct_user_uuid`、`private` 和内部 `private_index` 对所有流均不可更改；
-修改这些字段的请求返回 HTTP `400`。普通流不能通过更新转换为私有流。
+`source_name`, `provider_uuid`, `provider_identity`, `direct_user_uuid`, `private`, and `private_index` are immutable through the public API. Native creation requires `source_name = "native"` and null provider fields.
 
 流通通知模式请求:
 
@@ -1009,7 +992,8 @@ Content-Type: application/json
 | `summary_system_prompt` | 字符串,最大16384,或 `null` | 不需要 | 行动管理 | 特定主题的 LLM 系统提示符; `null` 选择应用程序默认. |
 | `summary_reasoning_effort` | `off`, `minimal`, `low`, `medium`, `high`没有`null` | 不需要 | 行动管理 | 每个总结推理选择; `off` 显式禁用推理,而 `null` 省略提供者选项.仅在选择的终点声明推理支持时使用. |
 | `source_name` | `native`, `zulip` | 不需要 | 不需要 | 主题源名;如果省略,默认为`native`. |
-| `source` | 目标 | 不需要 | 不需要 | 目标来源有效载荷. |
+| `provider_uuid` | UUID or `null` | no | yes | Provider instance UUID; `null` for native origins. |
+| `provider_identity` | string, max 255 or `null` | no | yes | Identity within that provider; `null` for native origins. |
 | `provider` | 对于一个物体或 `null` | 不需要 | 是的 | 提供者支持的主题提供商章;原生主题 `null`. |
 | `delivery` | 对于一个物体或 `null` | 不需要 | 是的 | 现在的提供者命令交付预测. |
 | `created_at` | 时间 | 不需要 | 是的 | 创造时间. |
@@ -1387,7 +1371,8 @@ Workspace 标记内容内的实体引用使用常规标记链接
 | `reactions` | 目标 | 不需要 | 是的 | 总反应数以 `emoji_name` 键. |
 | `reaction_users` | 目标 | 不需要 | 是的 | 对于被 `emoji_name` 键入的边界反应组,完成持久用户 UUID 列表.一个空的对象或缺失的密钥意味着仅计数;列表从来不是部分的. |
 | `source_name` | `native`, `zulip` | 不需要 | 不需要 | 消息源名称;如果省略,公众 API 默认将其设置为 `native`. |
-| `source` | 目标 | 不需要 | 不需要 | 消息源有效载荷;默认为`{"kind": "native"}`. Zulip `message_id`可以是`null`,直到输出同步成功. |
+| `provider_uuid` | UUID or `null` | no | yes | Provider instance UUID; `null` for native origins. |
+| `provider_identity` | string, max 255 or `null` | no | yes | Identity within that provider; `null` for native origins. |
 | `provider` | 对于一个物体或 `null` | 不需要 | 是的 | 提供商标志继承从选择的提供商支持流. |
 | `delivery` | 对于一个物体或 `null` | 不需要 | 是的 | 现在创建/update/delete交付投影. |
 | `created_at` | 时间 | 不需要 | 是的 | 创造时间. |
@@ -1420,9 +1405,8 @@ Workspace 标记内容内的实体引用使用常规标记链接
     "content": "Hello, workspace"
   },
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "user_uuid": "11111111-1111-1111-1111-111111111111",
   "read": true,
   "pinned": false,
@@ -1509,7 +1493,7 @@ Authorization: Bearer <access_token>
 | 阅读消息或阅读到消息 | `message.read` | `message` | 完全的用户消息快照由该操作返回. |
 | 阅读未读的消息 | `topic.updated`, `stream.updated`, `folder.updated` | `topic`, `stream`, `folder` | 更新了当前用户未读数的快照. |
 | 星或不星的消息 | `message.updated` | `message` | 当旗更改时,当前用户的全用户消息快照. |
-| 删除消息 | `message.deleted` | `message` | 删除消息 `uuid`, `stream_uuid`, `topic_uuid`, `author_uuid`, `source_name`,和 `source`,发送给每个流用户. |
+| 删除消息 | `message.deleted` | `message` | 删除消息 `uuid`, `stream_uuid`, `topic_uuid`, `author_uuid`, `source_name`,和 `provider_uuid`, `provider_identity`,发送给每个流用户. |
 | 删除未读的消息 | `topic.updated`, `stream.updated` | `topic`, `stream` | 更新未读数的快照,用于未读删除消息的用户; UI 从流快照中导出文件总和. |
 
 ## 项目 {#drafts}
@@ -1685,10 +1669,10 @@ If-Match: "1"
 它们不能将其与以前的值合并.
 
 反应实时有效载荷包括`uuid`,`project_id`,`message_uuid`,
-`user_uuid`, `emoji_name`, `source_name`, `source`, `provider`没有`delivery`.
+`user_uuid`, `emoji_name`, `source_name`, `provider_uuid`, `provider_identity`, `provider`没有`delivery`.
 他们从来没有暴露原始的`provider_metadata`或`delivery_metadata`.
 `message_reaction.updated`, `old_message_uuid`, `old_emoji_name`,
-`old_source_name`,和 `old_source`描述之前的反应目标.
+`old_source_name`,和 `old_provider_uuid` and `old_provider_identity`描述之前的反应目标.
 
 ## 文件 {#files}
 
@@ -1881,7 +1865,8 @@ REST `/events/` 和websocket交付使用相同的平面模式,并且两者都读
     "author_uuid": "author-user-uuid",
     "payload": {"kind": "markdown", "content": "Hello"},
     "source_name": "native",
-    "source": {"kind": "native"},
+    "provider_uuid": null,
+    "provider_identity": null,
     "read": true,
     "pinned": false,
     "starred": false,
@@ -1914,7 +1899,7 @@ Messenger 实体删除事件最小:
 - `stream.deleted`, `folder.deleted`, `folder_item.deleted`: `kind`, `uuid`
 - `topic.deleted`: `kind`, `uuid`, `stream_uuid`
 - `message.deleted`: `kind`, `uuid`, `stream_uuid`, `topic_uuid`,
-  `author_uuid`, `source_name`, `source`
+  `author_uuid`, `source_name`, `provider_uuid`, `provider_identity`
 
 `stream_bindings.created`是一个批次操作有效载荷:
 
@@ -2157,11 +2142,12 @@ IAM-认证的HTTP表面,没有提供商,邮件或日历
 单独在
 `workspace_provider_api_v1.yaml`.
 
-The Workspace backend element installs `workspace-api`,
-`workspace-messenger-events`, `workspace-messenger-worker`, and
-`workspace-history-import`. The history importer is a scaffold with an empty
-`step()` method, called every three seconds by default; configure its minimum
-period with `[history_import] step_interval`. The REST API
+The Workspace backend installs `workspace-api`, `workspace-messenger-events`,
+`workspace-messenger-worker`, `workspace-zulip-incoming` and
+`workspace-zulip-outgoing`. The incoming service receives live events using
+long polling and publishes object changes through Workspace client events.
+Historical message imports and backfill tasks are removed. Configure the
+incoming HTTP pool and fallback checks in `[zulip_incoming]`. The REST API
 uses sixteen HTTP workers by default. DBaaS provides PostgreSQL storage, and
 S3aaS stores file bytes and JSON sidecars. The separately versioned
 `workspace_ui` element serves the web UI and proxies API requests to the

@@ -21,6 +21,7 @@ from workspace.common import mutation_journal_opts
 from workspace.messenger_api import exceptions as messenger_exceptions
 from workspace.messenger_api.api import resource_projection
 from workspace.messenger_api.api import v2_store
+from workspace.messenger_api.dm import base
 from workspace.messenger_api.dm import v2_models
 
 
@@ -363,6 +364,7 @@ class JournalStore(v2_store.MessengerV2Store):
             placement_uuid=message.uuid,
             user_uuid=self.user_uuid,
             emoji_name=values["emoji_name"],
+            **base.WorkspaceProviderBase.creation_from(message),
         )
         response = resource_projection.simple(
             {
@@ -371,6 +373,10 @@ class JournalStore(v2_store.MessengerV2Store):
                 "message_uuid": message.uuid,
                 "user_uuid": fact.user_uuid,
                 "emoji_name": fact.emoji_name,
+                "source_name": fact.source_name,
+                "provider_uuid": fact.provider_uuid,
+                "provider_identity": fact.provider_identity,
+                "status": fact.status,
                 "created_at": fact.created_at,
                 "updated_at": fact.updated_at,
             }

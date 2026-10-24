@@ -90,7 +90,7 @@ current state. After a future migration, one target row stores exactly one
 copy of:
 
 - content and author;
-- projected `source`, `provider`, and `delivery` fields;
+- projected `provider_uuid`, `provider_identity`, `provider`, and `delivery` fields;
 - materialized `reactions` and `reaction_users`;
 - public `created_at` and `updated_at` timestamps.
 
@@ -152,7 +152,7 @@ The user binding gives exactly one public line.
 | `read`, `mentioned`, `starred`, `pinned` | Ready state of the user for placement from `USER_MESSAGE_STATE`; `read`  scalar projection `read_at IS NOT NULL`. |
 | `is_own` | Simple scalar comparison of `user_uuid` binding and `MESSAGE.author_uuid`; it does not require bypassing other lines. |
 | `author_uuid`, `payload` | Canonical `MESSAGE`. |
-| `source_name`, `source`, `provider`, `delivery` | Canonical `MESSAGE`; internal storage `provider`/`delivery` does not become public. |
+| `source_name`, `provider_uuid`, `provider_identity`, `provider`, `delivery` | Canonical `MESSAGE`; internal storage `provider`/`delivery` does not become public. |
 | `reactions`, `reaction_users` | Pre-materialized state of canonical `MESSAGE`, without aggregates in the reading representation. |
 | `created_at`, `updated_at` | Only the canonical `MESSAGE`. |
 
@@ -744,3 +744,6 @@ runtime/transport The controller is not selected..
 The only canonical list is in
 [`messenger_architecture_inventory.md`](messenger_architecture_inventory.md#единственный-список-open-решений).
 This document does not support a separate copy of the list.
+
+
+Provider origins use `source_name`, `provider_uuid`, and `provider_identity`; see [Provider identities](provider_identities.md). The former JSON `source` field is removed from messenger entities. `WorkspaceUser.source` is unchanged.

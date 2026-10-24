@@ -23,7 +23,6 @@ from restalchemy.common import exceptions as ra_exc
 from restalchemy.dm import models
 from restalchemy.dm import properties
 from restalchemy.dm import types
-from restalchemy.dm import types_dynamic
 
 from workspace.common import models as common_models
 from workspace.messenger_api.dm import message_payloads
@@ -59,45 +58,93 @@ class Color(types.Integer):
         return super().to_openapi_spec(prop_kwargs)
 
 
-class NativeSource(types_dynamic.AbstractKindModel):
-    KIND = "native"
-
-
-class ZulipSource(types_dynamic.AbstractKindModel):
-    KIND = "zulip"
-
-
 class SourceName(str, enum.Enum):
-    NATIVE = NativeSource.KIND
-    ZULIP = ZulipSource.KIND
+    NATIVE = "native"
+    ZULIP = "zulip"
 
 
 class StreamSourceName(str, enum.Enum):
-    NATIVE = NativeSource.KIND
-    ZULIP = ZulipSource.KIND
+    NATIVE = "native"
+    ZULIP = "zulip"
 
 
 class TopicSourceName(str, enum.Enum):
-    NATIVE = NativeSource.KIND
-    ZULIP = ZulipSource.KIND
+    NATIVE = "native"
+    ZULIP = "zulip"
 
 
-def native_source() -> NativeSource:
-    return NativeSource()
+class WorkspaceSyncStatus(str, enum.Enum):
+    NEW = "new"
+    SYNCING = "syncing"
+    ACTIVE = "active"
+    ERROR = "error"
 
 
-class WorkspaceSourceBase(models.Model):
+class WorkspaceSyncStatusBase(models.Model):
+    status = properties.property(
+        types.Enum([status.value for status in WorkspaceSyncStatus]),
+        default=WorkspaceSyncStatus.ACTIVE.value,
+        read_only=True,
+    )
+
+    def __init__(self, **kwargs: typing.Any) -> None:
+        kwargs.setdefault(
+            "status",
+            "active" if kwargs.get("source_name", "native") == "native" else "new",
+        )
+        super().__init__(**kwargs)
+
+
+class WorkspaceProviderBase(WorkspaceSyncStatusBase):
     source_name = properties.property(
         types.Enum([source.value for source in SourceName]),
         default=SourceName.NATIVE.value,
     )
-    source = properties.property(
-        types_dynamic.KindModelSelectorType(
-            types_dynamic.KindModelType(NativeSource),
-            types_dynamic.KindModelType(ZulipSource),
-        ),
-        default=native_source,
+    provider_uuid = properties.property(types.AllowNone(types.UUID()), default=None)
+    provider_identity = properties.property(
+        types.AllowNone(types.String(min_length=1, max_length=255)), default=None
     )
+
+    def validate(self) -> None:
+        super().validate()
+        if self.source_name == "native" and (
+            self.provider_uuid is not None
+            or self.provider_identity is not None
+            or self.status != "active"
+        ):
+            raise ra_exc.ValidationErrorException()
+        if self.source_name == "zulip" and self.provider_uuid is None:
+            raise ra_exc.ValidationErrorException()
+
+    @staticmethod
+    def creation_from(parent: typing.Any) -> dict[str, typing.Any]:
+        return {
+            "source_name": parent.source_name,
+            "provider_uuid": parent.provider_uuid,
+            "provider_identity": None,
+            "status": "active" if parent.source_name == "native" else "new",
+        }
+
+    @staticmethod
+    def validate_native_creation(values: dict[str, typing.Any]) -> None:
+        if (
+            values.get("source_name", "native") != "native"
+            or values.get("provider_uuid") is not None
+            or values.get("provider_identity") is not None
+            or values.get("status", "active") != "active"
+        ):
+            raise ra_exc.ValidationErrorException()
+
+    @staticmethod
+    def validate_provider_update(values: dict[str, typing.Any]) -> None:
+        if {"source_name", "provider_uuid", "provider_identity", "status"}.intersection(
+            values
+        ):
+            raise ra_exc.ValidationErrorException()
+
+
+class WorkspaceSourceBase(WorkspaceProviderBase):
+    pass
 
 
 class WorkspaceTopicSourceBase(WorkspaceSourceBase):
@@ -105,12 +152,9 @@ class WorkspaceTopicSourceBase(WorkspaceSourceBase):
         types.Enum([source.value for source in TopicSourceName]),
         default=SourceName.NATIVE.value,
     )
-    source = properties.property(
-        types_dynamic.KindModelSelectorType(
-            types_dynamic.KindModelType(NativeSource),
-            types_dynamic.KindModelType(ZulipSource),
-        ),
-        default=native_source,
+    provider_uuid = properties.property(types.AllowNone(types.UUID()), default=None)
+    provider_identity = properties.property(
+        types.AllowNone(types.String(min_length=1, max_length=255)), default=None
     )
 
 
@@ -248,6 +292,7 @@ class WorkspaceTopicNotificationMode(str, enum.Enum):
 
 
 class WorkspaceStreamBase(
+    WorkspaceSyncStatusBase,
     models.ModelWithUUID,
     models.ModelWithProject,
     common_models.ModelWithRequiredNameDesc,
@@ -261,12 +306,9 @@ class WorkspaceStreamBase(
         types.Enum([source.value for source in StreamSourceName]),
         required=True,
     )
-    source = properties.property(
-        types_dynamic.KindModelSelectorType(
-            types_dynamic.KindModelType(NativeSource),
-            types_dynamic.KindModelType(ZulipSource),
-        ),
-        required=True,
+    provider_uuid = properties.property(types.AllowNone(types.UUID()), default=None)
+    provider_identity = properties.property(
+        types.AllowNone(types.String(min_length=1, max_length=255)), default=None
     )
     invite_only = properties.property(
         types.Boolean(),
@@ -332,6 +374,7 @@ class WorkspaceStreamEncryptionCreation(models.Model):
 
 
 class WorkspaceUserStreamBase(
+    WorkspaceSyncStatusBase,
     UserScopedModelWithUUID,
     common_models.ModelWithRequiredNameDesc,
     models.ModelWithProject,
@@ -371,12 +414,9 @@ class WorkspaceUserStreamBase(
         types.Enum([source.value for source in StreamSourceName]),
         required=True,
     )
-    source = properties.property(
-        types_dynamic.KindModelSelectorType(
-            types_dynamic.KindModelType(NativeSource),
-            types_dynamic.KindModelType(ZulipSource),
-        ),
-        required=True,
+    provider_uuid = properties.property(types.AllowNone(types.UUID()), default=None)
+    provider_identity = properties.property(
+        types.AllowNone(types.String(min_length=1, max_length=255)), default=None
     )
     invite_only = properties.property(
         types.Boolean(),

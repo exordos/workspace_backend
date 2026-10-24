@@ -650,7 +650,7 @@ Comparing the presentation:
 | `read`, `mentioned`, `starred`, `pinned` | unique for placement `USER_MESSAGE_STATE`; public `read`  scalar `read_at IS NOT NULL` | Read only in CRUD | actions or worker |
 | `is_own` | The scalar equality of the connected ID | Read only | not stored as a source of truth |
 | `author_uuid`, `payload` | `MESSAGE.author_uuid/payload` | author is read-only; `payload` is for creation and updating | Canonical message |
-| `source_name`, `source` | `MESSAGE` | Only for creation | Canonical message |
+| `source_name`, `provider_uuid`, `provider_identity` | `MESSAGE` | Only for creation | Canonical message |
 | `provider`, `delivery` | The materialized projection `MESSAGE` | Read only | Provider path or background path |
 | `reactions`, `reaction_users` | The canonical state of things | Read only | Change in reaction or background path |
 | `created_at`, `updated_at` | `MESSAGE.created_at/updated_at` | Read only | Only the canonical message |
@@ -1141,9 +1141,8 @@ direct/self chat.
   "reactions": {},
   "reaction_users": {},
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "provider": null,
   "delivery": null,
   "created_at": "2026-06-22T10:10:00Z",
@@ -1173,9 +1172,8 @@ direct/self chat.
   "reactions": {},
   "reaction_users": {},
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "provider": null,
   "delivery": null,
   "created_at": "2026-06-22T10:10:00Z",
@@ -1205,9 +1203,8 @@ direct/self chat.
   "reactions": {},
   "reaction_users": {},
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "provider": null,
   "delivery": null,
   "created_at": "2026-06-22T10:10:00Z",
@@ -1237,9 +1234,8 @@ direct/self chat.
   "reactions": {},
   "reaction_users": {},
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "provider": null,
   "delivery": null,
   "created_at": "2026-06-22T10:10:00Z",
@@ -1270,9 +1266,8 @@ direct/self chat.
     "reactions": {},
     "reaction_users": {},
     "source_name": "native",
-    "source": {
-      "kind": "native"
-    },
+    "provider_uuid": null,
+    "provider_identity": null,
     "provider": null,
     "delivery": null,
     "created_at": "2026-06-22T10:10:00Z",
@@ -1952,9 +1947,8 @@ GET /api/workspace/v1/messenger/streams/?private=false&page_limit=50&page_marker
   "name": "Engineering",
   "description": "Engineering workspace",
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "invite_only": false,
   "announce": false
 }
@@ -1968,9 +1962,8 @@ Other participant:
   "name": "Direct",
   "description": "Private workspace",
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "direct_user_uuid": "33333333-3333-3333-3333-333333333333"
 }
 ```
@@ -1982,9 +1975,8 @@ Other participant:
   "name": "Personal notes",
   "description": "",
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "direct_user_uuid": "11111111-1111-1111-1111-111111111111"
 }
 ```
@@ -2008,9 +2000,8 @@ The current user `direct_user_uuid`:
   "active_unread_count": 0,
   "passive_unread_count": 0,
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "invite_only": false,
   "announce": false,
   "direct_user_uuid": "11111111-1111-1111-1111-111111111111",
@@ -2093,9 +2084,8 @@ list UUID, returns `400001005`.
   "active_unread_count": 2,
   "passive_unread_count": 0,
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "invite_only": false,
   "announce": false,
   "direct_user_uuid": null,
@@ -2127,9 +2117,8 @@ list UUID, returns `400001005`.
   "active_unread_count": 2,
   "passive_unread_count": 0,
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "invite_only": false,
   "announce": false,
   "direct_user_uuid": null,
@@ -2161,9 +2150,8 @@ list UUID, returns `400001005`.
   "active_unread_count": 1,
   "passive_unread_count": 1,
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "invite_only": false,
   "announce": false,
   "direct_user_uuid": null,
@@ -2195,9 +2183,8 @@ list UUID, returns `400001005`.
   "active_unread_count": 0,
   "passive_unread_count": 0,
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "invite_only": false,
   "announce": false,
   "direct_user_uuid": null,
@@ -2230,9 +2217,8 @@ list UUID, returns `400001005`.
     "active_unread_count": 2,
     "passive_unread_count": 0,
     "source_name": "native",
-    "source": {
-      "kind": "native"
-    },
+    "provider_uuid": null,
+    "provider_identity": null,
     "invite_only": false,
     "announce": false,
     "direct_user_uuid": null,
@@ -2855,9 +2841,8 @@ They get `403`.
   "summary_system_prompt": null,
   "summary_reasoning_effort": null,
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "provider": null,
   "delivery": null,
   "created_at": "2026-06-22T09:10:00Z",
@@ -2890,9 +2875,8 @@ follow, set-default, toggle-done, update request and read:
   "summary_system_prompt": "Summarize decisions, owners, and unresolved risks.",
   "summary_reasoning_effort": "medium",
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "provider": null,
   "delivery": null,
   "created_at": "2026-06-22T09:10:00Z",
@@ -2925,9 +2909,8 @@ follow, set-default, toggle-done, update request and read:
     "summary_system_prompt": null,
     "summary_reasoning_effort": null,
     "source_name": "native",
-    "source": {
-      "kind": "native"
-    },
+    "provider_uuid": null,
+    "provider_identity": null,
     "provider": null,
     "delivery": null,
     "created_at": "2026-06-22T09:10:00Z",

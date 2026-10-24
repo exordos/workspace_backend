@@ -34,6 +34,7 @@ from workspace.common import messenger_reaction_opts
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api.api import resource_projection
 from workspace.messenger_api.dm import message_payloads
+from workspace.messenger_api.dm import synchronization
 from workspace.messenger_api.dm import v2_models
 from workspace.services.messenger_workers import owned_projection
 
@@ -1147,7 +1148,8 @@ def _message_namespace(
                message.uuid AS canonical_message_uuid,
                message.author_uuid AS user_uuid, message.payload,
                message.created_at, message.updated_at, message.source_name,
-               message.source, message.reaction_users
+               message.provider_uuid,
+               message.provider_identity, message.status, message.reaction_users
         FROM messenger_message_placements AS placement
         JOIN messenger_messages AS message
           ON message.project_id = placement.project_id
@@ -1695,8 +1697,8 @@ def _process_fanout(
             INSERT INTO messenger_user_message_states (
                 uuid, project_id, placement_uuid, user_uuid,
                 membership_generation, read_at, mentioned,
-                created_at, updated_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                created_at, updated_at, source_name, provider_uuid, status
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (project_id, user_uuid, placement_uuid) DO UPDATE
             SET membership_generation = EXCLUDED.membership_generation,
                 read_at = EXCLUDED.read_at,
@@ -1717,6 +1719,9 @@ def _process_fanout(
                 f"](urn:user:{str(user_uuid).lower()})" in content,
                 now,
                 now,
+                message.source_name,
+                message.provider_uuid,
+                "active" if message.source_name == "native" else "new",
             ),
         )
     recipient_uuids = accepted_recipients
@@ -2069,7 +2074,10 @@ def _process_reaction_snapshot(
             old_message = types.SimpleNamespace(
                 uuid=_uuid(payload["old_message_uuid"]),
                 source_name=payload["old_source_name"],
-                source=payload["old_source"],
+                provider_uuid=_uuid(payload["old_provider_uuid"])
+                if payload["old_provider_uuid"] is not None
+                else None,
+                provider_identity=payload["old_provider_identity"],
             )
             emitted = messenger_events.create_message_reaction_updated_event(
                 reaction,
@@ -2627,7 +2635,7 @@ def _process_topic_membership_policy_rebuild(
     rows = session.execute(
         """
         SELECT placement.uuid, message.author_uuid, message.payload,
-               message.created_at
+               message.created_at, message.source_name, message.provider_uuid
         FROM messenger_message_placements AS placement
         JOIN messenger_messages AS message
           ON message.project_id = placement.project_id
@@ -2697,8 +2705,8 @@ def _process_topic_membership_policy_rebuild(
             INSERT INTO messenger_user_message_states (
                 uuid, project_id, placement_uuid, user_uuid,
                 membership_generation, read_at, mentioned,
-                created_at, updated_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                created_at, updated_at, source_name, provider_uuid, status
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (project_id, user_uuid, placement_uuid) DO UPDATE
             SET membership_generation = EXCLUDED.membership_generation,
                 read_at = EXCLUDED.read_at,
@@ -2719,6 +2727,9 @@ def _process_topic_membership_policy_rebuild(
                 f"](urn:user:{str(user_uuid).lower()})" in content,
                 now,
                 now,
+                row["source_name"],
+                row["provider_uuid"],
+                "active" if row["source_name"] == "native" else "new",
             ),
         )
     if rows:
@@ -2840,7 +2851,8 @@ def _deliver_snapshot_batch(
                         _uuid(recipient),
                         _uuid(payload["stream_uuid"]),
                         payload["source_name"],
-                        payload["source"],
+                        payload["provider_uuid"],
+                        payload["provider_identity"],
                         session=session,
                     )
                 )
@@ -2864,7 +2876,8 @@ def _deliver_snapshot_batch(
                         _uuid(payload["topic_uuid"]),
                         _uuid(payload["stream_uuid"]),
                         payload["source_name"],
-                        payload["source"],
+                        payload["provider_uuid"],
+                        payload["provider_identity"],
                         session=session,
                     )
                 )
@@ -2927,7 +2940,8 @@ def _deliver_snapshot_batch(
                 _uuid(placement["topic_uuid"]),
                 _uuid(payload["author_uuid"]),
                 payload["source_name"],
-                payload["source"],
+                payload["provider_uuid"],
+                payload["provider_identity"],
                 session=session,
                 compact=True,
             )
@@ -3393,6 +3407,7 @@ def process_one_projection_task(
             metrics[outcome_key] = metrics.get(outcome_key, 0.0) + 1
     except Exception as error:
         session.execute("ROLLBACK TO SAVEPOINT messenger_v2_projection_task", ())
+        synchronization.record_error(error, session=session)
         attempts = int(task["attempts"])
         status = "dead_letter" if attempts >= max_attempts else "failed"
         outcome = status

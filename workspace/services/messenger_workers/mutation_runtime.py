@@ -23,12 +23,10 @@ from restalchemy.common import exceptions
 from restalchemy.dm import filters as dm_filters
 from restalchemy.storage.sql import sessions
 
-from workspace.bridges.zulip.dm import flags
-from workspace.bridges.zulip.dm import models as zulip_models
-from workspace.bridges.zulip.dm import reactions
 from workspace.messenger_api import events
 from workspace.messenger_api.api import v2_store
 from workspace.messenger_api.dm import message_payloads
+from workspace.messenger_api.dm import synchronization
 from workspace.messenger_api.dm import v2_models
 from workspace.services.messenger_workers import keyed_dispatcher
 from workspace.services.messenger_workers import owned_projection
@@ -226,7 +224,6 @@ class MutationRuntime:
             self._dispatcher.trigger(("project", row["project_id"], row["user_uuid"]))
 
     def _scan(self, session: sessions.PgSQLSession) -> None:
-        self._scan_provider_inputs(session)
         if (
             session.execute(
                 """SELECT 1 FROM messenger_mutation_commands
@@ -311,68 +308,6 @@ class MutationRuntime:
             (),
         ).fetchall():
             self._dispatcher.trigger(("publish", row["project_id"]))
-
-    def _scan_provider_inputs(self, session: sessions.PgSQLSession) -> None:
-        # Provider observations already have durable revisioned input journals.
-        # Keep those originals rather than adding a second copy of each input.
-        for row in session.execute(
-            """SELECT project_id,message_uuid FROM bridge_zulip_v5_message_changes
-               UNION SELECT project_id,message_uuid FROM messenger_message_changes
-               LIMIT 128""",
-            (),
-        ).fetchall():
-            topics = session.execute(
-                """SELECT topic_uuid FROM messenger_message_placements
-                   WHERE project_id=%s AND message_uuid=%s
-                   UNION
-                   SELECT observed.topic AS topic_uuid FROM bridge_zulip_v5_messages AS observed
-                   WHERE observed.project_id=%s
-                     AND messenger_uuid_v5(observed.project_id,observed.message_uuid::text)=%s""",
-                (
-                    row["project_id"],
-                    row["message_uuid"],
-                    row["project_id"],
-                    row["message_uuid"],
-                ),
-            ).fetchall()
-            self._dispatcher.trigger(
-                ("provider_message", row["project_id"], row["message_uuid"]),
-                reservations=self._topic_reservations(row["project_id"], topics),
-            )
-        for row in session.execute(
-            """SELECT change.project_id,change.state_uuid,placement.topic_uuid
-               FROM bridge_zulip_v5_flag_changes AS change
-               JOIN messenger_user_message_states AS state
-                 ON state.project_id=change.project_id AND state.uuid=change.state_uuid
-               JOIN messenger_message_placements AS placement
-                 ON placement.project_id=state.project_id AND placement.uuid=state.placement_uuid
-               ORDER BY change.revision LIMIT 128""",
-            (),
-        ).fetchall():
-            topic_key = ("topic", row["project_id"], row["topic_uuid"])
-            self._dispatcher.trigger(
-                ("provider_flags", row["project_id"], row["topic_uuid"]),
-                [row["state_uuid"]],
-                [topic_key],
-            )
-        for row in session.execute(
-            """SELECT project_id,canonical_message_uuid FROM bridge_zulip_v5_reaction_changes
-               WHERE next_retry_at IS NULL OR next_retry_at<=NOW() AT TIME ZONE 'UTC'
-               ORDER BY revision LIMIT 128""",
-            (),
-        ).fetchall():
-            topics = session.execute(
-                "SELECT topic_uuid FROM messenger_message_placements WHERE project_id=%s AND message_uuid=%s",
-                (row["project_id"], row["canonical_message_uuid"]),
-            ).fetchall()
-            self._dispatcher.trigger(
-                (
-                    "provider_reactions",
-                    row["project_id"],
-                    row["canonical_message_uuid"],
-                ),
-                reservations=self._topic_reservations(row["project_id"], topics),
-            )
 
     def tick(self) -> bool:
         completed = self._dispatcher.poll()
@@ -481,6 +416,13 @@ class MutationRuntime:
             and str(message.topic_uuid) != command["payload"]["values"]["_topic_uuid"]
         ):
             raise exceptions.ValidationErrorException()
+        actor = session.execute(
+            "SELECT current_setting('workspace.outgoing_actor',true) AS actor"
+        ).fetchone()["actor"]
+        session.execute(
+            "SELECT set_config('workspace.outgoing_actor',%s,true)",
+            (str(store.user_uuid),),
+        )
         session.execute("SELECT set_config('workspace.batch_flags', 'on', true)", ())
         changed = session.execute(
             """UPDATE messenger_user_message_states AS state
@@ -514,6 +456,9 @@ class MutationRuntime:
             ),
         ).fetchall()
         session.execute("SELECT set_config('workspace.batch_flags', 'off', true)", ())
+        session.execute(
+            "SELECT set_config('workspace.outgoing_actor',%s,true)", (actor or "",)
+        )
         changes = typing.cast(owned_projection.Changes, owned_projection.CURRENT.get())
         if not changed:
             # Preserve the public idempotent repair behavior.
@@ -524,20 +469,6 @@ class MutationRuntime:
                 [store.user_uuid],
             )
             return v2_store._public(store._message(message.uuid), "messages")
-        session.execute(
-            """INSERT INTO bridge_zulip_v5_flag_changes(project_id,state_uuid)
-               SELECT %s,changed.uuid FROM unnest(%s::uuid[]) AS changed(uuid)
-               WHERE EXISTS (SELECT 1 FROM messenger_streams
-                   WHERE project_id=%s AND uuid=%s AND source_name='zulip')
-               ORDER BY changed.uuid
-               ON CONFLICT (project_id,state_uuid) DO UPDATE SET revision=EXCLUDED.revision""",
-            (
-                store.project_uuid,
-                [row["uuid"] for row in changed],
-                store.project_uuid,
-                message.stream_uuid,
-            ),
-        )
         session.execute(
             """WITH delta AS (
                  SELECT count(*) AS unread,
@@ -754,6 +685,12 @@ class MutationRuntime:
             ).folders[(project_id, row["user_uuid"], row["folder_uuid"])] = True
 
     def _publish(self, session: sessions.PgSQLSession, project_id: uuid.UUID) -> None:
+        locked = session.execute(
+            "SELECT pg_try_advisory_xact_lock(hashtextextended(%s::text, 0)) AS locked",
+            (project_id,),
+        ).fetchone()["locked"]
+        if not locked:
+            return
         for row in session.execute(
             "SELECT * FROM messenger_publication_outbox WHERE project_id=%s ORDER BY sequence LIMIT 256",
             (project_id,),
@@ -774,57 +711,18 @@ class MutationRuntime:
                 "DELETE FROM messenger_publication_outbox WHERE uuid=%s", (row["uuid"],)
             )
 
-    def _deleted_canonical(
-        self,
-        session: sessions.PgSQLSession,
-        project_id: uuid.UUID,
-        canonical_uuid: uuid.UUID,
-    ) -> bool:
-        current = session.execute(
-            "SELECT ingest_sequence FROM messenger_messages WHERE project_id=%s AND uuid=%s",
-            (project_id, canonical_uuid),
-        ).fetchone()
-        # Provider message IDs cannot be reused. An explicit native create
-        # using the same UUID has a different ingest generation and is valid.
-        return (
-            session.execute(
-                """SELECT 1 FROM messenger_message_delete_tombstones
-               WHERE project_id=%s AND canonical_message_uuid=%s
-                 AND (%s::bigint IS NULL OR ingest_sequence=%s) LIMIT 1""",
-                (
-                    project_id,
-                    canonical_uuid,
-                    current["ingest_sequence"] if current else None,
-                    current["ingest_sequence"] if current else None,
-                ),
-            ).fetchone()
-            is not None
-        )
-
-    def _ack_deleted_observations(
-        self,
-        session: sessions.PgSQLSession,
-        project_id: uuid.UUID,
-        canonical_uuid: uuid.UUID,
-    ) -> None:
-        # These are independent original input journals, not a dependent
-        # domain-data delete chain. Snapshot revisions fence concurrent input.
-        for table, key in [
-            ("bridge_zulip_v5_message_changes", "message_uuid"),
-            ("messenger_message_changes", "message_uuid"),
-            ("bridge_zulip_v5_reaction_changes", "canonical_message_uuid"),
-        ]:
-            row = session.execute(
-                f"SELECT revision FROM {table} WHERE project_id=%s AND {key}=%s",
-                (project_id, canonical_uuid),
-            ).fetchone()
-            if row is not None:
-                session.execute(
-                    f"DELETE FROM {table} WHERE project_id=%s AND {key}=%s AND revision=%s",
-                    (project_id, canonical_uuid, row["revision"]),
-                )
-
     def _execute(self, work: keyed_dispatcher.Work) -> owned_projection.Changes:
+        try:
+            return self._execute_transaction(work)
+        except Exception as error:
+            if getattr(error, "workspace_sync_scopes", ()):
+                with contexts.Context().session_manager() as session:
+                    synchronization.record_error(error, session=session)
+            raise
+
+    def _execute_transaction(
+        self, work: keyed_dispatcher.Work
+    ) -> owned_projection.Changes:
         with contexts.Context().session_manager() as session:
             session.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", ())
             with owned_projection.capture() as changes:
@@ -857,36 +755,6 @@ class MutationRuntime:
                     )
                 elif kind == "command":
                     self._commands(session, work)
-                elif kind == "provider_message":
-                    if self._deleted_canonical(session, *work.key[1:]):
-                        self._ack_deleted_observations(session, *work.key[1:])
-                    else:
-                        zulip_models.ZulipMessageState.reconcile_batch(
-                            1, project_id=work.key[1], message_uuids=[work.key[2]]
-                        )
-                elif kind == "provider_flags":
-                    flags.FlagChange.reconcile_batch(
-                        self._batch_size, state_ids=list(work.values)
-                    )
-                elif kind == "provider_reactions":
-                    if self._deleted_canonical(session, *work.key[1:]):
-                        self._ack_deleted_observations(session, *work.key[1:])
-                        return changes
-                    row = session.execute(
-                        "SELECT revision FROM bridge_zulip_v5_reaction_changes WHERE project_id=%s AND canonical_message_uuid=%s",
-                        work.key[1:],
-                    ).fetchone()
-                    if row is not None:
-                        if reactions.reconcile(*work.key[1:]):
-                            session.execute(
-                                "UPDATE bridge_zulip_v5_reaction_changes SET next_retry_at=NOW()+interval '5 seconds' WHERE project_id=%s AND canonical_message_uuid=%s AND revision=%s",
-                                (*work.key[1:], row["revision"]),
-                            )
-                        else:
-                            session.execute(
-                                "DELETE FROM bridge_zulip_v5_reaction_changes WHERE project_id=%s AND canonical_message_uuid=%s AND revision=%s",
-                                (*work.key[1:], row["revision"]),
-                            )
                 elif kind == "projection":
                     self._projections(session, work)
                 elif kind == "topic":
@@ -956,20 +824,9 @@ class MutationRuntime:
     ) -> None:
         kind = work.key[0]
         pairs = []
-        if kind in {"provider_message", "provider_reactions"}:
-            pairs.append(work.key[1:])
-        elif kind == "command" and ":message:" in work.key[1]:
+        if kind == "command" and ":message:" in work.key[1]:
             project_id, _kind, message_uuid = work.key[1].split(":")
             pairs.append((_uuid(project_id), _uuid(message_uuid)))
-        if kind == "provider_flags":
-            rows = session.execute(
-                """SELECT placement.project_id,placement.message_uuid
-                   FROM messenger_user_message_states AS state
-                   JOIN messenger_message_placements AS placement ON placement.project_id=state.project_id AND placement.uuid=state.placement_uuid
-                   WHERE state.uuid=ANY(%s::uuid[])""",
-                (list(work.values),),
-            ).fetchall()
-            pairs.extend((row["project_id"], row["message_uuid"]) for row in rows)
         if kind in {"command", "projection"}:
             if kind == "command":
                 rows = session.execute(
@@ -1015,10 +872,9 @@ class MutationRuntime:
         required = set()
         for project_id, canonical_uuid in pairs:
             topics = session.execute(
-                """SELECT topic_uuid FROM messenger_message_placements WHERE project_id=%s AND message_uuid=%s
-                   UNION SELECT topic AS topic_uuid FROM bridge_zulip_v5_messages
-                   WHERE project_id=%s AND messenger_uuid_v5(project_id,message_uuid::text)=%s""",
-                (project_id, canonical_uuid, project_id, canonical_uuid),
+                """SELECT topic_uuid FROM messenger_message_placements
+                   WHERE project_id=%s AND message_uuid=%s""",
+                (project_id, canonical_uuid),
             ).fetchall()
             required.update(self._topic_reservations(project_id, topics))
         if not required.issubset(work.reservations):
