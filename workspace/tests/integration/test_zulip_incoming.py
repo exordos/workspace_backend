@@ -960,7 +960,10 @@ def test_inbox_preserves_order_across_retry_and_service_restart(incoming):
     asyncio.run(run())
 
 
-def test_cutover_keeps_live_events_and_cursor_and_removes_history_tasks(_database):
+@pytest.mark.parametrize("placement_references", [False, True])
+def test_cutover_keeps_live_events_and_cursor_and_removes_history_tasks(
+    _database, placement_references
+):
     import importlib.util
     import psycopg
 
@@ -970,6 +973,16 @@ def test_cutover_keeps_live_events_and_cursor_and_removes_history_tasks(_databas
         with psycopg.connect(
             url, autocommit=True, row_factory=rows.dict_row
         ) as connection:
+            if placement_references:
+                for table in ("bridge_zulip_v5_deliveries", "bridge_zulip_v5_messages"):
+                    connection.execute(
+                        f"ALTER TABLE {table} ADD COLUMN placement_event_uuid uuid "
+                        "REFERENCES bridge_zulip_v5_events(uuid) ON DELETE SET NULL"
+                    )
+                connection.execute(
+                    "CREATE VIEW bridge_zulip_v5_retired_placement_states AS "
+                    "SELECT uuid, placement_event_uuid FROM bridge_zulip_v5_messages"
+                )
             owner, project = uuid.uuid4(), uuid.uuid4()
             conftest.seed_workspace_user(connection, owner, str(owner))
             account = external_models.ExternalAccount(
@@ -1042,6 +1055,23 @@ def test_cutover_keeps_live_events_and_cursor_and_removes_history_tasks(_databas
             assert (
                 connection.execute(
                     "SELECT to_regclass('bridge_zulip_v5_tasks') AS name"
+                ).fetchone()["name"]
+                is None
+            )
+            assert (
+                connection.execute(
+                    "SELECT to_regclass('bridge_zulip_v5_events') AS name"
+                ).fetchone()["name"]
+                is None
+            )
+            assert not connection.execute(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_name IN ('bridge_zulip_v5_deliveries', 'bridge_zulip_v5_messages') "
+                "AND column_name='placement_event_uuid'"
+            ).fetchall()
+            assert (
+                connection.execute(
+                    "SELECT to_regclass('bridge_zulip_v5_retired_placement_states') AS name"
                 ).fetchone()["name"]
                 is None
             )

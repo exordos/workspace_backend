@@ -93,7 +93,9 @@ WHERE event.source='zulip' AND event.event_id IS NOT NULL
 ORDER BY event.created_at, event.event_id
 ON CONFLICT DO NOTHING;
 DROP TABLE bridge_zulip_v5_tasks CASCADE;
-DROP TABLE bridge_zulip_v5_events;
+ALTER TABLE bridge_zulip_v5_deliveries DROP COLUMN IF EXISTS placement_event_uuid CASCADE;
+ALTER TABLE bridge_zulip_v5_messages DROP COLUMN IF EXISTS placement_event_uuid CASCADE;
+DROP TABLE bridge_zulip_v5_events CASCADE;
 DROP TABLE bridge_zulip_v5_subscriptions;
 DROP TABLE bridge_zulip_v5_message_fingerprints;
 DROP TABLE bridge_zulip_v5_history_batches CASCADE;
