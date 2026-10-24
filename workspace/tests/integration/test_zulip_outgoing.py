@@ -1398,3 +1398,68 @@ def test_file_receipt_never_temporarily_revokes_the_uploaders_access(
             await database.close()
 
     asyncio.run(run())
+
+
+def test_canonical_message_has_one_destination_and_copy_gets_new_uuid(
+    outgoing, db, _test_database_url
+):
+    api, account, channel, *_ = outgoing
+    second = api.post(
+        "/v1/messenger/streams/",
+        json={"name": "Second channel", "description": "", "source_name": "native"},
+    )
+    assert second.status_code == 201, second.text
+    second_stream = second.json()
+    with db.transaction():
+        db.execute("SELECT set_config('workspace.zulip_incoming','on',true)")
+        db.execute(
+            "UPDATE messenger_streams SET source_name='zulip',provider_uuid=%s,provider_identity='43' WHERE uuid=%s",
+            (account.provider_uuid, second_stream["uuid"]),
+        )
+        for table in ("messenger_topics", "messenger_stream_bindings"):
+            db.execute(
+                f"UPDATE {table} SET source_name='zulip',provider_uuid=%s,provider_identity='43:' WHERE stream_uuid=%s",
+                (account.provider_uuid, second_stream["uuid"]),
+            )
+        db.execute(
+            "UPDATE messenger_user_topic_bindings SET source_name='zulip',provider_uuid=%s,provider_identity='43::7' WHERE topic_uuid=%s",
+            (account.provider_uuid, second_stream["default_topic_uuid"]),
+        )
+    canonical = uuid.uuid4()
+    first = create(outgoing, canonical)
+    original = {
+        "uuid": str(canonical),
+        "stream_uuid": str(channel.stream_uuid),
+        "payload": first["payload"],
+    }
+    again = api.post("/v1/messenger/messages/", json=original)
+    assert again.status_code == 201 and again.json()["uuid"] == first["uuid"]
+    other = {**original, "stream_uuid": second_stream["uuid"]}
+    rejected = api.post("/v1/messenger/messages/", json=other)
+    assert rejected.status_code == 400, rejected.text
+    copied = api.post(
+        "/v1/messenger/messages/", json={**other, "uuid": str(uuid.uuid4())}
+    )
+    assert copied.status_code == 201, copied.text
+    assert copied.json()["uuid"] != first["uuid"]
+    assert (
+        db.execute(
+            "SELECT count(*) FROM messenger_message_placements WHERE message_uuid=%s",
+            (canonical,),
+        ).fetchone()[0]
+        == 1
+    )
+
+    async def run():
+        async with sender(account, _test_database_url) as (service, server):
+            await drain(service)
+            sends = [
+                call
+                for call in server.calls
+                if call[:2] == ("POST", "/api/v1/messages")
+            ]
+            assert len(sends) == 2
+            assert {str(call[2]["to"]) for call in sends} == {"42", "43"}
+            assert len(server.messages) == 2
+
+    asyncio.run(run())

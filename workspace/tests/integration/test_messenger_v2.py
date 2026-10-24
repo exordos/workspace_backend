@@ -947,112 +947,43 @@ def test_native_v2_membership_generation_fences_fanout_and_rebuilds_history(api,
         assert cursor.fetchone()[0] == 3
 
 
-def test_native_v2_canonical_message_supports_multiple_placements(
-    api, workspace_api, db
-):
-    workspace_api.user_uuid = api.user_uuid
-    workspace_api.project_id = api.project_id
-    peer_uuid = sys_uuid.uuid4()
-    conftest.seed_workspace_user(db, peer_uuid, f"user-{peer_uuid}")
-    _register_project_user(db, api.project_id, peer_uuid)
+def test_native_v2_canonical_message_copy_is_independent(api, db):
     stream = api.post(
-        STREAMS,
-        json={
-            "name": "Canonical placements",
-            "description": "",
-            "source_name": "native",
-        },
+        STREAMS, json={"name": "Copies", "description": "", "source_name": "native"}
     ).json()
-    _drain()
-    api.post(
-        f"{STREAMS}{stream['uuid']}/actions/add_users/invoke",
-        json={"member": [str(peer_uuid)]},
-    )
-    first_topic = api.post(
-        STREAM_TOPICS,
-        json={"stream_uuid": stream["uuid"], "name": "First"},
-    ).json()
-    second_topic = api.post(
-        STREAM_TOPICS,
-        json={"stream_uuid": stream["uuid"], "name": "Second"},
-    ).json()
-    _drain()
-
-    canonical_uuid = sys_uuid.uuid4()
-    message_body = {
-        "uuid": str(canonical_uuid),
+    topics = [
+        api.post(
+            STREAM_TOPICS, json={"stream_uuid": stream["uuid"], "name": name}
+        ).json()
+        for name in ("First", "Second")
+    ]
+    canonical_uuid = str(sys_uuid.uuid4())
+    body = {
+        "uuid": canonical_uuid,
         "stream_uuid": stream["uuid"],
-        "payload": {"kind": "markdown", "content": "shared content"},
+        "topic_uuid": topics[0]["uuid"],
+        "payload": {"kind": "markdown", "content": "original"},
     }
-    first = api.post(
-        MESSAGES,
-        json={**message_body, "topic_uuid": first_topic["uuid"]},
-    )
-    second = api.post(
-        MESSAGES,
-        json={**message_body, "topic_uuid": second_topic["uuid"]},
-    )
-    assert first.status_code == second.status_code == 201
-    assert first.json()["uuid"] != second.json()["uuid"]
-    assert first.json()["uuid"] == str(
-        sys_uuid.uuid5(sys_uuid.UUID(first_topic["uuid"]), str(canonical_uuid))
-    )
-    assert second.json()["uuid"] == str(
-        sys_uuid.uuid5(sys_uuid.UUID(second_topic["uuid"]), str(canonical_uuid))
-    )
-    _drain()
-
-    reaction = api.post(
-        MESSAGE_REACTIONS,
-        json={
-            "message_uuid": first.json()["uuid"],
-            "emoji_name": "rocket",
-        },
-    )
-    assert reaction.status_code == 201, reaction.text
-    _drain()
-    for placement_uuid in (first.json()["uuid"], second.json()["uuid"]):
-        visible = api.get(f"{MESSAGES}{placement_uuid}", user=peer_uuid)
-        assert visible.status_code == 200, visible.text
-        assert visible.json()["reactions"] == {"rocket": 1}
-
-    updated = api.put(
-        f"{MESSAGES}{first.json()['uuid']}",
-        json={"payload": {"kind": "markdown", "content": "updated once"}},
-    )
-    assert updated.status_code == 200, updated.text
-    _drain()
+    first = api.post(MESSAGES, json=body)
+    assert first.status_code == 201, first.text
+    assert api.post(MESSAGES, json=body).json()["uuid"] == first.json()["uuid"]
+    copy_body = {**body, "topic_uuid": topics[1]["uuid"]}
+    assert api.post(MESSAGES, json=copy_body).status_code == 400
+    second = api.post(MESSAGES, json={**copy_body, "uuid": str(sys_uuid.uuid4())})
+    assert second.status_code == 201, second.text
     assert (
-        api.get(f"{MESSAGES}{second.json()['uuid']}", user=peer_uuid).json()["payload"][
-            "content"
-        ]
-        == "updated once"
+        api.put(
+            f"{MESSAGES}{first.json()['uuid']}",
+            json={"payload": {"kind": "markdown", "content": "edited"}},
+        ).status_code
+        == 200
     )
-    events = workspace_api.get(EVENTS, params={"page_limit": 500}, user=peer_uuid)
-    updated_message_uuids = {
-        event["payload"]["uuid"]
-        for event in events.json()
-        if event["payload"]["kind"] == "message.updated"
-    }
-    assert {first.json()["uuid"], second.json()["uuid"]} <= updated_message_uuids
-
-    deleted = api.delete(f"{MESSAGES}{first.json()['uuid']}")
-    assert deleted.status_code == 204, deleted.text
-    _drain()
-    assert api.get(f"{MESSAGES}{first.json()['uuid']}").status_code == 404
-    assert api.get(f"{MESSAGES}{second.json()['uuid']}").status_code == 404
-    with db.cursor() as cursor:
-        cursor.execute(
-            """
-            SELECT
-                (SELECT count(*) FROM messenger_messages
-                 WHERE project_id = %s AND uuid = %s),
-                (SELECT count(*) FROM messenger_message_reaction_facts
-                 WHERE project_id = %s AND canonical_message_uuid = %s)
-            """,
-            (api.project_id, canonical_uuid, api.project_id, canonical_uuid),
-        )
-        assert cursor.fetchone() == (0, 0)
+    assert (
+        api.get(f"{MESSAGES}{second.json()['uuid']}").json()["payload"]["content"]
+        == "original"
+    )
+    assert api.delete(f"{MESSAGES}{first.json()['uuid']}").status_code == 204
+    assert api.get(f"{MESSAGES}{second.json()['uuid']}").status_code == 200
 
 
 def test_native_v2_actions_converge_counters_notifications_and_events(

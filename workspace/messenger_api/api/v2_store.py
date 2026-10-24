@@ -963,6 +963,14 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                     or existing_canonical["provider_uuid"] != stream.provider_uuid
                 ):
                     raise ra_exceptions.ValidationErrorException()
+        if (
+            session.execute(
+                "SELECT 1 FROM messenger_message_placements WHERE project_id=%s AND message_uuid=%s LIMIT 1",
+                (self.project_uuid, canonical_uuid),
+            ).fetchone()
+            is not None
+        ):
+            raise ra_exceptions.ValidationErrorException()
         inserted_placement = session.execute(
             """
             INSERT INTO messenger_message_placements (
