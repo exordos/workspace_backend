@@ -309,7 +309,6 @@ class MutationRuntime:
         ).fetchall():
             self._dispatcher.trigger(("publish", row["project_id"]))
 
-
     def tick(self) -> bool:
         completed = self._dispatcher.poll()
         for work, changes, error in completed:
@@ -417,6 +416,13 @@ class MutationRuntime:
             and str(message.topic_uuid) != command["payload"]["values"]["_topic_uuid"]
         ):
             raise exceptions.ValidationErrorException()
+        actor = session.execute(
+            "SELECT current_setting('workspace.outgoing_actor',true) AS actor"
+        ).fetchone()["actor"]
+        session.execute(
+            "SELECT set_config('workspace.outgoing_actor',%s,true)",
+            (str(store.user_uuid),),
+        )
         session.execute("SELECT set_config('workspace.batch_flags', 'on', true)", ())
         changed = session.execute(
             """UPDATE messenger_user_message_states AS state
@@ -450,6 +456,9 @@ class MutationRuntime:
             ),
         ).fetchall()
         session.execute("SELECT set_config('workspace.batch_flags', 'off', true)", ())
+        session.execute(
+            "SELECT set_config('workspace.outgoing_actor',%s,true)", (actor or "",)
+        )
         changes = typing.cast(owned_projection.Changes, owned_projection.CURRENT.get())
         if not changed:
             # Preserve the public idempotent repair behavior.
@@ -695,8 +704,6 @@ class MutationRuntime:
             session.execute(
                 "DELETE FROM messenger_publication_outbox WHERE uuid=%s", (row["uuid"],)
             )
-
-
 
     def _execute(self, work: keyed_dispatcher.Work) -> owned_projection.Changes:
         try:

@@ -1238,3 +1238,39 @@ def test_topic_edit_skips_already_deleted_messages_in_the_event(incoming, messag
         ]
         == updated["subject"]
     )
+
+
+def test_journal_read_enqueues_the_provider_flag_change(incoming):
+    from oslo_config import cfg
+    from workspace.common import mutation_journal_opts
+    from workspace.services.messenger_workers import mutation_runtime
+    from workspace.tests.integration import test_mutation_journal as journal_tests
+
+    api, db, account, _http, _url = incoming
+    unread = event()
+    unread["flags"] = []
+    apply(incoming, unread)
+    drain()
+    message = api.get("/v1/messenger/messages/").json()[0]
+    assert message["read"] is False
+    cfg.CONF.set_override("enabled", True, group=mutation_journal_opts.DOMAIN)
+    runtime = mutation_runtime.MutationRuntime()
+    try:
+        response = api.post(
+            f"/v1/messenger/messages/{message['uuid']}/actions/read/invoke"
+        )
+        assert response.status_code == 200, response.text
+        journal_tests.drain(runtime, db)
+        assert (
+            api.get("/v1/messenger/messages/" + message["uuid"]).json()["read"] is True
+        )
+        intents = db.execute(
+            "SELECT data->>'source_name',data->>'read_at',data->>'actor_uuid' FROM zulip_outgoing_intents WHERE entity_type='message_state' AND external_account_uuid=%s",
+            (account["uuid"],),
+        ).fetchall()
+        assert len(intents) == 1
+        assert intents[0][0] == "zulip" and intents[0][1] is not None
+        assert intents[0][2] == str(account["owner_user_uuid"])
+    finally:
+        runtime.close()
+        cfg.CONF.clear_override("enabled", group=mutation_journal_opts.DOMAIN)
