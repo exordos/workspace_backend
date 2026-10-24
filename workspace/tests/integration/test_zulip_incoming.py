@@ -871,13 +871,33 @@ def test_reaction_payload_preserves_its_actor_for_other_recipients(incoming):
         linked.delete()
 
 
-def test_topic_rename_preserves_identity_and_last_delete_removes_topic(incoming):
+@pytest.mark.parametrize("native", [False, True])
+def test_topic_rename_preserves_identity_and_last_delete_removes_topic(
+    incoming, native
+):
     api, db, account, http, _url = incoming
     apply(incoming, event())
     topic = db.execute(
         "SELECT uuid FROM messenger_topics WHERE project_id=%s AND provider_identity='42:General'",
         (account["project_id"],),
     ).fetchone()[0]
+    if native:
+        db.execute(
+            "UPDATE messenger_topics SET source_name='native',provider_uuid=NULL,"
+            "provider_identity=NULL WHERE project_id=%s AND uuid=%s",
+            (account["project_id"], topic),
+        )
+        db.execute(
+            outgoing_operations.UPSERT_ENTITY_LINK_SQL,
+            (
+                account["project_id"],
+                "topic",
+                topic,
+                account["provider_uuid"],
+                account["uuid"],
+                "42:General",
+            ),
+        )
     message = {**event()["message"], "subject": "Renamed topic"}
     http.request.return_value = {"message": message}
     apply(

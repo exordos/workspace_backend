@@ -2274,17 +2274,23 @@ class Operations:
             stream_uuid = await self.identity(
                 account, "stream", event["stream_id"], connection=connection
             )
-            topics = await rows(
-                connection,
-                SELECT_TOPIC_SQL,
-                (
-                    account["project_id"],
-                    stream_uuid,
-                    f"{event['stream_id']}:{event['orig_subject']}",
-                ),
-            )
+            for subject in (event["orig_subject"], event["subject"]):
+                identifier = await self.identity(
+                    account,
+                    "topic",
+                    f"{event['stream_id']}:{subject}",
+                    connection=connection,
+                )
+                topics = await rows(
+                    connection,
+                    SELECT_ROW_SQL.format(table=TABLES["topic"]),
+                    (account["project_id"], identifier),
+                )
+                if topics:
+                    break
             if topics:
                 topic = topics[0]
+                identity = f"{event['stream_id']}:{event['subject']}"
                 changed = await self.save(
                     connection,
                     TABLES["topic"],
@@ -2293,8 +2299,19 @@ class Operations:
                         "project_id": account["project_id"],
                         "name": event["subject"].removeprefix("✔ ") or "General",
                         "is_done": event["subject"].startswith("✔ "),
-                        "provider_identity": f"{event['stream_id']}:{event['subject']}",
+                        "provider_identity": identity,
                     },
+                )
+                await connection.execute(
+                    outgoing_operations.UPSERT_ENTITY_LINK_SQL,
+                    (
+                        account["project_id"],
+                        "topic",
+                        topic["uuid"],
+                        account["provider_uuid"],
+                        account["uuid"],
+                        identity,
+                    ),
                 )
                 if changed:
                     await self.snapshot(
