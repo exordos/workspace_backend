@@ -14,6 +14,7 @@ import pytest
 from restalchemy.common import contexts
 
 from workspace.bridges.zulip import incoming_operations
+from workspace.messenger_api import file_storage
 from workspace.messenger_api.dm import external_models
 from workspace.services import zulip_incoming
 from workspace.services import zulip_outgoing
@@ -1852,3 +1853,111 @@ def test_permanent_event_failure_does_not_block_the_next_event(
             await service.db.close()
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("reference", ["none", "file", "upload", "failure"])
+def test_incoming_file_removal_cleans_storage_after_commit(
+    incoming, monkeypatch, tmp_path, reference
+):
+    _api, db, account, http, url = incoming
+    monkeypatch.setenv("WORKSPACE_FILE_STORAGE_PATH", str(tmp_path))
+    http.download = mock.AsyncMock(return_value=(b"file", "text/plain"))
+    apply(
+        incoming,
+        {
+            "type": "attachment",
+            "op": "add",
+            "attachment": {"id": 55, "path_id": "1/a/file.txt", "name": "file.txt"},
+        },
+    )
+    apply(incoming, event("[file](/user_uploads/1/a/file.txt)"))
+    with db.cursor(row_factory=rows.dict_row) as cursor:
+        cursor.execute(
+            "SELECT * FROM m_workspace_files WHERE project_id=%s",
+            (account["project_id"],),
+        )
+        file = cursor.fetchone()
+    blob = file_storage.get_workspace_file_path(
+        file["uuid"], storage_object_id=file["storage_object_id"]
+    )
+    sidecar = file_storage._get_local_file_path(
+        file_storage.get_workspace_file_metadata_object_id(file["uuid"])
+    )
+    assert blob.exists() and sidecar.exists()
+    other = uuid.uuid4()
+    if reference == "file":
+        with db.transaction():
+            db.execute("SELECT set_config('workspace.zulip_incoming','on',true)")
+            db.execute(
+                "INSERT INTO m_workspace_files SELECT (jsonb_populate_record(NULL::m_workspace_files,to_jsonb(file)||jsonb_build_object('uuid',%s::uuid,'provider_identity',NULL))).* FROM m_workspace_files file WHERE uuid=%s",
+                (other, file["uuid"]),
+            )
+    elif reference == "upload":
+        db.execute(
+            "INSERT INTO zulip_outgoing_intents(project_id,entity_type,entity_uuid,ordering_key,external_account_uuid,operation,data) VALUES (%s,'file',%s,'pending-upload',%s,'insert',%s)",
+            (
+                account["project_id"],
+                other,
+                account["uuid"],
+                incoming_operations.json_value(file),
+            ),
+        )
+    apply(incoming, {"type": "attachment", "op": "remove", "attachment": {"id": 55}})
+    # The blob is still present immediately after the database deletion commits.
+    assert blob.exists()
+    with db.cursor(row_factory=rows.dict_row) as cursor:
+        cursor.execute(
+            "SELECT * FROM zulip_outgoing_intents WHERE project_id=%s AND entity_type='file' AND entity_uuid=%s AND operation='delete'",
+            (account["project_id"], file["uuid"]),
+        )
+        cleanup = cursor.fetchone()
+    assert cleanup
+    http.request.reset_mock()
+
+    async def finish():
+        database = zulip_outgoing.Database(url)
+        await database.open()
+        operations = incoming_operations.outgoing_operations.Operations(database, http)
+        try:
+            prepared = await operations.prepare(cleanup, account)
+            result = await operations.execute(cleanup, account, prepared, False)
+            await operations.finish(cleanup, account, prepared, result)
+        finally:
+            await database.close()
+
+    if reference == "upload":
+        with pytest.raises(incoming_operations.outgoing_operations.Pending):
+            asyncio.run(finish())
+        assert blob.exists()
+        assert (
+            db.execute(
+                "SELECT status FROM zulip_outgoing_intents WHERE id=%s",
+                (cleanup["id"],),
+            ).fetchone()[0]
+            != "done"
+        )
+        db.execute(
+            "UPDATE zulip_outgoing_intents SET status='done' WHERE entity_uuid=%s",
+            (other,),
+        )
+    if reference == "failure":
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                file_storage,
+                "delete_workspace_file",
+                mock.Mock(side_effect=OSError("Storage unavailable")),
+            )
+            with pytest.raises(OSError):
+                asyncio.run(finish())
+        assert blob.exists()
+        assert (
+            db.execute(
+                "SELECT status FROM zulip_outgoing_intents WHERE id=%s",
+                (cleanup["id"],),
+            ).fetchone()[0]
+            != "done"
+        )
+    asyncio.run(finish())
+    assert blob.exists() is (reference == "file")
+    assert not sidecar.exists()
+    http.request.assert_not_called()

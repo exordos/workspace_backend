@@ -22,6 +22,13 @@ from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api.dm import models
 
 
+ENQUEUE_FILE_CLEANUP_SQL = """
+    INSERT INTO zulip_outgoing_intents (
+        project_id, entity_type, entity_uuid, ordering_key,
+        external_account_uuid, operation, data
+    ) VALUES (%s, 'file', %s, %s, %s, 'delete', %s)
+"""
+
 SELECT_ROW_SQL = "SELECT * FROM {table} WHERE project_id = %s AND uuid = %s"
 INSERT_ROW_SQL = """
     INSERT INTO {table} ({columns}) VALUES ({parameters})
@@ -2618,6 +2625,23 @@ class Operations:
                 await connection.execute(
                     DELETE_ROW_SQL.format(table=TABLES["file"]),
                     (account["project_id"], file["uuid"]),
+                )
+                await connection.execute(
+                    ENQUEUE_FILE_CLEANUP_SQL,
+                    (
+                        account["project_id"],
+                        file["uuid"],
+                        f"file:{file['uuid']}",
+                        account["uuid"],
+                        json_value(
+                            {
+                                **file,
+                                "provider_deleted": True,
+                                "account_identity": account["external_account_id"],
+                                "account_provider_uuid": account["provider_uuid"],
+                            }
+                        ),
+                    ),
                 )
             else:
                 changed = await self.save(

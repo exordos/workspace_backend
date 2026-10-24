@@ -266,11 +266,11 @@ COMPLETE_INTENT_SQL = """
 """
 
 SELECT_FILE_REFERENCES_SQL = """
-    SELECT 1
+    SELECT 'file' AS kind
     FROM m_workspace_files
     WHERE storage_type = %s AND storage_id = %s AND storage_object_id = %s
     UNION ALL
-    SELECT 1
+    SELECT 'upload' AS kind
     FROM zulip_outgoing_intents
     WHERE entity_type = 'file'
       AND operation = 'insert'
@@ -278,7 +278,6 @@ SELECT_FILE_REFERENCES_SQL = """
       AND data->>'storage_type' = %s
       AND data->>'storage_id' = %s
       AND data->>'storage_object_id' = %s
-    LIMIT 1
 """
 
 
@@ -514,6 +513,8 @@ class Operations:
             )
         if kind == "file":
             if operation == "delete":
+                if data.get("provider_deleted"):
+                    return request("noop", "", "")
                 remote = data.get("remote_identity") or await self.identity(
                     intent, account, "file", intent["entity_uuid"]
                 )
@@ -1222,11 +1223,6 @@ class Operations:
                 ),
             )
         await self.status(intent, "active")
-        await self.db.sql(
-            COMPLETE_INTENT_SQL,
-            (intent["id"],),
-        )
-
         if intent["entity_type"] == "file" and intent["operation"] == "delete":
             data = intent["data"]
             references = await self.db.sql(
@@ -1247,3 +1243,11 @@ class Operations:
                     storage_type=data["storage_type"],
                     storage_object_id=data["storage_object_id"],
                 )
+            await asyncio.to_thread(
+                file_storage.delete_workspace_file_metadata,
+                uuid.UUID(data["uuid"]),
+                storage_type=data["storage_type"],
+            )
+            if references and not any(row["kind"] == "file" for row in references):
+                raise Pending("Waiting for unfinished uploads before deleting storage")
+        await self.db.sql(COMPLETE_INTENT_SQL, (intent["id"],))
