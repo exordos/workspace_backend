@@ -126,10 +126,9 @@ def outgoing(api, db, monkeypatch):
     zulip.get_messages.side_effect = lambda first, last: [dict(remote)]
     constructor = mock.Mock(return_value=zulip)
     yield api, account, channel, remote, zulip, constructor
-    for message in v2_models.WorkspaceMessage.objects.get_all(
-        filters={"project_id": filters.EQ(api.project_id)}
-    ):
-        message.delete()
+    # The fixture also owns published schemas predating content normalization.
+    # Delete their canonical roots without loading the current metadata model.
+    db.execute("DELETE FROM messenger_messages WHERE project_id=%s", (api.project_id,))
     account.delete()
     for stream in v2_models.WorkspaceStream.objects.get_all(
         filters={"project_id": filters.EQ(api.project_id)}
@@ -390,6 +389,35 @@ def test_superseded_edits_finish_without_replacing_the_latest_content(
             ] == ["Raw **message**", "third"]
 
     asyncio.run(run())
+
+
+def test_repeated_outgoing_content_reuses_conversion_and_page(
+    outgoing, db, _test_database_url
+):
+    _api, account, *_ = outgoing
+    first = create(outgoing)
+    second = create(outgoing)
+
+    async def run():
+        async with sender(account, _test_database_url) as (service, server):
+            # Sequential delivery proves reuse after the first conversion has
+            # committed; concurrent misses may both compute before sharing a page.
+            service.concurrency = 1
+            with mock.patch.object(
+                message_conversion,
+                "workspace_to_zulip",
+                wraps=message_conversion.workspace_to_zulip,
+            ) as convert:
+                await drain(service)
+            assert convert.call_count == 1
+            assert len(server.messages) == 2
+
+    asyncio.run(run())
+    assert db.execute(
+        "SELECT count(DISTINCT content_uuid) FROM messenger_messages WHERE uuid IN "
+        "(SELECT message_uuid FROM messenger_message_placements WHERE uuid=ANY(%s))",
+        ([uuid.UUID(first["uuid"]), uuid.UUID(second["uuid"])],),
+    ).fetchone() == (1,)
 
 
 def test_reaction_waits_for_message_id(outgoing, db, _test_database_url):
@@ -754,7 +782,7 @@ def test_create_then_delete_executes_from_snapshots_after_root_cleanup(
     asyncio.run(run())
 
 
-def seed_delivery(account, placement, message):
+def seed_delivery(account, placement):
     """Persist a known copy when testing inbound observations without HTTP."""
     topic = v2_models.WorkspaceStreamTopic.objects.get_one(
         filters={
@@ -768,7 +796,7 @@ def seed_delivery(account, placement, message):
         (
             uuid.uuid4(),
             account.project_id,
-            message.uuid,
+            placement.message_uuid,
             placement.stream_uuid,
             account.uuid,
             account.get_host(),
@@ -819,7 +847,9 @@ def export(account, payload, stream_uuid, zulip):
         }
         for _ in range(10):
             try:
-                return await operations.convert(intent, account_data)
+                return (await operations.convert(intent, account_data))[
+                    "provider_content"
+                ]
             except outgoing_operations.Pending:
                 files = await db.sql(
                     "SELECT * FROM zulip_outgoing_intents WHERE entity_type='file' AND status='new' AND entity_uuid=ANY(%s)",
@@ -903,13 +933,7 @@ def test_cutover_preserves_queued_and_unscheduled_changes(outgoing, db):
                     "project_id": filters.EQ(account.project_id),
                 }
             )
-            message = v2_models.WorkspaceMessage.objects.get_one(
-                filters={
-                    "uuid": filters.EQ(placement.message_uuid),
-                    "project_id": filters.EQ(account.project_id),
-                }
-            )
-            copies.append(seed_delivery(account, placement, message))
+            copies.append(seed_delivery(account, placement))
         contexts.Context().get_session().execute(
             "UPDATE bridge_zulip_v5_deliveries SET sending=true WHERE uuid=%s",
             (copies[0].uuid,),
@@ -1177,9 +1201,12 @@ def test_native_file_reference_never_schedules_an_upload(
     assert not intents(db, account)
 
 
+@pytest.mark.isolated_schema
 def test_provenance_migration_converts_legacy_children_and_retires_root_links(
     outgoing, db
 ):
+    # Reapplying this published migration reinstalls its published SQL trigger.
+    # It must not replace the current trigger in the shared test database.
     api, account, channel, *_ = outgoing
     public = create(outgoing)
     identifier = db.execute(

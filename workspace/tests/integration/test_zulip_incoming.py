@@ -19,6 +19,8 @@ from oslo_config import cfg
 from restalchemy.common import contexts
 
 from workspace.bridges.zulip import incoming_operations
+from workspace.bridges.zulip import content_cache
+from workspace.bridges.zulip import message_conversion
 from workspace.common import mutation_journal_opts
 from workspace.messenger_api import file_storage
 from workspace.messenger_api import publication
@@ -75,6 +77,63 @@ def event(content="Hello", identifier=101):
             "flags": [],
             "timestamp": int(datetime.datetime.now(datetime.timezone.utc).timestamp()),
         },
+    }
+
+
+def test_repeated_incoming_content_reuses_conversion_and_page(incoming):
+    api, db, *_ = incoming
+    with mock.patch.object(
+        message_conversion,
+        "zulip_to_workspace_cached",
+        wraps=message_conversion.zulip_to_workspace_cached,
+    ) as convert:
+        apply(
+            incoming, event("Reusable **text**", 701), event("Reusable **text**", 702)
+        )
+    assert convert.call_count == 1
+    messages = api.get("/v1/messenger/messages/").json()
+    assert len(messages) == 2
+    assert len({message["uuid"] for message in messages}) == 2
+    assert db.execute(
+        "SELECT count(DISTINCT content_uuid) FROM messenger_messages WHERE uuid IN "
+        "(SELECT message_uuid FROM messenger_message_placements WHERE uuid=ANY(%s))",
+        ([uuid.UUID(message["uuid"]) for message in messages],),
+    ).fetchone() == (1,)
+
+
+@pytest.mark.parametrize("text", ["> Quoted text", "```math\nx+y\n```"])
+def test_identity_dependent_incoming_content_keeps_each_message_reference(
+    incoming, text
+):
+    api, db, *_ = incoming
+    with mock.patch.object(
+        message_conversion,
+        "zulip_to_workspace_cached",
+        wraps=message_conversion.zulip_to_workspace_cached,
+    ) as convert:
+        apply(incoming, event(text, 711), event(text, 712))
+    assert convert.call_count == 2
+    messages = api.get("/v1/messenger/messages/").json()
+    assert len(messages) == 2
+    assert messages[0]["payload"] != messages[1]["payload"]
+    assert db.execute(
+        "SELECT count(*) FROM bridge_zulip_v5_content_snapshots cache "
+        "JOIN messenger_message_contents contents ON contents.uuid=cache.content_uuid "
+        "WHERE cache.direction='incoming' AND cache.delivery_uuid IS NULL "
+        "AND contents.provider_content=%s",
+        (text,),
+    ).fetchone() == (0,)
+
+
+def test_conversion_cache_collision_cannot_reuse_another_source(incoming):
+    api, _db, account, *_ = incoming
+    fixed_key = content_cache.key(account["provider_uuid"], "incoming", "fixed", {})
+    with mock.patch.object(content_cache, "key", return_value=fixed_key):
+        apply(incoming, event("First text", 721), event("Second text", 722))
+    messages = api.get("/v1/messenger/messages/").json()
+    assert {message["payload"]["content"] for message in messages} == {
+        "First text",
+        "Second text",
     }
 
 
@@ -492,7 +551,18 @@ def test_pending_zulip_echo_reuses_root_and_fills_canonical_identity(incoming):
     )
     db.execute(
         incoming_operations.outgoing_operations.INSERT_CONTENT_SNAPSHOT_SQL,
-        (uuid.uuid4(), delivery, "**Original**", "*Original*"),
+        (
+            uuid.uuid4(),
+            delivery,
+            db.execute(
+                "SELECT messenger_resolve_message_content(%s::jsonb,%s)",
+                (
+                    json.dumps({"kind": "markdown", "content": "**Original**"}),
+                    "*Original*",
+                ),
+            ).fetchone()[0],
+            1,
+        ),
     )
     db.execute(
         "UPDATE zulip_outgoing_intents SET status='done' WHERE project_id=%s",
@@ -501,10 +571,15 @@ def test_pending_zulip_echo_reuses_root_and_fills_canonical_identity(incoming):
     echo = event("*Original*", 202)
     echo["local_message_id"] = str(canonical)
     echo["message"]["timestamp"] += 5
-    apply(incoming, echo)
+    with mock.patch.object(
+        message_conversion,
+        "zulip_to_workspace_cached",
+        side_effect=AssertionError("An exact outgoing snapshot needs no reconversion"),
+    ):
+        apply(incoming, echo)
     drain()
     root = db.execute(
-        "SELECT source_name,provider_uuid,provider_identity,payload FROM messenger_messages WHERE project_id=%s AND uuid=%s",
+        "SELECT source_name,provider_uuid,provider_identity,payload FROM messenger_messages_with_content_v1 WHERE project_id=%s AND uuid=%s",
         (account["project_id"], canonical),
     ).fetchone()
     assert root == (
@@ -2061,10 +2136,14 @@ def test_stale_queued_edit_cannot_replace_a_newer_provider_update(incoming):
     with db.transaction():
         db.execute("SELECT set_config('workspace.zulip_incoming','on',true)")
         db.execute(
-            "UPDATE messenger_messages SET payload='{"
-            + '"kind":"markdown","content":"New provider edit"'
-            + "}',content_updated_at=%s WHERE project_id=%s",
-            (future, account["project_id"]),
+            "UPDATE messenger_messages SET content_uuid="
+            "messenger_resolve_message_content(%s::jsonb,NULL),"
+            "content_updated_at=%s WHERE project_id=%s",
+            (
+                json.dumps({"kind": "markdown", "content": "New provider edit"}),
+                future,
+                account["project_id"],
+            ),
         )
 
     async def prepare():
@@ -2557,7 +2636,7 @@ def test_provider_identity_collisions_do_not_cross_message_or_read_state(incomin
             },
         )
         found = db.execute(
-            "SELECT message.provider_uuid,message.payload->>'content',state.read_at IS NOT NULL FROM messenger_messages message JOIN messenger_message_placements placement ON placement.message_uuid=message.uuid AND placement.project_id=message.project_id JOIN messenger_user_message_states state ON state.placement_uuid=placement.uuid AND state.project_id=placement.project_id WHERE message.project_id=%s",
+            "SELECT message.provider_uuid,message.payload->>'content',state.read_at IS NOT NULL FROM messenger_messages_with_content_v1 message JOIN messenger_message_placements placement ON placement.message_uuid=message.uuid AND placement.project_id=message.project_id JOIN messenger_user_message_states state ON state.placement_uuid=placement.uuid AND state.project_id=placement.project_id WHERE message.project_id=%s",
             (account["project_id"],),
         ).fetchall()
         assert set(found) == {

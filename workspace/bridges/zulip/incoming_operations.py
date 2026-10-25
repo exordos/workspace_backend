@@ -16,6 +16,7 @@ from psycopg.types import json as pg_json
 
 from workspace.bridges.zulip import message_conversion
 from workspace.bridges.zulip import outgoing_operations
+from workspace.bridges.zulip import content_cache
 from workspace.common import emoji
 from workspace.messenger_api import file_storage
 from workspace.messenger_api import publication
@@ -110,10 +111,11 @@ SELECT_PENDING_SEND_SQL = """
     LIMIT 1
 """
 SELECT_CONTENT_SNAPSHOT_SQL = """
-    SELECT snapshot.workspace_content FROM bridge_zulip_v5_content_snapshots snapshot
+    SELECT contents.uuid,contents.workspace_content FROM bridge_zulip_v5_content_snapshots snapshot
     JOIN bridge_zulip_v5_deliveries delivery ON delivery.uuid = snapshot.delivery_uuid
+    JOIN messenger_message_contents contents ON contents.uuid=snapshot.content_uuid
     WHERE delivery.project_id = %s AND delivery.message_uuid = %s
-      AND snapshot.zulip_content = %s
+      AND contents.provider_content = %s
     ORDER BY snapshot.created_at DESC LIMIT 1
 """
 OBSERVE_DELIVERY_SQL = """
@@ -1180,7 +1182,7 @@ class Operations:
         if kind == "message":
             if "_shared_key" in event:
                 known = await self.db.sql(
-                    "SELECT payload,deleted_at FROM messenger_messages WHERE project_id=%s AND provider_uuid=%s AND source_name='zulip' AND provider_identity=%s",
+                    "SELECT payload,deleted_at FROM messenger_messages_with_content_v1 WHERE project_id=%s AND provider_uuid=%s AND source_name='zulip' AND provider_identity=%s",
                     (
                         account["project_id"],
                         account["provider_uuid"],
@@ -1991,7 +1993,7 @@ class Operations:
         )
         old = await rows(
             connection,
-            SELECT_ROW_SQL.format(table=TABLES["message"]),
+            SELECT_ROW_SQL.format(table="messenger_messages_with_content_v1"),
             (account["project_id"], identifier),
         )
         if deliveries and not old:
@@ -2163,17 +2165,41 @@ class Operations:
                     recipients=[row["viewer_user_uuid"] for row in snapshots],
                 )
             context["files"][target] = f"urn:file:{values['uuid']}"
-        payload = message_conversion.zulip_to_workspace(data, context)
         content_snapshots = await rows(
             connection,
             SELECT_CONTENT_SNAPSHOT_SQL,
             (account["project_id"], identifier, data["content"]),
         )
-        if content_snapshots:
-            payload = {
-                "kind": "markdown",
-                "content": content_snapshots[0]["workspace_content"],
-            }
+        cache_key = content_cache.key(
+            account["provider_uuid"],
+            "incoming",
+            data["content"],
+            content_cache.incoming_context(data, context),
+        )
+        # Exact outgoing snapshots retain the author's original spelling. They
+        # take precedence over generic conversions, including after a restart.
+        content = content_snapshots
+        if not content and str(data["id"]) not in data["content"]:
+            content = await rows(
+                connection,
+                content_cache.LOOKUP_SQL.format(source="provider_content"),
+                (*cache_key, data["content"]),
+            )
+        if content:
+            payload = content[0]["workspace_content"]
+        else:
+            payload, reusable = message_conversion.zulip_to_workspace_cached(
+                data, context
+            )
+            content = await rows(
+                connection,
+                content_cache.RESOLVE_SQL,
+                (pg_json.Jsonb(payload), data["content"]),
+            )
+            if reusable:
+                await connection.execute(
+                    content_cache.SAVE_SQL, (*cache_key, content[0]["uuid"])
+                )
         created = datetime.datetime.fromtimestamp(
             data["timestamp"], datetime.timezone.utc
         ).replace(tzinfo=None)
@@ -2202,7 +2228,7 @@ class Operations:
                     "uuid": identifier,
                     "project_id": account["project_id"],
                     "author_uuid": author,
-                    "payload": payload,
+                    "content_uuid": content[0]["uuid"],
                     "created_at": created,
                     "content_updated_at": edited,
                     **origin(account, str(data["id"])),
@@ -2652,7 +2678,7 @@ class Operations:
         identifier = data["id"] if kind == "message" else event["message_id"]
         canonical = await rows(
             connection,
-            "SELECT * FROM messenger_messages WHERE project_id=%s AND provider_uuid=%s AND source_name='zulip' AND provider_identity=%s",
+            "SELECT * FROM messenger_messages_with_content_v1 WHERE project_id=%s AND provider_uuid=%s AND source_name='zulip' AND provider_identity=%s",
             (account["project_id"], account["provider_uuid"], str(identifier)),
         )
         if not canonical:

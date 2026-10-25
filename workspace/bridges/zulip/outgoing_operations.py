@@ -12,6 +12,7 @@ import uuid
 from psycopg.types import json as pg_json
 
 from workspace.bridges.zulip import message_conversion
+from workspace.bridges.zulip import content_cache
 from workspace.common import emoji
 from workspace.messenger_api import file_storage
 
@@ -132,11 +133,7 @@ UPSERT_DELIVERED_MESSAGE_SQL = """
 """
 
 INSERT_CONTENT_SNAPSHOT_SQL = """
-    INSERT INTO bridge_zulip_v5_content_snapshots (
-        uuid, delivery_uuid, workspace_content, zulip_content
-    )
-    VALUES (%s, %s, %s, %s)
-    ON CONFLICT DO NOTHING
+    SELECT zulip_record_content_snapshot(%s,%s,%s,%s) AS uuid
 """
 
 SELECT_MESSAGE_RECIPIENTS_SQL = """
@@ -374,13 +371,13 @@ class Operations:
                 return request("delete", "DELETE", f"/messages/{remote}")
             if await self.outdated_edit(intent, account):
                 return request("noop", "", "", identity=remote)
-            text = await self.convert(intent, account)
-            await self.content_snapshot(intent, account, text, remote)
+            content = await self.convert(intent, account)
+            await self.content_snapshot(intent, account, content["uuid"], remote)
             return request(
                 "edit",
                 "PATCH",
                 f"/messages/{remote}",
-                {"content": text},
+                {"content": content["provider_content"]},
                 identity=remote,
             )
         if kind in ("reaction", "message_state"):
@@ -675,7 +672,7 @@ class Operations:
         )
 
     async def content_snapshot(
-        self, intent: dict, account: dict, text: str, remote: str
+        self, intent: dict, account: dict, content_uuid: object, remote: str
     ) -> None:
         data = intent["data"]
         delivery_uuid = uuid.uuid5(
@@ -698,7 +695,12 @@ class Operations:
         )
         await self.db.sql(
             INSERT_CONTENT_SNAPSHOT_SQL,
-            (intent["uuid"], deliveries[0]["uuid"], data["payload"]["content"], text),
+            (
+                intent["uuid"],
+                deliveries[0]["uuid"],
+                content_uuid,
+                data.get("content_revision"),
+            ),
         )
 
     async def send_message(self, intent: dict, account: dict) -> dict:
@@ -720,7 +722,7 @@ class Operations:
         )
         if not subscriptions:
             raise Pending("Waiting for the sender's event subscription")
-        text = await self.convert(intent, account)
+        content = await self.convert(intent, account)
         delivery_id = uuid.uuid5(
             account["uuid"], f"{intent['entity_uuid']}:{data['stream_uuid']}"
         )
@@ -741,13 +743,18 @@ class Operations:
         delivery_uuid = str(deliveries[0]["uuid"])
         await self.db.sql(
             INSERT_CONTENT_SNAPSHOT_SQL,
-            (intent["uuid"], delivery_uuid, data["payload"]["content"], text),
+            (
+                intent["uuid"],
+                delivery_uuid,
+                content["uuid"],
+                data.get("content_revision"),
+            ),
         )
         subscription = subscriptions[0]
         values = {
             "type": "direct" if topic is None else "channel",
             "to": recipient,
-            "content": text,
+            "content": content["provider_content"],
             "read_by_sender": True,
             "queue_id": subscription["queue_id"],
             "local_id": str(intent["entity_uuid"]),
@@ -788,7 +795,7 @@ class Operations:
             "-group" if route["channel_type"] == "group" else ""
         )
 
-    async def convert(self, intent: dict, account: dict) -> str:
+    async def convert(self, intent: dict, account: dict) -> dict:
         payload = intent["data"]["payload"]
         references = {
             (kind, identifier)
@@ -901,7 +908,21 @@ class Operations:
                         if "/#narrow/channel/" in url
                         else ""
                     )
-        return message_conversion.workspace_to_zulip(payload, context)
+        cache_key = content_cache.key(
+            account["provider_uuid"], "outgoing", payload, context
+        )
+        cached = await self.db.sql(
+            content_cache.LOOKUP_SQL.format(source="workspace_content"),
+            (*cache_key, pg_json.Jsonb(payload)),
+        )
+        if cached:
+            return cached[0]
+        text = message_conversion.workspace_to_zulip(payload, context)
+        content = (
+            await self.db.sql(content_cache.RESOLVE_SQL, (pg_json.Jsonb(payload), text))
+        )[0]
+        await self.db.sql(content_cache.SAVE_SQL, (*cache_key, content["uuid"]))
+        return {"uuid": content["uuid"], "provider_content": text}
 
     async def verify(
         self, intent: dict, account: dict, prepared: dict

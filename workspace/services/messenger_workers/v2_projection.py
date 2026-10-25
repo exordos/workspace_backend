@@ -1146,7 +1146,7 @@ def _message_namespace(
         """
         SELECT placement.uuid, placement.stream_uuid, placement.topic_uuid,
                message.uuid AS canonical_message_uuid,
-               message.author_uuid AS user_uuid, message.payload,
+               message.author_uuid AS user_uuid, contents.workspace_content AS payload,
                message.created_at, message.updated_at, message.source_name,
                message.provider_uuid,
                message.provider_identity, message.status, message.reaction_users
@@ -1154,6 +1154,7 @@ def _message_namespace(
         JOIN messenger_messages AS message
           ON message.project_id = placement.project_id
          AND message.uuid = placement.message_uuid
+        JOIN messenger_message_contents contents ON contents.uuid=message.content_uuid
         WHERE placement.project_id = %s AND placement.uuid = %s
           AND message.deleted_at IS NULL
         """,
@@ -2659,12 +2660,13 @@ def _process_topic_membership_policy_rebuild(
         return True
     rows = session.execute(
         """
-        SELECT placement.uuid, message.author_uuid, message.payload,
+        SELECT placement.uuid, message.author_uuid, contents.workspace_content AS payload,
                message.created_at, message.source_name, message.provider_uuid
         FROM messenger_message_placements AS placement
         JOIN messenger_messages AS message
           ON message.project_id = placement.project_id
          AND message.uuid = placement.message_uuid
+        JOIN messenger_message_contents contents ON contents.uuid=message.content_uuid
         WHERE placement.project_id = %s AND placement.topic_uuid = %s
           AND (message.source_name <> 'zulip'
                OR placement.uuid <> messenger_uuid_v5(message.uuid, 'zulip-placement'))

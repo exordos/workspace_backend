@@ -170,9 +170,9 @@ class WorkspaceMessage(
     __tablename__ = "messenger_messages"
 
     author_uuid = properties.property(types.UUID(), required=True, read_only=True)
-    payload = properties.property(
-        message_payloads.WORKSPACE_MESSAGE_PAYLOAD_TYPE,
-        required=True,
+    content_uuid = properties.property(types.UUID(), required=True)
+    content_revision = properties.property(
+        types.Integer(min_value=1), default=1, read_only=True
     )
     source_name = properties.property(
         types.Enum([source.value for source in base.SourceName]),
@@ -181,9 +181,6 @@ class WorkspaceMessage(
     provider_uuid = properties.property(types.AllowNone(types.UUID()), default=None)
     provider_identity = properties.property(
         types.AllowNone(types.String(min_length=1, max_length=255)), default=None
-    )
-    content_hash = properties.property(
-        types.AllowNone(types.String(max_length=64)), default=None, read_only=True
     )
     content_updated_at = properties.property(
         types.AllowNone(types.UTCDateTimeZ()), default=None, read_only=True

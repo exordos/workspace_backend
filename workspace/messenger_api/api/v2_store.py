@@ -890,7 +890,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             SELECT message.author_uuid, message.payload,
                    message.source_name, message.provider_uuid, message.provider_identity
             FROM messenger_message_placements AS placement
-            JOIN messenger_messages AS message
+            JOIN messenger_messages_with_content_v1 AS message
               ON message.project_id = placement.project_id
              AND message.uuid = placement.message_uuid
             WHERE placement.project_id = %s AND placement.uuid = %s
@@ -909,10 +909,12 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             return row
         existing_canonical = session.execute(
             """
-            SELECT author_uuid, payload, source_name, provider_uuid, provider_identity
-            FROM messenger_messages
-            WHERE project_id = %s AND uuid = %s
-            FOR UPDATE
+            SELECT message.author_uuid, contents.workspace_content AS payload,
+                   message.source_name, message.provider_uuid, message.provider_identity
+            FROM messenger_messages message
+            JOIN messenger_message_contents contents ON contents.uuid=message.content_uuid
+            WHERE message.project_id = %s AND message.uuid = %s
+            FOR UPDATE OF message
             """,
             (self.project_uuid, canonical_uuid),
         ).fetchone()
@@ -928,9 +930,10 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             inserted = session.execute(
                 """
                 INSERT INTO messenger_messages (
-                    uuid, project_id, author_uuid, payload,
+                    uuid, project_id, author_uuid, content_uuid,
                     source_name, provider_uuid, provider_identity, status, created_at, updated_at
-                ) VALUES (%s, %s, %s, %s::jsonb, %s, %s, NULL, %s, %s, %s)
+                ) VALUES (%s, %s, %s, messenger_resolve_message_content(%s::jsonb,NULL),
+                          %s, %s, NULL, %s, %s, %s)
                 ON CONFLICT (project_id, uuid) DO NOTHING
                 RETURNING uuid
                 """,
@@ -949,10 +952,12 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             if inserted is None:
                 existing_canonical = session.execute(
                     """
-                    SELECT author_uuid, payload, source_name, provider_uuid, provider_identity
-                    FROM messenger_messages
-                    WHERE project_id = %s AND uuid = %s
-                    FOR UPDATE
+                    SELECT message.author_uuid, contents.workspace_content AS payload,
+                           message.source_name, message.provider_uuid, message.provider_identity
+                    FROM messenger_messages message
+                    JOIN messenger_message_contents contents ON contents.uuid=message.content_uuid
+                    WHERE message.project_id = %s AND message.uuid = %s
+                    FOR UPDATE OF message
                     """,
                     (self.project_uuid, canonical_uuid),
                 ).fetchone()
@@ -1104,9 +1109,11 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         changed = session.execute(
             """
             UPDATE messenger_messages
-            SET payload = %s::jsonb, updated_at = NOW()
+            SET content_uuid = messenger_resolve_message_content(%s::jsonb,NULL),
+                updated_at = NOW()
             WHERE project_id = %s AND uuid = %s
-              AND payload IS DISTINCT FROM %s::jsonb
+              AND (SELECT workspace_content FROM messenger_message_contents
+                   WHERE uuid=messenger_messages.content_uuid) IS DISTINCT FROM %s::jsonb
             RETURNING uuid
             """,
             (
