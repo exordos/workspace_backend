@@ -25,6 +25,7 @@ from workspace.common import mutation_journal_opts
 from workspace.messenger_api import file_storage
 from workspace.messenger_api import publication
 from workspace.messenger_api.dm import external_models
+from workspace.services import zulip_history
 from workspace.services import zulip_incoming
 from workspace.services import zulip_outgoing
 from workspace.services.messenger_workers import v2_projection
@@ -2572,6 +2573,185 @@ def test_missing_topic_burst_shares_one_intention_and_removes_it_on_success(inco
     asyncio.run(run())
     assert len(api.get("/v1/messenger/messages/").json()) == 18
     http.request.assert_not_called()
+
+
+@pytest.mark.parametrize("free_slots", [128, 1])
+def test_full_retry_window_cannot_starve_newer_topic_dependencies(incoming, free_slots):
+    api, db, account, http, url = incoming
+    apply(incoming, event(identifier=100))
+    http.request.reset_mock()
+
+    async def run():
+        service = zulip_incoming.ZulipIncomingService(url)
+        await service.db.open()
+        service.operations = incoming_operations.Operations(service.db, http)
+        try:
+            values = [
+                {"id": index, **event(identifier=200 + index)}
+                for index in range(1, 129)
+            ]
+            for index, value in enumerate(values):
+                value["message"]["subject"] = f"Missing topic {index % 2}"
+            values.extend(
+                [
+                    {"id": 129, **event("Unrelated fresh message", 999)},
+                    {"id": 130, "type": "delete_message", "message_id": 201},
+                ]
+            )
+            async with service.db.transaction() as connection:
+                await service.append(
+                    connection, account, {"queue_id": "full-retry-window"}, values
+                )
+            parents = await service.db.sql(zulip_incoming.SELECT_EVENT_SQL, ([], 128))
+            assert len(parents) == 128
+            await asyncio.gather(*(service.process(row) for row in parents))
+            dependencies = await service.db.sql(
+                "SELECT id FROM zulip_incoming_events "
+                "WHERE payload->>'type'='ensure_dependency' ORDER BY id"
+            )
+            dependency_ids = {row["id"] for row in dependencies}
+            assert len(dependency_ids) == 2
+            assert min(dependency_ids) > max(row["id"] for row in parents)
+            # Reproduce the production window: every parent is ready to retry
+            # before dispatch, and history yields to its overdue realtime work.
+            await service.db.sql(
+                "UPDATE zulip_incoming_events SET next_retry_at=now(), "
+                "received_at=now()-interval '1 second' WHERE processed_at IS NULL"
+            )
+            busy_parameters = (
+                account["project_id"],
+                0.5,
+                account["project_id"],
+                256,
+                256,
+            )
+            assert (await service.db.sql(zulip_history.BUSY_SQL, busy_parameters))[0][
+                "busy"
+            ]
+            occupied = []
+            for index in range(128 - free_slots):
+                task = asyncio.create_task(asyncio.Event().wait())
+                service.tasks[-index - 1] = task
+                task.add_done_callback(service.completed)
+                occupied.append(task)
+            await service.dispatch()
+            selected = {key for key in service.tasks if key > 0}
+            assert len(selected & dependency_ids) == min(free_slots, 2)
+            await asyncio.gather(
+                *(task for key, task in service.tasks.items() if key > 0)
+            )
+            for task in occupied:
+                task.cancel()
+            await asyncio.gather(*occupied, return_exceptions=True)
+
+            # Use the real dispatcher through completion, including the later
+            # deletion, which must not overtake its pending message creation.
+            for _ in range(32):
+                await service.db.sql(
+                    "UPDATE zulip_incoming_events SET next_retry_at=now() "
+                    "WHERE processed_at IS NULL"
+                )
+                await service.dispatch()
+                if not service.tasks:
+                    break
+                await asyncio.gather(*service.tasks.values())
+            assert not await service.db.sql(
+                "SELECT id FROM zulip_incoming_events WHERE processed_at IS NULL"
+            )
+            assert not await service.db.sql(
+                "SELECT id FROM zulip_incoming_events WHERE error IS NOT NULL "
+                "OR payload->>'type'='ensure_dependency'"
+            )
+            publish()
+            assert not (await service.db.sql(zulip_history.BUSY_SQL, busy_parameters))[
+                0
+            ]["busy"]
+        finally:
+            tasks = list(service.tasks.values())
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await service.db.close()
+
+    asyncio.run(run())
+    messages = api.get("/v1/messenger/messages/").json()
+    assert {row["provider_identity"] for row in messages} == {
+        "100",
+        "999",
+        *(str(value) for value in range(202, 329)),
+    }
+    # Every creation publishes once, even the message deleted after its create.
+    assert db.execute(
+        "SELECT count(*) FROM m_workspace_visible_events WHERE project_id=%s "
+        "AND user_uuid=%s AND payload->>'kind'='message.created'",
+        (account["project_id"], account["owner_user_uuid"]),
+    ).fetchone() == (130,)
+    http.request.assert_not_called()
+
+
+def test_full_dependency_window_cannot_starve_its_newer_prerequisite(incoming):
+    api, db, account, http, url = incoming
+
+    async def run():
+        service = zulip_incoming.ZulipIncomingService(url, dependency_delay=0)
+        await service.db.open()
+        service.operations = incoming_operations.Operations(service.db, http)
+        try:
+            async with service.db.transaction() as connection:
+                await service.append(
+                    connection,
+                    account,
+                    {"queue_id": "nested-dependencies"},
+                    [
+                        {
+                            "id": index,
+                            "type": "ensure_dependency",
+                            "dependency": {
+                                "kind": "topic",
+                                "identity": f"42:Topic {index}",
+                                "stream_identity": "42",
+                                "subject": f"Topic {index}",
+                            },
+                        }
+                        for index in range(128)
+                    ],
+                )
+            parents = await service.db.sql(zulip_incoming.SELECT_EVENT_SQL, ([], 128))
+            await asyncio.gather(*(service.process(row) for row in parents))
+            prerequisite = await service.db.sql(
+                "SELECT id FROM zulip_incoming_events "
+                "WHERE payload->'dependency'->>'kind'='stream'"
+            )
+            assert len(prerequisite) == 1
+            assert prerequisite[0]["id"] > max(row["id"] for row in parents)
+            service.concurrency = 1
+            # A parent and its inserted prerequisite can have the same
+            # transaction timestamp. Each older parent may retry once, but
+            # must then yield rather than win every single-slot selection.
+            for _ in range(129):
+                await service.dispatch()
+                selected = set(service.tasks)
+                await asyncio.gather(*service.tasks.values())
+                if selected == {prerequisite[0]["id"]}:
+                    break
+            else:
+                pytest.fail("Nested prerequisite starved behind its retrying parents")
+            await drain_incoming(service)
+        finally:
+            tasks = list(service.tasks.values())
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await service.db.close()
+
+    asyncio.run(run())
+    assert db.execute(
+        "SELECT count(*) FROM messenger_topics WHERE project_id=%s "
+        "AND provider_identity LIKE '42:Topic %%'",
+        (account["project_id"],),
+    ).fetchone() == (128,)
+    assert not api.get("/v1/messenger/messages/").json()
+    http.request.assert_awaited_once()
 
 
 def test_dependency_chain_uses_dispatcher_without_inline_catalog_creation(incoming):
