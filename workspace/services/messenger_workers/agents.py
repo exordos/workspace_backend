@@ -55,6 +55,14 @@ def database_session_context() -> typing.Iterator[typing.Any]:
         yield session
 
 
+class MessengerPublicationAgent(basic.BasicService):
+    """Drain committed snapshots independently of slow projection work."""
+
+    def _iteration(self) -> None:
+        with database_session_context() as session:
+            publication.publish_pending(session)
+
+
 class MessengerWorkerAgent(basic.BasicService):
     def __init__(
         self,

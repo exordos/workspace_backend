@@ -57,7 +57,9 @@ def configure_worker_database() -> None:
     database.configure_postgresql("workspace-messenger-worker", conf=CONF)
 
 
-def build_worker_services() -> tuple[agents.MessengerWorkerAgent, ...]:
+def build_worker_services() -> tuple[
+    agents.MessengerWorkerAgent | agents.MessengerPublicationAgent, ...
+]:
     worker_count = (
         CONF[DOMAIN].v2_projection_workers if CONF[DOMAIN].v2_projection_enabled else 1
     )
@@ -106,6 +108,10 @@ def build_worker_services() -> tuple[agents.MessengerWorkerAgent, ...]:
         )
         service.add_setup(configure_worker_database)
         services.append(service)
+    if CONF[DOMAIN].v2_projection_enabled and not owned:
+        publisher = agents.MessengerPublicationAgent(iter_min_period=0.1, iter_pause=0)
+        publisher.add_setup(configure_worker_database)
+        services.append(publisher)
     return tuple(services)
 
 

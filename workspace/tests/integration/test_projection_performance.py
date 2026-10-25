@@ -18,6 +18,8 @@ from oslo_config import cfg
 from restalchemy.common import contexts
 
 from workspace.common import messenger_reaction_opts
+from workspace.messenger_api import publication
+from workspace.services.messenger_workers import agents
 from workspace.tests.integration import legacy_store
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.api import store_factory
@@ -2836,3 +2838,346 @@ def test_zulip_delivery_cutover_normalizes_pending_entity_order_only(api, db):
     assert rows[:2] == [(key, str(entity), str(entity), key, str(entity))] * 2
     assert rows[-1][0] == rows[-1][3] == old_keys[-1]
     assert rows[-1][2] is rows[-1][4] is None
+
+
+@pytest.mark.parametrize("batched", [False, True])
+def test_personal_counters_leave_journal_unlocked_and_fence_every_recipient(
+    api, batched
+):
+    users = [sys_uuid.uuid4(), sys_uuid.uuid4()]
+    payload = (
+        {"user_uuids": [str(users[1]), str(users[0]), str(users[1])]}
+        if batched
+        else {"user_uuid": str(users[0])}
+    )
+    task = {
+        "uuid": sys_uuid.uuid4(),
+        "project_id": api.project_id,
+        "task_kind": "read_counters",
+        "payload": payload,
+    }
+    with contexts.Context().session_manager() as session:
+        assert v2_projection._try_lock_projection_partition(session, task) == (
+            True,
+            False,
+        )
+        with psycopg.connect(conftest.TEST_DB_URL, autocommit=True) as observer:
+            assert observer.execute(
+                "SELECT pg_try_advisory_xact_lock(hashtextextended(%s::text, 0))",
+                (api.project_id,),
+            ).fetchone() == (True,)
+            for user in users if batched else users[:1]:
+                key = f"{v2_projection.PROJECTION_USER_PARTITION_PREFIX}:{api.project_id}:{user}"
+                assert observer.execute(
+                    "SELECT pg_try_advisory_xact_lock(hashtextextended(%s, 0))", (key,)
+                ).fetchone() == (False,)
+            key = f"{v2_projection.PROJECTION_USER_PARTITION_PREFIX}:{api.project_id}:{sys_uuid.uuid4()}"
+            assert observer.execute(
+                "SELECT pg_try_advisory_xact_lock(hashtextextended(%s, 0))", (key,)
+            ).fetchone() == (True,)
+
+
+@pytest.mark.parametrize("older_batched", [False, True])
+@pytest.mark.parametrize("overlap", [False, True])
+def test_batch_and_single_user_tasks_preserve_overlapping_fifo(
+    api, db, older_batched, overlap
+):
+    users = [str(sys_uuid.uuid4()) for _ in range(3)]
+    specs = []
+    for index, batched in enumerate((older_batched, not older_batched)):
+        user = users[0] if index == 0 or overlap else users[1]
+        specs.append(
+            {
+                "task_kind": "read_counters",
+                "scope_kind": "user-topic",
+                "scope_key": f"{api.project_id}:fifo:{index}",
+                "payload": {
+                    "source_kind": "message.created",
+                    **(
+                        {"user_uuids": [user, users[2]]}
+                        if batched
+                        else {"user_uuid": user}
+                    ),
+                },
+            }
+        )
+    ids = _seed_partition_claim_tasks(api, specs)
+    db.execute(
+        "UPDATE messenger_projection_tasks SET next_retry_at = NOW() + interval '1 hour' "
+        "WHERE outbox_event_uuid = %s",
+        (ids[0],),
+    )
+    db.commit()
+    with contexts.Context().session_manager() as session:
+        task = v2_projection._claim_task(
+            session, f"integration:batch-fifo:{sys_uuid.uuid4()}", 30
+        )
+        if overlap:
+            assert task is None
+        else:
+            assert task is not None and task["outbox_event_uuid"] == ids[1]
+        session.rollback()
+
+
+def test_counter_coalescing_does_not_expand_beyond_fenced_users(api, db, monkeypatch):
+    users = [str(sys_uuid.uuid4()) for _ in range(2)]
+    stream, topic = str(sys_uuid.uuid4()), str(sys_uuid.uuid4())
+    specs = [
+        {
+            "task_kind": "read_counters",
+            "scope_kind": "user-topic",
+            "scope_key": f"{api.project_id}:same-topic",
+            "payload": {
+                "source_kind": "message.created",
+                "stream_uuid": stream,
+                "topic_uuid": topic,
+                "user_uuids": [user],
+                "emit_public_event": False,
+            },
+        }
+        for user in users
+    ]
+    ids = _seed_partition_claim_tasks(api, specs)
+    refreshed = []
+    monkeypatch.setattr(
+        v2_projection,
+        "_refresh_recipient_counters",
+        lambda *args: refreshed.extend(args[4]),
+    )
+    monkeypatch.setattr(
+        v2_projection, "_enqueue_counter_outbox_events", lambda *args, **kwargs: None
+    )
+    with contexts.Context().session_manager() as session:
+        task = v2_projection._claim_task(session, "integration:batch-coalesce", 30)
+        assert task is not None
+        v2_projection._process_read_counters(session, task)
+    assert refreshed == [sys_uuid.UUID(users[0])]
+    assert db.execute(
+        "SELECT status FROM messenger_projection_tasks WHERE outbox_event_uuid=%s",
+        (ids[1],),
+    ).fetchone() == ("pending",)
+
+
+@pytest.mark.parametrize("hold_global", [False, True])
+def test_batched_user_work_and_global_work_still_fence_each_other(api, hold_global):
+    personal = {
+        "uuid": sys_uuid.uuid4(),
+        "project_id": api.project_id,
+        "task_kind": "read_counters",
+        "payload": {"user_uuids": [api.user_uuid]},
+    }
+    global_task = {
+        "uuid": sys_uuid.uuid4(),
+        "project_id": api.project_id,
+        "task_kind": "fanout",
+        "payload": {},
+    }
+    held, attempted = (
+        (global_task, personal) if hold_global else (personal, global_task)
+    )
+    with contexts.Context().session_manager() as session:
+        assert v2_projection._try_lock_projection_partition(session, held) == (
+            True,
+            False,
+        )
+        with psycopg.connect(
+            conftest.TEST_DB_URL, row_factory=psycopg.rows.dict_row
+        ) as other:
+            assert v2_projection._try_lock_projection_partition(other, attempted) == (
+                False,
+                not hold_global,
+            )
+            other.rollback()
+
+
+def test_waiting_global_admission_also_blocks_younger_batch(api, db):
+    ids = _seed_partition_claim_tasks(
+        api,
+        [
+            {
+                "task_kind": "fanout",
+                "scope_kind": "stream",
+                "scope_key": "global-before-batch",
+                "payload": {},
+            },
+            {
+                "task_kind": "read_counters",
+                "scope_kind": "user-topic",
+                "scope_key": "batch-after-global",
+                "payload": {
+                    "user_uuids": [api.user_uuid],
+                    "source_kind": "message.created",
+                },
+            },
+        ],
+    )
+    with contexts.Context().session_manager() as session:
+        task = session.execute(
+            "SELECT * FROM messenger_projection_tasks WHERE outbox_event_uuid=%s",
+            (ids[0],),
+        ).fetchone()
+        v2_projection._mark_projection_project_admission(session, task, 30)
+        session.execute(
+            "UPDATE messenger_projection_tasks SET next_retry_at=NOW()+interval '1 hour' WHERE uuid=%s",
+            (task["uuid"],),
+        )
+    with contexts.Context().session_manager() as session:
+        assert (
+            v2_projection._claim_task(session, "integration:batch-admission", 30)
+            is None
+        )
+        session.rollback()
+    db.execute(
+        "UPDATE messenger_projection_tasks SET status='completed' WHERE outbox_event_uuid=%s",
+        (ids[0],),
+    )
+    db.commit()
+    with contexts.Context().session_manager() as session:
+        assert (
+            v2_projection._claim_task(session, "integration:batch-admission", 30)[
+                "outbox_event_uuid"
+            ]
+            == ids[1]
+        )
+        session.rollback()
+
+
+def test_independent_publisher_commits_while_batched_counter_is_blocked(
+    api, db, monkeypatch
+):
+    stream, message = _create_message(api, "publication-during-counter")
+    _seed_partition_claim_tasks(
+        api,
+        [
+            {
+                "task_kind": "read_counters",
+                "scope_kind": "user-topic",
+                "scope_key": "slow-counter",
+                "payload": {
+                    "source_kind": "message.created",
+                    "user_uuids": [api.user_uuid],
+                    "stream_uuid": stream["uuid"],
+                    "topic_uuid": stream["default_topic_uuid"],
+                    "emit_public_event": False,
+                },
+            }
+        ],
+    )
+    ready, release = threading.Event(), threading.Event()
+    original = v2_projection._refresh_recipient_counters
+
+    def blocked_refresh(*args):
+        ready.set()
+        assert release.wait(10)
+        return original(*args)
+
+    monkeypatch.setattr(v2_projection, "_refresh_recipient_counters", blocked_refresh)
+    projection = agents.MessengerWorkerAgent(
+        v2_projection_enabled=True, projection_only=True
+    )
+    publisher = agents.MessengerPublicationAgent(iter_min_period=0, iter_pause=0)
+    with concurrent.futures.ThreadPoolExecutor(2) as pool:
+        counter = pool.submit(projection._run_v2_projection_tasks)
+        try:
+            assert ready.wait(5)
+            with contexts.Context().session_manager() as session:
+                queued = publication.enqueue(
+                    session,
+                    api.project_id,
+                    message["uuid"],
+                    [api.user_uuid],
+                    "message.created",
+                    {"marker": "during-counter"},
+                )
+            publishing = pool.submit(publisher._iteration)
+            publishing.result(2)
+            assert not counter.done()
+            row = db.execute(
+                "SELECT epoch_version FROM m_workspace_visible_events WHERE uuid=%s",
+                (queued[0].uuid,),
+            ).fetchone()
+            assert row is not None
+            assert db.execute(
+                "SELECT count(*) FROM messenger_publication_outbox WHERE uuid=%s",
+                (queued[0].uuid,),
+            ).fetchone() == (0,)
+            publisher._iteration()
+            assert db.execute(
+                "SELECT count(*) FROM m_workspace_visible_events WHERE uuid=%s",
+                (queued[0].uuid,),
+            ).fetchone() == (1,)
+        finally:
+            release.set()
+            counter.result(10)
+            projection.stop()
+            publisher.stop()
+
+
+def test_failed_batch_claim_releases_all_partially_acquired_user_locks(api):
+    users = sorted([str(sys_uuid.uuid4()), str(sys_uuid.uuid4())])
+    _seed_partition_claim_tasks(
+        api,
+        [
+            {
+                "task_kind": "read_counters",
+                "scope_kind": "user-topic",
+                "scope_key": "partly-busy-batch",
+                "payload": {"source_kind": "message.created", "user_uuids": users},
+            }
+        ],
+    )
+    with psycopg.connect(conftest.TEST_DB_URL, autocommit=True) as blocker:
+        blocked_key = f"{v2_projection.PROJECTION_USER_PARTITION_PREFIX}:{api.project_id}:{users[1]}"
+        blocker.execute(
+            "SELECT pg_advisory_lock(hashtextextended(%s, 0))", (blocked_key,)
+        )
+        with contexts.Context().session_manager() as session:
+            assert (
+                v2_projection._claim_task(session, "integration:partial-batch", 30)
+                is None
+            )
+            first_key = f"{v2_projection.PROJECTION_USER_PARTITION_PREFIX}:{api.project_id}:{users[0]}"
+            assert blocker.execute(
+                "SELECT pg_try_advisory_xact_lock(hashtextextended(%s, 0))",
+                (first_key,),
+            ).fetchone() == (True,)
+
+
+def test_independent_publisher_preserves_committed_epoch_order(api, db):
+    publisher = agents.MessengerPublicationAgent(iter_min_period=0.1, iter_pause=0)
+    with contexts.Context().session_manager() as writer:
+        before = publication.enqueue(
+            writer,
+            api.project_id,
+            sys_uuid.uuid4(),
+            [api.user_uuid],
+            "message.created",
+            {"marker": "before"},
+        )
+        assert publication.publish(writer, api.project_id) == 1
+        # A later committed snapshot cannot advance the cursor past an earlier
+        # event whose epoch has been allocated in an uncommitted transaction.
+        with psycopg.connect(
+            conftest.TEST_DB_URL, row_factory=psycopg.rows.dict_row
+        ) as producer:
+            after = publication.enqueue(
+                producer,
+                api.project_id,
+                sys_uuid.uuid4(),
+                [api.user_uuid],
+                "message.created",
+                {"marker": "after"},
+            )
+        with concurrent.futures.ThreadPoolExecutor(1) as pool:
+            pool.submit(publisher._iteration).result(5)
+        assert db.execute(
+            "SELECT count(*) FROM m_workspace_visible_events WHERE uuid=ANY(%s::uuid[])",
+            ([before[0].uuid, after[0].uuid],),
+        ).fetchone() == (0,)
+    publisher._iteration()
+    rows = db.execute(
+        "SELECT uuid, epoch_version FROM m_workspace_visible_events WHERE uuid=ANY(%s::uuid[]) ORDER BY epoch_version",
+        ([before[0].uuid, after[0].uuid],),
+    ).fetchall()
+    assert [row[0] for row in rows] == [before[0].uuid, after[0].uuid]
+    assert rows[0][1] < rows[1][1]
