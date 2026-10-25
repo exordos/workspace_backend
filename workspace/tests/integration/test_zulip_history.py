@@ -1099,6 +1099,54 @@ def test_history_does_not_subscribe_an_account_to_old_channels(incoming, known):
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("known", [False, True])
+def test_history_respects_inactive_direct_message_memberships(incoming, known):
+    api, db, account, _, _ = incoming
+    linked, _ = incoming_tests.peer_account(incoming)
+    remote = message(
+        102,
+        type="private",
+        recipient_id=1,
+        display_recipient=[
+            {"id": 7, "full_name": "Sender"},
+            {"id": 8, "full_name": "Peer"},
+        ],
+    )
+    remote.pop("stream_id")
+    remote.pop("subject")
+    try:
+        if known:
+            incoming_tests.apply(
+                incoming, {"type": "message", "message": {**remote, "id": 101}}
+            )
+            db.execute(
+                "UPDATE messenger_stream_bindings SET active=false WHERE project_id=%s AND user_uuid=%s",
+                (account["project_id"], account["owner_user_uuid"]),
+            )
+        request(db, account, {"subscriptions": []})
+
+        async def run():
+            async with worker(incoming, {102: remote}) as (service, _):
+                await drain(service, account)
+                assert not await service.db.sql("SELECT 1 FROM zulip_history_intents")
+                active = await service.db.sql(
+                    "SELECT active FROM messenger_stream_bindings WHERE project_id=%s AND user_uuid=%s",
+                    (account["project_id"], account["owner_user_uuid"]),
+                )
+                assert active == [{"active": not known}]
+                if known:
+                    assert not await service.db.sql(
+                        "SELECT 1 FROM messenger_messages WHERE project_id=%s AND provider_identity=%s",
+                        (account["project_id"], "102"),
+                    )
+                else:
+                    assert len(api.get("/v1/messenger/messages/").json()) == 1
+
+        asyncio.run(run())
+    finally:
+        linked.delete()
+
+
 def test_registration_recovers_a_missed_attachment_removal(
     incoming, tmp_path, monkeypatch
 ):

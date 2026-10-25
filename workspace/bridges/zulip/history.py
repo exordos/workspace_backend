@@ -271,11 +271,16 @@ class Operations(incoming_operations.Operations):
         messages = [
             item
             for item in messages
-            if item["type"] != "stream"
-            or (
-                members[str(item["stream_id"])]["active"]
-                if members.get(str(item["stream_id"]))
-                else subscribed_streams is None
+            if (
+                member["active"]
+                if (
+                    member := members.get(
+                        incoming_operations.stream_identity(account, item)
+                    )
+                )
+                is not None
+                else item["type"] != "stream"
+                or subscribed_streams is None
                 or item["stream_id"] in subscribed_streams
             )
         ]
