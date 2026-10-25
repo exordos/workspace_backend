@@ -35,10 +35,11 @@ The generated public Workspace and Messenger specification uses OpenAPI 3.0.3.
 - Client WebSocket events: `workspace-messenger-events`
 - Canonical projections: `workspace-messenger-worker`
 - Incoming Zulip events: `workspace-zulip-incoming`
+- History import and recovery: `workspace-zulip-history`
 - Outgoing Zulip intentions: `workspace-zulip-outgoing`
 
 Run each Zulip service as one separate process with
-`--config-file /etc/workspace/workspace.conf`. Both use asyncio, direct PostgreSQL
+`--config-file /etc/workspace/workspace.conf`. They use asyncio, direct PostgreSQL
 and persistent aiohttp connections. SQL transactions end before HTTP or waits.
 
 The incoming service supervises enabled external accounts and keeps one long poll
@@ -50,11 +51,30 @@ Workspace event projection publishes snapshots over WebSocket, including edits,
 reactions and personal flags on old messages. Provider changes never create
 outgoing intentions. Native copies retain empty `provider_identity`.
 
-Initial registration reads the user/channel catalog, not message history.
-Missing objects referenced by live events may be fetched individually. The
-history importer, task dispatcher and backfill tasks have been removed. An
-expired Zulip event queue is registered again without a historical backfill;
-changes missed before re-registration are not automatically recovered.
+Initial registration persists its catalog snapshot and requests background recovery.
+The separate `workspace-zulip-history` process compares catalogs and message pages
+against current Workspace state. Only differences enter `zulip_history_intents`;
+the same incoming operations apply them and publish client events. Incoming and
+history changes never produce provider outbox work.
+
+History cursors in `zulip_history_jobs` survive queue replacement and process
+restarts. The scanner loads recent messages first, fills gaps from its confirmed
+forward cursor, and walks older history backwards. Repeated queue resets coalesce
+into one job without resetting backfill or repair progress. A rolling repair also
+finds missed edits, reactions and flags on old messages. Unavailable messages are
+rechecked individually; access is removed only for the affected account.
+
+`[zulip_history]` defaults to pages of 500 messages, at most 1000 pending intentions,
+four concurrent account tasks and four HTTP connections, with one active task per
+provider. Page admission is serial; admitted intentions can prepare and apply
+concurrently. Accounts take turns after each page or intention. History pauses
+when realtime work is delayed by 0.5 seconds or a project's publication backlog
+reaches 256 entries. Historical publications have lower priority while preserving
+entity order. A completed repair restarts after 86400 seconds. Requests and file
+preparation run outside transactions. Short snapshot-isolation transactions
+check account identity, pending local work and concurrent changes before applying;
+stale message snapshots are fetched again. Permanent failures retain their error
+for inspection without holding up other intentions.
 
 `[zulip_incoming] connections` limits ordinary provider requests (default 128).
 Long polling has a separate connector so waiting accounts cannot block lookups.

@@ -56,6 +56,7 @@ from restalchemy.storage.sql import migrations as ra_migrations
 from oslo_config import cfg
 
 from workspace.common import file_storage_opts
+from workspace.common import database
 from workspace.common import messenger_reaction_opts
 from workspace.common import topic_summary_opts
 from workspace.messenger_api.api import context as auth_context
@@ -71,7 +72,9 @@ from workspace.workspace_api.api import app as workspace_app
 # --------------------------------------------------------------------------- #
 
 DEFAULT_TEST_DB_URL = "postgresql://workspace:pass@localhost:5432/workspace_test"
-TEST_DB_URL = os.environ.get("WORKSPACE_TEST_DB_URL", DEFAULT_TEST_DB_URL)
+TEST_DB_URL = database.connection_url_for_process(
+    os.environ.get("WORKSPACE_TEST_DB_URL", DEFAULT_TEST_DB_URL), "workspace-tests"
+)
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 MIGRATIONS_DIR = REPO_ROOT / "migrations"

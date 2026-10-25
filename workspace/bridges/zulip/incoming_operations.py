@@ -135,6 +135,7 @@ SELECT_CATALOG_SQL = """
     FROM m_external_accounts_v2 account
     JOIN m_workspace_users users ON users.uuid = account.owner_user_uuid
     WHERE account.project_id = %s AND account.provider_uuid = %s
+      AND (account.external_account_id=ANY(%s::text[]) OR users.first_name=ANY(%s::text[]))
 """
 SELECT_STREAMS_SQL = """
     SELECT stream.uuid, stream.name, stream.provider_identity
@@ -156,6 +157,8 @@ SELECT_TOPIC_REFERENCES_SQL = """
      AND member.user_uuid = personal.user_uuid AND member.active
     WHERE topic.project_id = %s AND stream.provider_uuid = %s AND personal.user_uuid = %s
       AND topic.deleted_at IS NULL AND stream.deleted_at IS NULL
+      AND (topic.provider_identity=ANY(%s::text[])
+           OR stream.name || '>' || topic.name=ANY(%s::text[]))
 """
 SELECT_MESSAGE_REFERENCES_SQL = """
     SELECT visible.uuid, message.provider_identity AS remote_id
@@ -233,6 +236,11 @@ SELECT_FLAG_SNAPSHOTS_SQL = """
 """
 SELECT_FILE_RECIPIENTS_SQL = """
     SELECT * FROM m_workspace_visible_files_v1 WHERE uuid = %s
+"""
+SELECT_REACTION_SNAPSHOT_SQL = """
+    SELECT provider_identity, emoji_name FROM messenger_message_reaction_facts
+    WHERE project_id=%s AND canonical_message_uuid=%s
+      AND provider_uuid=%s AND source_name='zulip'
 """
 SELECT_REACTION_SQL = """
     SELECT * FROM messenger_message_reaction_facts
@@ -333,6 +341,7 @@ ENSURE_MESSAGE_BINDINGS_SQL = """
         permissions = EXCLUDED.permissions, updated_at = now()
     WHERE messenger_user_message_bindings.membership_generation
           <> EXCLUDED.membership_generation
+       OR messenger_user_message_bindings.visibility <> EXCLUDED.visibility
     RETURNING user_uuid
 """
 ENSURE_MESSAGE_STATES_SQL = """
@@ -432,10 +441,18 @@ INSERT_MISSING_TOPIC_BINDINGS_SQL = """
 
 SAVE_ATTACHMENT_SQL = """
     INSERT INTO zulip_incoming_attachments
-        (project_id, provider_uuid, attachment_id, path, name)
-    VALUES (%s, %s, %s, %s, %s)
+        (project_id, provider_uuid, attachment_id, path, name, owner_identity)
+    VALUES (%s, %s, %s, %s, %s, %s)
     ON CONFLICT (project_id, provider_uuid, attachment_id) DO UPDATE
-    SET path = EXCLUDED.path, name = EXCLUDED.name
+    SET path=EXCLUDED.path,name=EXCLUDED.name,owner_identity=EXCLUDED.owner_identity,
+        updated_at=now()
+    WHERE (zulip_incoming_attachments.path,zulip_incoming_attachments.name,
+           zulip_incoming_attachments.owner_identity) IS DISTINCT FROM
+          (EXCLUDED.path,EXCLUDED.name,EXCLUDED.owner_identity)
+"""
+DELETE_ATTACHMENT_SQL = """
+    DELETE FROM zulip_incoming_attachments
+    WHERE project_id=%s AND provider_uuid=%s AND attachment_id=%s
 """
 SELECT_ATTACHMENT_SQL = """
     SELECT * FROM zulip_incoming_attachments
@@ -516,6 +533,85 @@ async def rows(
     connection: typing.Any, query: str, parameters: tuple = ()
 ) -> list[dict]:
     return await (await connection.execute(query, parameters)).fetchall()
+
+
+def references(messages: list) -> dict:
+    people = {str(item["sender_id"]) for item in messages}
+    names, remote_topics, named_topics, message_ids = set(), set(), set(), set()
+    for item in messages:
+        content = item["content"]
+        for name, remote in re.findall(r"@_?\*\*([^*|]+)(?:\|([0-9]+))?\*\*", content):
+            if remote:
+                people.add(remote)
+            else:
+                names.add(name)
+        for value in re.findall(r"#\*\*([^*]+)\*\*", content):
+            topic, separator, remote = value.rpartition("@")
+            if separator and remote.isdigit():
+                message_ids.add(remote)
+            elif ">" in value:
+                named_topics.add(value)
+        message_ids.update(re.findall(r"near/([0-9]+)", content))
+        for stream, topic in re.findall(
+            r"channel/(\d+)(?:-[^/\s)]+)?/topic/([^/\s)]+)", content
+        ):
+            topic = urllib.parse.unquote(re.sub(r"\.([\da-fA-F]{2})", r"%\1", topic))
+            remote_topics.add(f"{stream}:{topic}")
+    return {
+        "people": list(people),
+        "names": list(names),
+        "remote_topics": list(remote_topics),
+        "named_topics": list(named_topics),
+        "messages": list(message_ids),
+    }
+
+
+def conversion_context(
+    account: dict,
+    data: dict,
+    stream: dict,
+    topic: dict,
+    public_uuid: object,
+    prepared: dict,
+) -> dict:
+    context = {
+        "server_url": account["settings"]["server_url"],
+        "original_url": account["settings"]["server_url"].rstrip("/")
+        + f"/#narrow/near/{data['id']}",
+        "zulip_namespace": str(account["provider_uuid"]),
+        "own_user_id": account["external_account_id"],
+        "normalize_emoji": True,
+        "strict_identities": True,
+        "current_message_uuid": str(public_uuid),
+        "message_uuids": {str(data["id"]): str(public_uuid)},
+        "topic_uuids": {},
+        "messages": prepared.get("quoted_messages", {}),
+        "mention_uuids": {},
+        "stream_uuids": {},
+        "stream_ids": {},
+        "files": {},
+    }
+    for person in prepared.get("catalog", []):
+        user = str(person["owner_user_uuid"])
+        context["mention_uuids"][f"id:{person['external_account_id']}"] = user
+        if person["first_name"]:
+            context["mention_uuids"][f"name:{person['first_name']}"] = user
+    for item in prepared.get("streams", []):
+        context["stream_uuids"][item["name"]] = str(item["uuid"])
+        context["stream_ids"][item["name"]] = item["provider_identity"]
+    context["stream_uuids"][stream["name"]] = str(stream["uuid"])
+    if data["type"] == "stream":
+        context["stream_ids"][stream["name"]] = str(data["stream_id"])
+        context["topic_uuids"][f"{stream['name']}>{data['subject']}"] = str(
+            topic["uuid"]
+        )
+    for item in prepared.get("references", []):
+        context["message_uuids"][item["remote_id"]] = str(item["uuid"])
+    for item in prepared.get("topics", []):
+        context["topic_uuids"][f"{item['stream_name']}>{item['name']}"] = str(
+            item["uuid"]
+        )
+    return context
 
 
 class MissingSharedMessage(Exception):
@@ -1287,6 +1383,7 @@ class Operations:
         await self.message_dependencies(account, prepared["messages"], event=event)
         for message in prepared["messages"]:
             people.add(message["sender_id"])
+            people.update(item["user_id"] for item in message.get("reactions", []))
             people.update(
                 int(value)
                 for value in re.findall(r"\|([0-9]+)\*\*", message["content"])
@@ -1385,7 +1482,9 @@ class Operations:
                     "storage_id": storage.storage_id,
                     "storage_object_id": storage.storage_object_id,
                 }
-        if kind in ("stream", "subscription"):
+        if (kind == "stream" and event["op"] == "create") or (
+            kind == "subscription" and event["op"] == "add"
+        ):
             for item in event.get("streams", event.get("subscriptions", [])):
                 prepared["channels"][item["stream_id"]] = item
         for identifier in people:
@@ -1409,11 +1508,14 @@ class Operations:
                         raise
                 else:
                     prepared["people"][identifier] = result["user"]
+        references_ = references(prepared["messages"])
         prepared["catalog"] = await self.db.sql(
             SELECT_CATALOG_SQL,
             (
                 account["project_id"],
                 account["provider_uuid"],
+                references_["people"],
+                references_["names"],
             ),
         )
         scope = (
@@ -1421,13 +1523,18 @@ class Operations:
             account["provider_uuid"],
             account["owner_user_uuid"],
         )
-        prepared["streams"] = await self.db.sql(SELECT_STREAMS_SQL, scope)
-        prepared["topics"] = await self.db.sql(SELECT_TOPIC_REFERENCES_SQL, scope)
-        referenced = {
-            identifier
-            for message in prepared["messages"]
-            for identifier in re.findall(r"near/([0-9]+)", message["content"])
-        }
+        prepared["streams"] = (
+            await self.db.sql(SELECT_STREAMS_SQL, scope) if prepared["messages"] else []
+        )
+        prepared["topics"] = (
+            await self.db.sql(
+                SELECT_TOPIC_REFERENCES_SQL,
+                (*scope, references_["remote_topics"], references_["named_topics"]),
+            )
+            if references_["remote_topics"] or references_["named_topics"]
+            else []
+        )
+        referenced = references_["messages"]
         prepared["references"] = (
             await self.db.sql(
                 SELECT_MESSAGE_REFERENCES_SQL,
@@ -1820,7 +1927,11 @@ class Operations:
                 stream,
                 account["owner_user_uuid"],
                 account["external_account_id"],
-                mode="mentions_only" if data.get("is_muted", False) else None,
+                mode="mentions_only"
+                if data.get("is_muted", False)
+                else "all_messages"
+                if "is_muted" in data
+                else None,
             )
         if not stream["default_topic_uuid"]:
             topic = await self.topic(connection, account, stream, "")
@@ -2046,8 +2157,8 @@ class Operations:
             (
                 account["project_id"],
                 stream_uuid,
-                account["owner_user_uuid"] if old else None,
-                account["owner_user_uuid"] if old else None,
+                account["owner_user_uuid"] if old or event.get("history") else None,
+                account["owner_user_uuid"] if old or event.get("history") else None,
                 prepared.get("received_at"),
                 account["owner_user_uuid"],
             ),
@@ -2065,47 +2176,9 @@ class Operations:
             ),
             uuid.uuid5(identifier, str(stream_uuid)),
         )
-        context = {
-            "server_url": account["settings"]["server_url"],
-            "original_url": account["settings"]["server_url"].rstrip("/")
-            + f"/#narrow/near/{data['id']}",
-            "zulip_namespace": str(account["provider_uuid"]),
-            "own_user_id": account["external_account_id"],
-            "normalize_emoji": True,
-            "strict_identities": True,
-            "current_message_uuid": str(public_uuid),
-            "message_uuids": {str(data["id"]): str(public_uuid)},
-            "topic_uuids": {},
-            "messages": prepared.get("quoted_messages", {}),
-            "mention_uuids": {},
-            "stream_uuids": {},
-            "stream_ids": {},
-            "files": {},
-        }
-        for person in prepared.get("catalog", []):
-            user = str(person["owner_user_uuid"])
-            context["mention_uuids"][f"id:{person['external_account_id']}"] = user
-            if person["first_name"]:
-                context["mention_uuids"][f"name:{person['first_name']}"] = user
-        for remote, person in prepared["people"].items():
-            user = str(await self.user(connection, account, remote))
-            context["mention_uuids"][f"id:{remote}"] = user
-            context["mention_uuids"][f"name:{person['full_name']}"] = user
-        for item in prepared.get("streams", []):
-            context["stream_uuids"][item["name"]] = str(item["uuid"])
-            context["stream_ids"][item["name"]] = item["provider_identity"]
-        context["stream_uuids"][stream["name"]] = str(stream["uuid"])
-        if data["type"] == "stream":
-            context["stream_ids"][stream["name"]] = str(data["stream_id"])
-            context["topic_uuids"][f"{stream['name']}>{data['subject']}"] = str(
-                topic["uuid"]
-            )
-        for item in prepared.get("references", []):
-            context["message_uuids"][item["remote_id"]] = str(item["uuid"])
-        for item in prepared.get("topics", []):
-            context["topic_uuids"][f"{item['stream_name']}>{item['name']}"] = str(
-                item["uuid"]
-            )
+        context = conversion_context(
+            account, data, stream, topic, public_uuid, prepared
+        )
         for target, path in data.get("_files", []):
             file = prepared["files"][(stream_uuid, path)]
             if "missing" in file:
@@ -2165,6 +2238,10 @@ class Operations:
                     recipients=[row["viewer_user_uuid"] for row in snapshots],
                 )
             context["files"][target] = f"urn:file:{values['uuid']}"
+        for remote, person in prepared["people"].items():
+            user = str(await self.user(connection, account, remote))
+            context["mention_uuids"][f"id:{remote}"] = user
+            context["mention_uuids"][f"name:{person['full_name']}"] = user
         content_snapshots = await rows(
             connection,
             SELECT_CONTENT_SNAPSHOT_SQL,
@@ -2352,6 +2429,8 @@ class Operations:
             await self.flags(
                 connection, account, [data["id"]], data["flags"], snapshot=True
             )
+        if event.get("history") and "reactions" in data:
+            await self.reaction_snapshot(connection, account, data)
         for reaction in data.get("reactions", []):
             await self.reaction(
                 connection, account, {**reaction, "message_id": data["id"], "op": "add"}
@@ -2515,6 +2594,37 @@ class Operations:
                     ),
                 ),
             )
+
+    async def reaction_snapshot(
+        self, connection: typing.Any, account: dict, data: dict
+    ) -> None:
+        identifier = await self.identity(
+            account, "message", data["id"], connection=connection
+        )
+        existing = await rows(
+            connection,
+            SELECT_REACTION_SNAPSHOT_SQL,
+            (account["project_id"], identifier, account["provider_uuid"]),
+        )
+        identities = {
+            f"{data['id']}:{item['user_id']}:{item['reaction_type']}:{item['emoji_code']}"
+            for item in data["reactions"]
+        }
+        for item in existing:
+            if item["provider_identity"] not in identities:
+                remote, user, kind, code = item["provider_identity"].split(":", 3)
+                await self.reaction(
+                    connection,
+                    account,
+                    {
+                        "message_id": int(remote),
+                        "user_id": int(user),
+                        "reaction_type": kind,
+                        "emoji_code": code,
+                        "emoji_name": item["emoji_name"],
+                        "op": "remove",
+                    },
+                )
 
     async def reaction(
         self, connection: typing.Any, account: dict, event: dict
@@ -3152,6 +3262,7 @@ class Operations:
                     data["id"],
                     path,
                     data["name"],
+                    account["external_account_id"],
                 ),
             )
         files = (
@@ -3167,6 +3278,11 @@ class Operations:
             if path is not None
             else []
         )
+        if event["op"] == "remove":
+            await connection.execute(
+                DELETE_ATTACHMENT_SQL,
+                (account["project_id"], account["provider_uuid"], data["id"]),
+            )
         for file in files:
             if event["op"] == "remove":
                 audience = await rows(

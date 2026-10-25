@@ -739,7 +739,13 @@ def test_long_polling_reaches_an_actual_websocket_client(incoming, monkeypatch):
                 {"events": [item for item in inbox if item["id"] > cursor]}
             )
 
+        async def channel(request):
+            return web.json_response(
+                {"stream": {"stream_id": 42, "name": "Channel", "description": ""}}
+            )
+
         app = web.Application()
+        app.router.add_get("/api/v1/streams/42", channel)
         app.router.add_get("/api/v1/users/me", own_user)
         app.router.add_post("/api/v1/register", register)
         app.router.add_get("/api/v1/events", events)

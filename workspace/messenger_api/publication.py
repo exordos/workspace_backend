@@ -17,11 +17,32 @@ from workspace.messenger_api.api import resource_projection
 ENQUEUE_SQL = """
     WITH queued AS (
         INSERT INTO messenger_publication_outbox
-            (uuid, project_id, entity_uuid, kind, recipients, payload, recipient_payloads)
-        VALUES (%s, %s, %s, %s, %s::uuid[], %s::jsonb, %s::jsonb)
+            (uuid, project_id, entity_uuid, kind, recipients, payload, recipient_payloads, priority)
+        VALUES (%s, %s, %s, %s, %s::uuid[], %s::jsonb, %s::jsonb,
+                CASE WHEN current_setting('workspace.zulip_history',true)='on' THEN 1 ELSE 0 END)
         RETURNING uuid
     )
     SELECT uuid, pg_notify('workspace_projection_tasks', '') FROM queued
+"""
+
+SELECT_PENDING_SQL = """
+    WITH selected AS MATERIALIZED (
+        SELECT project_id,entity_uuid,priority,sequence
+        FROM messenger_publication_outbox WHERE project_id=%s
+        ORDER BY priority,sequence LIMIT 256
+    ), heads AS (
+        SELECT project_id,entity_uuid,min(priority) AS priority,max(sequence) AS last_sequence
+        FROM selected GROUP BY project_id,entity_uuid
+    )
+    SELECT pending.* FROM heads
+    CROSS JOIN LATERAL (
+        SELECT candidate.* FROM messenger_publication_outbox candidate
+        WHERE candidate.project_id=heads.project_id
+          AND candidate.entity_uuid=heads.entity_uuid
+          AND candidate.sequence<=heads.last_sequence
+        ORDER BY sequence LIMIT 256
+    ) pending
+    ORDER BY heads.priority,pending.sequence LIMIT 256
 """
 
 
@@ -69,7 +90,7 @@ def publish(session: sessions.PgSQLSession, project_id: object) -> int:
     if not locked:
         return 0
     rows = session.execute(
-        "SELECT * FROM messenger_publication_outbox WHERE project_id=%s ORDER BY sequence LIMIT 256",
+        SELECT_PENDING_SQL,
         (project_id,),
     ).fetchall()
     for row in rows:

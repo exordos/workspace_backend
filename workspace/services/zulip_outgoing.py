@@ -16,6 +16,7 @@ from psycopg import rows
 from psycopg.types import json as pg_json
 
 from workspace.bridges.zulip import outgoing_operations
+from workspace.common import database
 
 
 LOG = logging.getLogger(__name__)
@@ -105,7 +106,7 @@ class Database:
         *,
         application_name: str = "workspace-zulip-outgoing",
     ) -> None:
-        self.url = url
+        self.url = database.connection_url_for_process(url, application_name)
         self.application_name = application_name
         self.size = size
         self.connections: asyncio.Queue = asyncio.Queue()

@@ -19,6 +19,7 @@ from psycopg.types import json as pg_json
 from workspace.bridges.zulip import incoming_registry
 from workspace.bridges.zulip import incoming_operations
 from workspace.bridges.zulip import outgoing_operations
+from workspace.bridges.zulip import history
 from workspace.services import zulip_outgoing
 
 
@@ -299,6 +300,9 @@ class ZulipIncomingService:
         while True:
             try:
                 if subscription is None:
+                    registration_started = (
+                        await self.db.sql("SELECT clock_timestamp() AS value")
+                    )[0]["value"]
                     registration = await self.http.request(
                         account,
                         "POST",
@@ -309,6 +313,10 @@ class ZulipIncomingService:
                                 "subscription",
                                 "realm",
                                 "attachment",
+                                "message",
+                                "update_message_flags",
+                                "starred_messages",
+                                "user_topic",
                             ],
                             "apply_markdown": False,
                             "client_capabilities": {
@@ -343,23 +351,40 @@ class ZulipIncomingService:
                                 subscription["longpoll_timeout"],
                             ),
                         )
-                        initial = [
-                            {"type": "realm_user", "op": "add", "person": person}
-                            for person in registration.get("realm_users", [])
-                        ]
-                        initial.extend(
-                            {
-                                "type": "subscription",
-                                "op": "add",
-                                "subscriptions": [channel],
-                            }
-                            for channel in registration.get("subscriptions", [])
+                        await connection.execute(
+                            history.REQUEST_SQL,
+                            (
+                                account["uuid"],
+                                account["project_id"],
+                                account["provider_uuid"],
+                                account["owner_user_uuid"],
+                                account["external_account_id"],
+                                account["settings"]["server_url"],
+                                pg_json.Jsonb(
+                                    {
+                                        key: registration[key]
+                                        for key in (
+                                            "realm_users",
+                                            "subscriptions",
+                                            "attachments",
+                                            "unread_msgs",
+                                            "starred_messages",
+                                            "user_topics",
+                                        )
+                                        if key in registration
+                                    }
+                                ),
+                                subscription["queue_id"],
+                                registration_started,
+                                [
+                                    item["stream_id"]
+                                    for item in registration["subscriptions"]
+                                ]
+                                if "subscriptions" in registration
+                                else None,
+                            ),
                         )
-                        initial.extend(
-                            {"type": "attachment", "op": "add", "attachment": item}
-                            for item in registration.get("attachments", [])
-                        )
-                        initial.append({"type": "account_ready"})
+                        initial = [{"type": "account_ready"}]
                         await self.append(
                             connection,
                             account,
@@ -525,6 +550,8 @@ class ZulipIncomingService:
 
     @staticmethod
     def ordering_keys(account: dict, event: dict) -> list[str]:
+        if event["type"] == "attachment":
+            return [f"attachment:{event.get('attachment', event)['id']}"]
         message_event = event["type"] in {
             "message",
             "update_message",

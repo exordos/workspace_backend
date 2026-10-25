@@ -454,6 +454,17 @@ resources:
           poll_interval = 1
 
 
+          [zulip_history]
+          concurrency = 4
+          connections = 4
+          batch_size = 500
+          queue_limit = 1000
+          publication_limit = 256
+          realtime_delay = 0.5
+          repair_interval = 86400
+          poll_interval = 1
+
+
           [zulip_incoming]
           concurrency = 128
           connections = 128
@@ -623,6 +634,21 @@ resources:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       name: workspace-zulip-incoming
       path: /usr/bin/workspace-zulip-incoming --config-file /etc/workspace/workspace.conf
+      user: root
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_backend:uuid
+      service_type:
+        kind: simple
+        count: 1
+      target_status: enabled
+      before:
+        - kind: shell
+          command: /usr/local/bin/workspace-bootstrap
+    workspace_zulip_history:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace-zulip-history
+      path: /usr/bin/workspace-zulip-history --config-file /etc/workspace/workspace.conf
       user: root
       target:
         kind: node

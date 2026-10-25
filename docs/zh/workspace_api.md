@@ -22,6 +22,7 @@ Events WebSocket:    ws://127.0.0.1:21082/v1/events/ws
 Workspace REST API:  http://127.0.0.1:21084/v1
 Worker:              workspace-messenger-worker
 Zulip incoming:      workspace-zulip-incoming
+Zulip history:       workspace-zulip-history
 Workspace OpenAPI:   http://127.0.0.1:21084/specifications/3.0.3
 ```
 
@@ -2144,10 +2145,12 @@ IAM-认证的HTTP表面,没有提供商,邮件或日历
 
 The Workspace backend installs `workspace-api`, `workspace-messenger-events`,
 `workspace-messenger-worker`, `workspace-zulip-incoming` and
-`workspace-zulip-outgoing`. The incoming service receives live events using
+`workspace-zulip-outgoing` and `workspace-zulip-history`. The incoming service receives live events using
 long polling and publishes object changes through Workspace client events.
-Historical message imports and backfill tasks are removed. Configure the
-incoming HTTP pool and fallback checks in `[zulip_incoming]`. The REST API
+History import and queue-reset recovery run in a separate bounded process.
+It compares pages before recording differences and preserves its progress across
+reconnections. Configure its limits in `[zulip_history]`, and the incoming HTTP
+pool and fallback checks in `[zulip_incoming]`. The REST API
 uses sixteen HTTP workers by default. DBaaS provides PostgreSQL storage, and
 S3aaS stores file bytes and JSON sidecars. The separately versioned
 `workspace_ui` element serves the web UI and proxies API requests to the

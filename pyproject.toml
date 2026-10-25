@@ -133,6 +133,7 @@ where = ["."]
 
 [project.scripts]
 workspace-api = "workspace.cmd.workspace_api:main"
+workspace-zulip-history = "workspace.cmd.zulip_history:main"
 workspace-zulip-incoming = "workspace.cmd.zulip_incoming:main"
 workspace-zulip-outgoing = "workspace.cmd.zulip_outgoing:main"
 workspace-messenger-worker = "workspace.cmd.messenger_worker:main"

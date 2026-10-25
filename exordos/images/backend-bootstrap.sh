@@ -53,6 +53,7 @@ SERVICE_NAMES=(
     workspace-history-import
     workspace-zulip-realtime
     workspace-zulip-incoming
+    workspace-zulip-history
     workspace-zulip-outgoing
     workspace-external-bridge-control
     workspace-external-bridge-api
