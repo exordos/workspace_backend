@@ -125,12 +125,17 @@ Permanent failures remain visible with an error and do not block subsequent even
 
 Before upgrading, back up the database and stop the old realtime, history,
 incoming, outgoing and Messenger projection workers. Apply all migrations through
-0271 before starting the new workers and WebSocket services. Migration 0266
+0275 before starting the new workers and WebSocket services. Migration 0266
 preserves live queue cursors and received events while retiring history tasks;
 0267 enforces local native entities, 0269 retires queued delivery snapshots,
 0270 orders independent incoming messages separately, and 0271 deduplicates active
-dependency intentions. History import stays disabled. These cutovers are
-forward-only; rollback requires the backup.
+dependency intentions. Migration 0272 avoids duplicate incoming counter scope
+invalidations; 0273 introduces immutable message contents and per-message revision
+history; 0274 adds resumable history reconciliation; and 0275 makes content hashes
+safe to restore with an empty search path. Start `workspace-zulip-history` alongside
+the incoming and outgoing services to import and repair history silently. These
+cutovers are forward-only; rollback requires the backup. Deploy the matching Web
+UI after the backend because provider metadata now uses the flattened v6 fields.
 
 ## Storage
 
