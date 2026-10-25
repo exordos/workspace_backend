@@ -952,6 +952,42 @@ def test_registration_recovers_a_missed_attachment_removal(
     asyncio.run(run())
 
 
+def test_failed_catalog_removal_does_not_keep_registration_running(incoming):
+    _, db, account, _, _ = incoming
+    incoming_tests.apply(incoming, {"type": "message", "message": message()})
+    request(db, account, {"subscriptions": []})
+
+    async def run():
+        async with worker(incoming, {}) as (service, _):
+            await service.db.sql(
+                "UPDATE zulip_history_jobs SET newest_id=101,before_id=0,"
+                "backfill_done=true,completed_at=requested_at,"
+                "repair_after=now()+interval '1 day'"
+            )
+            await service.step(await job(service, account))
+            intent = (await service.db.sql("SELECT * FROM zulip_history_intents"))[0]
+            assert intent["entity_key"] == "subscription:42"
+            with mock.patch.object(
+                service, "prepare", side_effect=ValueError("permanent catalog failure")
+            ):
+                await service.step(await job(service, account))
+            for _ in range(5):
+                current = await job(service, account)
+                if current is None:
+                    break
+                await service.step(current)
+            assert await job(service, account) is None
+            failed = await service.db.sql("SELECT * FROM zulip_history_intents")
+            assert len(failed) == 1
+            assert failed[0]["failed"]
+            assert failed[0]["error"] == "permanent catalog failure"
+            assert not (
+                await service.db.sql("SELECT registration FROM zulip_history_jobs")
+            )[0]["registration"]
+
+    asyncio.run(run())
+
+
 def test_newer_catalog_event_is_not_repeatedly_reversed_by_registration(incoming):
     _, db, account, _, _ = incoming
     incoming_tests.apply(

@@ -455,6 +455,12 @@ class ZulipHistoryService:
     async def catalog(self, account: dict, job: dict) -> None:
         registration = job["registration"]
         ignored = set(registration.get("_ignored", []))
+        failed = await self.db.sql(
+            "SELECT entity_key FROM zulip_history_intents "
+            "WHERE external_account_uuid=%s AND failed AND fetched_at=%s",
+            (account["uuid"], job["registration_started_at"]),
+        )
+        ignored.update(item["entity_key"] for item in failed)
         events = history.catalog_events(registration)
         position = job["catalog_position"]
         page = events[position : position + self.batch_size]
