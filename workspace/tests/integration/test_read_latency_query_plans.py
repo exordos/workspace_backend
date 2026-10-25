@@ -91,11 +91,15 @@ def test_summary_boundary_probes_do_not_scan_unrelated_topics(api, db):
         )
         db.execute(
             """
-            INSERT INTO messenger_messages(uuid,project_id,author_uuid,payload,created_at)
+            WITH content AS MATERIALIZED (
+                SELECT messenger_resolve_message_content(
+                    '{"kind":"markdown","content":"Scale fixture"}'::jsonb,NULL) AS uuid
+            )
+            INSERT INTO messenger_messages(uuid,project_id,author_uuid,content_uuid,created_at)
             SELECT md5(%s || ':message:' || value)::uuid,%s,%s,
-                   '{"kind":"markdown","content":"Scale fixture"}'::jsonb,
+                   content.uuid,
                    timestamp '2026-01-01' + value * interval '1 second'
-            FROM generate_series(1,%s) AS value
+            FROM generate_series(1,%s) AS value CROSS JOIN content
             """,
             (api.project_id, api.project_id, api.user_uuid, message_count),
         )

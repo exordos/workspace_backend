@@ -145,14 +145,17 @@ def test_old_scope_preview_does_not_scan_unrelated_project_history(
     )
     db.execute(
         """
-        WITH messages AS (
+        WITH content AS MATERIALIZED (
+            SELECT messenger_resolve_message_content(
+                '{"kind":"markdown","content":"Recent unrelated message"}'::jsonb,NULL) AS uuid
+        ), messages AS (
             INSERT INTO messenger_messages
-                (uuid,project_id,author_uuid,payload,source_name,created_at)
+                (uuid,project_id,author_uuid,content_uuid,source_name,created_at)
             SELECT gen_random_uuid(),%s,%s,
-                   '{"kind":"markdown","content":"Recent unrelated message"}'::jsonb,
+                   content.uuid,
                    'native',
                    NOW()+number*interval '1 millisecond'
-            FROM generate_series(1,20000) AS input(number)
+            FROM generate_series(1,20000) AS input(number) CROSS JOIN content
             RETURNING uuid,project_id,created_at
         ), placements AS (
             INSERT INTO messenger_message_placements

@@ -30,9 +30,12 @@ def test_unread_mentions_avoid_scanning_the_users_entire_history(api, db):
             (prefix, prefix, count),
         )
         db.execute(
-            """INSERT INTO messenger_messages(uuid,project_id,author_uuid,payload)
-               SELECT message,%s,%s,'{"kind":"markdown","content":"history"}'::jsonb
-               FROM mention_plan_ids""",
+            """WITH content AS MATERIALIZED (
+                   SELECT messenger_resolve_message_content(
+                       '{"kind":"markdown","content":"history"}'::jsonb,NULL) AS uuid
+               )
+               INSERT INTO messenger_messages(uuid,project_id,author_uuid,content_uuid)
+               SELECT message,%s,%s,content.uuid FROM mention_plan_ids CROSS JOIN content""",
             (api.project_id, api.user_uuid),
         )
         db.execute(
@@ -68,6 +71,7 @@ def test_unread_mentions_avoid_scanning_the_users_entire_history(api, db):
         )
         for table in (
             "messenger_messages",
+            "messenger_message_contents",
             "messenger_message_placements",
             "messenger_user_message_bindings",
             "messenger_user_message_states",
