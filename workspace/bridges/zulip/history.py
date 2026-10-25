@@ -51,7 +51,12 @@ SELECT_MESSAGES_SQL = """
                    'provider_content',contents.provider_content
                ),'placement',to_jsonb(placement),
                'stream',to_jsonb(stream),'topic',to_jsonb(topic),
-               'membership',to_jsonb(member),'access',to_jsonb(access),
+               -- Counter publications must not invalidate unrelated messages.
+               -- Keep membership identity, generation and access controls.
+               'membership',to_jsonb(member)-ARRAY[
+                   'updated_at','unread_count','active_unread_count',
+                   'passive_unread_count','last_message_uuid'
+               ],'access',to_jsonb(access),
                'state',to_jsonb(state),'reactions',COALESCE(reactions.items,'[]')
            ) AS snapshot
     FROM messenger_messages message
@@ -189,7 +194,6 @@ def recently_changed(snapshot: dict | None, since: datetime.datetime) -> bool:
             "placement",
             "stream",
             "topic",
-            "membership",
             "access",
             "state",
         )

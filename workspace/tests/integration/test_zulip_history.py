@@ -652,6 +652,61 @@ def test_batch_comparison_uses_a_bounded_number_of_queries(incoming):
     asyncio.run(run())
 
 
+def test_history_flags_do_not_refetch_siblings_after_counter_updates(incoming):
+    _, db, account, _, _ = incoming
+    now = int(datetime.datetime.now(datetime.timezone.utc).timestamp()) + 5
+    messages = {
+        i: message(i, flags=["read"], sender_id=8, timestamp=now)
+        for i in range(101, 104)
+    }
+    incoming_tests.apply(
+        incoming,
+        {
+            "type": "realm_user",
+            "op": "add",
+            "person": {
+                "user_id": 8,
+                "full_name": "Other sender",
+                "email": "other@example.com",
+            },
+        },
+    )
+    incoming_tests.apply(
+        incoming, *({"type": "message", "message": item} for item in messages.values())
+    )
+    for item in messages.values():
+        item["flags"] = []
+    request(db, account)
+    db.execute("UPDATE zulip_history_jobs SET registration=NULL")
+
+    async def run():
+        async with worker(incoming, messages) as (service, calls):
+            for _ in range(100):
+                current = await job(service, account)
+                if current is None:
+                    break
+                await service.step(current)
+                incoming_tests.drain()
+                # Counter projection may touch the shared membership between
+                # history steps even when its resulting counters are unchanged.
+                db.execute(
+                    "UPDATE messenger_stream_bindings SET updated_at=clock_timestamp() "
+                    "WHERE project_id=%s AND user_uuid=%s",
+                    (account["project_id"], account["owner_user_uuid"]),
+                )
+            assert await job(service, account) is None
+            assert not [path for _, path, _ in calls if path.startswith("/messages/")]
+            assert (
+                await service.db.sql(
+                    "SELECT count(*) AS count FROM messenger_user_message_states "
+                    "WHERE user_uuid=%s AND read_at IS NULL",
+                    (account["owner_user_uuid"],),
+                )
+            )[0]["count"] == 3
+
+    asyncio.run(run())
+
+
 def test_failed_page_commit_keeps_both_work_and_cursor_unadvanced(
     incoming, monkeypatch
 ):
