@@ -65,6 +65,8 @@ ADVANCE_CURSOR_SQL = """
     SET last_event_id = GREATEST(last_event_id, %s)
     WHERE external_account_uuid = %s AND queue_id = %s
 """
+# Prerequisites may be newer than a full window of their waiting parents.
+# Rotate retries within each class so dependency chains can also make progress.
 SELECT_EVENT_SQL = """
     SELECT event.* FROM zulip_incoming_events event
     WHERE event.processed_at IS NULL AND event.next_retry_at <= now()
@@ -79,7 +81,8 @@ SELECT_EVENT_SQL = """
                  OR earlier.ordering_keys = ARRAY['*']::text[]
                  OR event.ordering_keys = ARRAY['*']::text[])
       ))
-    ORDER BY event.id LIMIT %s
+    ORDER BY CASE WHEN event.payload->>'type'='ensure_dependency' THEN 0 ELSE 1 END,
+             event.next_retry_at, event.id LIMIT %s
 """
 INSERT_DEPENDENCY_SQL = """
     INSERT INTO zulip_incoming_events (
