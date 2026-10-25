@@ -9,6 +9,8 @@ import pathlib
 import datetime
 import concurrent.futures
 import time
+import threading
+import socket
 import uuid
 from unittest import mock
 
@@ -22,6 +24,8 @@ from workspace.bridges.zulip import incoming_operations
 from workspace.bridges.zulip import content_cache
 from workspace.bridges.zulip import message_conversion
 from workspace.common import mutation_journal_opts
+from workspace.cmd import messenger_worker
+from workspace.messenger_api import websocket_service
 from workspace.messenger_api import file_storage
 from workspace.messenger_api import publication
 from workspace.messenger_api.dm import external_models
@@ -31,6 +35,7 @@ from workspace.services import zulip_outgoing
 from workspace.services.messenger_workers import v2_projection
 from workspace.services.messenger_workers import mutation_runtime
 from workspace.tests.integration import conftest
+from workspace.tests.integration import test_projection_performance as projection_tests
 from workspace.tests.integration import test_mutation_journal as journal_tests
 
 
@@ -3985,3 +3990,137 @@ def test_initial_message_does_not_rewrite_a_peers_pending_topic_binding(incoming
         ).fetchone() == ("42:General:8",)
     finally:
         linked.delete()
+
+
+@pytest.mark.isolated_schema
+def test_live_clients_receive_incoming_while_batched_counters_wait(
+    incoming, monkeypatch
+):
+    import websockets
+
+    api, db, account, _http, url = incoming
+    apply(
+        incoming,
+        {
+            "type": "subscription",
+            "op": "add",
+            "subscriptions": [{"stream_id": 42, "name": "Channel"}],
+        },
+    )
+    apply(incoming, event("before slow counter", 301))
+    drain()
+    message = api.get("/v1/messenger/messages/").json()[0]
+    outsider = uuid.uuid4()
+    conftest.seed_workspace_user(db, outsider, f"cassi-outsider-{outsider}")
+    entered, release = threading.Event(), threading.Event()
+    original = v2_projection._refresh_recipient_counters
+
+    def slow(*args):
+        if not entered.is_set():
+            entered.set()
+            assert release.wait(10)
+        return original(*args)
+
+    monkeypatch.setattr(v2_projection, "_refresh_recipient_counters", slow)
+    projection_tests._seed_partition_claim_tasks(
+        api,
+        [
+            {
+                "task_kind": "read_counters",
+                "scope_kind": "user-topic",
+                "scope_key": "cassi-slow-counter",
+                "payload": {
+                    "source_kind": "message.created",
+                    "user_uuids": [api.user_uuid],
+                    "stream_uuid": message["stream_uuid"],
+                    "topic_uuid": message["topic_uuid"],
+                    "emit_public_event": False,
+                },
+            }
+        ],
+    )
+    cfg.CONF.set_override("v2_projection_workers", 1, group=messenger_worker.DOMAIN)
+    services = messenger_worker.build_worker_services()
+
+    async def run():
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        server = websocket_service.MessengerEventsWebsocketServer(
+            db_url=url,
+            iam_engine_driver=mock.Mock(),
+            heartbeat_interval=25,
+            client_timeout=5,
+            catchup_limit=500,
+            send_queue_limit=32,
+            poll_interval=0.02,
+        )
+        server._authenticator.authenticate = lambda token: (
+            outsider if token == "other" else account["owner_user_uuid"],
+            account["project_id"],
+        )
+        serving = asyncio.create_task(server.serve("127.0.0.1", port))
+
+        async def receive_marker(client):
+            while True:
+                frame = json.loads(await client.recv())
+                if (
+                    frame.get("object_type") == "message"
+                    and frame.get("action") == "created"
+                    and frame["payload"]["payload"]["content"] == "during slow counter"
+                ):
+                    return frame
+
+        try:
+            async with contextlib.AsyncExitStack() as stack:
+                clients = []
+                for token in ("test", "test", "other"):
+                    deadline = time.monotonic() + 5
+                    while True:
+                        try:
+                            client = await stack.enter_async_context(
+                                websockets.connect(
+                                    f"ws://127.0.0.1:{port}/v1/events/ws",
+                                    subprotocols=[
+                                        "workspace.events.v1",
+                                        f"bearer.{token}",
+                                    ],
+                                )
+                            )
+                            break
+                        except ConnectionRefusedError:
+                            assert time.monotonic() < deadline
+                            await asyncio.sleep(0.01)
+                    while json.loads(await client.recv()).get("type") != "ready":
+                        pass
+                    clients.append(client)
+                assert await asyncio.to_thread(entered.wait, 5)
+                await asyncio.to_thread(
+                    apply, incoming, event("during slow counter", 302)
+                )
+                frames = await asyncio.wait_for(
+                    asyncio.gather(*(receive_marker(client) for client in clients[:2])),
+                    2,
+                )
+                assert frames[0]["uuid"] == frames[1]["uuid"]
+                assert not release.is_set()
+                with pytest.raises(TimeoutError):
+                    await asyncio.wait_for(receive_marker(clients[2]), 0.2)
+        finally:
+            release.set()
+            server.stop()
+            await serving
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(len(services)) as pool:
+            workers = [pool.submit(service._loop) for service in services]
+            try:
+                asyncio.run(run())
+            finally:
+                release.set()
+                for service in services:
+                    service.stop()
+                for worker in workers:
+                    worker.result(10)
+    finally:
+        cfg.CONF.clear_override("v2_projection_workers", group=messenger_worker.DOMAIN)

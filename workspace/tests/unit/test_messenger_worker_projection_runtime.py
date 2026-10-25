@@ -113,7 +113,9 @@ def test_worker_entrypoint_builds_one_primary_and_projection_only_peers():
             "v2_projection_workers", group=messenger_worker.DOMAIN
         )
 
-    assert len(services) == 4
+    assert len(services) == 5
+    *services, publisher = services
+    assert isinstance(publisher, agents.MessengerPublicationAgent)
     assert [service._projection_only for service in services] == [
         False,
         True,
@@ -510,3 +512,62 @@ def test_projection_metrics_log_surfaces_partition_activity(
     assert "event_lock_contention=2" in caplog.text
     assert "claim_ms_avg=2.500 claim_ms_max=4.000" in caplog.text
     assert "processing_ms_avg=5.000 task_age_max_s=3.000" in caplog.text
+
+
+def test_publication_has_an_independent_service_even_with_one_projection_worker():
+    messenger_worker.CONF.set_override(
+        "v2_projection_workers", 1, group=messenger_worker.DOMAIN
+    )
+    messenger_worker.CONF.set_override(
+        "enabled", False, group=mutation_journal_opts.DOMAIN
+    )
+    try:
+        services = messenger_worker.build_worker_services()
+        publishers = [
+            service
+            for service in services
+            if isinstance(service, agents.MessengerPublicationAgent)
+        ]
+        assert len(publishers) == 1
+        assert publishers[0]._iter_min_period == 0.1
+        assert len(services) == 2
+    finally:
+        messenger_worker.CONF.clear_override(
+            "v2_projection_workers", group=messenger_worker.DOMAIN
+        )
+        messenger_worker.CONF.clear_override(
+            "enabled", group=mutation_journal_opts.DOMAIN
+        )
+
+
+def test_publication_service_commits_each_pass_and_retries(monkeypatch):
+    calls = []
+
+    @contextlib.contextmanager
+    def session_context():
+        calls.append("begin")
+        try:
+            yield object()
+        except Exception:
+            calls.append("rollback")
+            raise
+        else:
+            calls.append("commit")
+
+    monkeypatch.setattr(agents, "database_session_context", session_context)
+    worker = agents.MessengerPublicationAgent(iter_min_period=0, iter_pause=0)
+    monkeypatch.setattr(agents.publication, "publish_pending", lambda session: 0)
+    worker._iteration()
+    assert calls == ["begin", "commit"]
+    calls.clear()
+
+    def failed(session):
+        raise RuntimeError("transient publication failure")
+
+    monkeypatch.setattr(agents.publication, "publish_pending", failed)
+    worker._loop_iteration()
+    assert calls == ["begin", "rollback"]
+    calls.clear()
+    monkeypatch.setattr(agents.publication, "publish_pending", lambda session: 1)
+    worker._iteration()
+    assert calls == ["begin", "commit"]

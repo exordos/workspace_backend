@@ -396,12 +396,23 @@ def _claim_partition_scan_is_truncated(
     )
 
 
+def _projection_users_sql(alias: str) -> str:
+    return f"""
+        CASE
+            WHEN {alias}.task_kind = 'read_counters'
+                 AND {alias}.payload ? 'user_uuids'
+                THEN {alias}.payload->'user_uuids'
+            WHEN {alias}.task_kind IN ('read_counters', 'folder_projection')
+                 AND {alias}.payload->>'user_uuid' IS NOT NULL
+                THEN jsonb_build_array({alias}.payload->>'user_uuid')
+            ELSE '[]'::jsonb
+        END
+    """
+
+
 def _user_claim_admission_predicate(alias: str) -> str:
     return f"""
-        NOT (
-            {alias}.task_kind IN ('read_counters', 'folder_projection')
-            AND {alias}.payload->>'user_uuid' IS NOT NULL
-        )
+        ({_projection_users_sql(alias)}) = '[]'::jsonb
         OR NOT EXISTS (
             SELECT 1
             FROM messenger_projection_tasks AS global_blocker
@@ -735,6 +746,7 @@ def _claim_task_for_lane(
                         OR scope_lease.owner = %s
                       )
                   AND ({candidate_lane_predicate})
+                  AND ({candidate_admission_predicate})
                 ORDER BY candidate.created_at,
                          candidate.ordering_created_at,
                          candidate.outbox_event_uuid
@@ -862,17 +874,16 @@ def _claim_task_for_lane(
               AND NOT EXISTS (
                     SELECT 1
                     FROM messenger_projection_tasks AS partition_predecessor
-                    WHERE task.task_kind IN (
-                            'read_counters', 'folder_projection'
+                    WHERE partition_predecessor.project_id = task.project_id
+                      AND partition_predecessor.status NOT IN (
+                            'completed', 'dead_letter'
                           )
-                      AND task.payload->>'user_uuid' IS NOT NULL
-                      AND partition_predecessor.project_id = task.project_id
-                      AND partition_predecessor.task_kind IN (
-                            'read_counters', 'folder_projection'
+                      AND ({_projection_users_sql("partition_predecessor")})
+                          ?| ARRAY(
+                              SELECT jsonb_array_elements_text(
+                                  {_projection_users_sql("task")}
+                              )
                           )
-                      AND partition_predecessor.payload->>'user_uuid' IS NOT NULL
-                      AND partition_predecessor.payload->>'user_uuid'
-                          = task.payload->>'user_uuid'
                       AND (
                             partition_predecessor.created_at,
                             partition_predecessor.ordering_created_at,
@@ -995,10 +1006,14 @@ def _try_lock_projection_partition(
     task: typing.Mapping[str, typing.Any],
 ) -> tuple[bool, bool]:
     """Fence global work while allowing different project users in parallel."""
-    user_uuid = task["payload"].get("user_uuid")
-    user_partition = (
-        task["task_kind"] in USER_PARTITION_TASK_KINDS and user_uuid is not None
-    )
+    payload = task["payload"]
+    users = []
+    if task["task_kind"] in USER_PARTITION_TASK_KINDS and (
+        payload.get("user_uuid") is not None
+        or (task["task_kind"] == "read_counters" and payload.get("user_uuids"))
+    ):
+        users = _counter_users(payload)
+    user_partition = bool(users)
     admission_key = f"{PROJECTION_PROJECT_ADMISSION_PREFIX}:{task['project_id']}"
     if user_partition:
         admitted = session.execute(
@@ -1051,22 +1066,19 @@ def _try_lock_projection_partition(
     if not project_gate:
         return False, False
     if user_partition:
-        user_gate_key = (
-            f"{PROJECTION_USER_PARTITION_PREFIX}:{task['project_id']}:{user_uuid}"
-        )
-        return (
-            bool(
-                session.execute(
-                    """
-                    SELECT pg_try_advisory_xact_lock(
-                        hashtextextended(%s, 0)
-                    ) AS locked
-                    """,
-                    (user_gate_key,),
-                ).fetchone()["locked"]
-            ),
-            False,
-        )
+        for user_uuid in users:
+            user_gate_key = (
+                f"{PROJECTION_USER_PARTITION_PREFIX}:{task['project_id']}:{user_uuid}"
+            )
+            locked = session.execute(
+                """
+                SELECT pg_try_advisory_xact_lock(hashtextextended(%s, 0)) AS locked
+                """,
+                (user_gate_key,),
+            ).fetchone()["locked"]
+            if not locked:
+                return False, False
+        return True, False
     return (
         bool(
             session.execute(
@@ -2216,6 +2228,10 @@ def _process_read_counters(
                       (payload->>'emit_message_read')::boolean,
                       FALSE
                   ) = FALSE
+                  AND %s::jsonb @> COALESCE(
+                      payload->'user_uuids',
+                      jsonb_build_array(payload->>'user_uuid')
+                  )
                 FOR UPDATE SKIP LOCKED
             )
             UPDATE messenger_projection_tasks AS task
@@ -2231,6 +2247,7 @@ def _process_read_counters(
                 task["scope_kind"],
                 task["scope_key"],
                 task["uuid"],
+                json.dumps([str(user) for user in users]),
                 task["project_id"],
             ),
         )
@@ -2238,14 +2255,6 @@ def _process_read_counters(
         emit_public_event = emit_public_event or any(
             sibling["payload"].get("emit_public_event", True) for sibling in siblings
         )
-        if "user_uuids" in payload:
-            users = sorted(
-                set(users).union(
-                    user
-                    for sibling in siblings
-                    for user in _counter_users(sibling["payload"])
-                )
-            )
     pending = _refresh_recipient_counters(
         session,
         task["project_id"],
