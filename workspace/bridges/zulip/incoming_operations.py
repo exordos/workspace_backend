@@ -625,6 +625,8 @@ class MissingDependency(Exception):
 
 
 class Operations:
+    emit_public_event = True
+
     def __init__(
         self, db: typing.Any, http: typing.Any, reaction_user_limit: int = 5
     ) -> None:
@@ -748,7 +750,7 @@ class Operations:
         recipients: list | None = None,
         control_effect: bool = False,
     ) -> None:
-        if not snapshots:
+        if not self.emit_public_event or not snapshots:
             return
         recipient_snapshots = recipients is None
         if recipients is None:
@@ -1985,6 +1987,7 @@ class Operations:
                 json_value(
                     {
                         "source_kind": "zulip.incoming",
+                        "emit_public_event": self.emit_public_event,
                         "user_uuids": [str(value) for value in users],
                         "stream_uuid": placement["stream_uuid"],
                         "topic_uuid": placement["topic_uuid"],
@@ -2586,6 +2589,7 @@ class Operations:
                     json_value(
                         {
                             "source_kind": "zulip.incoming",
+                            "emit_public_event": self.emit_public_event,
                             "user_uuid": account["owner_user_uuid"],
                             "stream_uuid": state["stream_uuid"],
                             "topic_uuid": state["topic_uuid"],

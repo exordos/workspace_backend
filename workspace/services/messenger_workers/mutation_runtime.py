@@ -590,7 +590,9 @@ class MutationRuntime:
                ORDER BY task.created_at, task.uuid""",
             (list(work.values),),
         ).fetchall():
-            if task["task_kind"] == "read_counters":
+            if task["task_kind"] == "read_counters" and task["payload"].get(
+                "emit_public_event", True
+            ):
                 payload = task["payload"]
                 changes = typing.cast(
                     owned_projection.Changes, owned_projection.CURRENT.get()

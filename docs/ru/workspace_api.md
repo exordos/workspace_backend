@@ -2150,6 +2150,9 @@ The Workspace backend installs `workspace-api`, `workspace-messenger-events`,
 `workspace-zulip-outgoing` and `workspace-zulip-history`. The incoming service receives live events using
 long polling and publishes object changes through Workspace client events.
 History import and queue-reset recovery run in a separate bounded process.
+History writes and deferred counter projections do not publish WebSocket events;
+clients fetch imported data through the unchanged REST API. Realtime events continue
+to publish normally.
 It compares pages before recording differences and preserves its progress across
 reconnections. Configure its limits in `[zulip_history]`, and the incoming HTTP
 pool and fallback checks in `[zulip_incoming]`. The REST API

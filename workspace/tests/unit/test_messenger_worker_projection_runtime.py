@@ -49,7 +49,8 @@ def test_stream_counter_snapshot_accepts_no_default_topic(monkeypatch):
         "_try_lock_project_event_tail",
         lambda *args: calls.append(("lock", args)),
     )
-    session = types.SimpleNamespace(execute=lambda *_args, **_kwargs: None)
+    cursor = types.SimpleNamespace(fetchall=lambda: [])
+    session = types.SimpleNamespace(execute=lambda *_args, **_kwargs: cursor)
 
     v2_projection._process_read_counters(
         session,

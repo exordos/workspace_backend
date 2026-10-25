@@ -54,8 +54,11 @@ outgoing intentions. Native copies retain empty `provider_identity`.
 Initial registration persists its catalog snapshot and requests background recovery.
 The separate `workspace-zulip-history` process compares catalogs and message pages
 against current Workspace state. Only differences enter `zulip_history_intents`;
-the same incoming operations apply them and publish client events. Incoming and
-history changes never produce provider outbox work.
+the same incoming operations apply them without publishing client events.
+History updates messages, catalogs, flags, reactions and counter projections in
+the database silently, including deferred projection tasks. Clients read imported
+data through the unchanged REST API. Normal realtime changes still publish
+WebSocket events. Incoming and history changes never produce provider outbox work.
 
 History cursors in `zulip_history_jobs` survive queue replacement and process
 restarts. The scanner loads recent messages first, fills gaps from its confirmed
@@ -69,8 +72,7 @@ four concurrent account tasks and four HTTP connections, with one active task pe
 provider. Page admission is serial; admitted intentions can prepare and apply
 concurrently. Accounts take turns after each page or intention. History pauses
 when realtime work is delayed by 0.5 seconds or a project's publication backlog
-reaches 256 entries. Historical publications have lower priority while preserving
-entity order. A completed repair restarts after 86400 seconds. Requests and file
+reaches 256 entries. A completed repair restarts after 86400 seconds. Requests and file
 preparation run outside transactions. Short snapshot-isolation transactions
 check account identity, pending local work and concurrent changes before applying;
 stale message snapshots are fetched again. Permanent failures retain their error

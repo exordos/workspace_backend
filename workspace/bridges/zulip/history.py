@@ -240,6 +240,8 @@ def entity_key(event: dict) -> str:
 
 
 class Operations(incoming_operations.Operations):
+    emit_public_event = False
+
     async def snapshots(
         self, account: dict, identifiers: list, connection: typing.Any = None
     ) -> dict[str, dict]:

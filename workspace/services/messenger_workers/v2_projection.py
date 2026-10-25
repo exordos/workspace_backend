@@ -1466,9 +1466,10 @@ def _enqueue_counter_outbox_events(
     topic_uuid: object,
     placement_uuid: object | None = None,
     include_topic: bool = True,
+    emit_public_event: bool = True,
 ) -> None:
     changes = owned_projection.CURRENT.get()
-    if changes is not None:
+    if changes is not None and emit_public_event:
         if include_topic and topic_uuid is not None:
             changes.topic(project_id, stream_uuid, topic_uuid, [user_uuid])
         else:
@@ -1476,6 +1477,7 @@ def _enqueue_counter_outbox_events(
         return
     common_payload = {
         "source_kind": source_kind,
+        "emit_public_event": emit_public_event,
         "user_uuid": user_uuid,
         "stream_uuid": stream_uuid,
         "topic_uuid": topic_uuid,
@@ -1515,6 +1517,7 @@ def _enqueue_folder_outbox_events(
     source_kind: str,
     user_uuid: object,
     stream_uuid: object,
+    emit_public_event: bool = True,
 ) -> None:
     stream = session.execute(
         """
@@ -1567,6 +1570,7 @@ def _enqueue_folder_outbox_events(
                     _plain(
                         {
                             "source_kind": source_kind,
+                            "emit_public_event": emit_public_event,
                             "user_uuid": user_uuid,
                             "stream_uuid": stream_uuid,
                             "folder_uuid": folder_uuid,
@@ -2162,6 +2166,7 @@ def _process_read_counters(
     session: typing.Any, task: typing.Mapping[str, typing.Any]
 ) -> None:
     payload = task["payload"]
+    emit_public_event = payload.get("emit_public_event", True)
     users = _counter_users(payload)
     user_uuid = users[0]
     topic_value = payload.get("topic_uuid")
@@ -2179,16 +2184,18 @@ def _process_read_counters(
                 source_kind="history.imported",
                 user_uuid=user_uuid,
                 stream_uuid=_uuid(payload["stream_uuid"]),
+                emit_public_event=emit_public_event,
             )
-        _try_lock_project_event_tail(session, task["project_id"])
-        _emit_unread_snapshots(
-            session,
-            task["project_id"],
-            _uuid(payload["stream_uuid"]),
-            topic_uuid,
-            users,
-            task["scope_kind"],
-        )
+        if emit_public_event:
+            _try_lock_project_event_tail(session, task["project_id"])
+            _emit_unread_snapshots(
+                session,
+                task["project_id"],
+                _uuid(payload["stream_uuid"]),
+                topic_uuid,
+                users,
+                task["scope_kind"],
+            )
         return
     if owned_projection.CURRENT.get() is None and not payload.get(
         "emit_message_read", False
@@ -2227,11 +2234,15 @@ def _process_read_counters(
                 task["project_id"],
             ),
         )
+        siblings = coalesced.fetchall()
+        emit_public_event = emit_public_event or any(
+            sibling["payload"].get("emit_public_event", True) for sibling in siblings
+        )
         if "user_uuids" in payload:
             users = sorted(
                 set(users).union(
                     user
-                    for sibling in coalesced.fetchall()
+                    for sibling in siblings
                     for user in _counter_users(sibling["payload"])
                 )
             )
@@ -2243,7 +2254,7 @@ def _process_read_counters(
         users,
         task["scope_kind"],
     )
-    if pending:
+    if pending or task["scope_kind"] == "user-topic":
         for user_uuid in users:
             _enqueue_counter_outbox_events(
                 session,
@@ -2253,7 +2264,8 @@ def _process_read_counters(
                 user_uuid=user_uuid,
                 stream_uuid=_uuid(payload["stream_uuid"]),
                 topic_uuid=topic_uuid,
-                include_topic=topic_uuid is not None,
+                include_topic=pending and topic_uuid is not None,
+                emit_public_event=emit_public_event,
             )
     if task["scope_kind"] == "user-stream":
         for user_uuid in users:
@@ -2264,7 +2276,10 @@ def _process_read_counters(
                 source_kind=payload["source_kind"],
                 user_uuid=user_uuid,
                 stream_uuid=_uuid(payload["stream_uuid"]),
+                emit_public_event=emit_public_event,
             )
+    if not emit_public_event:
+        return
     _try_lock_project_event_tail(session, task["project_id"])
     if payload.get("placement_uuid") and payload.get("emit_message_read"):
         messages = _v2_rows(

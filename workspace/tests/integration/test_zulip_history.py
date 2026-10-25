@@ -9,12 +9,16 @@ import uuid
 from unittest import mock
 
 import pytest
+from oslo_config import cfg
 
 from workspace.bridges.zulip import history
 from workspace.bridges.zulip import incoming_operations
 from workspace.bridges.zulip import outgoing_operations
+from workspace.common import mutation_journal_opts
 from workspace.messenger_api import publication
 from workspace.services import zulip_history
+from workspace.services.messenger_workers import mutation_runtime
+from workspace.tests.integration import test_mutation_journal as journal_tests
 from workspace.tests.integration import test_zulip_incoming as incoming_tests
 
 
@@ -143,6 +147,8 @@ async def drain(service, account):
 
 def test_history_import_resumes_and_repeated_scan_is_silent(incoming):
     _, db, account, _, _ = incoming
+    incoming_tests.drain()
+    before = incoming_tests.client_events(incoming)
     messages = {
         identifier: message(identifier, f"History {identifier}")
         for identifier in range(101, 109)
@@ -188,6 +194,66 @@ def test_history_import_resumes_and_repeated_scan_is_silent(incoming):
     asyncio.run(run())
     incoming_tests.drain()
     assert len(incoming[0].get("/v1/messenger/messages/").json()) == 8
+    assert incoming_tests.client_events(incoming) == before
+
+
+@pytest.mark.parametrize("journal", [False, True])
+@pytest.mark.parametrize("public_position", [None, 0, -1])
+def test_history_counters_preserve_a_realtime_publication(
+    incoming, journal, public_position
+):
+    api, db, account, _, _ = incoming
+    cfg.CONF.set_override("enabled", journal, group=mutation_journal_opts.DOMAIN)
+    runtime = mutation_runtime.MutationRuntime() if journal else None
+
+    def project():
+        if runtime is None:
+            incoming_tests.drain()
+        else:
+            journal_tests.drain(runtime, db)
+
+    try:
+        project()
+        before = incoming_tests.client_events(incoming)
+        request(db, account, {"subscriptions": [{"stream_id": 42, "name": "Channel"}]})
+
+        async def run():
+            async with worker(incoming, {101: message(), 102: message(102)}) as (
+                service,
+                _,
+            ):
+                await drain(service, account)
+
+        asyncio.run(run())
+        counters = db.execute(
+            "SELECT uuid FROM messenger_projection_tasks WHERE project_id=%s "
+            "AND task_kind='read_counters' ORDER BY created_at,uuid",
+            (account["project_id"],),
+        ).fetchall()
+        assert len(counters) >= 2
+        if public_position is not None:
+            # A normal realtime invalidation can share this authoritative scope.
+            db.execute(
+                "UPDATE messenger_projection_tasks SET payload="
+                "jsonb_set(payload,'{emit_public_event}','true') WHERE uuid=%s",
+                (counters[public_position][0],),
+            )
+        project()
+        messages = api.get("/v1/messenger/messages/").json()
+        assert len(messages) == 2
+        topic = api.get(
+            "/v1/messenger/stream_topics/" + messages[0]["topic_uuid"]
+        ).json()
+        assert topic["unread_count"] == 2
+        stream = api.get("/v1/messenger/streams/" + messages[0]["stream_uuid"]).json()
+        assert stream["unread_count"] == 2
+        assert bool(incoming_tests.client_events(incoming)[len(before) :]) == (
+            public_position is not None
+        )
+    finally:
+        if runtime is not None:
+            runtime.close()
+        cfg.CONF.clear_override("enabled", group=mutation_journal_opts.DOMAIN)
 
 
 @pytest.mark.parametrize("provider_content", [None, "Previous provider spelling"])
@@ -234,7 +300,8 @@ def test_history_repairs_provider_content_without_changing_workspace_payload(
     asyncio.run(run())
 
 
-def test_history_repairs_content_reactions_flags_and_scoped_absence(incoming):
+@pytest.mark.parametrize("journal", [False, True])
+def test_history_repairs_content_reactions_flags_and_scoped_absence(incoming, journal):
     _, db, account, _, _ = incoming
     first = message(
         reactions=[
@@ -252,42 +319,57 @@ def test_history_repairs_content_reactions_flags_and_scoped_absence(incoming):
         {"type": "message", "message": first},
         {"type": "message", "message": second},
     )
-    changed = message(
-        content="Updated",
-        flags=["read", "starred"],
-        last_edit_timestamp=first["timestamp"] + 5,
-    )
-    request(db, account)
-
-    async def run():
-        async with worker(incoming, {101: changed}) as (service, _):
-            await drain(service, account)
-            root = (
-                await service.db.sql(
-                    "SELECT payload,reactions FROM messenger_messages_with_content_v1 WHERE project_id=%s AND provider_identity=%s",
-                    (account["project_id"], "101"),
-                )
-            )[0]
-            assert root["payload"]["content"] == "Updated"
-            assert root["reactions"] == {}
-            assert not await service.db.sql(
-                "SELECT 1 FROM messenger_message_reaction_facts WHERE project_id=%s",
-                (account["project_id"],),
-            )
-            assert not await service.db.sql(
-                "SELECT 1 FROM messenger_messages WHERE project_id=%s AND deleted_at IS NOT NULL",
-                (account["project_id"],),
-            )
-
-    asyncio.run(run())
     incoming_tests.drain()
-    visible = incoming[0].get("/v1/messenger/messages/").json()
-    assert len(visible) == 1
-    assert visible[0]["starred"] is True
-    assert db.execute(
-        "SELECT read_at IS NOT NULL FROM messenger_user_message_states WHERE project_id=%s AND provider_identity=%s",
-        (account["project_id"], "101:7"),
-    ).fetchone()[0]
+    cfg.CONF.set_override("enabled", journal, group=mutation_journal_opts.DOMAIN)
+    runtime = mutation_runtime.MutationRuntime() if journal else None
+    try:
+        if runtime is not None:
+            journal_tests.drain(runtime, db)
+        before = incoming_tests.client_events(incoming)
+        changed = message(
+            content="Updated",
+            flags=["read", "starred"],
+            last_edit_timestamp=first["timestamp"] + 5,
+        )
+        request(db, account)
+
+        async def run():
+            async with worker(incoming, {101: changed}) as (service, _):
+                await drain(service, account)
+                root = (
+                    await service.db.sql(
+                        "SELECT payload,reactions FROM messenger_messages_with_content_v1 WHERE project_id=%s AND provider_identity=%s",
+                        (account["project_id"], "101"),
+                    )
+                )[0]
+                assert root["payload"]["content"] == "Updated"
+                assert root["reactions"] == {}
+                assert not await service.db.sql(
+                    "SELECT 1 FROM messenger_message_reaction_facts WHERE project_id=%s",
+                    (account["project_id"],),
+                )
+                assert not await service.db.sql(
+                    "SELECT 1 FROM messenger_messages WHERE project_id=%s AND deleted_at IS NOT NULL",
+                    (account["project_id"],),
+                )
+
+        asyncio.run(run())
+        if runtime is None:
+            incoming_tests.drain()
+        else:
+            journal_tests.drain(runtime, db)
+        assert incoming_tests.client_events(incoming) == before
+        visible = incoming[0].get("/v1/messenger/messages/").json()
+        assert len(visible) == 1
+        assert visible[0]["starred"] is True
+        assert db.execute(
+            "SELECT read_at IS NOT NULL FROM messenger_user_message_states WHERE project_id=%s AND provider_identity=%s",
+            (account["project_id"], "101:7"),
+        ).fetchone()[0]
+    finally:
+        if runtime is not None:
+            runtime.close()
+        cfg.CONF.clear_override("enabled", group=mutation_journal_opts.DOMAIN)
 
 
 def test_repeated_registration_keeps_cursors_and_does_not_duplicate_work(incoming):
@@ -745,7 +827,10 @@ def test_failed_page_commit_keeps_both_work_and_cursor_unadvanced(
 
 
 @pytest.mark.isolated_schema
-def test_history_process_reaches_an_actual_websocket_client(incoming, tmp_path):
+@pytest.mark.parametrize("age_days", [0, 4])
+def test_history_process_is_silent_for_an_actual_websocket_client(
+    incoming, tmp_path, age_days
+):
     import json
     import signal
     import socket
@@ -759,7 +844,10 @@ def test_history_process_reaches_an_actual_websocket_client(incoming, tmp_path):
     _, db, original, _, url = incoming
 
     async def run():
-        payload = message(content="From the history process")
+        now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+        payload = message(
+            content="From the history process", timestamp=now - age_days * 86400
+        )
         transports = []
 
         async def provider(request):
@@ -852,19 +940,10 @@ def test_history_process_reaches_an_actual_websocket_client(incoming, tmp_path):
                         assert child.returncode is None
                         await asyncio.sleep(0.02)
                     await asyncio.to_thread(incoming_tests.drain)
-                    while True:
-                        frame = json.loads(await websocket.recv())
-                        if (
-                            frame.get("object_type") == "message"
-                            and frame.get("action") == "created"
-                        ):
-                            assert (
-                                frame["payload"]["payload"]["content"]
-                                == "From the history process"
-                            )
-                            break
+                    with pytest.raises(asyncio.TimeoutError):
+                        await asyncio.wait_for(websocket.recv(), 0.2)
                     payload["content"] = "Edited through recovery"
-                    payload["last_edit_timestamp"] = payload["timestamp"] + 5
+                    payload["last_edit_timestamp"] = now + 5
                     request(db, account, queue="recovered")
                     while (
                         db.execute(
@@ -875,15 +954,23 @@ def test_history_process_reaches_an_actual_websocket_client(incoming, tmp_path):
                     ):
                         await asyncio.sleep(0.02)
                     await asyncio.to_thread(incoming_tests.drain)
+                    with pytest.raises(asyncio.TimeoutError):
+                        await asyncio.wait_for(websocket.recv(), 0.2)
+                    # A new realtime message must still reach this same connection.
+                    realtime = (incoming[0], db, account, incoming[3], url)
+                    await asyncio.to_thread(
+                        incoming_tests.apply,
+                        realtime,
+                        incoming_tests.event("Realtime stays visible", 102),
+                    )
+                    await asyncio.to_thread(incoming_tests.drain)
                     while True:
                         frame = json.loads(await websocket.recv())
-                        if (
-                            frame.get("object_type") == "message"
-                            and frame.get("action") == "updated"
-                        ):
+                        if frame.get("object_type") == "message":
+                            assert frame["action"] == "created"
                             assert (
                                 frame["payload"]["payload"]["content"]
-                                == payload["content"]
+                                == "Realtime stays visible"
                             )
                             break
                     assert len(set(transports)) < len(transports)
