@@ -4,12 +4,56 @@
 """Exercise the bootstrap's actual config parser against libpq URI semantics."""
 
 import pathlib
+import re
 import shlex
 import subprocess
 import sys
 
 import psycopg.conninfo
 import pytest
+
+
+def test_image_exports_every_manifest_workspace_service(tmp_path):
+    root = pathlib.Path(__file__).resolve().parents[3]
+    script = (root / "exordos/images/backend-install.sh").read_text()
+    binaries = script.split("WORKSPACE_BINARIES=(", 1)[1].split(")", 1)[0]
+    manifest = (root / "exordos/manifests/workspace.yaml.j2").read_text()
+    commands = set(re.findall(r"path: /usr/bin/(workspace-[\w-]+)\b", manifest))
+    venv = tmp_path / "venv"
+    exported = tmp_path / "exported"
+    (venv / "bin").mkdir(parents=True)
+    exported.mkdir()
+    for command in commands:
+        target = venv / "bin" / command
+        target.write_text("#!/bin/sh\nprintf '%s' " + shlex.quote(command) + "\n")
+        target.chmod(0o755)
+    export_loop = script.split('for binary in "${WORKSPACE_BINARIES[@]}"; do', 1)[
+        1
+    ].split("\ndone", 1)[0]
+    export_loop = export_loop.replace('"/usr/bin/$binary"', '"$EXPORT_PATH/$binary"')
+    subprocess.run(
+        [
+            "bash",
+            "-eu",
+            "-c",
+            "WORKSPACE_BINARIES=("
+            + binaries
+            + ")\n"
+            + "VENV_PATH="
+            + shlex.quote(str(venv))
+            + "\n"
+            + "EXPORT_PATH="
+            + shlex.quote(str(exported))
+            + "\n"
+            + 'sudo() { "$@"; }\nfor binary in "${WORKSPACE_BINARIES[@]}"; do'
+            + export_loop
+            + "\ndone",
+        ],
+        check=True,
+    )
+    for command in commands:
+        assert (exported / command).is_file(), command
+        assert subprocess.check_output([exported / command], text=True) == command
 
 
 @pytest.mark.parametrize(

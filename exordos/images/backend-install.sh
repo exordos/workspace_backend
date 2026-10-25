@@ -27,6 +27,7 @@ VENV_PATH="$GC_PATH/.venv"
 WORKSPACE_BINARIES=(
     workspace-api
     workspace-zulip-incoming
+    workspace-zulip-history
     workspace-zulip-outgoing
     workspace-messenger-worker
     workspace-messenger-events
