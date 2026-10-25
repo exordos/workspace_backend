@@ -32,7 +32,7 @@ from restalchemy.storage.sql import orm
 
 from workspace.common import file_storage_opts
 from workspace.common import models as common_models
-from workspace.messenger_api.dm import base
+from workspace.tests.integration.legacy_messenger import base
 from workspace.messenger_api.dm import message_payloads
 
 

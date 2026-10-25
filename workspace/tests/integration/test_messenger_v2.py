@@ -144,7 +144,6 @@ def test_first_request_materializes_iam_user_before_native_write(http_server, db
             "name": "First request",
             "description": "",
             "source_name": "native",
-            "source": {"kind": "native"},
         },
     )
 
@@ -278,12 +277,11 @@ def test_native_v2_cutover_preserves_v1_http_and_event_contract(api, workspace_a
             "name": "Native v2",
             "description": "Canonical native Messenger",
             "source_name": "native",
-            "source": {"kind": "native"},
         },
     )
     assert response.status_code == 201, response.text
     stream = response.json()
-    assert stream["source"] == {"kind": "native"}
+    assert stream.get("provider_uuid") is None
     assert _drain() >= 3
 
     response = api.post(
@@ -299,7 +297,6 @@ def test_native_v2_cutover_preserves_v1_http_and_event_contract(api, workspace_a
         json={
             "stream_uuid": stream["uuid"],
             "name": "Architecture",
-            "source": {"kind": "native"},
         },
     )
     assert response.status_code == 201, response.text
@@ -514,7 +511,6 @@ def test_native_v2_deleted_message_supersedes_pending_projection_work(api, db):
             "name": "Deleted pending projection",
             "description": "",
             "source_name": "native",
-            "source": {"kind": "native"},
         },
     )
     assert stream_response.status_code == 201, stream_response.text
@@ -526,7 +522,6 @@ def test_native_v2_deleted_message_supersedes_pending_projection_work(api, db):
         json={
             "stream_uuid": stream["uuid"],
             "name": "Delete before fanout",
-            "source": {"kind": "native"},
         },
     )
     assert topic_response.status_code == 201, topic_response.text
@@ -576,7 +571,6 @@ def test_native_v2_direct_stream_is_idempotent_and_closed(api, db):
         "name": "Direct",
         "description": "",
         "source_name": "native",
-        "source": {"kind": "native"},
         "direct_user_uuid": str(peer_uuid),
     }
     first = api.post(STREAMS, json=body)
@@ -640,7 +634,6 @@ def test_native_v2_private_stream_requires_peer(api, db, peer):
         "description": "",
         "private": True,
         "source_name": "native",
-        "source": {"kind": "native"},
         **peer,
     }
     for _ in range(2):
@@ -737,7 +730,6 @@ def test_native_v2_fanout_is_bounded_and_outbox_is_one_to_one(api, db):
             "name": "Bounded fanout",
             "description": "",
             "source_name": "native",
-            "source": {"kind": "native"},
         },
     ).json()
     _drain()
@@ -809,7 +801,6 @@ def test_native_v2_membership_generation_fences_fanout_and_rebuilds_history(api,
             "name": "Membership generations",
             "description": "",
             "source_name": "native",
-            "source": {"kind": "native"},
         },
     ).json()
     _drain()
@@ -956,113 +947,43 @@ def test_native_v2_membership_generation_fences_fanout_and_rebuilds_history(api,
         assert cursor.fetchone()[0] == 3
 
 
-def test_native_v2_canonical_message_supports_multiple_placements(
-    api, workspace_api, db
-):
-    workspace_api.user_uuid = api.user_uuid
-    workspace_api.project_id = api.project_id
-    peer_uuid = sys_uuid.uuid4()
-    conftest.seed_workspace_user(db, peer_uuid, f"user-{peer_uuid}")
-    _register_project_user(db, api.project_id, peer_uuid)
+def test_native_v2_canonical_message_copy_is_independent(api, db):
     stream = api.post(
-        STREAMS,
-        json={
-            "name": "Canonical placements",
-            "description": "",
-            "source_name": "native",
-            "source": {"kind": "native"},
-        },
+        STREAMS, json={"name": "Copies", "description": "", "source_name": "native"}
     ).json()
-    _drain()
-    api.post(
-        f"{STREAMS}{stream['uuid']}/actions/add_users/invoke",
-        json={"member": [str(peer_uuid)]},
-    )
-    first_topic = api.post(
-        STREAM_TOPICS,
-        json={"stream_uuid": stream["uuid"], "name": "First"},
-    ).json()
-    second_topic = api.post(
-        STREAM_TOPICS,
-        json={"stream_uuid": stream["uuid"], "name": "Second"},
-    ).json()
-    _drain()
-
-    canonical_uuid = sys_uuid.uuid4()
-    message_body = {
-        "uuid": str(canonical_uuid),
+    topics = [
+        api.post(
+            STREAM_TOPICS, json={"stream_uuid": stream["uuid"], "name": name}
+        ).json()
+        for name in ("First", "Second")
+    ]
+    canonical_uuid = str(sys_uuid.uuid4())
+    body = {
+        "uuid": canonical_uuid,
         "stream_uuid": stream["uuid"],
-        "payload": {"kind": "markdown", "content": "shared content"},
+        "topic_uuid": topics[0]["uuid"],
+        "payload": {"kind": "markdown", "content": "original"},
     }
-    first = api.post(
-        MESSAGES,
-        json={**message_body, "topic_uuid": first_topic["uuid"]},
-    )
-    second = api.post(
-        MESSAGES,
-        json={**message_body, "topic_uuid": second_topic["uuid"]},
-    )
-    assert first.status_code == second.status_code == 201
-    assert first.json()["uuid"] != second.json()["uuid"]
-    assert first.json()["uuid"] == str(
-        sys_uuid.uuid5(sys_uuid.UUID(first_topic["uuid"]), str(canonical_uuid))
-    )
-    assert second.json()["uuid"] == str(
-        sys_uuid.uuid5(sys_uuid.UUID(second_topic["uuid"]), str(canonical_uuid))
-    )
-    _drain()
-
-    reaction = api.post(
-        MESSAGE_REACTIONS,
-        json={
-            "message_uuid": first.json()["uuid"],
-            "emoji_name": "rocket",
-        },
-    )
-    assert reaction.status_code == 201, reaction.text
-    _drain()
-    for placement_uuid in (first.json()["uuid"], second.json()["uuid"]):
-        visible = api.get(f"{MESSAGES}{placement_uuid}", user=peer_uuid)
-        assert visible.status_code == 200, visible.text
-        assert visible.json()["reactions"] == {"rocket": 1}
-
-    updated = api.put(
-        f"{MESSAGES}{first.json()['uuid']}",
-        json={"payload": {"kind": "markdown", "content": "updated once"}},
-    )
-    assert updated.status_code == 200, updated.text
-    _drain()
+    first = api.post(MESSAGES, json=body)
+    assert first.status_code == 201, first.text
+    assert api.post(MESSAGES, json=body).json()["uuid"] == first.json()["uuid"]
+    copy_body = {**body, "topic_uuid": topics[1]["uuid"]}
+    assert api.post(MESSAGES, json=copy_body).status_code == 400
+    second = api.post(MESSAGES, json={**copy_body, "uuid": str(sys_uuid.uuid4())})
+    assert second.status_code == 201, second.text
     assert (
-        api.get(f"{MESSAGES}{second.json()['uuid']}", user=peer_uuid).json()["payload"][
-            "content"
-        ]
-        == "updated once"
+        api.put(
+            f"{MESSAGES}{first.json()['uuid']}",
+            json={"payload": {"kind": "markdown", "content": "edited"}},
+        ).status_code
+        == 200
     )
-    events = workspace_api.get(EVENTS, params={"page_limit": 500}, user=peer_uuid)
-    updated_message_uuids = {
-        event["payload"]["uuid"]
-        for event in events.json()
-        if event["payload"]["kind"] == "message.updated"
-    }
-    assert {first.json()["uuid"], second.json()["uuid"]} <= updated_message_uuids
-
-    deleted = api.delete(f"{MESSAGES}{first.json()['uuid']}")
-    assert deleted.status_code == 204, deleted.text
-    _drain()
-    assert api.get(f"{MESSAGES}{first.json()['uuid']}").status_code == 404
-    assert api.get(f"{MESSAGES}{second.json()['uuid']}").status_code == 404
-    with db.cursor() as cursor:
-        cursor.execute(
-            """
-            SELECT
-                (SELECT count(*) FROM messenger_messages
-                 WHERE project_id = %s AND uuid = %s),
-                (SELECT count(*) FROM messenger_message_reaction_facts
-                 WHERE project_id = %s AND canonical_message_uuid = %s)
-            """,
-            (api.project_id, canonical_uuid, api.project_id, canonical_uuid),
-        )
-        assert cursor.fetchone() == (0, 0)
+    assert (
+        api.get(f"{MESSAGES}{second.json()['uuid']}").json()["payload"]["content"]
+        == "original"
+    )
+    assert api.delete(f"{MESSAGES}{first.json()['uuid']}").status_code == 204
+    assert api.get(f"{MESSAGES}{second.json()['uuid']}").status_code == 200
 
 
 def test_native_v2_actions_converge_counters_notifications_and_events(
@@ -1079,7 +1000,6 @@ def test_native_v2_actions_converge_counters_notifications_and_events(
             "name": "Actions and counters",
             "description": "",
             "source_name": "native",
-            "source": {"kind": "native"},
         },
     ).json()
     _drain()
@@ -1207,7 +1127,6 @@ def test_native_v2_idempotent_reads_repair_stale_counters(api, db):
             "name": "Idempotent read repair",
             "description": "",
             "source_name": "native",
-            "source": {"kind": "native"},
         },
     ).json()
     _drain()
@@ -1311,7 +1230,6 @@ def test_projection_claim_bounds_interactive_read_priority(
             "name": "Interactive read claim priority",
             "description": "",
             "source_name": "native",
-            "source": {"kind": "native"},
         },
     ).json()
     _drain()
@@ -1414,7 +1332,6 @@ def test_projection_claim_ignores_unclaimable_overdue_tasks(
                     "name": name,
                     "description": "",
                     "source_name": "native",
-                    "source": {"kind": "native"},
                 },
             ).json()
         )
@@ -1575,7 +1492,6 @@ def test_native_v2_keeps_folder_file_and_draft_contracts(api, db):
             "name": "Adjacent contracts",
             "description": "",
             "source_name": "native",
-            "source": {"kind": "native"},
         },
     ).json()
     _drain()
@@ -1730,7 +1646,6 @@ def test_native_v2_isolates_projects_and_rejects_non_members(api, workspace_api,
             "name": "Current project",
             "description": "",
             "source_name": "native",
-            "source": {"kind": "native"},
         },
     )
     assert current_stream.status_code == 201, current_stream.text
@@ -1745,7 +1660,6 @@ def test_native_v2_isolates_projects_and_rejects_non_members(api, workspace_api,
             "name": "Cross-project direct",
             "description": "",
             "source_name": "native",
-            "source": {"kind": "native"},
             "direct_user_uuid": str(other_user),
         },
     )
@@ -1757,7 +1671,6 @@ def test_native_v2_isolates_projects_and_rejects_non_members(api, workspace_api,
             "name": "Other project",
             "description": "",
             "source_name": "native",
-            "source": {"kind": "native"},
         },
     )
     assert other_stream.status_code == 201, other_stream.text
@@ -1799,7 +1712,6 @@ def test_native_v2_scheduler_preserves_fifo_within_fanout_lane(api, monkeypatch)
             "name": "Newest first",
             "description": "",
             "source_name": "native",
-            "source": {"kind": "native"},
         },
     ).json()
     _drain()
@@ -1870,7 +1782,6 @@ def test_native_v2_scheduler_drains_aged_tasks_before_fresh_fanout(api, monkeypa
             "name": "Aged before fresh",
             "description": "",
             "source_name": "native",
-            "source": {"kind": "native"},
         },
     ).json()
     _drain()
@@ -2031,7 +1942,6 @@ def test_native_v2_coalesces_legacy_folder_snapshot_bursts(api, db):
             "name": "Legacy folder snapshot burst",
             "description": "",
             "source_name": "native",
-            "source": {"kind": "native"},
         },
     )
     assert stream_response.status_code == 201, stream_response.text
@@ -2151,7 +2061,6 @@ def test_native_v2_coalesces_snapshot_only_read_counter_bursts(api, db):
             "name": "Read counter snapshot burst",
             "description": "",
             "source_name": "native",
-            "source": {"kind": "native"},
         },
     )
     assert stream_response.status_code == 201, stream_response.text
@@ -2326,7 +2235,6 @@ def test_native_v2_fanout_supports_more_than_five_thousand_recipients(api, db):
             "name": "Large native audience",
             "description": "",
             "source_name": "native",
-            "source": {"kind": "native"},
         },
     )
     assert stream_response.status_code == 201, stream_response.text

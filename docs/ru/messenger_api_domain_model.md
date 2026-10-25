@@ -96,7 +96,7 @@ URI. Например, публичный `WorkspaceStream.owner` — обычн
 экземпляр:
 
 - содержимого и автора;
-- проекции полей `source`, `provider`, `delivery`;
+- проекции полей `provider_uuid`, `provider_identity`, `provider`, `delivery`;
 - материализованных `reactions` и `reaction_users`;
 - публичных `created_at` и `updated_at`.
 
@@ -158,7 +158,7 @@ lowercase hyphenated ASCII-представлении без braces, префи�
 | `read`, `mentioned`, `starred`, `pinned` | Готовое состояние пользователя для placement из `USER_MESSAGE_STATE`; `read` — скалярная проекция `read_at IS NOT NULL`. |
 | `is_own` | Простое скалярное сравнение `user_uuid` привязки и `MESSAGE.author_uuid`; оно не требует обхода других строк. |
 | `author_uuid`, `payload` | Канонический `MESSAGE`. |
-| `source_name`, `source`, `provider`, `delivery` | Канонический `MESSAGE`; внутреннее хранилище `provider`/`delivery` не становится публичным. |
+| `source_name`, `provider_uuid`, `provider_identity`, `provider`, `delivery` | Канонический `MESSAGE`; внутреннее хранилище `provider`/`delivery` не становится публичным. |
 | `reactions`, `reaction_users` | Заранее материализованное состояние канонического `MESSAGE`, без агрегатов в представлении чтения. |
 | `created_at`, `updated_at` | Только канонический `MESSAGE`. |
 
@@ -750,3 +750,6 @@ runtime/transport диспетчера не выбирается.
 Единственный канонический список находится в
 [`messenger_architecture_inventory.md`](messenger_architecture_inventory.md#единственный-список-open-решений).
 Этот документ не поддерживает отдельную копию списка.
+
+
+Provider origins use `source_name`, `provider_uuid`, and `provider_identity`; see [Provider identities](provider_identities.md). The former JSON `source` field is removed from messenger entities. `WorkspaceUser.source` is unchanged.

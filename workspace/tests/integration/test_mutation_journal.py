@@ -327,7 +327,7 @@ def test_topic_mutation_continues_during_stream_snapshot_and_requests_rerun(
         runtime.close()
 
 
-def test_new_placement_after_admission_extends_canonical_reservations(
+def test_new_copy_after_admission_has_independent_canonical_reservations(
     api, db, conversation
 ):
     stream, messages, _peer = conversation
@@ -345,24 +345,31 @@ def test_new_placement_after_admission_extends_canonical_reservations(
         native.STREAM_TOPICS,
         json={"stream_uuid": stream["uuid"], "name": "Late placement"},
     ).json()
+    values = {
+        "uuid": str(canonical),
+        "stream_uuid": stream["uuid"],
+        "topic_uuid": topic["uuid"],
+        "payload": message["payload"],
+    }
+    rejected = api.post(native.MESSAGES, json=values)
+    assert rejected.status_code == 400, rejected.text
+    values["uuid"] = str(uuid.uuid4())
     copy = api.post(
         native.MESSAGES,
-        json={
-            "uuid": str(canonical),
-            "stream_uuid": stream["uuid"],
-            "topic_uuid": topic["uuid"],
-            "payload": message["payload"],
-        },
+        json=values,
     )
     assert copy.status_code == 201, copy.text
     runtime = mutation_runtime.MutationRuntime()
     try:
         drain(runtime, db)
-        for placement in [message["uuid"], copy.json()["uuid"]]:
-            assert (
-                api.get(f"{native.MESSAGES}{placement}").json()["payload"]["content"]
-                == "edited all placements"
-            )
+        assert (
+            api.get(f"{native.MESSAGES}{message['uuid']}").json()["payload"]["content"]
+            == "edited all placements"
+        )
+        assert (
+            api.get(f"{native.MESSAGES}{copy.json()['uuid']}").json()["payload"]
+            == message["payload"]
+        )
     finally:
         runtime.close()
 
@@ -427,14 +434,10 @@ def test_duplicate_pending_reaction_returns_the_persisted_identity(
         runtime.close()
 
 
-def test_canonical_edit_updates_placements_the_author_no_longer_sees(
+def test_canonical_edit_does_not_change_a_copy_the_author_no_longer_sees(
     api, db, conversation
 ):
     _stream, messages, peer = conversation
-    canonical = db.execute(
-        "SELECT message_uuid FROM messenger_message_placements WHERE project_id=%s AND uuid=%s",
-        (api.project_id, messages[0]["uuid"]),
-    ).fetchone()[0]
     second = api.post(native.STREAMS, json={"name": "Other placement stream"}).json()
     response = api.post(
         f"{native.STREAMS}{second['uuid']}/actions/add_users/invoke",
@@ -444,7 +447,7 @@ def test_canonical_edit_updates_placements_the_author_no_longer_sees(
     copy = api.post(
         native.MESSAGES,
         json={
-            "uuid": str(canonical),
+            "uuid": str(uuid.uuid4()),
             "stream_uuid": second["uuid"],
             "topic_uuid": second["default_topic_uuid"],
             "payload": messages[0]["payload"],
@@ -477,7 +480,7 @@ def test_canonical_edit_updates_placements_the_author_no_longer_sees(
             api.get(f"{native.MESSAGES}{copy.json()['uuid']}", user=peer).json()[
                 "payload"
             ]["content"]
-            == "Edited canonical content"
+            == messages[0]["payload"]["content"]
         )
     finally:
         runtime.close()

@@ -18,11 +18,11 @@ from restalchemy.dm import filters as dm_filters
 from workspace.tests.integration.legacy_messenger import resource_projection
 from workspace.tests.integration.legacy_messenger import sql_canonical_store
 from workspace.messenger_api.api import store as api_store
-from workspace.messenger_api.dm import base
+from workspace.tests.integration.legacy_messenger import base
 from workspace.tests.integration.legacy_messenger import helpers
 from workspace.messenger_api.dm import message_payloads
 from migrations import legacy_messenger_read_state as read_state
-from workspace.messenger_api.dm import v2_models
+from workspace.tests.integration.legacy_messenger import v2_models
 
 
 CORE_RESOURCE_MODELS: dict[str, typing.Any] = {

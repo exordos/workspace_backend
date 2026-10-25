@@ -17,11 +17,13 @@ from restalchemy.common import contexts
 from restalchemy.common import exceptions as ra_exceptions
 from restalchemy.dm import filters as dm_filters
 
+from workspace.messenger_api.api import outgoing
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api import exceptions as messenger_exceptions
 from workspace.messenger_api.api import resource_projection
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.dm import helpers
+from workspace.messenger_api.dm import base
 from workspace.messenger_api.dm import models
 
 
@@ -661,6 +663,7 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             sys_uuid.UUID(avatar[len(models.WORKSPACE_USER_IMAGE_AVATAR_PREFIX) :]),
         )
 
+    @outgoing.api_change
     def create_resource(
         self,
         resource: str,
@@ -669,6 +672,7 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
         values = self._projection_values(values)
         values["uuid"] = values.get("uuid") or sys_uuid.uuid4()
         if resource == "files":
+            base.WorkspaceProviderBase.validate_native_creation(values)
             row = helpers.create_workspace_file(
                 project_id=self.project_uuid,
                 user_uuid=self.user_uuid,
@@ -678,6 +682,7 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             raise ValueError(f"Unsupported Messenger create resource {resource}")
         return _public_dict(row, resource)
 
+    @outgoing.api_change
     def update_resource(
         self,
         resource: str,
@@ -686,6 +691,7 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
     ) -> dict[str, typing.Any]:
         values = self._projection_values(values)
         if resource == "files":
+            base.WorkspaceProviderBase.validate_provider_update(values)
             row = helpers.update_workspace_file(
                 self.project_uuid,
                 self.user_uuid,
@@ -696,6 +702,7 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             raise ValueError(f"Unsupported Messenger update resource {resource}")
         return _public_dict(row, resource)
 
+    @outgoing.api_change
     def delete_resource(
         self,
         resource: str,

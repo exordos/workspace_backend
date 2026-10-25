@@ -338,7 +338,6 @@ def add_message_encryption_contract(
                 "name",
                 "description",
                 "source_name",
-                "source",
                 "invite_only",
                 "announce",
                 "direct_user_uuid",

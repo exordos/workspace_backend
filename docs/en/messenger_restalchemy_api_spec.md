@@ -650,7 +650,7 @@ Comparing the presentation:
 | `read`, `mentioned`, `starred`, `pinned` | unique for placement `USER_MESSAGE_STATE`; public `read`  scalar `read_at IS NOT NULL` | Read only in CRUD | actions or worker |
 | `is_own` | The scalar equality of the connected ID | Read only | not stored as a source of truth |
 | `author_uuid`, `payload` | `MESSAGE.author_uuid/payload` | author is read-only; `payload` is for creation and updating | Canonical message |
-| `source_name`, `source` | `MESSAGE` | Only for creation | Canonical message |
+| `source_name`, `provider_uuid`, `provider_identity` | `MESSAGE` | Only for creation | Canonical message |
 | `provider`, `delivery` | The materialized projection `MESSAGE` | Read only | Provider path or background path |
 | `reactions`, `reaction_users` | The canonical state of things | Read only | Change in reaction or background path |
 | `created_at`, `updated_at` | `MESSAGE.created_at/updated_at` | Read only | Only the canonical message |
@@ -1141,9 +1141,8 @@ direct/self chat.
   "reactions": {},
   "reaction_users": {},
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "provider": null,
   "delivery": null,
   "created_at": "2026-06-22T10:10:00Z",
@@ -1173,9 +1172,8 @@ direct/self chat.
   "reactions": {},
   "reaction_users": {},
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "provider": null,
   "delivery": null,
   "created_at": "2026-06-22T10:10:00Z",
@@ -1205,9 +1203,8 @@ direct/self chat.
   "reactions": {},
   "reaction_users": {},
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "provider": null,
   "delivery": null,
   "created_at": "2026-06-22T10:10:00Z",
@@ -1237,9 +1234,8 @@ direct/self chat.
   "reactions": {},
   "reaction_users": {},
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "provider": null,
   "delivery": null,
   "created_at": "2026-06-22T10:10:00Z",
@@ -1270,9 +1266,8 @@ direct/self chat.
     "reactions": {},
     "reaction_users": {},
     "source_name": "native",
-    "source": {
-      "kind": "native"
-    },
+    "provider_uuid": null,
+    "provider_identity": null,
     "provider": null,
     "delivery": null,
     "created_at": "2026-06-22T10:10:00Z",
@@ -1418,11 +1413,9 @@ REACTION_FIELDS = field_permissions.FieldsPermissions(
     fields={
         "message_uuid": {
             constants.CREATE: field_permissions.Permissions.RW,
-            constants.UPDATE: field_permissions.Permissions.RW,
         },
         "emoji_name": {
             constants.CREATE: field_permissions.Permissions.RW,
-            constants.UPDATE: field_permissions.Permissions.RW,
         },
     },
 )
@@ -1455,12 +1448,6 @@ class WorkspaceMessageReactionController(
     def filter(self, **filters):
         return reaction_queries.visible_facts(
             context=self.get_context(), filters=filters, session=self.session,
-        )
-
-    def update(self, uuid, **values):
-        return reaction_fact_commands.update_one_owned(
-            context=self.get_context(), reaction_uuid=uuid,
-            values=values, session=self.session,
         )
 
     def delete(self, uuid):
@@ -1496,7 +1483,6 @@ The common lease/fencing protocol remains open implementation detail.
 | List of | `GET /api/workspace/v1/messenger/message_reactions/` | The Committee will be presenting reactions in the field of | without body; filters `message_uuid`/`user_uuid` and pagination are supported | `200`, `REACTION_LIST_RESPONSE` |
 | The creation | `POST /api/workspace/v1/messenger/message_reactions/` | placement UUID -> access check -> One initial fact of reaction to the canonical message | `REACTION_CREATE_REQUEST` | `201`, `REACTION_RESPONSE` |
 | - Get it . | `GET /api/workspace/v1/messenger/message_reactions/{reaction_uuid}` | The Committee will be presenting reactions in the field of | Without a body. | `200`, `REACTION_RESPONSE` |
-| I 'm going to update | `PUT /api/workspace/v1/messenger/message_reactions/{reaction_uuid}` | One user-owned fact | `REACTION_UPDATE_REQUEST` | `200`, `REACTION_UPDATE_RESPONSE` |
 | I 'm going to delete it . | `DELETE /api/workspace/v1/messenger/message_reactions/{reaction_uuid}` | One user-owned fact | Without a body. | `204`, The empty body . |
 
 Example list:
@@ -1505,20 +1491,14 @@ Example list:
 GET /api/workspace/v1/messenger/message_reactions/?message_uuid=a93dca35-3061-4748-bda4-7f6f8c660ea5&page_limit=100
 ```
 
+Reactions are immutable: create or delete them. To change an emoji, delete the old reaction and create a new one. PUT returns 405.
+
 `REACTION_CREATE_REQUEST`:
 
 ```json
 {
   "message_uuid": "a93dca35-3061-4748-bda4-7f6f8c660ea5",
   "emoji_name": "thumbs_up"
-}
-```
-
-`REACTION_UPDATE_REQUEST`:
-
-```json
-{
-  "emoji_name": "heart"
 }
 ```
 
@@ -1535,22 +1515,6 @@ GET /api/workspace/v1/messenger/message_reactions/?message_uuid=a93dca35-3061-47
   "delivery": null,
   "created_at": "2026-06-22T10:12:00Z",
   "updated_at": "2026-06-22T10:12:00Z"
-}
-```
-
-`REACTION_UPDATE_RESPONSE`:
-
-```json
-{
-  "uuid": "bd4b7632-8788-435a-93cc-6873657335c6",
-  "project_id": "22222222-2222-2222-2222-222222222222",
-  "message_uuid": "a93dca35-3061-4748-bda4-7f6f8c660ea5",
-  "user_uuid": "11111111-1111-1111-1111-111111111111",
-  "emoji_name": "heart",
-  "provider": null,
-  "delivery": null,
-  "created_at": "2026-06-22T10:12:00Z",
-  "updated_at": "2026-06-22T10:13:00Z"
 }
 ```
 
@@ -1952,9 +1916,8 @@ GET /api/workspace/v1/messenger/streams/?private=false&page_limit=50&page_marker
   "name": "Engineering",
   "description": "Engineering workspace",
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "invite_only": false,
   "announce": false
 }
@@ -1968,9 +1931,8 @@ Other participant:
   "name": "Direct",
   "description": "Private workspace",
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "direct_user_uuid": "33333333-3333-3333-3333-333333333333"
 }
 ```
@@ -1982,9 +1944,8 @@ Other participant:
   "name": "Personal notes",
   "description": "",
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "direct_user_uuid": "11111111-1111-1111-1111-111111111111"
 }
 ```
@@ -2008,9 +1969,8 @@ The current user `direct_user_uuid`:
   "active_unread_count": 0,
   "passive_unread_count": 0,
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "invite_only": false,
   "announce": false,
   "direct_user_uuid": "11111111-1111-1111-1111-111111111111",
@@ -2093,9 +2053,8 @@ list UUID, returns `400001005`.
   "active_unread_count": 2,
   "passive_unread_count": 0,
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "invite_only": false,
   "announce": false,
   "direct_user_uuid": null,
@@ -2127,9 +2086,8 @@ list UUID, returns `400001005`.
   "active_unread_count": 2,
   "passive_unread_count": 0,
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "invite_only": false,
   "announce": false,
   "direct_user_uuid": null,
@@ -2161,9 +2119,8 @@ list UUID, returns `400001005`.
   "active_unread_count": 1,
   "passive_unread_count": 1,
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "invite_only": false,
   "announce": false,
   "direct_user_uuid": null,
@@ -2195,9 +2152,8 @@ list UUID, returns `400001005`.
   "active_unread_count": 0,
   "passive_unread_count": 0,
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "invite_only": false,
   "announce": false,
   "direct_user_uuid": null,
@@ -2230,9 +2186,8 @@ list UUID, returns `400001005`.
     "active_unread_count": 2,
     "passive_unread_count": 0,
     "source_name": "native",
-    "source": {
-      "kind": "native"
-    },
+    "provider_uuid": null,
+    "provider_identity": null,
     "invite_only": false,
     "announce": false,
     "direct_user_uuid": null,
@@ -2855,9 +2810,8 @@ They get `403`.
   "summary_system_prompt": null,
   "summary_reasoning_effort": null,
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "provider": null,
   "delivery": null,
   "created_at": "2026-06-22T09:10:00Z",
@@ -2890,9 +2844,8 @@ follow, set-default, toggle-done, update request and read:
   "summary_system_prompt": "Summarize decisions, owners, and unresolved risks.",
   "summary_reasoning_effort": "medium",
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "provider": null,
   "delivery": null,
   "created_at": "2026-06-22T09:10:00Z",
@@ -2925,9 +2878,8 @@ follow, set-default, toggle-done, update request and read:
     "summary_system_prompt": null,
     "summary_reasoning_effort": null,
     "source_name": "native",
-    "source": {
-      "kind": "native"
-    },
+    "provider_uuid": null,
+    "provider_identity": null,
     "provider": null,
     "delivery": null,
     "created_at": "2026-06-22T09:10:00Z",

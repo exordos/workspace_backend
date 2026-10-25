@@ -4,6 +4,7 @@
 # you may not use this file except in compliance with the License.
 
 import uuid as sys_uuid
+from unittest import mock
 
 import pytest
 
@@ -49,11 +50,19 @@ def test_external_accounts_use_the_new_provider_neutral_messenger_route():
         ("https://192.168.100.28/", "192.168.100.28"),
     ],
 )
-def test_external_account_host_excludes_scheme_port_and_path(server_url, host):
+def test_external_account_host_is_read_from_provider(server_url, host):
     account = external_models.ExternalAccount(
         project_id=sys_uuid.uuid4(),
         owner_user_uuid=sys_uuid.uuid4(),
         provider="zulip",
         settings={"server_url": server_url},
     )
-    assert account.get_host() == host
+    provider = external_models.Provider(hostname=host)
+    account.provider_uuid = provider.uuid
+    with mock.patch.object(
+        external_models.Provider,
+        "objects",
+        mock.Mock(get_one=mock.Mock(return_value=provider)),
+    ) as objects:
+        assert account.get_host() == host
+    assert objects.get_one.call_args.kwargs["filters"]["uuid"].value == provider.uuid

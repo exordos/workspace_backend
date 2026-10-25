@@ -54,9 +54,8 @@ HTTP `201`:
   "summary_system_prompt": null,
   "summary_reasoning_effort": null,
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "provider": null,
   "delivery": null,
   "created_at": "2026-06-22T09:10:00Z",

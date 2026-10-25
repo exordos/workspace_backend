@@ -650,7 +650,7 @@ class WorkspaceUserMessage(
 | `read`, `mentioned`, `starred`, `pinned` | уникальное для placement `USER_MESSAGE_STATE`; публичное `read` — скалярное `read_at IS NOT NULL` | только для чтения в CRUD | действия или worker |
 | `is_own` | скалярное равенство соединённых ID | только для чтения | не хранится как источник истины |
 | `author_uuid`, `payload` | `MESSAGE.author_uuid/payload` | автор только для чтения; `payload` для создания и обновления | каноническое сообщение |
-| `source_name`, `source` | `MESSAGE` | только для создания | каноническое сообщение |
+| `source_name`, `provider_uuid`, `provider_identity` | `MESSAGE` | только для создания | каноническое сообщение |
 | `provider`, `delivery` | материализованная проекция `MESSAGE` | только для чтения | путь провайдера или фоновый путь |
 | `reactions`, `reaction_users` | материализованное каноническое состояние | только для чтения | изменение реакции или фоновый путь |
 | `created_at`, `updated_at` | `MESSAGE.created_at/updated_at` | только для чтения | только каноническое сообщение |
@@ -1141,9 +1141,8 @@ direct/self chat.
   "reactions": {},
   "reaction_users": {},
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "provider": null,
   "delivery": null,
   "created_at": "2026-06-22T10:10:00Z",
@@ -1173,9 +1172,8 @@ direct/self chat.
   "reactions": {},
   "reaction_users": {},
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "provider": null,
   "delivery": null,
   "created_at": "2026-06-22T10:10:00Z",
@@ -1205,9 +1203,8 @@ direct/self chat.
   "reactions": {},
   "reaction_users": {},
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "provider": null,
   "delivery": null,
   "created_at": "2026-06-22T10:10:00Z",
@@ -1237,9 +1234,8 @@ direct/self chat.
   "reactions": {},
   "reaction_users": {},
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "provider": null,
   "delivery": null,
   "created_at": "2026-06-22T10:10:00Z",
@@ -1270,9 +1266,8 @@ direct/self chat.
     "reactions": {},
     "reaction_users": {},
     "source_name": "native",
-    "source": {
-      "kind": "native"
-    },
+    "provider_uuid": null,
+    "provider_identity": null,
     "provider": null,
     "delivery": null,
     "created_at": "2026-06-22T10:10:00Z",
@@ -1418,11 +1413,9 @@ REACTION_FIELDS = field_permissions.FieldsPermissions(
     fields={
         "message_uuid": {
             constants.CREATE: field_permissions.Permissions.RW,
-            constants.UPDATE: field_permissions.Permissions.RW,
         },
         "emoji_name": {
             constants.CREATE: field_permissions.Permissions.RW,
-            constants.UPDATE: field_permissions.Permissions.RW,
         },
     },
 )
@@ -1455,12 +1448,6 @@ class WorkspaceMessageReactionController(
     def filter(self, **filters):
         return reaction_queries.visible_facts(
             context=self.get_context(), filters=filters, session=self.session,
-        )
-
-    def update(self, uuid, **values):
-        return reaction_fact_commands.update_one_owned(
-            context=self.get_context(), reaction_uuid=uuid,
-            values=values, session=self.session,
         )
 
     def delete(self, uuid):
@@ -1496,7 +1483,6 @@ RestAlchemy вставки, обновления или удаления ров�
 | список | `GET /api/workspace/v1/messenger/message_reactions/` | представление реакций в области | без тела; поддерживаются фильтры `message_uuid`/`user_uuid` и пагинация | `200`, `REACTION_LIST_RESPONSE` |
 | создание | `POST /api/workspace/v1/messenger/message_reactions/` | placement UUID -> access check -> один исходный факт реакции на каноническое сообщение | `REACTION_CREATE_REQUEST` | `201`, `REACTION_RESPONSE` |
 | получение | `GET /api/workspace/v1/messenger/message_reactions/{reaction_uuid}` | представление реакций в области | без тела | `200`, `REACTION_RESPONSE` |
-| обновление | `PUT /api/workspace/v1/messenger/message_reactions/{reaction_uuid}` | один принадлежащий пользователю исходный факт | `REACTION_UPDATE_REQUEST` | `200`, `REACTION_UPDATE_RESPONSE` |
 | удаление | `DELETE /api/workspace/v1/messenger/message_reactions/{reaction_uuid}` | один принадлежащий пользователю исходный факт | без тела | `204`, пустое тело |
 
 Пример списка:
@@ -1505,20 +1491,14 @@ RestAlchemy вставки, обновления или удаления ров�
 GET /api/workspace/v1/messenger/message_reactions/?message_uuid=a93dca35-3061-4748-bda4-7f6f8c660ea5&page_limit=100
 ```
 
+Реакции можно только создавать и удалять. Для смены эмодзи удалите старую реакцию и создайте новую. PUT возвращает 405.
+
 `REACTION_CREATE_REQUEST`:
 
 ```json
 {
   "message_uuid": "a93dca35-3061-4748-bda4-7f6f8c660ea5",
   "emoji_name": "thumbs_up"
-}
-```
-
-`REACTION_UPDATE_REQUEST`:
-
-```json
-{
-  "emoji_name": "heart"
 }
 ```
 
@@ -1535,22 +1515,6 @@ GET /api/workspace/v1/messenger/message_reactions/?message_uuid=a93dca35-3061-47
   "delivery": null,
   "created_at": "2026-06-22T10:12:00Z",
   "updated_at": "2026-06-22T10:12:00Z"
-}
-```
-
-`REACTION_UPDATE_RESPONSE`:
-
-```json
-{
-  "uuid": "bd4b7632-8788-435a-93cc-6873657335c6",
-  "project_id": "22222222-2222-2222-2222-222222222222",
-  "message_uuid": "a93dca35-3061-4748-bda4-7f6f8c660ea5",
-  "user_uuid": "11111111-1111-1111-1111-111111111111",
-  "emoji_name": "heart",
-  "provider": null,
-  "delivery": null,
-  "created_at": "2026-06-22T10:12:00Z",
-  "updated_at": "2026-06-22T10:13:00Z"
 }
 ```
 
@@ -1952,9 +1916,8 @@ GET /api/workspace/v1/messenger/streams/?private=false&page_limit=50&page_marker
   "name": "Engineering",
   "description": "Engineering workspace",
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "invite_only": false,
   "announce": false
 }
@@ -1968,9 +1931,8 @@ GET /api/workspace/v1/messenger/streams/?private=false&page_limit=50&page_marker
   "name": "Direct",
   "description": "Private workspace",
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "direct_user_uuid": "33333333-3333-3333-3333-333333333333"
 }
 ```
@@ -1982,9 +1944,8 @@ GET /api/workspace/v1/messenger/streams/?private=false&page_limit=50&page_marker
   "name": "Personal notes",
   "description": "",
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "direct_user_uuid": "11111111-1111-1111-1111-111111111111"
 }
 ```
@@ -2008,9 +1969,8 @@ GET /api/workspace/v1/messenger/streams/?private=false&page_limit=50&page_marker
   "active_unread_count": 0,
   "passive_unread_count": 0,
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "invite_only": false,
   "announce": false,
   "direct_user_uuid": "11111111-1111-1111-1111-111111111111",
@@ -2093,9 +2053,8 @@ GET /api/workspace/v1/messenger/streams/?private=false&page_limit=50&page_marker
   "active_unread_count": 2,
   "passive_unread_count": 0,
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "invite_only": false,
   "announce": false,
   "direct_user_uuid": null,
@@ -2127,9 +2086,8 @@ GET /api/workspace/v1/messenger/streams/?private=false&page_limit=50&page_marker
   "active_unread_count": 2,
   "passive_unread_count": 0,
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "invite_only": false,
   "announce": false,
   "direct_user_uuid": null,
@@ -2161,9 +2119,8 @@ GET /api/workspace/v1/messenger/streams/?private=false&page_limit=50&page_marker
   "active_unread_count": 1,
   "passive_unread_count": 1,
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "invite_only": false,
   "announce": false,
   "direct_user_uuid": null,
@@ -2195,9 +2152,8 @@ GET /api/workspace/v1/messenger/streams/?private=false&page_limit=50&page_marker
   "active_unread_count": 0,
   "passive_unread_count": 0,
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "invite_only": false,
   "announce": false,
   "direct_user_uuid": null,
@@ -2230,9 +2186,8 @@ GET /api/workspace/v1/messenger/streams/?private=false&page_limit=50&page_marker
     "active_unread_count": 2,
     "passive_unread_count": 0,
     "source_name": "native",
-    "source": {
-      "kind": "native"
-    },
+    "provider_uuid": null,
+    "provider_identity": null,
     "invite_only": false,
     "announce": false,
     "direct_user_uuid": null,
@@ -2855,9 +2810,8 @@ GET /api/workspace/v1/messenger/stream_topics/?stream_uuid=75309057-419c-4b12-a7
   "summary_system_prompt": null,
   "summary_reasoning_effort": null,
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "provider": null,
   "delivery": null,
   "created_at": "2026-06-22T09:10:00Z",
@@ -2890,9 +2844,8 @@ GET /api/workspace/v1/messenger/stream_topics/?stream_uuid=75309057-419c-4b12-a7
   "summary_system_prompt": "Summarize decisions, owners, and unresolved risks.",
   "summary_reasoning_effort": "medium",
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "provider": null,
   "delivery": null,
   "created_at": "2026-06-22T09:10:00Z",
@@ -2925,9 +2878,8 @@ GET /api/workspace/v1/messenger/stream_topics/?stream_uuid=75309057-419c-4b12-a7
     "summary_system_prompt": null,
     "summary_reasoning_effort": null,
     "source_name": "native",
-    "source": {
-      "kind": "native"
-    },
+    "provider_uuid": null,
+    "provider_identity": null,
     "provider": null,
     "delivery": null,
     "created_at": "2026-06-22T09:10:00Z",

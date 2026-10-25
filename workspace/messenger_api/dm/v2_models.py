@@ -161,6 +161,7 @@ class WorkspaceUserFolderItem(
 
 
 class WorkspaceMessage(
+    base.WorkspaceProviderBase,
     models.ModelWithUUID,
     models.ModelWithProject,
     models.ModelWithTimestamp,
@@ -169,17 +170,17 @@ class WorkspaceMessage(
     __tablename__ = "messenger_messages"
 
     author_uuid = properties.property(types.UUID(), required=True, read_only=True)
-    payload = properties.property(
-        message_payloads.WORKSPACE_MESSAGE_PAYLOAD_TYPE,
-        required=True,
+    content_uuid = properties.property(types.UUID(), required=True)
+    content_revision = properties.property(
+        types.Integer(min_value=1), default=1, read_only=True
     )
     source_name = properties.property(
         types.Enum([source.value for source in base.SourceName]),
         default=base.SourceName.NATIVE.value,
     )
-    source = properties.property(types.Dict(), default=base.native_source)
-    content_hash = properties.property(
-        types.AllowNone(types.String(max_length=64)), default=None, read_only=True
+    provider_uuid = properties.property(types.AllowNone(types.UUID()), default=None)
+    provider_identity = properties.property(
+        types.AllowNone(types.String(min_length=1, max_length=255)), default=None
     )
     content_updated_at = properties.property(
         types.AllowNone(types.UTCDateTimeZ()), default=None, read_only=True
@@ -329,6 +330,7 @@ class WorkspaceUserMessageBinding(
 
 
 class WorkspaceUserMessageState(
+    base.WorkspaceProviderBase,
     models.ModelWithUUID,
     models.ModelWithProject,
     models.ModelWithTimestamp,
@@ -417,6 +419,7 @@ class WorkspaceUserMessage(
 
 
 class WorkspaceStream(
+    base.WorkspaceProviderBase,
     models.ModelWithUUID,
     models.ModelWithProject,
     common_models.ModelWithRequiredNameDesc,
@@ -434,7 +437,10 @@ class WorkspaceStream(
         types.Enum([source.value for source in base.StreamSourceName]),
         default=base.SourceName.NATIVE.value,
     )
-    source = properties.property(types.Dict(), default=base.native_source)
+    provider_uuid = properties.property(types.AllowNone(types.UUID()), default=None)
+    provider_identity = properties.property(
+        types.AllowNone(types.String(min_length=1, max_length=255)), default=None
+    )
     invite_only = properties.property(types.Boolean(), default=False)
     announce = properties.property(types.Boolean(), default=False)
     direct_user_uuid = properties.property(types.AllowNone(types.UUID()), default=None)
@@ -456,6 +462,7 @@ class WorkspaceStream(
 
 
 class WorkspaceStreamBinding(
+    base.WorkspaceProviderBase,
     models.ModelWithUUID,
     models.ModelWithProject,
     models.ModelWithTimestamp,
@@ -498,6 +505,7 @@ class WorkspaceUserStream(
 
 
 class WorkspaceStreamBindingView(
+    base.WorkspaceProviderBase,
     models.ModelWithUUID,
     models.ModelWithProject,
     models.ModelWithTimestamp,
@@ -548,6 +556,7 @@ class WorkspaceStreamTopic(
 
 
 class WorkspaceUserTopicBinding(
+    base.WorkspaceProviderBase,
     models.ModelWithUUID,
     models.ModelWithProject,
     models.ModelWithTimestamp,
@@ -635,6 +644,7 @@ class WorkspaceUserTopic(
 
 
 class WorkspaceMessageReactionFact(
+    base.WorkspaceProviderBase,
     models.ModelWithUUID,
     models.ModelWithProject,
     models.ModelWithTimestamp,
@@ -651,6 +661,7 @@ class WorkspaceMessageReactionFact(
 
 
 class WorkspaceMessageReactionView(
+    base.WorkspaceProviderBase,
     models.ModelWithUUID,
     models.ModelWithProject,
     models.ModelWithTimestamp,

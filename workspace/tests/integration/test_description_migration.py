@@ -89,7 +89,7 @@ def test_api_description_limit_and_round_trip(api, db, resource, length):
     description = "\N{CYRILLIC SMALL LETTER YA}" * length
     values = {"name": "Example", "description": description}
     if resource == "streams":
-        values.update(source_name="native", source={"kind": "native"})
+        values.update(source_name="native")
     else:
         values.update(
             stream_uuid=conftest.seed_user_stream(

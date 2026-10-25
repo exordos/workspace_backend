@@ -34,6 +34,7 @@ from workspace.common import messenger_reaction_opts
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api.api import resource_projection
 from workspace.messenger_api.dm import message_payloads
+from workspace.messenger_api.dm import synchronization
 from workspace.messenger_api.dm import v2_models
 from workspace.services.messenger_workers import owned_projection
 
@@ -1145,13 +1146,15 @@ def _message_namespace(
         """
         SELECT placement.uuid, placement.stream_uuid, placement.topic_uuid,
                message.uuid AS canonical_message_uuid,
-               message.author_uuid AS user_uuid, message.payload,
+               message.author_uuid AS user_uuid, contents.workspace_content AS payload,
                message.created_at, message.updated_at, message.source_name,
-               message.source, message.reaction_users
+               message.provider_uuid,
+               message.provider_identity, message.status, message.reaction_users
         FROM messenger_message_placements AS placement
         JOIN messenger_messages AS message
           ON message.project_id = placement.project_id
          AND message.uuid = placement.message_uuid
+        JOIN messenger_message_contents contents ON contents.uuid=message.content_uuid
         WHERE placement.project_id = %s AND placement.uuid = %s
           AND message.deleted_at IS NULL
         """,
@@ -1463,9 +1466,10 @@ def _enqueue_counter_outbox_events(
     topic_uuid: object,
     placement_uuid: object | None = None,
     include_topic: bool = True,
+    emit_public_event: bool = True,
 ) -> None:
     changes = owned_projection.CURRENT.get()
-    if changes is not None:
+    if changes is not None and emit_public_event:
         if include_topic and topic_uuid is not None:
             changes.topic(project_id, stream_uuid, topic_uuid, [user_uuid])
         else:
@@ -1473,6 +1477,7 @@ def _enqueue_counter_outbox_events(
         return
     common_payload = {
         "source_kind": source_kind,
+        "emit_public_event": emit_public_event,
         "user_uuid": user_uuid,
         "stream_uuid": stream_uuid,
         "topic_uuid": topic_uuid,
@@ -1512,6 +1517,7 @@ def _enqueue_folder_outbox_events(
     source_kind: str,
     user_uuid: object,
     stream_uuid: object,
+    emit_public_event: bool = True,
 ) -> None:
     stream = session.execute(
         """
@@ -1564,6 +1570,7 @@ def _enqueue_folder_outbox_events(
                     _plain(
                         {
                             "source_kind": source_kind,
+                            "emit_public_event": emit_public_event,
                             "user_uuid": user_uuid,
                             "stream_uuid": stream_uuid,
                             "folder_uuid": folder_uuid,
@@ -1695,8 +1702,8 @@ def _process_fanout(
             INSERT INTO messenger_user_message_states (
                 uuid, project_id, placement_uuid, user_uuid,
                 membership_generation, read_at, mentioned,
-                created_at, updated_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                created_at, updated_at, source_name, provider_uuid, status
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (project_id, user_uuid, placement_uuid) DO UPDATE
             SET membership_generation = EXCLUDED.membership_generation,
                 read_at = EXCLUDED.read_at,
@@ -1717,6 +1724,9 @@ def _process_fanout(
                 f"](urn:user:{str(user_uuid).lower()})" in content,
                 now,
                 now,
+                message.source_name,
+                message.provider_uuid,
+                "active" if message.source_name == "native" else "new",
             ),
         )
     recipient_uuids = accepted_recipients
@@ -2069,7 +2079,10 @@ def _process_reaction_snapshot(
             old_message = types.SimpleNamespace(
                 uuid=_uuid(payload["old_message_uuid"]),
                 source_name=payload["old_source_name"],
-                source=payload["old_source"],
+                provider_uuid=_uuid(payload["old_provider_uuid"])
+                if payload["old_provider_uuid"] is not None
+                else None,
+                provider_identity=payload["old_provider_identity"],
             )
             emitted = messenger_events.create_message_reaction_updated_event(
                 reaction,
@@ -2136,11 +2149,26 @@ def _process_reaction_snapshot(
         )
 
 
+def _counter_users(payload: typing.Mapping[str, typing.Any]) -> list[sys_uuid.UUID]:
+    return sorted(
+        {
+            _uuid(value)
+            for value in (
+                payload["user_uuids"]
+                if "user_uuids" in payload
+                else [payload["user_uuid"]]
+            )
+        }
+    )
+
+
 def _process_read_counters(
     session: typing.Any, task: typing.Mapping[str, typing.Any]
 ) -> None:
     payload = task["payload"]
-    user_uuid = _uuid(payload["user_uuid"])
+    emit_public_event = payload.get("emit_public_event", True)
+    users = _counter_users(payload)
+    user_uuid = users[0]
     topic_value = payload.get("topic_uuid")
     topic_uuid = None if topic_value is None else _uuid(topic_value)
     if task["scope_kind"] == "user-topic" and topic_uuid is None:
@@ -2156,16 +2184,18 @@ def _process_read_counters(
                 source_kind="history.imported",
                 user_uuid=user_uuid,
                 stream_uuid=_uuid(payload["stream_uuid"]),
+                emit_public_event=emit_public_event,
             )
-        _try_lock_project_event_tail(session, task["project_id"])
-        _emit_unread_snapshots(
-            session,
-            task["project_id"],
-            _uuid(payload["stream_uuid"]),
-            topic_uuid,
-            [user_uuid],
-            task["scope_kind"],
-        )
+        if emit_public_event:
+            _try_lock_project_event_tail(session, task["project_id"])
+            _emit_unread_snapshots(
+                session,
+                task["project_id"],
+                _uuid(payload["stream_uuid"]),
+                topic_uuid,
+                users,
+                task["scope_kind"],
+            )
         return
     if owned_projection.CURRENT.get() is None and not payload.get(
         "emit_message_read", False
@@ -2173,7 +2203,7 @@ def _process_read_counters(
         # Counter tasks are authoritative snapshots.  One claimed snapshot can
         # absorb every idle snapshot-only sibling for the same user scope;
         # tasks that must emit a per-message read event remain independent.
-        session.execute(
+        coalesced = session.execute(
             """
             WITH siblings AS MATERIALIZED (
                 SELECT uuid
@@ -2194,6 +2224,7 @@ def _process_read_counters(
                 last_error = NULL, updated_at = NOW()
             FROM siblings
             WHERE task.project_id = %s AND task.uuid = siblings.uuid
+            RETURNING task.payload
             """,
             (
                 task["project_id"],
@@ -2203,34 +2234,52 @@ def _process_read_counters(
                 task["project_id"],
             ),
         )
+        siblings = coalesced.fetchall()
+        emit_public_event = emit_public_event or any(
+            sibling["payload"].get("emit_public_event", True) for sibling in siblings
+        )
+        if "user_uuids" in payload:
+            users = sorted(
+                set(users).union(
+                    user
+                    for sibling in siblings
+                    for user in _counter_users(sibling["payload"])
+                )
+            )
     pending = _refresh_recipient_counters(
         session,
         task["project_id"],
         _uuid(payload["stream_uuid"]),
         topic_uuid,
-        [user_uuid],
+        users,
         task["scope_kind"],
     )
-    if pending:
-        _enqueue_counter_outbox_events(
-            session,
-            source_event_uuid=task["outbox_event_uuid"],
-            project_id=task["project_id"],
-            source_kind="zulip.reconciled",
-            user_uuid=user_uuid,
-            stream_uuid=_uuid(payload["stream_uuid"]),
-            topic_uuid=topic_uuid,
-            include_topic=topic_uuid is not None,
-        )
+    if pending or task["scope_kind"] == "user-topic":
+        for user_uuid in users:
+            _enqueue_counter_outbox_events(
+                session,
+                source_event_uuid=task["outbox_event_uuid"],
+                project_id=task["project_id"],
+                source_kind="zulip.reconciled",
+                user_uuid=user_uuid,
+                stream_uuid=_uuid(payload["stream_uuid"]),
+                topic_uuid=topic_uuid,
+                include_topic=pending and topic_uuid is not None,
+                emit_public_event=emit_public_event,
+            )
     if task["scope_kind"] == "user-stream":
-        _enqueue_folder_outbox_events(
-            session,
-            source_event_uuid=task["outbox_event_uuid"],
-            project_id=task["project_id"],
-            source_kind=payload["source_kind"],
-            user_uuid=user_uuid,
-            stream_uuid=_uuid(payload["stream_uuid"]),
-        )
+        for user_uuid in users:
+            _enqueue_folder_outbox_events(
+                session,
+                source_event_uuid=task["outbox_event_uuid"],
+                project_id=task["project_id"],
+                source_kind=payload["source_kind"],
+                user_uuid=user_uuid,
+                stream_uuid=_uuid(payload["stream_uuid"]),
+                emit_public_event=emit_public_event,
+            )
+    if not emit_public_event:
+        return
     _try_lock_project_event_tail(session, task["project_id"])
     if payload.get("placement_uuid") and payload.get("emit_message_read"):
         messages = _v2_rows(
@@ -2256,7 +2305,7 @@ def _process_read_counters(
         task["project_id"],
         _uuid(payload["stream_uuid"]),
         topic_uuid,
-        [user_uuid],
+        users,
         task["scope_kind"],
     )
 
@@ -2277,7 +2326,7 @@ def _process_folder_projection(
         # Legacy flag repair can enqueue the same authoritative folder rebuild
         # once per message.  The claimed rebuild absorbs every idle sibling for
         # this scope because none of them carries a historical snapshot.
-        session.execute(
+        coalesced = session.execute(
             """
             WITH siblings AS MATERIALIZED (
                 SELECT uuid
@@ -2299,9 +2348,15 @@ def _process_folder_projection(
                 last_error = NULL, updated_at = NOW()
             FROM siblings
             WHERE task.project_id = %s AND task.uuid = siblings.uuid
+            RETURNING task.payload
             """,
             (project_id, task["scope_key"], task["uuid"], project_id),
         )
+        if any(
+            sibling["payload"].get("emit_public_event", True)
+            for sibling in coalesced.fetchall()
+        ):
+            payload = {**payload, "emit_public_event": True}
     if source_kind == "folder.deleted":
         if not payload.get("emit_public_event", True):
             return
@@ -2626,12 +2681,13 @@ def _process_topic_membership_policy_rebuild(
         return True
     rows = session.execute(
         """
-        SELECT placement.uuid, message.author_uuid, message.payload,
-               message.created_at
+        SELECT placement.uuid, message.author_uuid, contents.workspace_content AS payload,
+               message.created_at, message.source_name, message.provider_uuid
         FROM messenger_message_placements AS placement
         JOIN messenger_messages AS message
           ON message.project_id = placement.project_id
          AND message.uuid = placement.message_uuid
+        JOIN messenger_message_contents contents ON contents.uuid=message.content_uuid
         WHERE placement.project_id = %s AND placement.topic_uuid = %s
           AND (message.source_name <> 'zulip'
                OR placement.uuid <> messenger_uuid_v5(message.uuid, 'zulip-placement'))
@@ -2697,8 +2753,8 @@ def _process_topic_membership_policy_rebuild(
             INSERT INTO messenger_user_message_states (
                 uuid, project_id, placement_uuid, user_uuid,
                 membership_generation, read_at, mentioned,
-                created_at, updated_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                created_at, updated_at, source_name, provider_uuid, status
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (project_id, user_uuid, placement_uuid) DO UPDATE
             SET membership_generation = EXCLUDED.membership_generation,
                 read_at = EXCLUDED.read_at,
@@ -2719,6 +2775,9 @@ def _process_topic_membership_policy_rebuild(
                 f"](urn:user:{str(user_uuid).lower()})" in content,
                 now,
                 now,
+                row["source_name"],
+                row["provider_uuid"],
+                "active" if row["source_name"] == "native" else "new",
             ),
         )
     if rows:
@@ -2840,7 +2899,8 @@ def _deliver_snapshot_batch(
                         _uuid(recipient),
                         _uuid(payload["stream_uuid"]),
                         payload["source_name"],
-                        payload["source"],
+                        payload["provider_uuid"],
+                        payload["provider_identity"],
                         session=session,
                     )
                 )
@@ -2864,7 +2924,8 @@ def _deliver_snapshot_batch(
                         _uuid(payload["topic_uuid"]),
                         _uuid(payload["stream_uuid"]),
                         payload["source_name"],
-                        payload["source"],
+                        payload["provider_uuid"],
+                        payload["provider_identity"],
                         session=session,
                     )
                 )
@@ -2927,7 +2988,8 @@ def _deliver_snapshot_batch(
                 _uuid(placement["topic_uuid"]),
                 _uuid(payload["author_uuid"]),
                 payload["source_name"],
-                payload["source"],
+                payload["provider_uuid"],
+                payload["provider_identity"],
                 session=session,
                 compact=True,
             )
@@ -3393,6 +3455,7 @@ def process_one_projection_task(
             metrics[outcome_key] = metrics.get(outcome_key, 0.0) + 1
     except Exception as error:
         session.execute("ROLLBACK TO SAVEPOINT messenger_v2_projection_task", ())
+        synchronization.record_error(error, session=session)
         attempts = int(task["attempts"])
         status = "dead_letter" if attempts >= max_attempts else "failed"
         outcome = status

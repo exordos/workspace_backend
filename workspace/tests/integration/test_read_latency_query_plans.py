@@ -62,7 +62,10 @@ def test_unread_existence_probe_does_not_order_candidates(db, monkeypatch, has_u
         assert sum(node["Actual Rows"] * node["Actual Loops"] for node in scanned) <= 1
 
 
+@pytest.mark.isolated_schema
 def test_summary_boundary_probes_do_not_scan_unrelated_topics(api, db):
+    # The global summary claim must use this test's controlled population;
+    # unrelated modules otherwise change the planner and measured row counts.
     response = api.post(
         "/v1/messenger/streams/",
         json={"name": "Summary query scale", "source_name": "native"},
@@ -88,11 +91,15 @@ def test_summary_boundary_probes_do_not_scan_unrelated_topics(api, db):
         )
         db.execute(
             """
-            INSERT INTO messenger_messages(uuid,project_id,author_uuid,payload,created_at)
+            WITH content AS MATERIALIZED (
+                SELECT messenger_resolve_message_content(
+                    '{"kind":"markdown","content":"Scale fixture"}'::jsonb,NULL) AS uuid
+            )
+            INSERT INTO messenger_messages(uuid,project_id,author_uuid,content_uuid,created_at)
             SELECT md5(%s || ':message:' || value)::uuid,%s,%s,
-                   '{"kind":"markdown","content":"Scale fixture"}'::jsonb,
+                   content.uuid,
                    timestamp '2026-01-01' + value * interval '1 second'
-            FROM generate_series(1,%s) AS value
+            FROM generate_series(1,%s) AS value CROSS JOIN content
             """,
             (api.project_id, api.project_id, api.user_uuid, message_count),
         )

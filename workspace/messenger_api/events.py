@@ -481,7 +481,9 @@ def create_message_events(
         "starred": False,
         "reactions": {},
         "source_name": message.source_name,
-        "source": message.source,
+        "status": message.status,
+        "provider_uuid": message.provider_uuid,
+        "provider_identity": message.provider_identity,
         "reaction_users": getattr(message, "reaction_users", {}) or {},
     }
     user_messages = [
@@ -946,7 +948,8 @@ def create_message_deleted_events(
     topic_uuid: object,
     author_uuid: object,
     source_name: typing.Any,
-    source: typing.Any,
+    provider_uuid: typing.Any,
+    provider_identity: typing.Any,
     session: typing.Any = None,
     compact: typing.Any = False,
 ) -> typing.Any:
@@ -956,7 +959,10 @@ def create_message_deleted_events(
         "topic_uuid": _event_payload_value("topic_uuid", topic_uuid),
         "author_uuid": _event_payload_value("author_uuid", author_uuid),
         "source_name": _event_payload_value("source_name", source_name),
-        "source": _event_payload_value("source", source),
+        "provider_uuid": _event_payload_value("provider_uuid", provider_uuid),
+        "provider_identity": _event_payload_value(
+            "provider_identity", provider_identity
+        ),
     }
     if compact:
         return create_broadcast_event(
@@ -976,7 +982,8 @@ def create_message_deleted_events(
             topic_uuid,
             author_uuid,
             source_name,
-            source,
+            provider_uuid,
+            provider_identity,
             session=session,
         )
         for recipient in recipients
@@ -1015,7 +1022,8 @@ def create_message_deleted_event(
     topic_uuid: object,
     author_uuid: object,
     source_name: typing.Any,
-    source: typing.Any,
+    provider_uuid: typing.Any,
+    provider_identity: typing.Any,
     session: typing.Any = None,
 ) -> typing.Any:
     return _create_workspace_event(
@@ -1028,7 +1036,10 @@ def create_message_deleted_event(
             "topic_uuid": _event_payload_value("topic_uuid", topic_uuid),
             "author_uuid": _event_payload_value("author_uuid", author_uuid),
             "source_name": _event_payload_value("source_name", source_name),
-            "source": _event_payload_value("source", source),
+            "provider_uuid": _event_payload_value("provider_uuid", provider_uuid),
+            "provider_identity": _event_payload_value(
+                "provider_identity", provider_identity
+            ),
         },
         session=session,
     )
@@ -1057,7 +1068,10 @@ def _message_reaction_event_payload(
             "source_name",
             message.source_name,
         ),
-        "source": _event_payload_value("source", message.source),
+        "provider_uuid": _event_payload_value("provider_uuid", message.provider_uuid),
+        "provider_identity": _event_payload_value(
+            "provider_identity", message.provider_identity
+        ),
     }
     payload.update(values)
     return payload
@@ -1106,7 +1120,12 @@ def create_message_reaction_updated_event(
                 "source_name",
                 old_message.source_name,
             ),
-            old_source=_event_payload_value("source", old_message.source),
+            old_provider_uuid=_event_payload_value(
+                "provider_uuid", old_message.provider_uuid
+            ),
+            old_provider_identity=_event_payload_value(
+                "provider_identity", old_message.provider_identity
+            ),
         ),
         session=session,
     )
@@ -1212,7 +1231,8 @@ def create_topic_deleted_event(
     topic_uuid: object,
     stream_uuid: object,
     source_name: typing.Any,
-    source: typing.Any,
+    provider_uuid: typing.Any,
+    provider_identity: typing.Any,
     session: typing.Any = None,
 ) -> typing.Any:
     return _create_workspace_event(
@@ -1223,7 +1243,10 @@ def create_topic_deleted_event(
             "uuid": _event_payload_value("uuid", topic_uuid),
             "stream_uuid": _event_payload_value("stream_uuid", stream_uuid),
             "source_name": _event_payload_value("source_name", source_name),
-            "source": _event_payload_value("source", source),
+            "provider_uuid": _event_payload_value("provider_uuid", provider_uuid),
+            "provider_identity": _event_payload_value(
+                "provider_identity", provider_identity
+            ),
         },
         session=session,
     )
@@ -1234,7 +1257,8 @@ def create_stream_deleted_event(
     user_uuid: object,
     stream_uuid: object,
     source_name: typing.Any,
-    source: typing.Any,
+    provider_uuid: typing.Any,
+    provider_identity: typing.Any,
     session: typing.Any = None,
 ) -> typing.Any:
     return _create_workspace_event(
@@ -1244,7 +1268,10 @@ def create_stream_deleted_event(
         payload={
             "uuid": _event_payload_value("uuid", stream_uuid),
             "source_name": _event_payload_value("source_name", source_name),
-            "source": _event_payload_value("source", source),
+            "provider_uuid": _event_payload_value("provider_uuid", provider_uuid),
+            "provider_identity": _event_payload_value(
+                "provider_identity", provider_identity
+            ),
         },
         session=session,
     )

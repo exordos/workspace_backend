@@ -19,6 +19,11 @@ from workspace.services.messenger_workers import projection_wakeup
 from workspace.services.messenger_workers import v2_projection
 
 
+@pytest.fixture(autouse=True)
+def _no_pending_publications(monkeypatch):
+    monkeypatch.setattr(agents.publication, "publish_pending", lambda _session: 0)
+
+
 def test_stream_counter_snapshot_accepts_no_default_topic(monkeypatch):
     project_uuid = sys_uuid.uuid4()
     stream_uuid = sys_uuid.uuid4()
@@ -44,7 +49,8 @@ def test_stream_counter_snapshot_accepts_no_default_topic(monkeypatch):
         "_try_lock_project_event_tail",
         lambda *args: calls.append(("lock", args)),
     )
-    session = types.SimpleNamespace(execute=lambda *_args, **_kwargs: None)
+    cursor = types.SimpleNamespace(fetchall=lambda: [])
+    session = types.SimpleNamespace(execute=lambda *_args, **_kwargs: cursor)
 
     v2_projection._process_read_counters(
         session,

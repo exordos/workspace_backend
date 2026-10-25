@@ -28,9 +28,9 @@ below the auth layer, including the composite-primary-key controllers.
 """
 
 import contextlib
-import datetime
 import gc
 import hashlib
+import importlib.util
 import json
 import os
 import pathlib
@@ -46,6 +46,7 @@ import requests
 
 from gcl_iam import engines as iam_engines
 from gcl_iam import middlewares as iam_mw
+from restalchemy.common import contexts
 from restalchemy.api import applications
 from restalchemy.api import middlewares
 from restalchemy.api.middlewares import contexts as contexts_mw
@@ -55,9 +56,9 @@ from restalchemy.storage.sql import migrations as ra_migrations
 from oslo_config import cfg
 
 from workspace.common import file_storage_opts
+from workspace.common import database
 from workspace.common import messenger_reaction_opts
 from workspace.common import topic_summary_opts
-from workspace.bridges.zulip.dm import models as zulip_models
 from workspace.messenger_api.api import context as auth_context
 from workspace.messenger_api.api import middlewares as app_middlewares
 from workspace.messenger_api.api import store_factory
@@ -71,10 +72,43 @@ from workspace.workspace_api.api import app as workspace_app
 # --------------------------------------------------------------------------- #
 
 DEFAULT_TEST_DB_URL = "postgresql://workspace:pass@localhost:5432/workspace_test"
-TEST_DB_URL = os.environ.get("WORKSPACE_TEST_DB_URL", DEFAULT_TEST_DB_URL)
+TEST_DB_URL = database.connection_url_for_process(
+    os.environ.get("WORKSPACE_TEST_DB_URL", DEFAULT_TEST_DB_URL), "workspace-tests"
+)
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 MIGRATIONS_DIR = REPO_ROOT / "migrations"
+
+
+class DataMigration:
+    """Exercise one data/trigger migration without rolling back unrelated schema."""
+
+    def __init__(self, migration):
+        self.migration = migration
+        self.applied = True
+
+    def _run(self, filename, operation):
+        spec = importlib.util.spec_from_file_location(
+            "tested_data_migration", MIGRATIONS_DIR / filename
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with contexts.Context().session_manager() as session:
+            getattr(module.migration_step, operation)(session)
+
+    def apply_migration(self, filename):
+        if not self.applied:
+            self._run(filename, "upgrade")
+            self.applied = True
+
+    def rollback_migration(self, filename):
+        if self.applied:
+            self._run(filename, "downgrade")
+            self.applied = False
+
+    def get_latest_migration(self):
+        return self.migration
+
 
 # Headers used by the mocked auth middleware to build the request context.
 HEADER_USER = "X-Test-User-Uuid"
@@ -443,6 +477,10 @@ def pytest_configure(config):
         raise pytest.UsageError("--integration-shard requires 0 <= INDEX < COUNT")
     config.addinivalue_line(
         "markers",
+        "pre_outgoing_schema: test published outgoing migrations before their removal",
+    )
+    config.addinivalue_line(
+        "markers",
         "pre_retirement_schema: verify a published migration before compatibility retirement",
     )
     config.addinivalue_line(
@@ -468,10 +506,28 @@ def pytest_collection_modifyitems(config, items):
 
 @pytest.fixture(autouse=True)
 def _test_database_url(_database, request, monkeypatch):
+    if request.node.get_closest_marker("pre_outgoing_schema") is not None:
+        with isolated_migration_database(
+            "0264-Add-synchronization-status-to-provider-entities-ca9efd.py"
+        ) as database_url:
+            path = next(MIGRATIONS_DIR.glob("0265-*.py"))
+            spec = importlib.util.spec_from_file_location("outgoing_test_schema", path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            # Current incoming code reads intentions; the historical migration
+            # under test still owns the old outbound tables and triggers.
+            with psycopg.connect(database_url, autocommit=True) as connection:
+                connection.execute(module.SCHEMA)
+            yield database_url
+        return
     if request.node.get_closest_marker("isolated_schema") is not None:
         engine = ra_migrations.MigrationEngine(migrations_path=str(MIGRATIONS_DIR))
         with isolated_migration_database(engine.get_latest_migration()) as database_url:
-            yield database_url
+            api_store.configure_store_factory(store_factory.build_store_factory())
+            try:
+                yield database_url
+            finally:
+                api_store.configure_store_factory(store_factory.build_store_factory())
         return
     if request.node.get_closest_marker("pre_retirement_schema") is None:
         with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
@@ -503,7 +559,7 @@ def _test_database_url(_database, request, monkeypatch):
         # Historical rollbacks can recreate these tables. Keep the current
         # queue models usable without applying the compatibility retirement.
         with psycopg.connect(TEST_DB_URL, autocommit=True) as connection:
-            connection.execute("""ALTER TABLE bridge_zulip_v5_tasks
+            connection.execute("""ALTER TABLE IF EXISTS bridge_zulip_v5_tasks
                 ADD COLUMN IF NOT EXISTS queue VARCHAR(16) NOT NULL DEFAULT 'background',
                 ADD COLUMN IF NOT EXISTS concurrency_key TEXT NOT NULL DEFAULT ''""")
             for table in (
@@ -559,28 +615,6 @@ def db(_test_database_url):
         yield conn
     finally:
         conn.close()
-
-
-@pytest.fixture
-def scheduled_reconciliation(_database):
-    """Keep reconciliation waiting while exercising account-bound queue work."""
-    task = zulip_models.Task(
-        priority=zulip_models.TASK_PRIORITY_RECONCILIATION,
-        not_before_at=datetime.datetime.now(datetime.timezone.utc)
-        + datetime.timedelta(days=1),
-        content=zulip_models.ReconciliationContent(),
-    )
-    task.insert()
-    counters = zulip_models.Task(
-        priority=zulip_models.TASK_PRIORITY_REFRESH_MESSAGE_COUNTERS,
-        not_before_at=datetime.datetime.now(datetime.timezone.utc)
-        + datetime.timedelta(days=1),
-        content=zulip_models.RefreshMessageCountersContent(),
-    )
-    counters.insert()
-    yield task
-    counters.delete()
-    task.delete()
 
 
 # --------------------------------------------------------------------------- #

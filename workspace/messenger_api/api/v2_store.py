@@ -14,11 +14,11 @@ from restalchemy.common import contexts
 from restalchemy.common import exceptions as ra_exceptions
 from restalchemy.dm import filters as dm_filters
 
+from workspace.messenger_api.api import outgoing
 from workspace.messenger_api.api import resource_projection
 from workspace.messenger_api.api import sql_canonical_store
 from workspace.messenger_api.api import store as api_store
 from workspace.common import emoji
-from workspace.bridges.zulip.dm import models as zulip_models
 from workspace.common import mutation_journal_opts
 from workspace.messenger_api.dm import base
 from workspace.messenger_api.dm import helpers
@@ -44,13 +44,6 @@ _INTERNAL_FIELDS = {
     "deleted_at",
     "visible",
 }
-
-
-def _simple_source(value: object) -> dict[str, typing.Any]:
-    source = resource_projection.simple(value)
-    if not isinstance(source, dict) or source.get("kind") != "native":
-        raise ra_exceptions.ValidationErrorException()
-    return source
 
 
 def _public(row: typing.Any, resource: str) -> dict[str, typing.Any]:
@@ -390,9 +383,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             encryption=values.get("encryption", False),
             current_encryption_key_uuid=values.get("current_encryption_key_uuid"),
         )
-        source = _simple_source(values.get("source", {"kind": "native"}))
-        if source_name != "native":
-            raise ra_exceptions.ValidationErrorException()
+        base.WorkspaceProviderBase.validate_native_creation(values)
         direct_user_uuid = values.get("direct_user_uuid")
         direct_user = (
             None if direct_user_uuid is None else sys_uuid.UUID(str(direct_user_uuid))
@@ -440,7 +431,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             participants = (self.user_uuid,)
             existing_row = session.execute(
                 """
-                SELECT project_id, owner_uuid, source_name, source, private,
+                SELECT project_id, owner_uuid, source_name, provider_uuid, provider_identity, private,
                        direct_user_uuid, name, description,
                        encryption, current_encryption_key_uuid
                 FROM messenger_streams
@@ -454,7 +445,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                     existing_row["project_id"] != self.project_uuid
                     or existing_row["owner_uuid"] != self.user_uuid
                     or existing_row["source_name"] != source_name
-                    or existing_row["source"] != source
+                    or existing_row["provider_uuid"] is not None
                     or existing_row["private"] != private
                     or existing_row["direct_user_uuid"] is not None
                     or existing_row["name"] != values["name"]
@@ -473,7 +464,8 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             name=values["name"],
             description=values.get("description", ""),
             source_name=source_name,
-            source=source,
+            provider_uuid=None,
+            provider_identity=None,
             invite_only=values.get("invite_only", False),
             announce=values.get("announce", False),
             direct_user_uuid=direct_user,
@@ -489,12 +481,12 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             """
             INSERT INTO messenger_streams (
                 uuid, project_id, name, description, owner_uuid,
-                source_name, source, invite_only, announce,
+                source_name, provider_uuid, provider_identity, invite_only, announce,
                 direct_user_uuid, private, private_index, color,
                 default_topic_uuid, created_at, updated_at,
                 encryption, current_encryption_key_uuid
             ) VALUES (
-                %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                 %s, %s, %s, %s, %s, %s, %s, %s, %s
             )
             """,
@@ -505,7 +497,8 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 stream_model.description,
                 self.user_uuid,
                 source_name,
-                json.dumps(source),
+                None,
+                None,
                 stream_model.invite_only,
                 stream_model.announce,
                 direct_user,
@@ -545,9 +538,9 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             """
             INSERT INTO messenger_topics (
                 uuid, project_id, stream_uuid, name, color,
-                source_name, source, created_at, updated_at
+                source_name, provider_uuid, provider_identity, created_at, updated_at
             ) VALUES (%s, %s, %s, 'General Topic', %s,
-                      'native', '{"kind":"native"}'::jsonb, %s, %s)
+                      'native', NULL, NULL, %s, %s)
             """,
             (
                 topic_uuid,
@@ -611,14 +604,14 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         session = contexts.Context().get_session()
         stream = self._stream(values["stream_uuid"])
         topic_uuid = sys_uuid.UUID(str(values.get("uuid") or sys_uuid.uuid4()))
-        source = _simple_source(values.get("source", {"kind": "native"}))
+        base.WorkspaceProviderBase.validate_native_creation(values)
         now = session.execute("SELECT NOW() AS value", ()).fetchone()["value"]
         session.execute(
             """
             INSERT INTO messenger_topics (
                 uuid, project_id, stream_uuid, name, color,
-                source_name, source, created_at, updated_at
-            ) VALUES (%s, %s, %s, %s, %s, 'native', %s::jsonb, %s, %s)
+                source_name, provider_uuid, provider_identity, status, created_at, updated_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, NULL, %s, %s, %s)
             """,
             (
                 topic_uuid,
@@ -626,7 +619,9 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 stream.uuid,
                 values["name"],
                 values.get("color", base.random_color()),
-                json.dumps(source),
+                stream.source_name,
+                stream.provider_uuid,
+                "active" if stream.source_name == "native" else "new",
                 now,
                 now,
             ),
@@ -635,10 +630,10 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             """
             INSERT INTO messenger_user_topic_bindings (
                 uuid, project_id, user_uuid, topic_uuid,
-                notification_mode, created_at, updated_at
+                notification_mode, created_at, updated_at, source_name, provider_uuid, status
             )
             SELECT messenger_uuid_v5(%s, binding.user_uuid::text),
-                   %s, binding.user_uuid, %s, 'default', %s, %s
+                   %s, binding.user_uuid, %s, 'default', %s, %s, %s, %s, %s
             FROM messenger_stream_bindings AS binding
             WHERE binding.project_id = %s
               AND binding.stream_uuid = %s
@@ -651,6 +646,9 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 topic_uuid,
                 now,
                 now,
+                stream.source_name,
+                stream.provider_uuid,
+                "active" if stream.source_name == "native" else "new",
                 self.project_uuid,
                 stream.uuid,
             ),
@@ -800,6 +798,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         )
         return _public(self._folder_item(item_uuid), "folder_items")
 
+    @outgoing.api_change
     def create_resource(
         self,
         resource: str,
@@ -863,6 +862,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             (key_uuid, self.project_uuid, stream_uuid),
         )
 
+    @outgoing.api_change
     def create_message(
         self,
         values: dict[str, typing.Any],
@@ -882,15 +882,15 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         topic = self._topic(topic_uuid)
         if topic.stream_uuid != stream.uuid:
             raise ra_exceptions.ValidationErrorException()
-        source = _simple_source(values.get("source", {"kind": "native"}))
+        base.WorkspaceProviderBase.validate_native_creation(values)
         canonical_uuid = sys_uuid.UUID(str(values.get("uuid") or sys_uuid.uuid4()))
         placement_uuid = sys_uuid.uuid5(topic.uuid, str(canonical_uuid))
         existing_placement = session.execute(
             """
             SELECT message.author_uuid, message.payload,
-                   message.source_name, message.source
+                   message.source_name, message.provider_uuid, message.provider_identity
             FROM messenger_message_placements AS placement
-            JOIN messenger_messages AS message
+            JOIN messenger_messages_with_content_v1 AS message
               ON message.project_id = placement.project_id
              AND message.uuid = placement.message_uuid
             WHERE placement.project_id = %s AND placement.uuid = %s
@@ -900,8 +900,8 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         if existing_placement is not None and (
             existing_placement["author_uuid"] != self.user_uuid
             or existing_placement["payload"] != canonical_payload
-            or existing_placement["source_name"] != "native"
-            or existing_placement["source"] != source
+            or existing_placement["source_name"] != stream.source_name
+            or existing_placement["provider_uuid"] != stream.provider_uuid
         ):
             raise ra_exceptions.ValidationErrorException()
         if existing_placement is not None:
@@ -909,18 +909,20 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             return row
         existing_canonical = session.execute(
             """
-            SELECT author_uuid, payload, source_name, source
-            FROM messenger_messages
-            WHERE project_id = %s AND uuid = %s
-            FOR UPDATE
+            SELECT message.author_uuid, contents.workspace_content AS payload,
+                   message.source_name, message.provider_uuid, message.provider_identity
+            FROM messenger_messages message
+            JOIN messenger_message_contents contents ON contents.uuid=message.content_uuid
+            WHERE message.project_id = %s AND message.uuid = %s
+            FOR UPDATE OF message
             """,
             (self.project_uuid, canonical_uuid),
         ).fetchone()
         if existing_canonical is not None and (
             existing_canonical["author_uuid"] != self.user_uuid
             or existing_canonical["payload"] != canonical_payload
-            or existing_canonical["source_name"] != "native"
-            or existing_canonical["source"] != source
+            or existing_canonical["source_name"] != stream.source_name
+            or existing_canonical["provider_uuid"] != stream.provider_uuid
         ):
             raise ra_exceptions.ValidationErrorException()
         now = session.execute("SELECT NOW() AS value", ()).fetchone()["value"]
@@ -928,9 +930,10 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             inserted = session.execute(
                 """
                 INSERT INTO messenger_messages (
-                    uuid, project_id, author_uuid, payload,
-                    source_name, source, created_at, updated_at
-                ) VALUES (%s, %s, %s, %s::jsonb, 'native', %s::jsonb, %s, %s)
+                    uuid, project_id, author_uuid, content_uuid,
+                    source_name, provider_uuid, provider_identity, status, created_at, updated_at
+                ) VALUES (%s, %s, %s, messenger_resolve_message_content(%s::jsonb,NULL),
+                          %s, %s, NULL, %s, %s, %s)
                 ON CONFLICT (project_id, uuid) DO NOTHING
                 RETURNING uuid
                 """,
@@ -939,7 +942,9 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                     self.project_uuid,
                     self.user_uuid,
                     json.dumps(canonical_payload),
-                    json.dumps(source),
+                    stream.source_name,
+                    stream.provider_uuid,
+                    "active" if stream.source_name == "native" else "new",
                     now,
                     now,
                 ),
@@ -947,20 +952,30 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             if inserted is None:
                 existing_canonical = session.execute(
                     """
-                    SELECT author_uuid, payload, source_name, source
-                    FROM messenger_messages
-                    WHERE project_id = %s AND uuid = %s
-                    FOR UPDATE
+                    SELECT message.author_uuid, contents.workspace_content AS payload,
+                           message.source_name, message.provider_uuid, message.provider_identity
+                    FROM messenger_messages message
+                    JOIN messenger_message_contents contents ON contents.uuid=message.content_uuid
+                    WHERE message.project_id = %s AND message.uuid = %s
+                    FOR UPDATE OF message
                     """,
                     (self.project_uuid, canonical_uuid),
                 ).fetchone()
                 if existing_canonical is None or (
                     existing_canonical["author_uuid"] != self.user_uuid
                     or existing_canonical["payload"] != canonical_payload
-                    or existing_canonical["source_name"] != "native"
-                    or existing_canonical["source"] != source
+                    or existing_canonical["source_name"] != stream.source_name
+                    or existing_canonical["provider_uuid"] != stream.provider_uuid
                 ):
                     raise ra_exceptions.ValidationErrorException()
+        if (
+            session.execute(
+                "SELECT 1 FROM messenger_message_placements WHERE project_id=%s AND message_uuid=%s LIMIT 1",
+                (self.project_uuid, canonical_uuid),
+            ).fetchone()
+            is not None
+        ):
+            raise ra_exceptions.ValidationErrorException()
         inserted_placement = session.execute(
             """
             INSERT INTO messenger_message_placements (
@@ -1028,10 +1043,10 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             INSERT INTO messenger_user_message_states (
                 uuid, project_id, placement_uuid, user_uuid,
                 membership_generation, read_at, mentioned,
-                created_at, updated_at
+                created_at, updated_at, source_name, provider_uuid, status
             )
             SELECT %s, %s, %s, %s, membership_generation,
-                   %s, %s, %s, %s
+                   %s, %s, %s, %s, %s, %s, %s
             FROM messenger_stream_bindings
             WHERE project_id = %s AND stream_uuid = %s
               AND user_uuid = %s AND active
@@ -1045,6 +1060,9 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 mentioned,
                 now,
                 now,
+                stream.source_name,
+                stream.provider_uuid,
+                "active" if stream.source_name == "native" else "new",
                 self.project_uuid,
                 stream.uuid,
                 self.user_uuid,
@@ -1074,6 +1092,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         row = _public(self._message(placement_uuid), "messages")
         return row
 
+    @outgoing.api_change
     def update_message(
         self,
         message_uuid: sys_uuid.UUID,
@@ -1090,9 +1109,11 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         changed = session.execute(
             """
             UPDATE messenger_messages
-            SET payload = %s::jsonb, updated_at = NOW()
+            SET content_uuid = messenger_resolve_message_content(%s::jsonb,NULL),
+                updated_at = NOW()
             WHERE project_id = %s AND uuid = %s
-              AND payload IS DISTINCT FROM %s::jsonb
+              AND (SELECT workspace_content FROM messenger_message_contents
+                   WHERE uuid=messenger_messages.content_uuid) IS DISTINCT FROM %s::jsonb
             RETURNING uuid
             """,
             (
@@ -1128,6 +1149,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         row = _public(self._message(message_uuid), "messages")
         return row
 
+    @outgoing.api_change
     def delete_message(
         self,
         message_uuid: sys_uuid.UUID,
@@ -1157,7 +1179,8 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                     "message_created_at": message.created_at,
                     "author_uuid": message.author_uuid,
                     "source_name": message.source_name,
-                    "source": resource_projection.simple(message.source),
+                    "provider_uuid": message.provider_uuid,
+                    "provider_identity": message.provider_identity,
                 },
             )
         session.execute(
@@ -1200,8 +1223,8 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             """
             INSERT INTO messenger_message_reaction_facts (
                 uuid, project_id, canonical_message_uuid, placement_uuid,
-                user_uuid, emoji_name
-            ) VALUES (%s, %s, %s, %s, %s, %s)
+                user_uuid, emoji_name, source_name, provider_uuid, status
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT DO NOTHING
             RETURNING uuid
             """,
@@ -1212,6 +1235,9 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 message.uuid,
                 self.user_uuid,
                 values["emoji_name"],
+                message.source_name,
+                message.provider_uuid,
+                "active" if message.source_name == "native" else "new",
             ),
         ).fetchone()
         if inserted is None:
@@ -1244,6 +1270,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         )
         return reaction
 
+    @outgoing.api_change
     def update_resource(
         self,
         resource: str,
@@ -1284,7 +1311,9 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             stream.validate_encryption_update(values)
             forbidden = {
                 "source_name",
-                "source",
+                "provider_uuid",
+                "provider_identity",
+                "status",
                 "direct_user_uuid",
                 "private_index",
                 "private",
@@ -1330,74 +1359,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             row = _public(self._topic(topic.uuid), "stream_topics")
             return row
         if resource == "message_reactions":
-            reaction = v2_models.WorkspaceMessageReactionView.objects.get_one(
-                filters=self._v2_scope_filters(
-                    resource, {"uuid": dm_filters.EQ(resource_uuid)}
-                )
-            )
-            if reaction.user_uuid != self.user_uuid:
-                raise ra_exceptions.ValidationErrorException()
-            old_message = self._message(reaction.message_uuid)
-            message = self._message(values.get("message_uuid", reaction.message_uuid))
-            if "emoji_name" in values:
-                values = {
-                    **values,
-                    "emoji_name": emoji.normalize_name(values["emoji_name"]),
-                }
-            emoji_name = values.get("emoji_name", reaction.emoji_name)
-            changed = session.execute(
-                """
-                UPDATE messenger_message_reaction_facts
-                SET canonical_message_uuid = %s, placement_uuid = %s,
-                    emoji_name = %s, updated_at = NOW()
-                WHERE project_id = %s AND uuid = %s
-                  AND (canonical_message_uuid, placement_uuid, emoji_name)
-                      IS DISTINCT FROM (%s::uuid, %s::uuid, %s::text)
-                RETURNING uuid
-                """,
-                (
-                    message.canonical_message_uuid,
-                    message.uuid,
-                    emoji_name,
-                    self.project_uuid,
-                    reaction.uuid,
-                    message.canonical_message_uuid,
-                    message.uuid,
-                    emoji_name,
-                ),
-            ).fetchone()
-            if changed is None:
-                return self.get_resource(resource, reaction.uuid)
-            updated_reaction = self.get_resource(resource, reaction.uuid)
-            self._enqueue(
-                "reaction_snapshot",
-                "message",
-                f"{self.project_uuid}:{message.canonical_message_uuid}",
-                {
-                    "source_kind": "message_reaction.updated",
-                    "reaction_uuid": reaction.uuid,
-                    "placement_uuid": message.uuid,
-                    "reaction": updated_reaction,
-                    "old_message_uuid": old_message.uuid,
-                    "old_emoji_name": reaction.emoji_name,
-                    "old_source_name": old_message.source_name,
-                    "old_source": resource_projection.simple(old_message.source),
-                    "emit_reaction_event": True,
-                },
-            )
-            if old_message.canonical_message_uuid != message.canonical_message_uuid:
-                self._enqueue(
-                    "reaction_snapshot",
-                    "message",
-                    f"{self.project_uuid}:{old_message.canonical_message_uuid}",
-                    {
-                        "source_kind": "message_reaction.updated_old",
-                        "reaction_uuid": reaction.uuid,
-                        "placement_uuid": old_message.uuid,
-                        "emit_reaction_event": False,
-                    },
-                )
-            return updated_reaction
+            raise ra_exceptions.ValidationErrorException()
         if resource == "stream_bindings":
             binding = v2_models.WorkspaceStreamBindingView.objects.get_one(
                 filters=self._v2_scope_filters(
@@ -1465,6 +1427,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             return self.get_resource(resource, binding.uuid)
         return super().update_resource(resource, resource_uuid, values)
 
+    @outgoing.api_change
     def delete_resource(
         self,
         resource: str,
@@ -1601,7 +1564,8 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                     "source_kind": "stream.deleted",
                     "stream_uuid": stream.uuid,
                     "source_name": stream.source_name,
-                    "source": resource_projection.simple(stream.source),
+                    "provider_uuid": stream.provider_uuid,
+                    "provider_identity": stream.provider_identity,
                     "recipients": [binding.user_uuid],
                 },
             )
@@ -1644,7 +1608,8 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                     "topic_uuid": topic.uuid,
                     "stream_uuid": topic.stream_uuid,
                     "source_name": topic.source_name,
-                    "source": resource_projection.simple(topic.source),
+                    "provider_uuid": topic.provider_uuid,
+                    "provider_identity": topic.provider_identity,
                 },
             )
             cleared_default = session.execute(
@@ -1680,7 +1645,8 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                     "source_kind": "stream.deleted",
                     "stream_uuid": stream.uuid,
                     "source_name": stream.source_name,
-                    "source": resource_projection.simple(stream.source),
+                    "provider_uuid": stream.provider_uuid,
+                    "provider_identity": stream.provider_identity,
                     "all_recipients": True,
                     "private": stream.private,
                 },
@@ -1740,6 +1706,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             candidate_values,
         ).fetchone()["present"]
 
+    @outgoing.api_change
     def perform_action(
         self,
         resource: str,
@@ -1812,10 +1779,10 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                                 uuid, project_id, stream_uuid, user_uuid,
                                 who_uuid, active, membership_generation, role,
                                 notification_mode, notification_updated_at,
-                                created_at, updated_at
+                                created_at, updated_at, source_name, provider_uuid, status
                             ) VALUES (
                                 %s, %s, %s, %s, %s, true, 1, %s,
-                                'all_messages', %s, %s, %s
+                                'all_messages', %s, %s, %s, %s, %s, %s
                             )
                             """,
                             (
@@ -1828,6 +1795,9 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                                 now,
                                 now,
                                 now,
+                                stream.source_name,
+                                stream.provider_uuid,
+                                "active" if stream.source_name == "native" else "new",
                             ),
                         )
                     else:
@@ -1858,10 +1828,11 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                         """
                         INSERT INTO messenger_user_topic_bindings (
                             uuid, project_id, user_uuid, topic_uuid,
-                            notification_mode, created_at, updated_at
+                            notification_mode, created_at, updated_at, source_name, provider_uuid, status
                         )
                         SELECT messenger_uuid_v5(topic.uuid, %s),
-                               %s, %s, topic.uuid, 'default', %s, %s
+                               %s, %s, topic.uuid, 'default', %s, %s, topic.source_name, topic.provider_uuid,
+                               CASE WHEN topic.source_name='native' THEN 'active' ELSE 'new' END
                         FROM messenger_topics AS topic
                         WHERE topic.project_id = %s AND topic.stream_uuid = %s
                         ON CONFLICT (project_id, user_uuid, topic_uuid) DO NOTHING
@@ -2169,14 +2140,6 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 """,
                 (self.project_uuid, stream.uuid, self.user_uuid),
             ).fetchone()
-            zulip_models.enqueue_notifications(
-                self.project_uuid,
-                self.user_uuid,
-                stream.uuid,
-                None,
-                values["notification_mode"],
-                session,
-            )
             topics = session.execute(
                 """
                 SELECT uuid FROM messenger_topics
@@ -2343,14 +2306,6 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 """,
                 (self.project_uuid, topic.uuid, self.user_uuid),
             ).fetchone()
-            zulip_models.enqueue_notifications(
-                self.project_uuid,
-                self.user_uuid,
-                topic.stream_uuid,
-                topic.uuid,
-                values["notification_mode"],
-                session,
-            )
             self._enqueue_counter_projections(
                 source_kind="topic.updated",
                 user_uuid=self.user_uuid,

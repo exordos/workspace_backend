@@ -650,7 +650,7 @@ Vergleich der Darstellung:
 | `read`, `mentioned`, `starred`, `pinned` | einzigartig für die Platzierung `USER_MESSAGE_STATE`; öffentlich `read`  skalar `read_at IS NOT NULL` | Nur für den Lesebereich CRUD | Handlungen oder worker |
 | `is_own` | Die skalare Gleichheit der verbundenen ID | Nur für das Lesen | nicht als Quelle der Wahrheit gespeichert wird |
 | `author_uuid`, `payload` | `MESSAGE.author_uuid/payload` | Autor nur für Lesen; `payload` für Erstellen und Aktualisieren | Kanonische Nachricht |
-| `source_name`, `source` | `MESSAGE` | Nur für die Erstellung | Kanonische Nachricht |
+| `source_name`, `provider_uuid`, `provider_identity` | `MESSAGE` | Nur für die Erstellung | Kanonische Nachricht |
 | `provider`, `delivery` | Verkörperte Projektion `MESSAGE` | Nur für das Lesen | Provider-Pfad oder Hintergrundpfad |
 | `reactions`, `reaction_users` | der materialisierte kanonische Zustand | Nur für das Lesen | Veränderung der Reaktion oder des Hintergrundweges |
 | `created_at`, `updated_at` | `MESSAGE.created_at/updated_at` | Nur für das Lesen | Nur ein Kanonikum |
@@ -1141,9 +1141,8 @@ direct/self chat.
   "reactions": {},
   "reaction_users": {},
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "provider": null,
   "delivery": null,
   "created_at": "2026-06-22T10:10:00Z",
@@ -1173,9 +1172,8 @@ direct/self chat.
   "reactions": {},
   "reaction_users": {},
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "provider": null,
   "delivery": null,
   "created_at": "2026-06-22T10:10:00Z",
@@ -1205,9 +1203,8 @@ direct/self chat.
   "reactions": {},
   "reaction_users": {},
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "provider": null,
   "delivery": null,
   "created_at": "2026-06-22T10:10:00Z",
@@ -1237,9 +1234,8 @@ direct/self chat.
   "reactions": {},
   "reaction_users": {},
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "provider": null,
   "delivery": null,
   "created_at": "2026-06-22T10:10:00Z",
@@ -1270,9 +1266,8 @@ direct/self chat.
     "reactions": {},
     "reaction_users": {},
     "source_name": "native",
-    "source": {
-      "kind": "native"
-    },
+    "provider_uuid": null,
+    "provider_identity": null,
     "provider": null,
     "delivery": null,
     "created_at": "2026-06-22T10:10:00Z",
@@ -1418,11 +1413,9 @@ REACTION_FIELDS = field_permissions.FieldsPermissions(
     fields={
         "message_uuid": {
             constants.CREATE: field_permissions.Permissions.RW,
-            constants.UPDATE: field_permissions.Permissions.RW,
         },
         "emoji_name": {
             constants.CREATE: field_permissions.Permissions.RW,
-            constants.UPDATE: field_permissions.Permissions.RW,
         },
     },
 )
@@ -1455,12 +1448,6 @@ class WorkspaceMessageReactionController(
     def filter(self, **filters):
         return reaction_queries.visible_facts(
             context=self.get_context(), filters=filters, session=self.session,
-        )
-
-    def update(self, uuid, **values):
-        return reaction_fact_commands.update_one_owned(
-            context=self.get_context(), reaction_uuid=uuid,
-            values=values, session=self.session,
         )
 
     def delete(self, uuid):
@@ -1496,7 +1483,6 @@ wird geändert und topic lock wird nicht verwendet; spezifisches storage/claim p
 | Liste | `GET /api/workspace/v1/messenger/message_reactions/` | Reaktionen im Bereich | ohne Körper; Filter `message_uuid`/`user_uuid` und Pagination werden unterstützt | `200`, `REACTION_LIST_RESPONSE` |
 | Gründung | `POST /api/workspace/v1/messenger/message_reactions/` | placement UUID -> access check -> ein Ausgangsfall der Reaktion auf die kanonische Nachricht | `REACTION_CREATE_REQUEST` | `201`, `REACTION_RESPONSE` |
 | - Erhalten | `GET /api/workspace/v1/messenger/message_reactions/{reaction_uuid}` | Reaktionen im Bereich | Ohne Körper | `200`, `REACTION_RESPONSE` |
-| Erneuerung | `PUT /api/workspace/v1/messenger/message_reactions/{reaction_uuid}` | ein Benutzer-Besitzungs-Faktor | `REACTION_UPDATE_REQUEST` | `200`, `REACTION_UPDATE_RESPONSE` |
 | Löschen | `DELETE /api/workspace/v1/messenger/message_reactions/{reaction_uuid}` | ein Benutzer-Besitzungs-Faktor | Ohne Körper | `204`, Leerkörper |
 
 Beispiel für eine Liste:
@@ -1505,20 +1491,14 @@ Beispiel für eine Liste:
 GET /api/workspace/v1/messenger/message_reactions/?message_uuid=a93dca35-3061-4748-bda4-7f6f8c660ea5&page_limit=100
 ```
 
+Reaktionen sind unveränderlich: nur Erstellen und Löschen sind erlaubt. Zum Ändern eines Emojis die alte Reaktion löschen und eine neue erstellen. PUT liefert 405.
+
 `REACTION_CREATE_REQUEST`:
 
 ```json
 {
   "message_uuid": "a93dca35-3061-4748-bda4-7f6f8c660ea5",
   "emoji_name": "thumbs_up"
-}
-```
-
-`REACTION_UPDATE_REQUEST`:
-
-```json
-{
-  "emoji_name": "heart"
 }
 ```
 
@@ -1535,22 +1515,6 @@ GET /api/workspace/v1/messenger/message_reactions/?message_uuid=a93dca35-3061-47
   "delivery": null,
   "created_at": "2026-06-22T10:12:00Z",
   "updated_at": "2026-06-22T10:12:00Z"
-}
-```
-
-`REACTION_UPDATE_RESPONSE`:
-
-```json
-{
-  "uuid": "bd4b7632-8788-435a-93cc-6873657335c6",
-  "project_id": "22222222-2222-2222-2222-222222222222",
-  "message_uuid": "a93dca35-3061-4748-bda4-7f6f8c660ea5",
-  "user_uuid": "11111111-1111-1111-1111-111111111111",
-  "emoji_name": "heart",
-  "provider": null,
-  "delivery": null,
-  "created_at": "2026-06-22T10:12:00Z",
-  "updated_at": "2026-06-22T10:13:00Z"
 }
 ```
 
@@ -1952,9 +1916,8 @@ GET /api/workspace/v1/messenger/streams/?private=false&page_limit=50&page_marker
   "name": "Engineering",
   "description": "Engineering workspace",
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "invite_only": false,
   "announce": false
 }
@@ -1968,9 +1931,8 @@ Ein anderer Teilnehmer:
   "name": "Direct",
   "description": "Private workspace",
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "direct_user_uuid": "33333333-3333-3333-3333-333333333333"
 }
 ```
@@ -1982,9 +1944,8 @@ Ein anderer Teilnehmer:
   "name": "Personal notes",
   "description": "",
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "direct_user_uuid": "11111111-1111-1111-1111-111111111111"
 }
 ```
@@ -2008,9 +1969,8 @@ Der aktuelle Benutzer in `direct_user_uuid`:
   "active_unread_count": 0,
   "passive_unread_count": 0,
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "invite_only": false,
   "announce": false,
   "direct_user_uuid": "11111111-1111-1111-1111-111111111111",
@@ -2093,9 +2053,8 @@ Die Liste UUID, gibt zurück `400001005`.
   "active_unread_count": 2,
   "passive_unread_count": 0,
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "invite_only": false,
   "announce": false,
   "direct_user_uuid": null,
@@ -2127,9 +2086,8 @@ Die Liste UUID, gibt zurück `400001005`.
   "active_unread_count": 2,
   "passive_unread_count": 0,
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "invite_only": false,
   "announce": false,
   "direct_user_uuid": null,
@@ -2161,9 +2119,8 @@ Die Liste UUID, gibt zurück `400001005`.
   "active_unread_count": 1,
   "passive_unread_count": 1,
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "invite_only": false,
   "announce": false,
   "direct_user_uuid": null,
@@ -2195,9 +2152,8 @@ Die Liste UUID, gibt zurück `400001005`.
   "active_unread_count": 0,
   "passive_unread_count": 0,
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "invite_only": false,
   "announce": false,
   "direct_user_uuid": null,
@@ -2230,9 +2186,8 @@ Die Liste UUID, gibt zurück `400001005`.
     "active_unread_count": 2,
     "passive_unread_count": 0,
     "source_name": "native",
-    "source": {
-      "kind": "native"
-    },
+    "provider_uuid": null,
+    "provider_identity": null,
     "invite_only": false,
     "announce": false,
     "direct_user_uuid": null,
@@ -2855,9 +2810,8 @@ Sie bekommen `403`.
   "summary_system_prompt": null,
   "summary_reasoning_effort": null,
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "provider": null,
   "delivery": null,
   "created_at": "2026-06-22T09:10:00Z",
@@ -2890,9 +2844,8 @@ Aktivitäten follow, set-default, toggle-done, Anfrage- und Leserneuheiten:
   "summary_system_prompt": "Summarize decisions, owners, and unresolved risks.",
   "summary_reasoning_effort": "medium",
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "provider": null,
   "delivery": null,
   "created_at": "2026-06-22T09:10:00Z",
@@ -2925,9 +2878,8 @@ Aktivitäten follow, set-default, toggle-done, Anfrage- und Leserneuheiten:
     "summary_system_prompt": null,
     "summary_reasoning_effort": null,
     "source_name": "native",
-    "source": {
-      "kind": "native"
-    },
+    "provider_uuid": null,
+    "provider_identity": null,
     "provider": null,
     "delivery": null,
     "created_at": "2026-06-22T09:10:00Z",

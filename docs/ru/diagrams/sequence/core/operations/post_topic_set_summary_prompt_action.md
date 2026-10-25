@@ -52,9 +52,8 @@ HTTP `200`:
   "summary_system_prompt": "Суммируй решения, ответственных и нерешённые риски.",
   "summary_reasoning_effort": "medium",
   "source_name": "native",
-  "source": {
-    "kind": "native"
-  },
+  "provider_uuid": null,
+  "provider_identity": null,
   "provider": null,
   "delivery": null,
   "created_at": "2026-06-22T09:10:00Z",

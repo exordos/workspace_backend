@@ -270,6 +270,7 @@ class _ZulipToWorkspace:
         self.message = message
         self.context = context
         self.unsupported = False
+        self.uses_current_message = False
         linkifiers = context.get("linkifier_urls", {})
         pattern = _INLINE
         if linkifiers:
@@ -321,6 +322,8 @@ class _ZulipToWorkspace:
         return "\n\n".join(parts)
 
     def message_uuid(self, message_id: str) -> str:
+        if message_id == str(self.message["id"]):
+            self.uses_current_message = True
         mapped = self.context.get("message_uuids", {}).get(message_id)
         if mapped is not None:
             return mapped
@@ -335,6 +338,8 @@ class _ZulipToWorkspace:
     def snapshot(
         self, content: str, author: str = "unknown", message_id: str | None = None
     ) -> str:
+        if message_id is None:
+            self.uses_current_message = True
         encoded = base64.urlsafe_b64encode(content.encode()).decode().rstrip("=")
         identifier = (
             self.message_uuid(message_id)
@@ -668,6 +673,13 @@ class _ZulipToWorkspace:
 
 def zulip_to_workspace(message: dict, context: dict) -> dict[str, str]:
     """Convert a Zulip API Markdown message to a Workspace Markdown payload."""
+    return zulip_to_workspace_cached(message, context)[0]
+
+
+def zulip_to_workspace_cached(
+    message: dict, context: dict
+) -> tuple[dict[str, str], bool]:
+    """Return the payload and whether it is independent of this message's identity."""
     converter = _ZulipToWorkspace(message, context)
     content = converter.body(message["content"])
     if converter.unsupported:
@@ -677,7 +689,12 @@ def zulip_to_workspace(message: dict, context: dict) -> dict[str, str]:
             + _markdown_link("Original message", f"urn:url:{context['original_url']}")
         )
     payload = message_payloads.MarkdownPayload(content=content)
-    return {"kind": payload.kind, "content": payload.content}
+    reusable = not (
+        converter.unsupported
+        or converter.uses_current_message
+        or str(message["id"]) in message["content"]
+    )
+    return {"kind": payload.kind, "content": payload.content}, reusable
 
 
 def _reverse_lookup(context: dict, mapping: str, value: str) -> str:

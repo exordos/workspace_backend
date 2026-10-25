@@ -11,7 +11,6 @@ import typing
 import uuid as sys_uuid
 
 
-from workspace.messenger_api.dm import base
 from workspace.messenger_api.dm import models
 
 
@@ -68,6 +67,17 @@ def as_dict(
     result = simple(value)
     if not isinstance(result, dict):
         raise TypeError("Messenger projection rows must serialize to dictionaries")
+    if resource in {
+        "streams",
+        "stream_bindings",
+        "stream_topics",
+        "messages",
+        "message_reactions",
+        "files",
+    }:
+        result.setdefault("status", "active")
+        result.setdefault("provider_uuid", None)
+        result.setdefault("provider_identity", None)
     if resource == "streams":
         result.setdefault("current_encryption_key_uuid", None)
     if resource == "stream_topics":
@@ -88,10 +98,4 @@ def projection_values(
     result = values.copy()
     for name in ("project_id", "user_uuid"):
         result.pop(name, None)
-    source = result.get("source")
-    if isinstance(source, dict):
-        source_type = base.WorkspaceSourceBase.properties.properties[
-            "source"
-        ].get_property_type()
-        result["source"] = source_type.from_simple_type(source)
     return result

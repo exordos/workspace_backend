@@ -193,11 +193,6 @@ def test_populated_cutover_preserves_messages_state_files_drafts_and_summary(
         "SELECT emoji_name FROM messenger_message_reaction_facts WHERE project_id=%s",
         (ids["project"],),
     ).fetchone() == ("thumbs_up",)
-    with contexts.Context().session_manager():
-        store = v2_store.MessengerV2Store(ids["project"], ids["user"])
-        public = store.get_resource("messages", ids["alias"])
-        assert public["uuid"] == str(ids["placement"])
-        assert public["payload"]["content"] == "Preserved content"
     assert (
         connection.execute(
             "SELECT proname FROM pg_proc WHERE pronamespace='public'::regnamespace AND prokind='f' "
@@ -205,6 +200,14 @@ def test_populated_cutover_preserves_messages_state_files_drafts_and_summary(
         ).fetchall()
         == []
     )
+    # Current read models are checked only after reaching the current schema.
+    engine = migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    engine.apply_migration(engine.get_latest_migration())
+    with contexts.Context().session_manager():
+        store = v2_store.MessengerV2Store(ids["project"], ids["user"])
+        public = store.get_resource("messages", ids["alias"])
+        assert public["uuid"] == str(ids["placement"])
+        assert public["payload"]["content"] == "Preserved content"
     # Deleting the canonical root owns cleanup after every FK is retargeted.
     connection.execute("DELETE FROM messenger_streams WHERE uuid=%s", (ids["stream"],))
     for table in (
@@ -269,6 +272,11 @@ def test_cutover_preserves_bitmap_reads_after_legacy_flags_were_cleaned(before_c
         (ids["user"], sequence // 4096, sequence % 4096),
     )
     _upgrade()
+    # This cutover predates the publication journal. Draining its projection
+    # work must not require later publication tables or process that queue.
+    assert connection.execute(
+        "SELECT to_regclass('messenger_publication_outbox')"
+    ).fetchone() == (None,)
     with contexts.Context().session_manager() as session:
         assert (
             v2_projection.drain_projection_queue(

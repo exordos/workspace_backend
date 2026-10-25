@@ -8,7 +8,6 @@ import uuid
 import psycopg
 import pytest
 from restalchemy.common import contexts
-from restalchemy.storage.sql import migrations
 
 from migrations import zulip_upgrade_data
 from workspace.tests.integration import conftest
@@ -26,9 +25,8 @@ from workspace.tests.integration import conftest
 def test_merge_preserves_unarchived_direct_conversation(
     http_server, archived, expected, destination_exists
 ):
-    head = migrations.MigrationEngine(
-        str(conftest.MIGRATIONS_DIR)
-    ).get_latest_migration()
+    # Exercise the published rekey helper on its last physical-payload schema.
+    head = next(conftest.MIGRATIONS_DIR.glob("0272-*.py")).name
     with conftest.isolated_migration_database(head) as url:
         project, owner, peer = (uuid.uuid4() for _ in range(3))
         streams = [uuid.UUID(int=index) for index in range(1, 4)]

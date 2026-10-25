@@ -13,6 +13,12 @@ from restalchemy.storage.sql import migrations as ra_migrations
 
 from workspace.messenger_api import topic_summarization
 from workspace.tests.integration import legacy_store
+from workspace.tests.integration.legacy_messenger import (
+    store_factory as historical_factory,
+)
+from workspace.tests.integration.legacy_messenger import (
+    v2_projection as historical_projection,
+)
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.api import store_factory
 from migrations import legacy_messenger_read_state as read_state
@@ -31,6 +37,7 @@ MIGRATION = "0187-Process-only-Markdown-message-content-90458e.py"
 @pytest.fixture
 def content_migration_database(_database, http_server):
     with conftest.isolated_migration_database(MIGRATION) as database_url:
+        api_store.configure_store_factory(historical_factory.build_store_factory())
         with psycopg.connect(database_url, autocommit=True) as connection:
             # The current IAM model includes this independent, later catalog field.
             connection.execute(
@@ -48,8 +55,12 @@ def content_migration_database(_database, http_server):
 
 
 @pytest.fixture(autouse=True)
-def _production_v2_store(_database):
-    api_store.configure_store_factory(store_factory.build_store_factory())
+def _production_v2_store(_database, request, monkeypatch):
+    if request.node.get_closest_marker("pre_retirement_schema") is not None:
+        api_store.configure_store_factory(historical_factory.build_store_factory())
+        monkeypatch.setattr(test_messenger_v2, "v2_projection", historical_projection)
+    else:
+        api_store.configure_store_factory(store_factory.build_store_factory())
     try:
         yield
     finally:

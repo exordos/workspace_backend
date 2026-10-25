@@ -161,7 +161,7 @@ def test_message_mutations_use_dedicated_canonical_store_operations(fake_store):
     deleted = controller.delete(MESSAGE_UUID)
 
     assert created["source_name"] == "native"
-    assert created["source"] == {"kind": "native"}
+    assert created.get("provider_uuid") is None
     assert "provider" not in created
     assert "delivery" not in created
     assert updated["uuid"] == MESSAGE_UUID
@@ -339,7 +339,9 @@ def test_draft_mutations_require_if_match(fake_store):
 
 
 def test_external_accounts_are_part_of_messenger_routes():
-    assert workspace_routes.MessengerRoute.external_accounts is routes.ExternalAccountRoute
+    assert (
+        workspace_routes.MessengerRoute.external_accounts is routes.ExternalAccountRoute
+    )
 
 
 def test_controllers_do_not_access_sql_objects_or_deleted_provider_api():

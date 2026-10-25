@@ -96,7 +96,7 @@ Die Ereignisse sind minimal:
 - `stream.deleted`, `folder.deleted` und `folder_item.deleted`: `kind`, `uuid`;
 - `topic.deleted`: `kind`, `uuid`, `stream_uuid`;
 - `message.deleted`: `kind`, `uuid`, `stream_uuid`, `topic_uuid`,
-  `author_uuid`, `source_name` und `source`.
+  `author_uuid`, `source_name` und `provider_uuid`, `provider_identity`.
 
 Reaktionsänderungen emittieren `message_reaction.created`,
 `message_reaction.updated` oder `message_reaction.deleted` für den als Interessent dienenden Benutzer.

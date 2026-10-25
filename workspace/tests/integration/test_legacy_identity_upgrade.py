@@ -30,7 +30,8 @@ V5_HEADS = sorted(
 )
 def test_legacy_conversion_still_requires_coordinated_rollback(captured_table):
     engine = migrations.MigrationEngine(str(conftest.MIGRATIONS_DIR))
-    with conftest.isolated_migration_database(engine.get_latest_migration()) as url:
+    capture_migration = next(conftest.MIGRATIONS_DIR.glob("0247-*.py")).name
+    with conftest.isolated_migration_database(capture_migration) as url:
         with psycopg.connect(url, autocommit=True) as database:
             database.execute(f"CREATE TABLE {captured_table} (kind TEXT)")
         with pytest.raises(RuntimeError, match="coordinated pre-upgrade checkpoint"):
@@ -67,7 +68,16 @@ def test_existing_v5_upgrade_does_not_rewrite_data_or_require_a_bridge(starting_
                 "SELECT to_jsonb(stream) FROM messenger_streams stream WHERE uuid=%s",
                 (stream,),
             ).fetchone()[0]
-            assert {key: after[key] for key in before} == before
+            # The v6 cutover intentionally removes the nested source column.
+            # All original business data must survive its replacement.
+            assert {key: after[key] for key in before if key != "source"} == {
+                key: value for key, value in before.items() if key != "source"
+            }
+            assert "source" not in after
+            assert after["source_name"] == "native"
+            assert after["provider_uuid"] is None
+            assert after["provider_identity"] is None
+            assert after["status"] == "active"
             assert database.execute(
                 "SELECT to_regclass('public.workspace_zulip_v5_legacy_state')"
             ).fetchone() == (None,)
@@ -128,7 +138,7 @@ def test_migration_keeps_public_addresses_when_they_overlap_canonical_ids(http_s
 def test_data_reference_rewrite_preserves_literal_uuid_text():
 
     with conftest.isolated_migration_database(
-        migrations.MigrationEngine(str(conftest.MIGRATIONS_DIR)).get_latest_migration()
+        next(conftest.MIGRATIONS_DIR.glob("0272-*.py")).name
     ):
         project, old, new = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
         with contexts.Context().session_manager() as session:
@@ -182,9 +192,9 @@ def test_upgrade_accepts_release_schemas_without_legacy_summary_boundary_constra
 
 def test_data_conversion_merges_shared_conversations_without_losing_user_data():
 
-    head = migrations.MigrationEngine(
-        str(conftest.MIGRATIONS_DIR)
-    ).get_latest_migration()
+    # This helper belongs to the identity cutover, before payload columns
+    # moved to immutable pages. End-to-end upgrades below still target HEAD.
+    head = next(conftest.MIGRATIONS_DIR.glob("0272-*.py")).name
     with conftest.isolated_migration_database(head) as url:
         project, owner, destination, topic_destination, folder = (
             uuid.uuid4() for _ in range(5)
@@ -306,9 +316,9 @@ def test_data_conversion_rewrites_nested_forward_links_without_changing_edit_tim
 
     from workspace.bridges.zulip import message_conversion
 
-    head = migrations.MigrationEngine(
-        str(conftest.MIGRATIONS_DIR)
-    ).get_latest_migration()
+    # This helper belongs to the identity cutover, before payload columns
+    # moved to immutable pages. End-to-end upgrades below still target HEAD.
+    head = next(conftest.MIGRATIONS_DIR.glob("0272-*.py")).name
     with conftest.isolated_migration_database(head) as url:
         project, owner, old, new, message = (uuid.uuid4() for _ in range(5))
         inner = f"[Original](urn:message:{old}) Plain UUID: {old}"
@@ -359,9 +369,9 @@ def test_data_conversion_rewrites_nested_forward_links_without_changing_edit_tim
 
 def test_data_conversion_keeps_pending_projection_ordering_and_progress_on_new_ids():
 
-    head = migrations.MigrationEngine(
-        str(conftest.MIGRATIONS_DIR)
-    ).get_latest_migration()
+    # This helper belongs to the identity cutover, before payload columns
+    # moved to immutable pages. End-to-end upgrades below still target HEAD.
+    head = next(conftest.MIGRATIONS_DIR.glob("0272-*.py")).name
     with conftest.isolated_migration_database(head):
         project, old, new, event, task = (uuid.uuid4() for _ in range(5))
         with contexts.Context().session_manager() as session:
@@ -392,9 +402,9 @@ def test_data_conversion_keeps_pending_projection_ordering_and_progress_on_new_i
 
 def test_data_conversion_releases_old_worker_leases_before_scopes_merge():
 
-    head = migrations.MigrationEngine(
-        str(conftest.MIGRATIONS_DIR)
-    ).get_latest_migration()
+    # This helper belongs to the identity cutover, before payload columns
+    # moved to immutable pages. End-to-end upgrades below still target HEAD.
+    head = next(conftest.MIGRATIONS_DIR.glob("0272-*.py")).name
     with conftest.isolated_migration_database(head):
         project, destination = uuid.uuid4(), uuid.uuid4()
         with contexts.Context().session_manager() as session:

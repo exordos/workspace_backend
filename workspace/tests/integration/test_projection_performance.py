@@ -70,7 +70,6 @@ def _create_message(api, name):
             "name": name,
             "description": "",
             "source_name": "native",
-            "source": {"kind": "native"},
         },
     ).json()
     _drain()
@@ -146,14 +145,17 @@ def test_old_scope_preview_does_not_scan_unrelated_project_history(
     )
     db.execute(
         """
-        WITH messages AS (
+        WITH content AS MATERIALIZED (
+            SELECT messenger_resolve_message_content(
+                '{"kind":"markdown","content":"Recent unrelated message"}'::jsonb,NULL) AS uuid
+        ), messages AS (
             INSERT INTO messenger_messages
-                (uuid,project_id,author_uuid,payload,source_name,source,created_at)
+                (uuid,project_id,author_uuid,content_uuid,source_name,created_at)
             SELECT gen_random_uuid(),%s,%s,
-                   '{"kind":"markdown","content":"Recent unrelated message"}'::jsonb,
-                   'native','{"kind":"native"}'::jsonb,
+                   content.uuid,
+                   'native',
                    NOW()+number*interval '1 millisecond'
-            FROM generate_series(1,20000) AS input(number)
+            FROM generate_series(1,20000) AS input(number) CROSS JOIN content
             RETURNING uuid,project_id,created_at
         ), placements AS (
             INSERT INTO messenger_message_placements
@@ -312,7 +314,6 @@ def test_native_reaction_snapshot_switches_complete_lists_at_configured_limit(
             "name": "bounded-native-reactions",
             "description": "",
             "source_name": "native",
-            "source": {"kind": "native"},
         },
     )
     assert response.status_code == 201, response.text
@@ -615,9 +616,16 @@ def test_reaction_burst_coalesces_and_preserves_realtime_events(
         f"{MESSAGE_REACTIONS}{reaction_uuid}",
         json={"emoji_name": "heart"},
     )
-    assert updated.status_code == 200, updated.text
+    assert updated.status_code == 405, updated.text
+    removed = api.delete(f"{MESSAGE_REACTIONS}{reaction_uuid}")
+    assert removed.status_code == 204, removed.text
+    added = api.post(
+        MESSAGE_REACTIONS, json={"message_uuid": message["uuid"], "emoji_name": "heart"}
+    )
+    assert added.status_code == 201, added.text
+    heart_reaction_uuid = added.json()["uuid"]
     if delete_reaction:
-        deleted = api.delete(f"{MESSAGE_REACTIONS}{reaction_uuid}")
+        deleted = api.delete(f"{MESSAGE_REACTIONS}{heart_reaction_uuid}")
         assert deleted.status_code in (200, 204), deleted.text
 
     with contexts.Context().session_manager() as session:
@@ -634,10 +642,10 @@ def test_reaction_burst_coalesces_and_preserves_realtime_events(
                    jsonb_agg(execution_stats ORDER BY created_at, uuid)
             FROM messenger_projection_tasks
             WHERE project_id = %s AND task_kind = 'reaction_snapshot'
-              AND payload->>'reaction_uuid' = %s
+              AND payload->>'reaction_uuid' IN (%s,%s)
               AND status = 'completed'
             """,
-            (api.project_id, reaction_uuid),
+            (api.project_id, reaction_uuid, heart_reaction_uuid),
         )
         completed, actually_claimed, execution_stats = cursor.fetchone()
         cursor.execute(
@@ -652,7 +660,7 @@ def test_reaction_burst_coalesces_and_preserves_realtime_events(
         )
         events = cursor.fetchall()
 
-    expected_events = 3 if delete_reaction else 2
+    expected_events = 4 if delete_reaction else 3
     assert completed == expected_events
     assert actually_claimed == 1
     claimed_stats = [stats for stats in execution_stats if stats.get("claim_count")]
@@ -674,7 +682,7 @@ def test_reaction_burst_coalesces_and_preserves_realtime_events(
     reaction_actions = [
         action for kind, action, _payload in events if kind == "message_reaction"
     ]
-    assert reaction_actions == ["created", "updated"] + (
+    assert reaction_actions == ["created", "deleted", "created"] + (
         ["deleted"] if delete_reaction else []
     )
     message_events = [payload for kind, _action, payload in events if kind == "message"]
@@ -923,7 +931,6 @@ def test_coalesced_reaction_events_resolve_each_placement(api, db, monkeypatch):
             "name": "reaction-secondary-placement",
             "description": "",
             "source_name": "native",
-            "source": {"kind": "native"},
         },
     ).json()
     _drain()
@@ -1030,7 +1037,9 @@ def test_coalesced_reaction_events_resolve_each_placement(api, db, monkeypatch):
     assert set(guarded_streams) == {stream_uuid for _, stream_uuid in placements}
 
 
-def test_reaction_move_rebuilds_both_message_snapshots(api, db, monkeypatch):
+def test_replacing_a_reaction_on_another_message_rebuilds_both_snapshots(
+    api, db, monkeypatch
+):
     stream, source = _create_message(api, "reaction-move-source")
     target_response = api.post(
         MESSAGES,
@@ -1060,7 +1069,13 @@ def test_reaction_move_rebuilds_both_message_snapshots(api, db, monkeypatch):
         f"{MESSAGE_REACTIONS}{reaction_uuid}",
         json={"message_uuid": target["uuid"], "emoji_name": "heart"},
     )
-    assert moved.status_code == 200, moved.text
+    assert moved.status_code == 405, moved.text
+    removed = api.delete(f"{MESSAGE_REACTIONS}{reaction_uuid}")
+    assert removed.status_code == 204, removed.text
+    added = api.post(
+        MESSAGE_REACTIONS, json={"message_uuid": target["uuid"], "emoji_name": "heart"}
+    )
+    assert added.status_code == 201, added.text
     with contexts.Context().session_manager() as session:
         assert v2_projection.process_one_projection_task(
             session, "integration:reaction-move:new"
@@ -1077,15 +1092,15 @@ def test_reaction_move_rebuilds_both_message_snapshots(api, db, monkeypatch):
             SELECT payload->>'source_kind', status
             FROM messenger_projection_tasks
             WHERE project_id = %s AND task_kind = 'reaction_snapshot'
-              AND payload->>'reaction_uuid' = %s
-              AND payload->>'source_kind' LIKE 'message_reaction.updated%%'
+              AND payload->>'reaction_uuid' IN (%s,%s)
+              AND payload->>'source_kind' IN ('message_reaction.created','message_reaction.deleted')
             ORDER BY created_at, uuid
             """,
-            (api.project_id, reaction_uuid),
+            (api.project_id, reaction_uuid, added.json()["uuid"]),
         )
         assert set(cursor.fetchall()) == {
-            ("message_reaction.updated", "completed"),
-            ("message_reaction.updated_old", "completed"),
+            ("message_reaction.created", "completed"),
+            ("message_reaction.deleted", "completed"),
         }
 
 
@@ -2178,6 +2193,10 @@ def test_fair_scheduler_bounds_fanout_under_large_read_backlog(api, monkeypatch)
                     json.dumps(payload),
                 ),
             )
+        # Plan bulk fixture alignment against its current size, not earlier tests.
+        session.execute(
+            "ANALYZE messenger_projection_tasks, messenger_domain_outbox_events", ()
+        )
         session.execute(
             """
             UPDATE messenger_projection_tasks AS task
@@ -2772,3 +2791,48 @@ def test_fair_scheduler_filters_blocked_rows_before_candidate_limit(
 
         assert claimed is not None
         assert claimed["scope_key"] == available_scope_key
+
+
+def test_zulip_delivery_cutover_normalizes_pending_entity_order_only(api, db):
+    entity = sys_uuid.uuid4()
+    old_keys = [str(sys_uuid.uuid4()) for _ in range(3)]
+    ids = _seed_partition_claim_tasks(
+        api,
+        [
+            {
+                "task_kind": "delivery_snapshot_event",
+                "scope_kind": "resource",
+                "scope_key": key,
+                "payload": {
+                    "source_kind": "zulip.incoming",
+                    "kind": "message.read",
+                    "entity_uuid": str(entity),
+                },
+            }
+            for key in old_keys
+        ],
+    )
+    db.execute(
+        "UPDATE messenger_projection_tasks SET status='completed' "
+        "WHERE outbox_event_uuid=%s",
+        (ids[-1],),
+    )
+    path = next(conftest.MIGRATIONS_DIR.glob("0268-*.py"))
+    spec = importlib.util.spec_from_file_location("zulip_delivery_order", path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    with contexts.Context().session_manager() as session:
+        migration.migration_step.upgrade(session)
+        migration.migration_step.upgrade(session)
+    rows = db.execute(
+        "SELECT task.scope_key,task.ordering_key,task.payload->>'resource_uuid',"
+        "event.scope_key,event.payload->>'resource_uuid' "
+        "FROM messenger_projection_tasks task JOIN messenger_domain_outbox_events event "
+        "ON event.project_id=task.project_id AND event.uuid=task.outbox_event_uuid "
+        "WHERE task.outbox_event_uuid=ANY(%s) ORDER BY event.created_at",
+        (ids,),
+    ).fetchall()
+    key = f"{api.project_id}:incoming:{entity}"
+    assert rows[:2] == [(key, str(entity), str(entity), key, str(entity))] * 2
+    assert rows[-1][0] == rows[-1][3] == old_keys[-1]
+    assert rows[-1][2] is rows[-1][4] is None

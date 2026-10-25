@@ -11,7 +11,11 @@ import pytest
 from restalchemy.common import contexts
 from restalchemy.storage.sql import migrations
 
-from workspace.services.messenger_workers import v2_projection
+from workspace.tests.integration.legacy_messenger import v2_projection
+from workspace.messenger_api.api import store as api_store
+from workspace.tests.integration.legacy_messenger import (
+    store_factory as historical_factory,
+)
 from workspace.tests.integration import conftest
 
 BASELINE = (
@@ -38,6 +42,7 @@ def test_repair_requires_unambiguous_unchanged_active_native_snapshot(
     http_server, scenario, expected
 ):
     with conftest.isolated_migration_database(BASELINE) as url:
+        api_store.configure_store_factory(historical_factory.build_store_factory())
         project, owner, peer, target, original, carrier = (
             uuid.uuid4() for _ in range(6)
         )

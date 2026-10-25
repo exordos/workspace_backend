@@ -96,7 +96,7 @@ events are minimal:
 - `stream.deleted`, `folder.deleted`, and `folder_item.deleted`: `kind`, `uuid`;
 - `topic.deleted`: `kind`, `uuid`, `stream_uuid`;
 - `message.deleted`: `kind`, `uuid`, `stream_uuid`, `topic_uuid`,
-  `author_uuid`, `source_name`, and `source`.
+  `author_uuid`, `source_name`, `provider_uuid`, and `provider_identity`.
 
 Reaction changes emit `message_reaction.created`,
 `message_reaction.updated`, or `message_reaction.deleted` for the acting user.

@@ -223,13 +223,13 @@ def test_an_old_announcement_cannot_be_republished_in_another_topic(api, db):
         assert cursor.fetchone() == (2,)
 
 
-def test_an_announcement_can_set_the_key_once_in_each_stream(api):
+def test_independent_announcements_can_set_the_same_key_once_in_each_stream(api):
     streams = [_create_stream(api), _create_stream(api)]
     key_uuid = sys_uuid.uuid4()
-    canonical_uuid = str(sys_uuid.uuid4())
     for stream in streams:
         response = api.post(
-            MESSAGES, json=_announcement(stream["uuid"], key_uuid, uuid=canonical_uuid)
+            MESSAGES,
+            json=_announcement(stream["uuid"], key_uuid, uuid=str(sys_uuid.uuid4())),
         )
         assert response.status_code == 201, response.text
         read = api.get(f"{STREAMS}{stream['uuid']}")

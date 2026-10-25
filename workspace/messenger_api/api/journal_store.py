@@ -21,6 +21,7 @@ from workspace.common import mutation_journal_opts
 from workspace.messenger_api import exceptions as messenger_exceptions
 from workspace.messenger_api.api import resource_projection
 from workspace.messenger_api.api import v2_store
+from workspace.messenger_api.dm import base
 from workspace.messenger_api.dm import v2_models
 
 
@@ -363,6 +364,7 @@ class JournalStore(v2_store.MessengerV2Store):
             placement_uuid=message.uuid,
             user_uuid=self.user_uuid,
             emoji_name=values["emoji_name"],
+            **base.WorkspaceProviderBase.creation_from(message),
         )
         response = resource_projection.simple(
             {
@@ -371,6 +373,10 @@ class JournalStore(v2_store.MessengerV2Store):
                 "message_uuid": message.uuid,
                 "user_uuid": fact.user_uuid,
                 "emoji_name": fact.emoji_name,
+                "source_name": fact.source_name,
+                "provider_uuid": fact.provider_uuid,
+                "provider_identity": fact.provider_identity,
+                "status": fact.status,
                 "created_at": fact.created_at,
                 "updated_at": fact.updated_at,
             }
@@ -382,30 +388,6 @@ class JournalStore(v2_store.MessengerV2Store):
             f"{self.project_uuid}:message:{message.canonical_message_uuid}",
             self._topics(message),
             response,
-        )
-
-    def update_resource(
-        self, resource: str, resource_uuid: uuid.UUID, values: dict[str, typing.Any]
-    ) -> dict[str, typing.Any]:
-        if resource != "message_reactions":
-            return super().update_resource(resource, resource_uuid, values)
-        reaction = self.get_resource(resource, resource_uuid)
-        if uuid.UUID(str(reaction["user_uuid"])) != self.user_uuid:
-            raise exceptions.ValidationErrorException()
-        old_message = self._message(reaction["message_uuid"])
-        message = self._message(values.get("message_uuid", reaction["message_uuid"]))
-        if "emoji_name" in values:
-            values = {
-                **values,
-                "emoji_name": emoji.normalize_name(values["emoji_name"]),
-            }
-        return self._admit(
-            "reaction_update",
-            resource_uuid,
-            values,
-            f"{self.project_uuid}:message:{old_message.canonical_message_uuid}",
-            self._topics(old_message) + self._topics(message),
-            {**reaction, **values},
         )
 
     def delete_resource(

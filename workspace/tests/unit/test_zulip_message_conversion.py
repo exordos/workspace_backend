@@ -12,6 +12,7 @@ import re
 import pytest
 
 from workspace.bridges.zulip import message_conversion
+from workspace.bridges.zulip import content_cache
 
 
 EXAMPLES = json.loads(
@@ -29,6 +30,36 @@ FILE_COUNTS = {
     "audio_attachment": 1,
     "mixed_formatting": 2,
 }
+
+
+@pytest.mark.parametrize(
+    "content,reusable",
+    [("Plain **text**", True), ("> quoted text", False), ("```math\nx+y\n```", False)],
+)
+def test_conversion_cache_excludes_current_message_identity(content, reusable):
+    context = {
+        "server_url": "https://zulip.example.test",
+        "original_url": "https://zulip.example.test/#narrow/near/71",
+        "current_message_uuid": "11111111-1111-4111-8111-111111111111",
+    }
+    message = {"id": 71, "content": content}
+    payload, actual = message_conversion.zulip_to_workspace_cached(message, context)
+    assert actual == reusable
+    assert payload == message_conversion.zulip_to_workspace(message, context)
+
+
+def test_conversion_cache_key_is_scoped_to_provider_source_and_resolved_context():
+    provider = "11111111-1111-4111-8111-111111111111"
+    other = "22222222-2222-4222-8222-222222222222"
+    context = {"files": {"/upload": "urn:file:" + provider}}
+    original = content_cache.key(provider, "incoming", "Source", context)
+    assert original == content_cache.key(provider, "incoming", "Source", context)
+    assert original != content_cache.key(other, "incoming", "Source", context)
+    assert original != content_cache.key(provider, "outgoing", "Source", context)
+    assert original != content_cache.key(provider, "incoming", "Edited", context)
+    assert original != content_cache.key(
+        provider, "incoming", "Source", {"files": {"/upload": "urn:file:" + other}}
+    )
 
 
 @pytest.mark.parametrize("mapped", [False, True])

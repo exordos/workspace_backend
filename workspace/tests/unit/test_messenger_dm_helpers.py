@@ -243,6 +243,19 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         with (
             mock.patch.object(dm_helpers.models, "WorkspaceFile", FakeWorkspaceFile),
             mock.patch.object(
+                dm_helpers.v2_models,
+                "WorkspaceStream",
+                mock.Mock(
+                    objects=mock.Mock(
+                        get_one=mock.Mock(
+                            return_value=types.SimpleNamespace(
+                                source_name="native", provider_uuid=None
+                            )
+                        )
+                    )
+                ),
+            ),
+            mock.patch.object(
                 dm_helpers.file_storage,
                 "get_workspace_file_storage_info",
                 return_value=storage_info,
@@ -327,6 +340,19 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
 
         with (
             mock.patch.object(dm_helpers.models, "WorkspaceFile", FakeWorkspaceFile),
+            mock.patch.object(
+                dm_helpers.v2_models,
+                "WorkspaceStream",
+                mock.Mock(
+                    objects=mock.Mock(
+                        get_one=mock.Mock(
+                            return_value=types.SimpleNamespace(
+                                source_name="native", provider_uuid=None
+                            )
+                        )
+                    )
+                ),
+            ),
             mock.patch.object(
                 dm_helpers.models,
                 "get_stream_recipients",

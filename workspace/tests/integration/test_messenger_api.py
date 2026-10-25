@@ -34,6 +34,7 @@ from restalchemy.storage.sql import sessions as ra_sessions
 from oslo_config import cfg
 
 from workspace.common import messenger_reaction_opts
+from workspace.services.messenger_workers import v2_projection as current_projection
 from workspace.tests.integration.legacy_messenger import events as messenger_events
 from workspace.messenger_api import exceptions as messenger_exceptions
 from workspace.messenger_api import file_storage
@@ -1174,6 +1175,7 @@ def test_workspace_event_payload_identity_backfill_migration(_database, db):
 # --------------------------------------------------------------------------- #
 
 
+@pytest.mark.isolated_schema
 def test_file_json_crud_scopes_access_and_deletes_access_rows(api, db):
     stream_uuid = conftest.seed_user_stream(
         db, api.project_id, api.user_uuid, "files-team"
@@ -1340,6 +1342,7 @@ def test_non_public_files_are_scoped_to_the_request_project(api, db):
     assert response.status_code == 404, response.text
 
 
+@pytest.mark.isolated_schema
 def test_file_multipart_upload_writes_local_file(api, db, tmp_path, monkeypatch):
     monkeypatch.setenv(file_storage.ENV_STORAGE_PATH, str(tmp_path))
     stream_uuid = conftest.seed_user_stream(
@@ -1944,14 +1947,26 @@ def test_stream_get_by_uuid_is_scoped(api, db):
     assert resp.status_code == 404, resp.text
 
 
+def _drain_current_projection():
+    with ra_contexts.Context().session_manager() as session:
+        current_projection.drain_projection_queue(
+            session, f"current-api:{sys_uuid.uuid4()}"
+        )
+        failures = session.execute(
+            "SELECT task_kind,last_error FROM messenger_projection_tasks "
+            "WHERE status IN ('failed','dead_letter')",
+            (),
+        ).fetchall()
+        assert not failures, failures
+
+
+@pytest.mark.isolated_schema
 def test_stream_create_writes_realtime_event(api, db):
     resp = api.post(
         STREAMS,
         json={
             "name": "Engineering",
             "description": "Engineering workspace",
-            "source_name": "native",
-            "source": {"kind": "native"},
             "invite_only": False,
             "announce": False,
         },
@@ -1959,20 +1974,21 @@ def test_stream_create_writes_realtime_event(api, db):
     assert resp.status_code in (200, 201), resp.text
     stream = resp.json()
 
-    with db.cursor() as cur:
-        cur.execute(
-            """
-            SELECT epoch_version, user_uuid, payload
-            FROM m_workspace_events
-            WHERE project_id = %s
-            ORDER BY epoch_version
-            """,
-            (api.project_id,),
-        )
-        rows = cur.fetchall()
+    _drain_current_projection()
+    response = api.get(EVENTS)
+    assert response.status_code == 200, response.text
+    rows = [
+        (event["epoch_version"], event["user_uuid"], event["payload"])
+        for event in response.json()
+    ]
 
     assert len(rows) == 4
-    epoch_version, user_uuid, payload = rows[0]
+    # Independent stream/topic projection scopes can complete in either order.
+    # The client cursor still orders every emitted event by its unique epoch.
+    assert [row[0] for row in rows] == sorted({row[0] for row in rows})
+    stream_rows = [row for row in rows if row[2]["kind"] == "stream.created"]
+    assert len(stream_rows) == 1
+    epoch_version, user_uuid, payload = stream_rows[0]
     assert str(user_uuid) == str(api.user_uuid)
     assert payload["kind"] == "stream.created"
     assert payload["uuid"] == stream["uuid"]
@@ -1991,7 +2007,10 @@ def test_stream_create_writes_realtime_event(api, db):
     assert 0 <= stream["color"] <= 0xFFFFFF
     assert payload["color"] == stream["color"]
     assert payload["source_name"] == "native"
-    assert payload["source"] == {"kind": "native"}
+    assert "source" not in payload
+    assert payload["provider_uuid"] is None
+    assert payload["provider_identity"] is None
+    assert payload["status"] == "active"
 
     event = messenger_events.event_row_to_messenger_event(
         {
@@ -2010,7 +2029,9 @@ def test_stream_create_writes_realtime_event(api, db):
     assert event["payload"].get("last_message_uuid") is None
     assert event["payload"]["default_topic_uuid"] == stream["default_topic_uuid"]
 
-    topic_epoch_version, topic_user_uuid, topic_payload = rows[3]
+    topic_rows = [row for row in rows if row[2]["kind"] == "topic.created"]
+    assert len(topic_rows) == 1
+    topic_epoch_version, topic_user_uuid, topic_payload = topic_rows[0]
     assert str(topic_user_uuid) == str(api.user_uuid)
     assert topic_payload["kind"] == "topic.created"
     assert topic_payload["name"] == "General Topic"
@@ -2038,7 +2059,10 @@ def test_stream_create_writes_realtime_event(api, db):
     assert topic_event["payload"]["name"] == "General Topic"
     assert topic_event["payload"]["is_default"] is True
 
-    folder_events = [row[2] for row in rows[1:3]]
+    folder_events = sorted(
+        (row[2] for row in rows if row[2]["kind"] == "folder.updated"),
+        key=lambda payload: payload["uuid"],
+    )
     assert [payload["kind"] for payload in folder_events] == [
         "folder.updated",
         "folder.updated",
@@ -2282,6 +2306,7 @@ def test_stream_delete_cascades_data_and_writes_realtime_events(api, db):
 
 
 @pytest.mark.parametrize("peer", ({}, {"direct_user_uuid": None}))
+@pytest.mark.isolated_schema
 def test_private_stream_creation_without_peer_is_rejected(api, db, peer):
     stream_uuid = sys_uuid.uuid4()
     response = api.post(
@@ -2291,27 +2316,25 @@ def test_private_stream_creation_without_peer_is_rejected(api, db, peer):
             "name": "Invalid private stream",
             "private": True,
             "source_name": "native",
-            "source": {"kind": "native"},
             **peer,
         },
     )
     assert response.status_code == 400, response.text
     with db.cursor() as cursor:
         cursor.execute(
-            "SELECT count(*) FROM m_workspace_streams WHERE uuid = %s",
+            "SELECT count(*) FROM messenger_streams WHERE uuid = %s",
             (stream_uuid,),
         )
         assert cursor.fetchone() == (0,)
 
 
 @pytest.mark.parametrize("with_peer", (False, True))
+@pytest.mark.isolated_schema
 def test_ordinary_stream_cannot_be_converted_to_private(api, with_peer):
     response = api.post(
         STREAMS,
         json={
             "name": "Ordinary stream",
-            "source_name": "native",
-            "source": {"kind": "native"},
         },
     )
     assert response.status_code == 201, response.text
@@ -2328,6 +2351,7 @@ def test_ordinary_stream_cannot_be_converted_to_private(api, with_peer):
     assert reloaded.json().get("direct_user_uuid") is None
 
 
+@pytest.mark.isolated_schema
 def test_direct_stream_create_is_idempotent_and_creates_owner_bindings(api, db):
     direct_user_uuid = sys_uuid.uuid4()
     conftest.seed_workspace_user(
@@ -2335,12 +2359,14 @@ def test_direct_stream_create_is_idempotent_and_creates_owner_bindings(api, db):
         direct_user_uuid,
         f"user-{direct_user_uuid}",
     )
+    db.execute(
+        "SELECT messenger_v2_register_project_user(%s,%s)",
+        (api.project_id, direct_user_uuid),
+    )
     expected_index = ":".join(sorted([str(api.user_uuid), str(direct_user_uuid)]))
     payload = {
         "name": "Direct",
         "description": "Private workspace",
-        "source_name": "native",
-        "source": {"kind": "native"},
         "direct_user_uuid": str(direct_user_uuid),
     }
 
@@ -2389,7 +2415,10 @@ def test_direct_stream_create_is_idempotent_and_creates_owner_bindings(api, db):
 
     assert second_stream["uuid"] == first_stream["uuid"]
     assert unchanged_stream["source_name"] == "native"
-    assert unchanged_stream["source"] == {"kind": "native"}
+    assert "source" not in unchanged_stream
+    assert unchanged_stream["provider_uuid"] is None
+    assert unchanged_stream["provider_identity"] is None
+    assert unchanged_stream["status"] == "active"
     assert unchanged_stream["private"] is True
     assert first_stream["private"] is True
     assert first_stream["direct_user_uuid"] == str(direct_user_uuid)
@@ -2399,7 +2428,7 @@ def test_direct_stream_create_is_idempotent_and_creates_owner_bindings(api, db):
         cur.execute(
             """
             SELECT private_index
-            FROM m_workspace_streams
+            FROM messenger_streams
             WHERE project_id = %s
                 AND uuid = %s
             """,
@@ -2409,7 +2438,7 @@ def test_direct_stream_create_is_idempotent_and_creates_owner_bindings(api, db):
         cur.execute(
             """
             SELECT uuid, user_uuid, role
-            FROM m_workspace_stream_bindings
+            FROM messenger_stream_bindings
             WHERE project_id = %s
                 AND stream_uuid = %s
             ORDER BY user_uuid
@@ -2417,29 +2446,27 @@ def test_direct_stream_create_is_idempotent_and_creates_owner_bindings(api, db):
             (api.project_id, first_stream["uuid"]),
         )
         bindings = cur.fetchall()
-        cur.execute(
-            """
-            SELECT user_uuid, payload
-            FROM m_workspace_events
-            WHERE project_id = %s
-                AND payload->>'kind' = 'stream.created'
-                AND payload->>'uuid' = %s
-            ORDER BY user_uuid
-            """,
-            (api.project_id, first_stream["uuid"]),
-        )
-        events = cur.fetchall()
-        cur.execute(
-            """
-            SELECT user_uuid, payload
-            FROM m_workspace_events
-            WHERE project_id = %s
-                AND payload->>'kind' = 'folder.updated'
-            ORDER BY user_uuid, payload->>'uuid'
-            """,
-            (api.project_id,),
-        )
-        folder_events = cur.fetchall()
+
+    _drain_current_projection()
+    delivered = []
+    for user in sorted([str(api.user_uuid), str(direct_user_uuid)]):
+        response = api.get(EVENTS, user=user)
+        assert response.status_code == 200, response.text
+        delivered.extend((user, event["payload"]) for event in response.json())
+    events = [
+        (user, payload)
+        for user, payload in delivered
+        if payload["kind"] == "stream.created"
+        and payload["uuid"] == first_stream["uuid"]
+    ]
+    folder_events = sorted(
+        (
+            (user, payload)
+            for user, payload in delivered
+            if payload["kind"] == "folder.updated"
+        ),
+        key=lambda row: (row[0], row[1]["uuid"]),
+    )
 
     assert stored_private_index == expected_index
     assert [(str(user_uuid), role) for _uuid, user_uuid, role in bindings] == [
@@ -2467,6 +2494,10 @@ def test_direct_stream_create_is_idempotent_and_creates_owner_bindings(api, db):
         third_user_uuid,
         f"user-{third_user_uuid}",
     )
+    db.execute(
+        "SELECT messenger_v2_register_project_user(%s,%s)",
+        (api.project_id, third_user_uuid),
+    )
     resp = api.post(
         f"{STREAMS}{first_stream['uuid']}/actions/add_users/invoke",
         json={"member": [str(third_user_uuid)]},
@@ -2487,7 +2518,7 @@ def test_direct_stream_create_is_idempotent_and_creates_owner_bindings(api, db):
         cur.execute(
             """
             SELECT user_uuid, role
-            FROM m_workspace_stream_bindings
+            FROM messenger_stream_bindings
             WHERE project_id = %s
                 AND stream_uuid = %s
             ORDER BY user_uuid
@@ -2501,6 +2532,7 @@ def test_direct_stream_create_is_idempotent_and_creates_owner_bindings(api, db):
     ]
 
 
+@pytest.mark.isolated_schema
 def test_self_direct_stream_is_stable_private_singleton_with_message_history(api, db):
     expected_stream_uuid = messenger_dm_helpers.deterministic_direct_stream_uuid(
         api.project_id,
@@ -2511,8 +2543,6 @@ def test_self_direct_stream_is_stable_private_singleton_with_message_history(api
     payload = {
         "name": "Personal notes",
         "description": "",
-        "source_name": "native",
-        "source": {"kind": "native"},
         "direct_user_uuid": api.user_uuid,
     }
 
@@ -2552,7 +2582,7 @@ def test_self_direct_stream_is_stable_private_singleton_with_message_history(api
         cur.execute(
             """
             SELECT private_index, direct_user_uuid, default_topic_uuid
-            FROM m_workspace_streams
+            FROM messenger_streams
             WHERE project_id = %s AND uuid = %s
             """,
             (api.project_id, first_stream["uuid"]),
@@ -2561,7 +2591,7 @@ def test_self_direct_stream_is_stable_private_singleton_with_message_history(api
         cur.execute(
             """
             SELECT uuid, user_uuid, role
-            FROM m_workspace_stream_bindings
+            FROM messenger_stream_bindings
             WHERE project_id = %s AND stream_uuid = %s
             """,
             (api.project_id, first_stream["uuid"]),
@@ -2570,24 +2600,21 @@ def test_self_direct_stream_is_stable_private_singleton_with_message_history(api
         cur.execute(
             """
             SELECT COUNT(*)
-            FROM m_workspace_stream_topics
+            FROM messenger_topics
             WHERE project_id = %s AND stream_uuid = %s
             """,
             (api.project_id, first_stream["uuid"]),
         )
         topic_count = cur.fetchone()[0]
-        cur.execute(
-            """
-            SELECT COUNT(*)
-            FROM m_workspace_events
-            WHERE project_id = %s
-              AND user_uuid = %s
-              AND payload->>'kind' = 'stream.created'
-              AND payload->>'uuid' = %s
-            """,
-            (api.project_id, api.user_uuid, first_stream["uuid"]),
-        )
-        created_event_count = cur.fetchone()[0]
+
+    _drain_current_projection()
+    response = api.get(EVENTS)
+    assert response.status_code == 200, response.text
+    created_event_count = sum(
+        event["payload"]["kind"] == "stream.created"
+        and event["payload"]["uuid"] == first_stream["uuid"]
+        for event in response.json()
+    )
 
     assert stored_index == expected_index
     assert str(direct_user_uuid) == api.user_uuid
@@ -2618,6 +2645,10 @@ def test_self_direct_stream_is_stable_private_singleton_with_message_history(api
 
     third_user_uuid = sys_uuid.uuid4()
     conftest.seed_workspace_user(db, third_user_uuid, f"user-{third_user_uuid}")
+    db.execute(
+        "SELECT messenger_v2_register_project_user(%s,%s)",
+        (api.project_id, third_user_uuid),
+    )
     for identity_update in (
         {"source_name": "native"},
         {"source": {"kind": "native"}},
@@ -5895,12 +5926,14 @@ def test_message_create_writes_compact_read_state_and_visible_events(
     )["payload"]
     assert packed_author_payload["kind"] == "message.created"
     assert packed_other_payload["kind"] == "message.created"
+    # The frozen writer retains its historical source snapshot while the
+    # current HTTP resource shape omits that retired property.
     assert {
         key: value for key, value in packed_author_payload.items() if key != "kind"
-    } == {**message, "uuid": public_message_uuid}
+    } == {**message, "uuid": public_message_uuid, "source": {"kind": "native"}}
     assert {
         key: value for key, value in packed_other_payload.items() if key != "kind"
-    } == {**other_message, "uuid": public_message_uuid}
+    } == {**other_message, "uuid": public_message_uuid, "source": {"kind": "native"}}
 
     author_resp = workspace_api.get(EVENTS, params={"page_limit": 100})
     assert author_resp.status_code == 200, author_resp.text
@@ -6719,8 +6752,18 @@ def test_message_reaction_crud_is_user_scoped_and_writes_message_events(api, db)
         f"{MESSAGE_REACTIONS}{reaction_uuid}",
         json={"emoji_name": "heart"},
     )
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["emoji_name"] == "heart"
+    assert resp.status_code == 405, resp.text
+    assert (
+        api.get(f"{MESSAGE_REACTIONS}{reaction_uuid}").json()["emoji_name"]
+        == "thumbs_up"
+    )
+    removed = api.delete(f"{MESSAGE_REACTIONS}{reaction_uuid}")
+    assert removed.status_code == 204, removed.text
+    added = api.post(
+        MESSAGE_REACTIONS, json={"message_uuid": message_uuid, "emoji_name": "heart"}
+    )
+    assert added.status_code == 201, added.text
+    heart_reaction_uuid = added.json()["uuid"]
 
     resp = api.get(f"{MESSAGES}{message_uuid}")
     assert resp.status_code == 200, resp.text
@@ -6793,6 +6836,7 @@ def test_message_reaction_crud_is_user_scoped_and_writes_message_events(api, db)
         {"thumbs_up": 1},
         {"eyes": 1, "thumbs_up": 1},
         {"eyes": 1, "thumbs_up": 2},
+        {"eyes": 1, "thumbs_up": 1},
         {"eyes": 1, "heart": 1, "thumbs_up": 1},
         {"heart": 1, "thumbs_up": 1},
     ]
@@ -6816,6 +6860,9 @@ def test_message_reaction_crud_is_user_scoped_and_writes_message_events(api, db)
             "thumbs_up": [str(other_user)],
         },
     ]
+    expected_reaction_user_snapshots.insert(
+        3, {"eyes": [str(api.user_uuid)], "thumbs_up": [str(other_user)]}
+    )
     message_event_rows = [row for row in reaction_event_rows if row[0] == "message"]
     reaction_state_event_rows = [
         row for row in reaction_event_rows if row[0] == "message_reaction"
@@ -6847,7 +6894,8 @@ def test_message_reaction_crud_is_user_scoped_and_writes_message_events(api, db)
         ("created", str(api.user_uuid), reaction_uuid, "thumbs_up"),
         ("created", str(api.user_uuid), second_reaction_uuid, "eyes"),
         ("created", str(other_user), other_reaction_uuid, "thumbs_up"),
-        ("updated", str(api.user_uuid), reaction_uuid, "heart"),
+        ("deleted", str(api.user_uuid), reaction_uuid, "thumbs_up"),
+        ("created", str(api.user_uuid), heart_reaction_uuid, "heart"),
         ("deleted", str(api.user_uuid), second_reaction_uuid, "eyes"),
     ]
     assert len(reaction_state_event_rows) == len(expected_reaction_events)

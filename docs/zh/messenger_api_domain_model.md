@@ -96,7 +96,7 @@ URI. 例如,公共 `WorkspaceStream.owner` 普通 UUID 属性,而
 副本:
 
 - 内容和作者;
-- 田间投影 `source`, `provider`, `delivery`;
+- 田间投影 `provider_uuid`, `provider_identity`, `provider`, `delivery`;
 - 已实现的 `reactions` 和 `reaction_users`;
 - 公共 `created_at` 和 `updated_at`.
 
@@ -158,7 +158,7 @@ lowercase hyphenated ASCII-没有子,前和额外的表达
 | `read`, `mentioned`, `starred`, `pinned` | 用户的准备状态,可从 `USER_MESSAGE_STATE`; `read`  梯形投影中进行放置 `read_at IS NOT NULL`. |
 | `is_own` | 简单的尺度比较`user_uuid`和`MESSAGE.author_uuid`的绑定;它不需要绕过其他行. |
 | `author_uuid`, `payload` | 规范性 `MESSAGE`. |
-| `source_name`, `source`, `provider`, `delivery` | 定制性 `MESSAGE`;内部存储器 `provider`/`delivery` 不会公开. |
+| `source_name`, `provider_uuid`, `provider_identity`, `provider`, `delivery` | 定制性 `MESSAGE`;内部存储器 `provider`/`delivery` 不会公开. |
 | `reactions`, `reaction_users` | 预先实现的正规状态`MESSAGE`,没有读取表现中的聚合物. |
 | `created_at`, `updated_at` | 只有正规的 `MESSAGE`. |
 
@@ -750,3 +750,6 @@ runtime/transport 管理员无法选择.
 唯一的正规名单是
 [`messenger_architecture_inventory.md`](messenger_architecture_inventory.md#единственный-список-open-решений).
 这个文档不支持单独的列表副本.
+
+
+Provider origins use `source_name`, `provider_uuid`, and `provider_identity`; see [Provider identities](provider_identities.md). The former JSON `source` field is removed from messenger entities. `WorkspaceUser.source` is unchanged.
