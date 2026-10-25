@@ -16,6 +16,27 @@ from workspace.tests.integration import test_messenger_v2 as native
 pytestmark = pytest.mark.isolated_schema
 
 
+def test_content_hashes_restore_with_an_empty_search_path(db):
+    # pg_restore clears search_path before recreating stored generated columns.
+    with db.transaction():
+        db.execute("SET LOCAL search_path = ''")
+        db.execute(
+            "CREATE TEMP TABLE restored_content_hashes ("
+            "workspace_content jsonb,provider_content text,"
+            "workspace_hash text GENERATED ALWAYS AS "
+            "(public.messenger_workspace_content_hash(workspace_content)) STORED,"
+            "provider_hash text GENERATED ALWAYS AS "
+            "(public.messenger_provider_content_hash(provider_content)) STORED)"
+        )
+        assert db.execute(
+            "INSERT INTO pg_temp.restored_content_hashes VALUES ('{}','hello') "
+            "RETURNING workspace_hash,provider_hash"
+        ).fetchone() == (
+            "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+        )
+
+
 def _stream(api):
     response = api.post(native.STREAMS, json={"name": "Immutable contents"})
     assert response.status_code == 201, response.text
