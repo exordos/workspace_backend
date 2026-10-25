@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.10"
 resolution-markers = [
     "python_full_version >= '3.13'",
@@ -718,7 +718,7 @@ name = "exceptiongroup"
 version = "1.3.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
+    { name = "typing-extensions" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/50/79/66800aadf48771f6b62f7eb014e352e5d06856655206165d775e675a02c9/exceptiongroup-1.3.1.tar.gz", hash = "sha256:8b412432c6055b0b7d14c310000ae93352ed6754f70fa8f7c34141f91c4e3219", size = 30371, upload-time = "2025-11-21T23:01:54.787Z" }
 wheels = [
@@ -1990,7 +1990,7 @@ wheels = [
 
 [[package]]
 name = "restalchemy"
-version = "16.0.3"
+version = "16.1.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "email-validator" },
@@ -2003,9 +2003,9 @@ dependencies = [
     { name = "requests" },
     { name = "webob" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/d1/19/6d6349940b2abe0b8fe9cb95477fd09305ec2bbf6e569875221cb08a49e9/restalchemy-16.0.3.tar.gz", hash = "sha256:49a5e73cc6c35cc566ac107536aaa56b98da972496cd910bed4674250ec9cf86", size = 633960, upload-time = "2026-09-03T13:08:47.799Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/73/16/650f2476a3c9d93c4c3c0f2ddbfc7ce1c52505ed97533cafc4cd50146d54/restalchemy-16.1.3.tar.gz", hash = "sha256:7125821f4a5e8044491078a2010760e28db1f7292c43157ddee2a9c04c9b76bd", size = 644635, upload-time = "2026-10-21T15:22:09.807Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/63/3f/ff344ccfc228eba16d015ce8ebdf2af96c58e830348d8c6e58afe45a6269/restalchemy-16.0.3-py3-none-any.whl", hash = "sha256:053f95bbf1ab15b2c36fa9d84efe28c3011c82b9fc8c735758ae049d529763fb", size = 674736, upload-time = "2026-09-03T13:08:45.853Z" },
+    { url = "https://files.pythonhosted.org/packages/aa/48/7d3df25ef89c845b3c7e0acdef080d4e5a3d30f5f0d37c3a02bcbd9a2b2a/restalchemy-16.1.3-py3-none-any.whl", hash = "sha256:a141264ef3b7256ac240f4856fdb441d7c5eb2775aa47ff39e8dfff0011833ba", size = 683932, upload-time = "2026-10-21T15:22:07.877Z" },
 ]
 
 [[package]]
@@ -2394,7 +2394,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8.0.0,<9.0.0" },
     { name = "pytest-timer", marker = "extra == 'test'", specifier = ">=1.0.0,<2.0.0" },
     { name = "requests", specifier = ">=2.32.0,<3.0.0" },
-    { name = "restalchemy", specifier = ">=16.0.3,<17.0.0" },
+    { name = "restalchemy", specifier = ">=16.1.3,<17.0.0" },
     { name = "ruff", marker = "extra == 'ruff'" },
     { name = "shellcheck-py", marker = "extra == 'shellcheck'" },
     { name = "tox", marker = "extra == 'dev'", specifier = ">=4.0.0" },
