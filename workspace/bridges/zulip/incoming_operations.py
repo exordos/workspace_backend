@@ -238,7 +238,7 @@ SELECT_FILE_RECIPIENTS_SQL = """
     SELECT * FROM m_workspace_visible_files_v1 WHERE uuid = %s
 """
 SELECT_REACTION_SNAPSHOT_SQL = """
-    SELECT provider_identity, emoji_name FROM messenger_message_reaction_facts
+    SELECT provider_identity, user_uuid, emoji_name FROM messenger_message_reaction_facts
     WHERE project_id=%s AND canonical_message_uuid=%s
       AND provider_uuid=%s AND source_name='zulip'
 """
@@ -2616,22 +2616,25 @@ class Operations:
         }
         for item in existing:
             if item["provider_identity"] not in identities:
-                remote, user, kind, code = item["provider_identity"].split(":", 3)
                 await self.reaction(
                     connection,
                     account,
                     {
-                        "message_id": int(remote),
-                        "user_id": int(user),
-                        "reaction_type": kind,
-                        "emoji_code": code,
-                        "emoji_name": item["emoji_name"],
+                        "message_id": data["id"],
                         "op": "remove",
                     },
+                    user_uuid=item["user_uuid"],
+                    emoji_name=item["emoji_name"],
                 )
 
     async def reaction(
-        self, connection: typing.Any, account: dict, event: dict
+        self,
+        connection: typing.Any,
+        account: dict,
+        event: dict,
+        *,
+        user_uuid: object | None = None,
+        emoji_name: str | None = None,
     ) -> None:
         identifier = await self.identity(
             account, "message", event["message_id"], connection=connection
@@ -2641,9 +2644,15 @@ class Operations:
         )
         if not placements:
             return
-        user = await self.user(connection, account, event["user_id"])
+        user = (
+            user_uuid
+            if user_uuid is not None
+            else await self.user(connection, account, event["user_id"])
+        )
         name = (
-            emoji.name_for_code(event["emoji_code"], event["emoji_name"])
+            emoji_name
+            if emoji_name is not None
+            else emoji.name_for_code(event["emoji_code"], event["emoji_name"])
             if event["reaction_type"] == "unicode_emoji"
             else event["emoji_name"]
         )
@@ -2675,9 +2684,11 @@ class Operations:
             SELECT_REACTION_SQL,
             (account["project_id"], identifier, user, name),
         )
-        remote = f"{event['message_id']}:{event['user_id']}:{event['reaction_type']}:{event['emoji_code']}"
-        fact_uuid = existing[0]["uuid"] if existing else uuid.uuid5(identifier, remote)
         if event["op"] == "add":
+            remote = f"{event['message_id']}:{event['user_id']}:{event['reaction_type']}:{event['emoji_code']}"
+            fact_uuid = (
+                existing[0]["uuid"] if existing else uuid.uuid5(identifier, remote)
+            )
             changed = await self.save(
                 connection,
                 TABLES["reaction"],
@@ -2713,6 +2724,9 @@ class Operations:
                 ),
             )
         else:
+            if not existing:
+                return
+            fact_uuid = existing[0]["uuid"]
             deleted = await rows(
                 connection,
                 DELETE_ROW_SQL.format(table=TABLES["reaction"]),

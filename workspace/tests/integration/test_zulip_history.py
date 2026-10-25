@@ -372,6 +372,58 @@ def test_history_repairs_content_reactions_flags_and_scoped_absence(incoming, jo
         cfg.CONF.clear_override("enabled", group=mutation_journal_opts.DOMAIN)
 
 
+@pytest.mark.parametrize("provider_identity", [None, "101:7:smile"])
+@pytest.mark.parametrize("retained", [False, True])
+def test_history_reconciles_reactions_using_persisted_fact_keys(
+    incoming, provider_identity, retained
+):
+    _, db, account, _, _ = incoming
+    reaction = {
+        "user_id": 7,
+        "emoji_name": "smile",
+        "emoji_code": "1f604",
+        "reaction_type": "unicode_emoji",
+    }
+    incoming_tests.apply(
+        incoming, {"type": "message", "message": message(reactions=[reaction])}
+    )
+    canonical_name = db.execute(
+        "SELECT emoji_name FROM messenger_message_reaction_facts WHERE project_id=%s",
+        (account["project_id"],),
+    ).fetchone()[0]
+    db.execute(
+        "UPDATE messenger_message_reaction_facts SET provider_identity=%s WHERE project_id=%s",
+        (provider_identity, account["project_id"]),
+    )
+    request(db, account)
+
+    async def run():
+        async with worker(
+            incoming, {101: message(reactions=[reaction] if retained else [])}
+        ) as (service, _):
+            await drain(service, account)
+            request(db, account, queue="repeat")
+            await drain(service, account)
+            facts = await service.db.sql(
+                "SELECT emoji_name FROM messenger_message_reaction_facts WHERE project_id=%s",
+                (account["project_id"],),
+            )
+            assert facts == ([{"emoji_name": canonical_name}] if retained else [])
+            root = (
+                await service.db.sql(
+                    "SELECT reactions FROM messenger_messages WHERE project_id=%s",
+                    (account["project_id"],),
+                )
+            )[0]
+            assert root["reactions"] == ({canonical_name: 1} if retained else {})
+            assert not await service.db.sql(
+                "SELECT 1 FROM zulip_outgoing_intents WHERE project_id=%s",
+                (account["project_id"],),
+            )
+
+    asyncio.run(run())
+
+
 def test_repeated_registration_keeps_cursors_and_does_not_duplicate_work(incoming):
     _, db, account, _, _ = incoming
     request(db, account)
