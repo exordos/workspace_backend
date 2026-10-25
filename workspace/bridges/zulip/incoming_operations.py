@@ -1052,6 +1052,9 @@ class Operations:
                         ),
                     )
                     if found and not found[0]["active"]:
+                        if spec["user"] != account["external_account_id"]:
+                            # This account cannot reopen another recipient's chat.
+                            return found[0]
                         raise ValueError(
                             "Incoming message belongs to an inactive membership"
                         )

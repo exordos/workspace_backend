@@ -1147,6 +1147,51 @@ def test_history_respects_inactive_direct_message_memberships(incoming, known):
         linked.delete()
 
 
+def test_history_imports_dm_without_reactivating_an_inactive_peer(incoming):
+    api, db, account, _, _ = incoming
+    linked, _ = incoming_tests.peer_account(incoming)
+    remote = message(
+        101,
+        type="private",
+        recipient_id=1,
+        display_recipient=[
+            {"id": 7, "full_name": "Sender"},
+            {"id": 8, "full_name": "Peer"},
+        ],
+    )
+    remote.pop("stream_id")
+    remote.pop("subject")
+    try:
+        incoming_tests.apply(incoming, {"type": "message", "message": remote})
+        db.execute(
+            "UPDATE messenger_stream_bindings SET active=false WHERE project_id=%s AND user_uuid=%s",
+            (account["project_id"], linked.owner_user_uuid),
+        )
+        request(db, account, {"subscriptions": []})
+
+        async def run():
+            async with worker(incoming, {101: remote, 102: {**remote, "id": 102}}) as (
+                service,
+                _,
+            ):
+                await drain(service, account)
+                assert not await service.db.sql("SELECT 1 FROM zulip_history_intents")
+                assert (
+                    await service.db.sql(
+                        "SELECT active FROM messenger_stream_bindings WHERE project_id=%s AND user_uuid=%s",
+                        (account["project_id"], linked.owner_user_uuid),
+                    )
+                ) == [{"active": False}]
+
+        asyncio.run(run())
+        assert len(api.get("/v1/messenger/messages/").json()) == 2
+        assert not api.get(
+            "/v1/messenger/messages/", user=linked.owner_user_uuid
+        ).json()
+    finally:
+        linked.delete()
+
+
 def test_registration_recovers_a_missed_attachment_removal(
     incoming, tmp_path, monkeypatch
 ):
