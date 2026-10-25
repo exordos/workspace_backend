@@ -256,6 +256,48 @@ def test_history_counters_preserve_a_realtime_publication(
         cfg.CONF.clear_override("enabled", group=mutation_journal_opts.DOMAIN)
 
 
+def test_silent_folder_rebuild_preserves_a_pending_realtime_publication(incoming):
+    _, db, account, _, _ = incoming
+    incoming_tests.apply(incoming, incoming_tests.event())
+    incoming_tests.drain()
+    before = incoming_tests.client_events(incoming)
+    folder = db.execute(
+        "SELECT folder_uuid FROM messenger_user_folder_bindings WHERE project_id=%s AND user_uuid=%s ORDER BY folder_uuid LIMIT 1",
+        (account["project_id"], account["owner_user_uuid"]),
+    ).fetchone()[0]
+    identifiers = []
+    for emit in (False, True):
+        identifier = uuid.uuid4()
+        identifiers.append(identifier)
+        db.execute(
+            "INSERT INTO messenger_domain_outbox_events (uuid,project_id,event_kind,scope_kind,scope_key,payload) VALUES (%s,%s,'folder_projection','user-folder',%s,%s)",
+            (
+                identifier,
+                account["project_id"],
+                f"{account['project_id']}:{account['owner_user_uuid']}:{folder}",
+                incoming_operations.json_value(
+                    {
+                        "source_kind": "zulip.reconciled",
+                        "user_uuid": account["owner_user_uuid"],
+                        "folder_uuid": folder,
+                        "emit_public_event": emit,
+                    }
+                ),
+            ),
+        )
+    with incoming_tests.contexts.Context().session_manager() as session:
+        task = session.execute(
+            "SELECT * FROM messenger_projection_tasks WHERE outbox_event_uuid=%s",
+            (identifiers[0],),
+        ).fetchone()
+        assert incoming_tests.v2_projection._process_task(session, task, 1000)
+    incoming_tests.publish()
+    assert any(
+        event["kind"] == "folder.updated"
+        for event in incoming_tests.client_events(incoming)[len(before) :]
+    )
+
+
 @pytest.mark.parametrize("provider_content", [None, "Previous provider spelling"])
 def test_history_repairs_provider_content_without_changing_workspace_payload(
     incoming, provider_content

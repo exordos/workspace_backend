@@ -2326,7 +2326,7 @@ def _process_folder_projection(
         # Legacy flag repair can enqueue the same authoritative folder rebuild
         # once per message.  The claimed rebuild absorbs every idle sibling for
         # this scope because none of them carries a historical snapshot.
-        session.execute(
+        coalesced = session.execute(
             """
             WITH siblings AS MATERIALIZED (
                 SELECT uuid
@@ -2348,9 +2348,15 @@ def _process_folder_projection(
                 last_error = NULL, updated_at = NOW()
             FROM siblings
             WHERE task.project_id = %s AND task.uuid = siblings.uuid
+            RETURNING task.payload
             """,
             (project_id, task["scope_key"], task["uuid"], project_id),
         )
+        if any(
+            sibling["payload"].get("emit_public_event", True)
+            for sibling in coalesced.fetchall()
+        ):
+            payload = {**payload, "emit_public_event": True}
     if source_kind == "folder.deleted":
         if not payload.get("emit_public_event", True):
             return
