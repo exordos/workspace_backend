@@ -1103,7 +1103,7 @@ def test_first_message_initializes_current_members_and_keeps_personal_flags(
         linked.delete()
 
 
-def test_incoming_counter_invalidations_are_batched_by_topic(incoming):
+def test_incoming_counter_invalidations_are_partitioned_by_recipient(incoming):
     _api, db, account, _http, _url = incoming
     linked, peer = peer_account(incoming)
     subscription = {
@@ -1121,18 +1121,16 @@ def test_incoming_counter_invalidations_are_batched_by_topic(incoming):
               AND payload->>'source_kind'='zulip.incoming'""",
             (account["project_id"],),
         ).fetchall()
-        assert len(invalidations) == 4
-        assert all(
-            set(item[0]["user_uuids"])
-            == {str(account["owner_user_uuid"]), str(linked.owner_user_uuid)}
-            for item in invalidations
-        )
+        assert len(invalidations) == 8
+        for user in (account["owner_user_uuid"], linked.owner_user_uuid):
+            assert sum(item[0]["user_uuid"] == str(user) for item in invalidations) == 4
+        assert all("user_uuids" not in item[0] for item in invalidations)
     finally:
         linked.delete()
 
 
 @pytest.mark.parametrize("journal", [False, True])
-def test_batched_counter_consumers_merge_recipients_without_losing_updates(
+def test_counter_consumers_coalesce_each_recipient_without_losing_updates(
     incoming, journal
 ):
     api, db, account, _http, _url = incoming
@@ -1165,14 +1163,16 @@ def test_batched_counter_consumers_merge_recipients_without_losing_updates(
                 journal_tests.drain(runtime, db)
             else:
                 drain()
-        merged = [
+        refreshed = [
             call
             for call in refresh.call_args_list
-            if str(call.args[3]) == topic_uuid
-            and set(call.args[4])
-            == {account["owner_user_uuid"], linked.owner_user_uuid}
+            if str(call.args[3]) == topic_uuid and call.args[5] == "user-topic"
         ]
-        assert len(merged) == 1
+        assert len(refreshed) == 2
+        assert {tuple(call.args[4]) for call in refreshed} == {
+            (account["owner_user_uuid"],),
+            (linked.owner_user_uuid,),
+        }
         for user in (account["owner_user_uuid"], linked.owner_user_uuid):
             assert (
                 api.get("/v1/messenger/stream_topics/" + topic_uuid, user=user).json()[
@@ -1207,6 +1207,95 @@ def test_batched_counter_consumers_merge_recipients_without_losing_updates(
         if runtime is not None:
             runtime.close()
         cfg.CONF.clear_override("enabled", group=mutation_journal_opts.DOMAIN)
+        linked.delete()
+
+
+def test_failed_recipient_does_not_block_other_recipient_counters(
+    incoming, monkeypatch
+):
+    api, db, account, _http, _url = incoming
+    linked, peer = peer_account(incoming)
+    subscription = {
+        "type": "subscription",
+        "op": "add",
+        "subscriptions": [{"stream_id": 42, "name": "Channel"}],
+    }
+    refresh = v2_projection._refresh_recipient_counters
+
+    def fail_peer(session, project, stream, topic, users, scope):
+        if linked.owner_user_uuid in users:
+            raise RuntimeError("cassi regression: recipient counter failed")
+        return refresh(session, project, stream, topic, users, scope)
+
+    try:
+        apply(incoming, subscription)
+        apply(peer, subscription)
+        drain()
+        before = len(client_events(incoming))
+        apply(incoming, event(identifier=211))
+        message = api.get("/v1/messenger/messages/").json()[0]
+        monkeypatch.setattr(v2_projection, "_refresh_recipient_counters", fail_peer)
+        for _ in range(50):
+            # A worker commits one durable task, including its events, at a time.
+            with contexts.Context().session_manager() as session:
+                v2_projection.process_one_projection_task(
+                    session, "cassi-counter-isolation"
+                )
+            failed = db.execute(
+                "SELECT count(*) FROM messenger_projection_tasks WHERE project_id=%s "
+                "AND status='failed' AND payload->>'source_kind'='zulip.incoming'",
+                (api.project_id,),
+            ).fetchone()[0]
+            counters = db.execute(
+                "SELECT unread_count FROM messenger_stream_bindings WHERE project_id=%s "
+                "AND stream_uuid=%s AND user_uuid=%s",
+                (api.project_id, message["stream_uuid"], account["owner_user_uuid"]),
+            ).fetchone()[0]
+            folder = db.execute(
+                "SELECT unread_count FROM messenger_user_folder_bindings "
+                "WHERE project_id=%s AND user_uuid=%s "
+                "AND folder_uuid='00000000-0000-0000-0000-000000000000'",
+                (api.project_id, account["owner_user_uuid"]),
+            ).fetchone()
+            if failed and counters == 1 and folder == (1,):
+                break
+        assert failed == 1
+        assert counters == 1
+        assert folder == (1,)
+        assert (
+            api.get("/v1/messenger/stream_topics/" + message["topic_uuid"]).json()[
+                "unread_count"
+            ]
+            == 1
+        )
+        publish()
+        for event_type in ("topic.updated", "stream.updated", "folder.updated"):
+            assert any(
+                value["kind"] == event_type
+                for value in client_events(incoming)[before:]
+            )
+        # The failed user's work remains durable; recovery must converge too.
+        monkeypatch.setattr(v2_projection, "_refresh_recipient_counters", refresh)
+        db.execute(
+            "UPDATE messenger_projection_tasks SET next_retry_at=NOW() "
+            "WHERE project_id=%s AND status='failed'",
+            (api.project_id,),
+        )
+        drain()
+        for user in (account["owner_user_uuid"], linked.owner_user_uuid):
+            assert (
+                api.get(
+                    "/v1/messenger/stream_topics/" + message["topic_uuid"], user=user
+                ).json()["unread_count"]
+                == 1
+            )
+            assert (
+                api.get(
+                    "/v1/messenger/streams/" + message["stream_uuid"], user=user
+                ).json()["unread_count"]
+                == 1
+            )
+    finally:
         linked.delete()
 
 
