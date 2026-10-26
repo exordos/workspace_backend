@@ -678,7 +678,10 @@ def test_personal_preview_scope_backfills_existing_states(
         "FROM messenger_user_message_states WHERE project_id=%s AND placement_uuid=%s AND user_uuid=%s",
         (api.project_id, placement_uuid, api.user_uuid),
     ).fetchone()
-    filename = next(conftest.MIGRATIONS_DIR.glob("0280-*.py"))
+    filename = (
+        conftest.MIGRATIONS_DIR
+        / "0280-Index-recipient-scoped-canonical-message-previews-6025ad.py"
+    )
     spec = importlib.util.spec_from_file_location("personal_preview_scope", filename)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -756,7 +759,10 @@ def test_personal_preview_scope_resumes_while_history_is_being_read(
         "WHERE project_id=%s AND placement_uuid=%s",
         (api.project_id, message["uuid"]),
     )
-    filename = next(conftest.MIGRATIONS_DIR.glob("0280-*.py"))
+    filename = (
+        conftest.MIGRATIONS_DIR
+        / "0280-Index-recipient-scoped-canonical-message-previews-6025ad.py"
+    )
     spec = importlib.util.spec_from_file_location("personal_preview_resume", filename)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

@@ -1473,7 +1473,10 @@ def test_direct_recipient_migration_replaces_only_recipient_capture(
 ):
     outgoing, _peer = direct_outgoing
     _api, account, *_ = outgoing
-    path = next(conftest.MIGRATIONS_DIR.glob("0280-*.py"))
+    path = (
+        conftest.MIGRATIONS_DIR
+        / "0280-Restore-direct-Zulip-message-recipients-d1cf4e.py"
+    )
     spec = importlib.util.spec_from_file_location("direct_recipient_migration", path)
     migration = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(migration)
