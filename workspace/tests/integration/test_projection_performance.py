@@ -16,6 +16,7 @@ import psycopg
 import pytest
 from oslo_config import cfg
 from restalchemy.common import contexts
+from restalchemy.storage.sql import sessions
 
 from workspace.common import messenger_reaction_opts
 from workspace.messenger_api import publication
@@ -128,6 +129,69 @@ def _plan_nodes(plan):
     yield plan
     for child in plan.get("Plans", []):
         yield from _plan_nodes(child)
+
+
+@pytest.mark.parametrize(
+    ("task_kind", "lane", "users"),
+    [
+        ("reaction_snapshot", "reaction_snapshot", {}),
+        ("fanout", "fanout", {}),
+        ("read_counters", "read_state", {"user_uuids": []}),
+    ],
+)
+def test_claim_without_users_does_not_scan_unrelated_user_predecessors(
+    api, db, monkeypatch, task_kind, lane, users
+):
+    db.execute(
+        """
+        INSERT INTO messenger_domain_outbox_events
+            (uuid,project_id,event_kind,scope_kind,scope_key,payload,created_at)
+        SELECT gen_random_uuid(),%s,'read_counters','user-topic',number::text,
+               jsonb_build_object('source_kind','messages.read','user_uuid',%s::text),
+               NOW()-interval '1 day'
+        FROM generate_series(1,10000) AS input(number)
+        """,
+        (api.project_id, api.user_uuid),
+    )
+    target = _seed_partition_claim_tasks(
+        api,
+        [
+            {
+                "task_kind": task_kind,
+                "scope_kind": "message",
+                "scope_key": str(sys_uuid.uuid4()),
+                "payload": {"source_kind": "zulip.incoming", **users},
+            }
+        ],
+    )[0]
+    db.execute("ANALYZE messenger_projection_tasks, messenger_domain_outbox_events")
+    plans = []
+    execute = sessions.PgSQLSession.execute
+
+    def explain(current, statement, values=None):
+        if "FROM messenger_projection_tasks AS partition_predecessor" in statement:
+            plans.append(
+                execute(
+                    current,
+                    "EXPLAIN (ANALYZE,BUFFERS,TIMING OFF,FORMAT JSON) " + statement,
+                    values,
+                ).fetchone()["QUERY PLAN"][0]["Plan"]
+            )
+        return execute(current, statement, values)
+
+    monkeypatch.setattr(sessions.PgSQLSession, "execute", explain)
+    monkeypatch.setattr(v2_projection, "_FAIR_SCHEDULER_CYCLE", itertools.repeat(lane))
+    with contexts.Context().session_manager() as session:
+        claimed = v2_projection._claim_task(session, "integration:empty-users", 30)
+        assert claimed["outbox_event_uuid"] == target
+    assert len(plans) == 1
+    scanned = [
+        node
+        for node in _plan_nodes(plans[0])
+        if node.get("Alias") == "partition_predecessor"
+    ]
+    assert scanned
+    assert all(node["Actual Loops"] == 0 for node in scanned), json.dumps(scanned)
 
 
 @pytest.mark.parametrize("scope_kind", ["user-stream", "user-topic"])

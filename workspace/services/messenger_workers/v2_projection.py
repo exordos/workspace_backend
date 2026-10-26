@@ -871,31 +871,34 @@ def _claim_task_for_lane(
                             'completed', 'dead_letter'
                           )
               )
-              AND NOT EXISTS (
-                    SELECT 1
-                    FROM messenger_projection_tasks AS partition_predecessor
-                    WHERE partition_predecessor.project_id = task.project_id
-                      AND partition_predecessor.status NOT IN (
-                            'completed', 'dead_letter'
-                          )
-                      AND ({_projection_users_sql("partition_predecessor")})
-                          ?| ARRAY(
-                              SELECT jsonb_array_elements_text(
-                                  {_projection_users_sql("task")}
+              AND (
+                    ({_projection_users_sql("task")}) = '[]'::jsonb
+                    OR NOT EXISTS (
+                        SELECT 1
+                        FROM messenger_projection_tasks AS partition_predecessor
+                        WHERE partition_predecessor.project_id = task.project_id
+                          AND partition_predecessor.status NOT IN (
+                                'completed', 'dead_letter'
                               )
-                          )
-                      AND (
-                            partition_predecessor.created_at,
-                            partition_predecessor.ordering_created_at,
-                            partition_predecessor.outbox_event_uuid
-                          ) < (
-                            task.created_at,
-                            task.ordering_created_at,
-                            task.outbox_event_uuid
-                          )
-                      AND partition_predecessor.status NOT IN (
-                            'completed', 'dead_letter'
-                          )
+                          AND ({_projection_users_sql("partition_predecessor")})
+                              ?| ARRAY(
+                                  SELECT jsonb_array_elements_text(
+                                      {_projection_users_sql("task")}
+                                  )
+                              )
+                          AND (
+                                partition_predecessor.created_at,
+                                partition_predecessor.ordering_created_at,
+                                partition_predecessor.outbox_event_uuid
+                              ) < (
+                                task.created_at,
+                                task.ordering_created_at,
+                                task.outbox_event_uuid
+                              )
+                          AND partition_predecessor.status NOT IN (
+                                'completed', 'dead_letter'
+                              )
+                    )
               )
               AND ({task_lane_predicate})
               AND ({task_admission_predicate})
