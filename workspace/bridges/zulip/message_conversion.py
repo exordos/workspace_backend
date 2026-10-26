@@ -106,6 +106,14 @@ def _markdown_link(
     return f"{'!' if image else ''}[{label}]({target}{title})"
 
 
+def file_urn(identifier: object, content_type: str) -> str:
+    """Classify provider attachments using their downloaded MIME type."""
+    kind = content_type.lower().split("/", 1)[0]
+    if kind not in ("image", "video"):
+        kind = "file"
+    return f"urn:{kind}:{identifier}"
+
+
 def parse_url(target: str, base_url: str = "") -> urllib.parse.SplitResult | None:
     """Parse a message link, leaving malformed destinations as ordinary text."""
     try:
