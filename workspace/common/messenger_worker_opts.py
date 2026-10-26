@@ -10,6 +10,14 @@ DOMAIN = "messenger_worker_agent"
 
 messenger_worker_opts = [
     cfg.IntOpt(
+        "history-retention-seconds",
+        default=3600,
+        min=1,
+        help="Keep successfully completed service work and unused content for this long",
+    ),
+    cfg.IntOpt("history-prune-interval-seconds", default=60, min=1),
+    cfg.IntOpt("history-prune-batch-size", default=1000, min=1, max=1000),
+    cfg.IntOpt(
         "event-retention-seconds",
         default=72 * 60 * 60,
         min=60 * 60,
