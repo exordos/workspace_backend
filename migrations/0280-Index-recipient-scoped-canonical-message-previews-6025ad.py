@@ -183,24 +183,21 @@ def _backfill(session):
                     block,
                     blocks,
                 )
-        # Parent changes are atomic, but a concurrent move/date update can race
-        # a backfill snapshot. Another pass repairs any such stale overwrite.
-        if repaired == 0:
-            # A concurrent flag update can relocate an unprocessed row behind
-            # the physical cursor. Verify the whole snapshot before finishing.
-            mismatch = session.execute("""
-                SELECT count(*) > 0 AS mismatch
-                    FROM messenger_user_message_states AS personal
-                    JOIN messenger_message_placements AS placement
-                      ON placement.project_id=personal.project_id AND placement.uuid=personal.placement_uuid
-                    JOIN messenger_messages AS message
-                      ON message.project_id=placement.project_id AND message.uuid=placement.message_uuid
-                    WHERE (personal.preview_stream_uuid,personal.preview_topic_uuid,personal.preview_created_at)
-                        IS DISTINCT FROM (placement.stream_uuid,placement.topic_uuid,message.created_at)
-            """).fetchone()["mismatch"]
-            session.commit()
-            if not mismatch:
-                return
+        # A concurrent flag update can relocate an unprocessed row behind
+        # the physical cursor. Verify the whole snapshot before finishing.
+        mismatch = session.execute("""
+            SELECT count(*) > 0 AS mismatch
+                FROM messenger_user_message_states AS personal
+                JOIN messenger_message_placements AS placement
+                  ON placement.project_id=personal.project_id AND placement.uuid=personal.placement_uuid
+                JOIN messenger_messages AS message
+                  ON message.project_id=placement.project_id AND message.uuid=placement.message_uuid
+                WHERE (personal.preview_stream_uuid,personal.preview_topic_uuid,personal.preview_created_at)
+                    IS DISTINCT FROM (placement.stream_uuid,placement.topic_uuid,message.created_at)
+        """).fetchone()["mismatch"]
+        session.commit()
+        if not mismatch:
+            return
 
 
 def _indexes(session, *, create):
@@ -243,8 +240,19 @@ class MigrationStep(migrations.AbstractMigrationStep):
         return False
 
     def upgrade(self, session):
-        session.execute("SET LOCAL lock_timeout='3s'")
-        session.execute(SCHEMA_SQL)
+        initialized = session.execute("""
+            SELECT count(*) = 3 AS initialized FROM pg_trigger
+            WHERE (tgrelid,tgname) IN (
+                ('messenger_user_message_states'::regclass,'messenger_set_personal_preview_scope'),
+                ('messenger_message_placements'::regclass,'messenger_move_personal_preview_scope'),
+                ('messenger_messages'::regclass,'messenger_date_personal_preview_scope')
+            )
+        """).fetchone()["initialized"]
+        # Schema installation commits atomically. Resuming a backfill must not
+        # reacquire exclusive table locks while ordinary readers are active.
+        if not initialized:
+            session.execute("SET LOCAL lock_timeout='3s'")
+            session.execute(SCHEMA_SQL)
         session.commit()
         _backfill(session)
         _indexes(session, create=True)

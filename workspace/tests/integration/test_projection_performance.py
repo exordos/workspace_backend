@@ -648,6 +648,29 @@ def test_personal_preview_scope_backfills_existing_states(
 
 
 @pytest.mark.isolated_schema
+def test_personal_preview_scope_resumes_while_history_is_being_read(api, db):
+    _stream, message = _create_message(api, "preview-resume-with-readers")
+    db.execute(
+        "UPDATE messenger_user_message_states SET preview_stream_uuid=NULL "
+        "WHERE project_id=%s AND placement_uuid=%s",
+        (api.project_id, message["uuid"]),
+    )
+    filename = next(conftest.MIGRATIONS_DIR.glob("0280-*.py"))
+    spec = importlib.util.spec_from_file_location("personal_preview_resume", filename)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    with psycopg.connect(db.info.dsn) as reader:
+        reader.execute("SELECT 1 FROM messenger_user_message_states LIMIT 1")
+        with contexts.Context().session_manager() as session:
+            module.migration_step.upgrade(session)
+    assert db.execute(
+        "SELECT preview_stream_uuid IS NOT NULL FROM messenger_user_message_states "
+        "WHERE project_id=%s AND placement_uuid=%s",
+        (api.project_id, message["uuid"]),
+    ).fetchone() == (True,)
+
+
+@pytest.mark.isolated_schema
 def test_personal_preview_scope_tracks_moves_and_canonical_date_changes(api, db):
     original, first = _create_message(api, "preview-source")
     destination, second = _create_message(api, "preview-destination")
