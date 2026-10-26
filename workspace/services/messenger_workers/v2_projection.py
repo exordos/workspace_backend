@@ -1317,11 +1317,17 @@ def _refresh_recipient_counters(
         FROM ({targets}) AS target
         LEFT JOIN unread ON unread.user_uuid = target.user_uuid
         LEFT JOIN LATERAL (
-            -- A visible placement supplies a safe lower date bound. Imported
-            -- placements already have the source date, so the canonical date
-            -- index can find the preview without sorting the entire history.
+            -- Bound the placement-first fast path. Empty/sparse recipients
+            -- must not walk the whole topic just to establish a date floor.
             SELECT message.created_at
-            FROM messenger_message_placements AS placement
+            FROM (
+                SELECT placement.*
+                FROM messenger_message_placements AS placement
+                WHERE placement.project_id = target.project_id
+                  AND placement.{scope_column} = target.scope_uuid
+                ORDER BY placement.created_at DESC, placement.uuid DESC
+                LIMIT {PREVIEW_CANDIDATE_LIMIT}
+            ) AS placement
             JOIN messenger_messages AS message
               ON message.project_id = placement.project_id AND message.uuid = placement.message_uuid
              AND message.deleted_at IS NULL
@@ -1347,6 +1353,7 @@ def _refresh_recipient_counters(
                 {visible_joins}
                 WHERE placement.project_id = target.project_id
                   AND placement.message_uuid = recent.uuid
+                  AND placement.stream_uuid = target.stream_uuid
                   AND placement.{scope_column} = target.scope_uuid
                 ORDER BY placement.uuid DESC
                 LIMIT 1
@@ -1355,15 +1362,36 @@ def _refresh_recipient_counters(
             LIMIT 1
         ) AS recent_preview ON true
         LEFT JOIN LATERAL (
-            -- Materialize the visible scope and look up each canonical row.
-            -- Otherwise the date-order LIMIT can drive a project-wide scan.
-            WITH scoped AS MATERIALIZED (
-                SELECT placement.uuid, placement.message_uuid
-                FROM messenger_message_placements AS placement
-                {visible_joins}
+            -- Start the fallback from this viewer's current personal state.
+            -- The lateral point lookup prevents an empty scope from driving
+            -- another complete scan of other recipients' topic placements.
+            WITH viewer AS MATERIALIZED (
+                SELECT personal.project_id, personal.placement_uuid,
+                       personal.user_uuid, personal.membership_generation
+                FROM messenger_user_message_states AS personal
                 WHERE recent_preview.uuid IS NULL
-                  AND placement.project_id = target.project_id
-                  AND placement.{scope_column} = target.scope_uuid
+                  AND personal.project_id = target.project_id
+                  AND personal.user_uuid = target.user_uuid
+                  AND personal.membership_generation = target.membership_generation
+            ), scoped AS MATERIALIZED (
+                SELECT placement.uuid, placement.message_uuid
+                FROM viewer AS personal
+                CROSS JOIN LATERAL (
+                    SELECT placement.uuid, placement.message_uuid, placement.topic_uuid
+                    FROM messenger_message_placements AS placement
+                    WHERE placement.project_id = personal.project_id
+                      AND placement.uuid = personal.placement_uuid
+                      AND placement.{scope_column} = target.scope_uuid
+                    LIMIT 1
+                ) AS placement
+                JOIN messenger_topics AS topic
+                  ON topic.project_id = personal.project_id AND topic.uuid = placement.topic_uuid
+                 AND topic.deleted_at IS NULL
+                JOIN messenger_user_message_bindings AS access
+                  ON access.project_id = personal.project_id AND access.user_uuid = personal.user_uuid
+                 AND access.placement_uuid = personal.placement_uuid
+                 AND access.membership_generation = personal.membership_generation
+                 AND access.visibility = 'visible'
             )
             SELECT scoped.uuid
             FROM scoped

@@ -1989,26 +1989,25 @@ class Operations:
             )
         )
         users = sorted({member["user_uuid"] for member in members}, key=str)
-        if not users:
-            return
-        await connection.execute(
-            ENQUEUE_COUNTERS_SQL,
-            (
-                uuid.uuid4(),
-                account["project_id"],
-                f"{account['project_id']}:topic:{placement['topic_uuid']}",
-                json_value(
-                    {
-                        "source_kind": "zulip.incoming",
-                        "emit_public_event": self.emit_public_event,
-                        "user_uuids": [str(value) for value in users],
-                        "stream_uuid": placement["stream_uuid"],
-                        "topic_uuid": placement["topic_uuid"],
-                        "placement_uuid": placement["uuid"],
-                    }
+        for user_uuid in users:
+            await connection.execute(
+                ENQUEUE_COUNTERS_SQL,
+                (
+                    uuid.uuid4(),
+                    account["project_id"],
+                    f"{account['project_id']}:{user_uuid}:{placement['topic_uuid']}",
+                    json_value(
+                        {
+                            "source_kind": "zulip.incoming",
+                            "emit_public_event": self.emit_public_event,
+                            "user_uuid": user_uuid,
+                            "stream_uuid": placement["stream_uuid"],
+                            "topic_uuid": placement["topic_uuid"],
+                            "placement_uuid": placement["uuid"],
+                        }
+                    ),
                 ),
-            ),
-        )
+            )
 
     async def delete_message(
         self, connection: typing.Any, account: dict, remote: object
