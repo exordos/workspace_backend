@@ -7,7 +7,8 @@
 
 Context contains server_url and original_url, plus optional mention_uuids
 (id:<Zulip ID> or name:<name>), stream_uuids (name), topic_uuids (channel>topic),
-message_uuids (Zulip ID), stream_ids (name -> Zulip ID), files (URL -> Workspace
+message_uuids (Zulip ID), stream_ids (name -> Zulip ID), dm_stream_uuids
+(provider identity -> visible Workspace stream UUID), files (URL -> Workspace
 file URN), deleted_files and inaccessible_files (source URLs), linkifier_urls,
 user_group_ids, and custom_emoji_names.
 The optional messages mapping contains
@@ -388,8 +389,9 @@ class _ZulipToWorkspace:
                         "dm:" + ",".join(map(str, users)),
                     )
                 )
-                if identifier in self.context["dm_stream_uuids"]:
-                    return f"urn:stream:{identifier}"
+                mapped = self.context["dm_stream_uuids"].get(f"dm:{identifier}")
+                if mapped is not None:
+                    return f"urn:stream:{mapped}"
             match = re.search(
                 r"(?:^|/)channel/(\d+)(?:-([^/]+))?(?:/topic/([^/]+))?", url.fragment
             )

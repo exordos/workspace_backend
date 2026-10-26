@@ -1441,6 +1441,59 @@ def test_direct_messages_share_one_conversation_in_both_directions(incoming):
         linked.delete()
 
 
+@pytest.mark.parametrize("members", [[7, 8], [7, 8, 9]])
+@pytest.mark.parametrize("visible", [False, True])
+def test_dm_links_resolve_only_to_existing_visible_workspace_streams(
+    incoming, members, visible
+):
+    api, db, account, _http, _url = incoming
+    peers = [peer_account(incoming, identifier)[0] for identifier in members[1:]]
+    try:
+        # Zulip can omit the current user and change member order in its URL.
+        remote = ",".join(str(member) for member in reversed(members[1:]))
+        url = account["settings"]["server_url"] + f"/#narrow/dm/{remote}-conversation"
+        private = event(f"[This conversation]({url})", 901)
+        private["message"].update(
+            type="private",
+            recipient_id=1,
+            display_recipient=[
+                {"id": member, "full_name": str(member)} for member in members
+            ],
+        )
+        private["message"].pop("stream_id")
+        private["message"].pop("subject")
+        apply(incoming, private)
+        created = api.get("/v1/messenger/messages/").json()[0]
+        target = created["stream_uuid"]
+        assert created["payload"]["content"] == (
+            f"[This conversation](urn:stream:{target})"
+        )
+        if not visible:
+            db.execute(
+                "UPDATE messenger_stream_bindings SET active=false "
+                "WHERE project_id=%s AND stream_uuid=%s AND user_uuid=%s",
+                (account["project_id"], target, account["owner_user_uuid"]),
+            )
+        apply(incoming, event(f"[Conversation]({url})", 902))
+        drain()
+        messages = api.get("/v1/messenger/messages/").json()
+        message = next(row for row in messages if row["provider_identity"] == "902")
+        href = f"urn:stream:{target}" if visible else f"urn:url:{url}"
+        assert message["payload"]["content"] == f"[Conversation]({href})"
+        assert db.execute(
+            "SELECT count(*) FROM messenger_streams WHERE project_id=%s",
+            (account["project_id"],),
+        ).fetchone() == (2,)
+        assert db.execute(
+            "SELECT active FROM messenger_stream_bindings "
+            "WHERE project_id=%s AND stream_uuid=%s AND user_uuid=%s",
+            (account["project_id"], target, account["owner_user_uuid"]),
+        ).fetchone() == (visible,)
+    finally:
+        for peer in peers:
+            peer.delete()
+
+
 def test_message_move_removes_old_placement_and_publishes_both_scopes(incoming):
     api, db, account, http, _url = incoming
     apply(incoming, event())
