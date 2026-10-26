@@ -2753,9 +2753,8 @@ class Operations:
         reactions = {row["emoji_name"]: row["count"] for row in counts}
         reaction_users = {
             row["emoji_name"]: row["users"]
-            if 0 < row["count"] <= self.reaction_user_limit
-            else []
             for row in counts
+            if 0 < row["count"] <= self.reaction_user_limit
         }
         await self.save(
             connection,

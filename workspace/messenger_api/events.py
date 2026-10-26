@@ -395,10 +395,20 @@ def _get_packer_request() -> typing.Any:
 
 def pack_workspace_event(event: typing.Any, request: typing.Any = None) -> typing.Any:
     request = request or _get_packer_request()
-    return ra_packers.BaseResourcePacker(
+    result = ra_packers.BaseResourcePacker(
         WORKSPACE_EVENT_RESOURCE,
         request,
     ).pack(event)
+    if (
+        result["object_type"] == MESSAGE_OBJECT_TYPE
+        and "reaction_users" in result["payload"]
+    ):
+        result["payload"]["reaction_users"] = {
+            name: users
+            for name, users in result["payload"]["reaction_users"].items()
+            if users
+        }
+    return result
 
 
 def event_row_to_messenger_event(row: typing.Any) -> typing.Any:

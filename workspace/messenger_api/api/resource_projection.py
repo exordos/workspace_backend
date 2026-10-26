@@ -80,6 +80,10 @@ def as_dict(
         result.setdefault("provider_identity", None)
     if resource == "streams":
         result.setdefault("current_encryption_key_uuid", None)
+    if resource == "messages" and "reaction_users" in result:
+        result["reaction_users"] = {
+            name: users for name, users in result["reaction_users"].items() if users
+        }
     if resource == "stream_topics":
         for name in (
             "summary",

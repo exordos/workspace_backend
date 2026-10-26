@@ -19,6 +19,7 @@ from restalchemy.common import contexts
 
 from workspace.common import messenger_reaction_opts
 from workspace.messenger_api import publication
+from workspace.messenger_api import events
 from workspace.services.messenger_workers import agents
 from workspace.tests.integration import legacy_store
 from workspace.messenger_api.api import store as api_store
@@ -3181,3 +3182,69 @@ def test_independent_publisher_preserves_committed_epoch_order(api, db):
     ).fetchall()
     assert [row[0] for row in rows] == [before[0].uuid, after[0].uuid]
     assert rows[0][1] < rows[1][1]
+
+
+def test_existing_empty_reaction_users_do_not_break_message_pages_or_replay(api, db):
+    stream, message = _create_message(api, "existing-count-only-reaction-users")
+    for index in range(49):
+        response = api.post(
+            MESSAGES,
+            json={
+                "stream_uuid": stream["uuid"],
+                "topic_uuid": stream["default_topic_uuid"],
+                "payload": {"kind": "markdown", "content": f"Page row {index}"},
+            },
+        )
+        assert response.status_code == 201, response.text
+    _drain()
+    counts = {"grin": 12, "eyes": 1}
+    old_users = {"grin": [], "eyes": [str(api.user_uuid)]}
+    expected_users = {"eyes": [str(api.user_uuid)]}
+    canonical_uuid = db.execute(
+        "SELECT message_uuid FROM messenger_message_placements "
+        "WHERE project_id=%s AND uuid=%s",
+        (api.project_id, message["uuid"]),
+    ).fetchone()[0]
+    db.execute(
+        "UPDATE messenger_messages SET reactions=%s::jsonb,reaction_users=%s::jsonb "
+        "WHERE project_id=%s AND uuid=%s",
+        (json.dumps(counts), json.dumps(old_users), api.project_id, canonical_uuid),
+    )
+    for path, params in (
+        (MESSAGES, {"stream_uuid": stream["uuid"], "page_limit": 50}),
+        (f"{MESSAGES}{message['uuid']}", {}),
+    ):
+        response = api.get(path, params=params)
+        assert response.status_code == 200, response.text
+        payload = response.json()
+        if isinstance(payload, list):
+            assert len(payload) == 50
+            assert all(
+                users for row in payload for users in row["reaction_users"].values()
+            )
+            payload = next(row for row in payload if row["uuid"] == message["uuid"])
+        assert payload["reactions"] == counts
+        assert payload["reaction_users"] == expected_users
+    replay = events.event_row_to_messenger_event(
+        {
+            "uuid": sys_uuid.uuid4(),
+            "project_id": api.project_id,
+            "user_uuid": api.user_uuid,
+            "epoch_version": 1,
+            "payload": {
+                **message,
+                "kind": "message.updated",
+                "reactions": counts,
+                "reaction_users": old_users,
+            },
+        }
+    )
+    assert replay["payload"]["reactions"] == counts
+    assert replay["payload"]["reaction_users"] == expected_users
+    assert (
+        db.execute(
+            "SELECT reaction_users FROM messenger_messages WHERE uuid=%s",
+            (canonical_uuid,),
+        ).fetchone()[0]
+        == old_users
+    )
