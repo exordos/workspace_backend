@@ -20,6 +20,7 @@ from workspace.services import zulip_history
 from workspace.services.messenger_workers import mutation_runtime
 from workspace.tests.integration import test_mutation_journal as journal_tests
 from workspace.tests.integration import test_zulip_incoming as incoming_tests
+from workspace.tests.integration import test_projection_performance as projection_tests
 
 
 incoming = incoming_tests.incoming
@@ -195,6 +196,125 @@ def test_history_import_resumes_and_repeated_scan_is_silent(incoming):
     incoming_tests.drain()
     assert len(incoming[0].get("/v1/messenger/messages/").json()) == 8
     assert incoming_tests.client_events(incoming) == before
+
+
+def test_latest_known_message_keeps_numeric_order_and_visibility(incoming):
+    _, db, account, _, _ = incoming
+    parameters = (
+        account["owner_user_uuid"],
+        account["project_id"],
+        account["provider_uuid"],
+    )
+    assert db.execute(zulip_history.SELECT_LATEST_KNOWN_SQL, parameters).fetchone() == (
+        0,
+    )
+    incoming_tests.apply(
+        incoming,
+        *(
+            incoming_tests.event(identifier=identifier)
+            for identifier in (9, 10, 11, 12, 13)
+        ),
+    )
+    db.execute(
+        "UPDATE messenger_messages SET deleted_at=now() "
+        "WHERE project_id=%s AND provider_identity='11'",
+        (account["project_id"],),
+    )
+    db.execute(
+        "UPDATE messenger_user_message_bindings access SET visibility='hidden' "
+        "FROM messenger_message_placements placement JOIN messenger_messages message "
+        "ON message.project_id=placement.project_id AND message.uuid=placement.message_uuid "
+        "WHERE access.project_id=placement.project_id AND access.placement_uuid=placement.uuid "
+        "AND message.project_id=%s AND message.provider_identity='12'",
+        (account["project_id"],),
+    )
+    db.execute(
+        "UPDATE messenger_messages SET provider_identity='not-numeric' "
+        "WHERE project_id=%s AND provider_identity='13'",
+        (account["project_id"],),
+    )
+    assert db.execute(zulip_history.SELECT_LATEST_KNOWN_SQL, parameters).fetchone() == (
+        10,
+    )
+    for index in range(len(parameters)):
+        unrelated = list(parameters)
+        unrelated[index] = uuid.uuid4()
+        assert db.execute(
+            zulip_history.SELECT_LATEST_KNOWN_SQL, unrelated
+        ).fetchone() == (0,)
+
+
+@pytest.mark.isolated_schema
+def test_latest_known_message_does_not_scan_all_visible_history(incoming):
+    _, db, account, _, _ = incoming
+    incoming_tests.apply(incoming, incoming_tests.event(identifier=9))
+    stream_uuid, topic_uuid, content_uuid = db.execute(
+        "SELECT placement.stream_uuid,placement.topic_uuid,message.content_uuid "
+        "FROM messenger_messages message JOIN messenger_message_placements placement "
+        "ON placement.project_id=message.project_id AND placement.message_uuid=message.uuid "
+        "WHERE message.project_id=%s AND message.provider_identity='9'",
+        (account["project_id"],),
+    ).fetchone()
+    db.execute(
+        """
+        WITH messages AS (
+            INSERT INTO messenger_messages
+                (uuid,project_id,author_uuid,content_uuid,source_name,provider_uuid,provider_identity)
+            SELECT gen_random_uuid(),%s,%s,%s,'zulip',%s,(1000000+number)::text
+            FROM generate_series(1,10000) AS input(number)
+            RETURNING uuid,project_id
+        ), placements AS (
+            INSERT INTO messenger_message_placements
+                (uuid,project_id,message_uuid,stream_uuid,topic_uuid)
+            SELECT gen_random_uuid(),project_id,uuid,%s,%s FROM messages
+            RETURNING uuid,project_id
+        )
+        INSERT INTO messenger_user_message_bindings
+            (uuid,project_id,placement_uuid,user_uuid,membership_generation,
+             relation_role,visibility,permissions)
+        SELECT gen_random_uuid(),project_id,uuid,%s,1,'author','visible','{}'::jsonb
+        FROM placements
+        """,
+        (
+            account["project_id"],
+            account["owner_user_uuid"],
+            content_uuid,
+            account["provider_uuid"],
+            stream_uuid,
+            topic_uuid,
+            account["owner_user_uuid"],
+        ),
+    )
+    for table in (
+        "messenger_messages",
+        "messenger_message_placements",
+        "messenger_user_message_bindings",
+    ):
+        db.execute(f"ANALYZE {table}")
+    parameters = (
+        account["owner_user_uuid"],
+        account["project_id"],
+        account["provider_uuid"],
+    )
+    assert db.execute(zulip_history.SELECT_LATEST_KNOWN_SQL, parameters).fetchone() == (
+        1010000,
+    )
+    plan = db.execute(
+        "EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) "
+        + zulip_history.SELECT_LATEST_KNOWN_SQL,
+        parameters,
+    ).fetchone()[0][0]
+    scanned = sum(
+        node["Actual Rows"] * node["Actual Loops"]
+        for node in projection_tests._plan_nodes(plan["Plan"])
+        if node.get("Relation Name")
+        in {
+            "messenger_messages",
+            "messenger_message_placements",
+            "messenger_user_message_bindings",
+        }
+    )
+    assert scanned < 100, plan
 
 
 @pytest.mark.parametrize("journal", [False, True])

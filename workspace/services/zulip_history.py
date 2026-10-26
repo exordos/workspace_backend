@@ -97,16 +97,21 @@ SELECT_MISSING_SQL = """
     ORDER BY remote_id DESC LIMIT %s
 """
 SELECT_LATEST_KNOWN_SQL = """
-    SELECT COALESCE(max(message.provider_identity::bigint),0) AS remote_id
-    FROM messenger_messages message
-    JOIN messenger_message_placements placement
-      ON placement.project_id=message.project_id AND placement.message_uuid=message.uuid
-    JOIN messenger_user_message_bindings access
-      ON access.project_id=placement.project_id AND access.placement_uuid=placement.uuid
-     AND access.user_uuid=%s AND access.visibility='visible'
-    WHERE message.project_id=%s AND message.provider_uuid=%s
-      AND message.source_name='zulip' AND message.provider_identity ~ '^[0-9]+$'
-      AND message.deleted_at IS NULL
+    SELECT COALESCE((
+        SELECT message.provider_identity::bigint
+        FROM messenger_messages message
+        WHERE EXISTS (
+            SELECT 1 FROM messenger_message_placements placement
+            JOIN messenger_user_message_bindings access
+              ON access.project_id=placement.project_id AND access.placement_uuid=placement.uuid
+            WHERE placement.project_id=message.project_id AND placement.message_uuid=message.uuid
+              AND access.user_uuid=%s AND access.visibility='visible'
+        ) AND message.project_id=%s AND message.provider_uuid=%s
+          AND message.source_name='zulip' AND message.provider_identity ~ '^[0-9]+$'
+          AND message.deleted_at IS NULL
+        ORDER BY message.provider_identity::bigint DESC
+        LIMIT 1
+    ),0) AS remote_id
 """
 HISTORY_TRANSACTION_SQL = """
     SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;
