@@ -101,6 +101,13 @@ never enter the provider outbox. Entities created in a Zulip context inherit
 empty until the provider receipt arrives. A canonical message has one destination;
 a copy requires a new UUID.
 
+One-to-one Zulip messages resolve the selected direct peer in the sender's
+project and provider, including imported contacts without credentials or a
+local stream subscription. A missing peer identity leaves the send pending.
+Group-message recipients come from the group's active bindings. A group send
+waits until every member has a provider identity rather than sending to a
+partial group or back to the sender alone.
+
 `[zulip_outgoing] concurrency` and `connections` default to 128. The HTTP connector
 opens connections on demand, reuses them and closes connections idle for 15 seconds.
 Zulip rate-limit responses delay retries. A prepared request is durable before

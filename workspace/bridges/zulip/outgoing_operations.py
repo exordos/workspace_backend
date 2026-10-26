@@ -110,6 +110,7 @@ SELECT_PEER_ACCOUNT_SQL = """
     FROM m_external_accounts_v2
     WHERE project_id = %s
       AND owner_user_uuid = %s
+      AND provider = 'zulip'
       AND provider_uuid = %s
       AND external_account_id IS NOT NULL
 """
@@ -137,16 +138,19 @@ INSERT_CONTENT_SNAPSHOT_SQL = """
 """
 
 SELECT_MESSAGE_RECIPIENTS_SQL = """
+    WITH members AS (
+        SELECT project_id,user_uuid
+        FROM messenger_stream_bindings
+        WHERE project_id = %s AND stream_uuid = %s AND active
+    )
     SELECT DISTINCT account.external_account_id::bigint AS id
-    FROM messenger_stream_bindings binding
-    JOIN m_external_accounts_v2 account
-      ON account.project_id = binding.project_id
-     AND account.owner_user_uuid = binding.user_uuid
-    WHERE binding.project_id = %s
-      AND binding.stream_uuid = %s
-      AND binding.active
-      AND account.provider_uuid = %s
-      AND account.external_account_id IS NOT NULL
+    FROM members
+    LEFT JOIN m_external_accounts_v2 account
+      ON account.project_id = members.project_id
+     AND account.owner_user_uuid = members.user_uuid
+     AND account.provider = 'zulip'
+     AND account.provider_uuid = %s
+    ORDER BY id
 """
 
 SELECT_SUBSCRIPTION_SQL = """
@@ -343,7 +347,8 @@ class Operations:
             return {
                 "channel_type": "private"
                 if stream["direct_user_uuid"] is not None
-                else "group"
+                else "group",
+                "direct_user_uuid": stream["direct_user_uuid"],
             }
         identity = await self.identity(intent, account, "stream", data["stream_uuid"])
         return {"stream_id": int(identity), "channel_type": "channel"}
@@ -709,12 +714,31 @@ class Operations:
         if route["channel_type"] == "channel":
             recipient = route["stream_id"]
             topic = data["topic_name"]
+        elif route["channel_type"] == "private":
+            peers = await self.db.sql(
+                SELECT_PEER_ACCOUNT_SQL,
+                (
+                    intent["project_id"],
+                    route["direct_user_uuid"],
+                    account["provider_uuid"],
+                ),
+            )
+            if not peers:
+                raise Pending("Waiting for the direct message recipient")
+            recipient = [int(peers[0]["external_account_id"])]
+            topic = None
         else:
             peers = await self.db.sql(
                 SELECT_MESSAGE_RECIPIENTS_SQL,
                 (intent["project_id"], data["stream_uuid"], account["provider_uuid"]),
             )
-            recipient = data.get("recipient_ids") or [row["id"] for row in peers]
+            recipient = [row["id"] for row in peers]
+            if (
+                not recipient
+                or None in recipient
+                or not set(recipient) - {int(account["external_account_id"])}
+            ):
+                raise Pending("Waiting for the group message recipients")
             topic = None
         subscriptions = await self.db.sql(
             SELECT_SUBSCRIPTION_SQL,
