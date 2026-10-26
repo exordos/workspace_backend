@@ -161,12 +161,20 @@ SELECT_TOPIC_REFERENCES_SQL = """
            OR stream.name || '>' || topic.name=ANY(%s::text[]))
 """
 SELECT_MESSAGE_REFERENCES_SQL = """
+    WITH scope(project_id,user_uuid,identities,provider_uuid) AS (
+        VALUES (%s::uuid,%s::uuid,%s::text[],%s::uuid)
+    )
     SELECT visible.uuid, message.provider_identity AS remote_id
-    FROM messenger_api_user_messages_v1 visible
-    JOIN messenger_messages message
-      ON message.project_id=visible.project_id AND message.uuid=visible.canonical_message_uuid
-    WHERE visible.project_id=%s AND visible.user_uuid=%s AND visible.visible
-      AND message.provider_identity=ANY(%s::text[]) AND message.provider_uuid=%s
+    FROM scope JOIN messenger_messages message
+      ON message.project_id=scope.project_id AND message.provider_uuid=scope.provider_uuid
+     AND message.provider_identity=ANY(scope.identities)
+    CROSS JOIN LATERAL (
+        SELECT visible.uuid FROM messenger_api_user_messages_v1 visible
+        WHERE visible.project_id=message.project_id AND visible.user_uuid=scope.user_uuid
+          AND visible.canonical_message_uuid=message.uuid AND visible.visible
+        -- Expand the full visibility view only for each requested message.
+        OFFSET 0
+    ) visible
 """
 SELECT_SCOPED_FILE_SQL = """
     SELECT file.* FROM m_workspace_files file
