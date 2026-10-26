@@ -648,7 +648,9 @@ def test_personal_preview_scope_backfills_existing_states(
 
 
 @pytest.mark.isolated_schema
-def test_personal_preview_scope_resumes_while_history_is_being_read(api, db):
+def test_personal_preview_scope_resumes_while_history_is_being_read(
+    api, db, _test_database_url
+):
     _stream, message = _create_message(api, "preview-resume-with-readers")
     db.execute(
         "UPDATE messenger_user_message_states SET preview_stream_uuid=NULL "
@@ -659,7 +661,7 @@ def test_personal_preview_scope_resumes_while_history_is_being_read(api, db):
     spec = importlib.util.spec_from_file_location("personal_preview_resume", filename)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    with psycopg.connect(db.info.dsn) as reader:
+    with psycopg.connect(_test_database_url) as reader:
         reader.execute("SELECT 1 FROM messenger_user_message_states LIMIT 1")
         with contexts.Context().session_manager() as session:
             module.migration_step.upgrade(session)
@@ -748,7 +750,7 @@ def test_personal_preview_scope_tracks_moves_and_canonical_date_changes(api, db)
 @pytest.mark.isolated_schema
 @pytest.mark.parametrize("date_first", [True, False])
 def test_personal_preview_scope_preserves_concurrent_date_and_topic_changes(
-    api, db, date_first
+    api, db, date_first, _test_database_url
 ):
     source, message = _create_message(api, "preview-concurrent-source")
     destination, _ = _create_message(api, "preview-concurrent-destination")
@@ -775,8 +777,8 @@ def test_personal_preview_scope_preserves_concurrent_date_and_topic_changes(
     if not date_first:
         operations.reverse()
     with (
-        psycopg.connect(db.info.dsn) as first,
-        psycopg.connect(db.info.dsn) as second,
+        psycopg.connect(_test_database_url) as first,
+        psycopg.connect(_test_database_url) as second,
         concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool,
     ):
         first.execute(*operations[0])
@@ -811,14 +813,16 @@ def test_personal_preview_scope_preserves_concurrent_date_and_topic_changes(
 
 
 @pytest.mark.isolated_schema
-def test_personal_preview_scope_handles_deferred_parent_inserts(api, db):
+def test_personal_preview_scope_handles_deferred_parent_inserts(
+    api, db, _test_database_url
+):
     stream, message = _create_message(api, "preview-deferred-parents")
     placement_uuid, canonical_uuid = sys_uuid.uuid4(), sys_uuid.uuid4()
     content_uuid = db.execute(
         "SELECT content_uuid FROM messenger_messages WHERE project_id=%s LIMIT 1",
         (api.project_id,),
     ).fetchone()[0]
-    with psycopg.connect(db.info.dsn) as connection:
+    with psycopg.connect(_test_database_url) as connection:
         connection.execute("SET CONSTRAINTS ALL DEFERRED")
         connection.execute(
             "INSERT INTO messenger_user_message_states "
