@@ -597,6 +597,7 @@ def conversion_context(
         "mention_uuids": {},
         "stream_uuids": {},
         "stream_ids": {},
+        "dm_stream_uuids": {},
         "files": {},
     }
     for person in prepared.get("catalog", []):
@@ -604,10 +605,11 @@ def conversion_context(
         context["mention_uuids"][f"id:{person['external_account_id']}"] = user
         if person["first_name"]:
             context["mention_uuids"][f"name:{person['first_name']}"] = user
-    for item in prepared.get("streams", []):
+    for item in (*prepared.get("streams", []), stream):
         context["stream_uuids"][item["name"]] = str(item["uuid"])
         context["stream_ids"][item["name"]] = item["provider_identity"]
-    context["stream_uuids"][stream["name"]] = str(stream["uuid"])
+        if item["provider_identity"].startswith("dm:"):
+            context["dm_stream_uuids"][item["provider_identity"]] = str(item["uuid"])
     if data["type"] == "stream":
         context["stream_ids"][stream["name"]] = str(data["stream_id"])
         context["topic_uuids"][f"{stream['name']}>{data['subject']}"] = str(

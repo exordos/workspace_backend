@@ -8,11 +8,40 @@ import copy
 import json
 import pathlib
 import re
+import uuid
 
 import pytest
 
 from workspace.bridges.zulip import message_conversion
 from workspace.bridges.zulip import content_cache
+
+
+@pytest.mark.parametrize(
+    ("origin", "recipient", "mapped"),
+    [
+        ("https://zulip.example.test", "8", True),
+        ("https://zulip.example.test", "999", False),
+        ("https://other.example.test", "8", False),
+    ],
+)
+def test_strict_dm_links_use_persisted_workspace_identity(origin, recipient, mapped):
+    namespace = uuid.UUID("11111111-1111-4111-8111-111111111111")
+    remote = uuid.uuid5(namespace, "dm:7,8")
+    workspace_uuid = "22222222-2222-4222-8222-222222222222"
+    context = {
+        "server_url": "https://zulip.example.test",
+        "original_url": "https://zulip.example.test/#narrow/near/1",
+        "strict_identities": True,
+        "own_user_id": "7",
+        "zulip_namespace": str(namespace),
+        "dm_stream_uuids": {f"dm:{remote}": workspace_uuid},
+    }
+    url = f"{origin}/#narrow/dm/{recipient}-conversation"
+    result = message_conversion.zulip_to_workspace(
+        {"id": 1, "content": f"[Conversation]({url})"}, context
+    )
+    expected = f"urn:stream:{workspace_uuid}" if mapped else f"urn:url:{url}"
+    assert result["content"] == f"[Conversation]({expected})"
 
 
 EXAMPLES = json.loads(

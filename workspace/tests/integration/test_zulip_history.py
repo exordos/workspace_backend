@@ -145,6 +145,70 @@ async def drain(service, account):
     pytest.fail("History did not finish its bounded scan")
 
 
+@pytest.mark.parametrize("members", [[7, 8], [7, 8, 9]])
+def test_history_dm_links_resume_a_failed_job_without_resetting_history(
+    incoming, members
+):
+    api, db, account, _http, _url = incoming
+    peers = [
+        incoming_tests.peer_account(incoming, identifier)[0]
+        for identifier in members[1:]
+    ]
+    try:
+        private = incoming_tests.event("Known private conversation", 901)
+        private["message"].update(
+            type="private",
+            recipient_id=1,
+            display_recipient=[
+                {"id": member, "full_name": str(member)} for member in members
+            ],
+        )
+        private["message"].pop("stream_id")
+        private["message"].pop("subject")
+        incoming_tests.apply(incoming, private)
+        target = api.get("/v1/messenger/messages/").json()[0]["stream_uuid"]
+        incoming_tests.drain()
+        events_before = incoming_tests.client_events(incoming)
+        base = account["settings"]["server_url"]
+        remote = ",".join(str(member) for member in reversed(members[1:]))
+        unknown = base + f"/#narrow/dm/{remote},999-unknown"
+        text = f"[Known]({base}/#narrow/dm/{remote}-peers) [Unknown]({unknown})"
+        messages = {
+            901: {**private["message"], "reactions": []},
+            902: message(902, text),
+        }
+        request(db, account)
+        db.execute(
+            "UPDATE zulip_history_jobs SET error=%s,attempts=1,next_attempt_at=NOW() "
+            "WHERE external_account_uuid=%s",
+            ("'dm_stream_uuids'", account["uuid"]),
+        )
+
+        async def run():
+            async with worker(incoming, messages) as (service, _calls):
+                await drain(service, account)
+
+        asyncio.run(run())
+        incoming_tests.drain()
+        imported = next(
+            row
+            for row in api.get("/v1/messenger/messages/").json()
+            if row["provider_identity"] == "902"
+        )
+        assert imported["payload"]["content"] == (
+            f"[Known](urn:stream:{target}) [Unknown](urn:url:{unknown})"
+        )
+        assert db.execute(
+            "SELECT error,attempts,backfill_done FROM zulip_history_jobs "
+            "WHERE external_account_uuid=%s",
+            (account["uuid"],),
+        ).fetchone() == (None, 0, True)
+        assert incoming_tests.client_events(incoming) == events_before
+    finally:
+        for peer in peers:
+            peer.delete()
+
+
 def test_history_import_resumes_and_repeated_scan_is_silent(incoming):
     _, db, account, _, _ = incoming
     incoming_tests.drain()
