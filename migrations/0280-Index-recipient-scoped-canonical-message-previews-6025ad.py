@@ -119,7 +119,7 @@ FOR EACH ROW EXECUTE FUNCTION messenger_date_personal_preview_scope();
 """
 
 LOG = logging.getLogger(__name__)
-BATCH_SIZE = 10000
+BATCH_BLOCKS = 128
 INDEXES = tuple(
     (
         f"messenger_user_message_states_{scope}_preview_idx",
@@ -134,24 +134,24 @@ INDEXES = tuple(
 
 
 def _backfill(session):
-    # A restart scans the stable key again and skips already repaired rows.
-    # Commit each batch so history ingestion and other recipients can proceed.
+    # Walk physical windows so the backfill does not fetch each heap page in
+    # random UUID order. CTIDs are locked and used only within one statement.
+    # A new pass includes rows relocated or inserted during an earlier pass.
     while True:
-        cursor = None
+        blocks = session.execute(
+            "SELECT ceil(pg_relation_size('messenger_user_message_states')::numeric "
+            "/ current_setting('block_size')::int)::bigint AS blocks"
+        ).fetchone()["blocks"]
+        session.commit()
         repaired = 0
-        while True:
-            after = (
-                ""
-                if cursor is None
-                else "WHERE (project_id,uuid) > (%s::uuid,%s::uuid)"
-            )
+        for block in range(0, blocks, BATCH_BLOCKS):
             result = session.execute(
-                f"""WITH batch AS MATERIALIZED (
+                """WITH batch AS MATERIALIZED (
                     SELECT project_id,uuid,placement_uuid,ctid
                     FROM messenger_user_message_states
-                    {after} ORDER BY project_id,uuid LIMIT {BATCH_SIZE} FOR UPDATE
+                    WHERE ctid >= %s::tid AND ctid < %s::tid FOR UPDATE
                 ), source AS MATERIALIZED (
-                    SELECT batch.project_id,batch.uuid,batch.ctid,placement.stream_uuid,
+                    SELECT batch.ctid,placement.stream_uuid,
                            placement.topic_uuid,message.created_at
                     FROM batch
                     CROSS JOIN LATERAL (
@@ -171,17 +171,18 @@ def _backfill(session):
                       AND (personal.preview_stream_uuid,personal.preview_topic_uuid,personal.preview_created_at)
                           IS DISTINCT FROM (source.stream_uuid,source.topic_uuid,source.created_at)
                     RETURNING 1
-                ) SELECT (SELECT count(*) FROM repaired) AS repaired,
-                    (SELECT project_id FROM batch ORDER BY project_id DESC,uuid DESC LIMIT 1) AS project_id,
-                    (SELECT uuid FROM batch ORDER BY project_id DESC,uuid DESC LIMIT 1) AS uuid""",
-                () if cursor is None else cursor,
+                ) SELECT count(*) AS repaired FROM repaired""",
+                (f"({block},0)", f"({block + BATCH_BLOCKS},0)"),
             ).fetchone()
             session.commit()
             repaired += result["repaired"]
-            if result["uuid"] is None:
-                break
-            cursor = (result["project_id"], result["uuid"])
-            LOG.info("Personal preview backfill: %s rows repaired", repaired)
+            if result["repaired"] or block % (BATCH_BLOCKS * 100) == 0:
+                LOG.info(
+                    "Personal preview backfill: %s rows repaired, block %s/%s",
+                    repaired,
+                    block,
+                    blocks,
+                )
         # Parent changes are atomic, but a concurrent move/date update can race
         # a backfill snapshot. Another pass repairs any such stale overwrite.
         if repaired == 0:

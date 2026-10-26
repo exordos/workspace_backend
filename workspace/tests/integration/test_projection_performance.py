@@ -547,17 +547,48 @@ def test_personal_preview_scope_backfills_existing_states(api, db):
         "FROM messenger_user_message_states WHERE project_id=%s AND placement_uuid=%s",
         (api.project_id, placement_uuid),
     ).fetchone() == (None, None, None)
+    db.execute(
+        """WITH users AS (
+            INSERT INTO m_workspace_users
+                (uuid,username,source,status,avatar,created_at,updated_at)
+            SELECT gen_random_uuid(),'preview-peer-'||number,'iam','active',
+                   avatar,NOW(),NOW()
+            FROM m_workspace_users CROSS JOIN generate_series(1,128) AS input(number)
+            WHERE uuid=%s RETURNING uuid
+        ), members AS (
+            INSERT INTO messenger_project_users(project_id,user_uuid)
+            SELECT %s,uuid FROM users RETURNING user_uuid
+        ), access AS (
+            INSERT INTO messenger_user_message_bindings
+                (uuid,project_id,placement_uuid,user_uuid,membership_generation,
+                 relation_role,visibility,permissions)
+            SELECT gen_random_uuid(),%s,%s,user_uuid,1,
+                   'member','visible','{}'::jsonb FROM members
+            RETURNING uuid,project_id,placement_uuid,user_uuid,membership_generation
+        ) INSERT INTO messenger_user_message_states
+            (uuid,project_id,placement_uuid,user_uuid,membership_generation,binding_uuid,read_at)
+          SELECT gen_random_uuid(),project_id,placement_uuid,user_uuid,
+                 membership_generation,uuid,NOW() FROM access""",
+        (api.user_uuid, api.project_id, api.project_id, placement_uuid),
+    )
     before = db.execute(
         "SELECT read_at,mentioned,starred,pinned,created_at,updated_at "
-        "FROM messenger_user_message_states WHERE project_id=%s AND placement_uuid=%s",
-        (api.project_id, placement_uuid),
+        "FROM messenger_user_message_states WHERE project_id=%s AND placement_uuid=%s AND user_uuid=%s",
+        (api.project_id, placement_uuid, api.user_uuid),
     ).fetchone()
     filename = next(conftest.MIGRATIONS_DIR.glob("0280-*.py"))
     spec = importlib.util.spec_from_file_location("personal_preview_scope", filename)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    module.BATCH_BLOCKS = 1
     with contexts.Context().session_manager() as session:
         module.migration_step.upgrade(session)
+    assert db.execute(
+        "SELECT count(*) FROM messenger_user_message_states "
+        "WHERE project_id=%s AND preview_stream_uuid=%s AND preview_topic_uuid=%s "
+        "AND preview_created_at IS NOT NULL",
+        (api.project_id, stream["uuid"], stream["default_topic_uuid"]),
+    ).fetchone() == (129,)
     assert db.execute(
         "SELECT personal.preview_stream_uuid=placement.stream_uuid,"
         "personal.preview_topic_uuid=placement.topic_uuid,"
@@ -573,8 +604,8 @@ def test_personal_preview_scope_backfills_existing_states(api, db):
     assert (
         db.execute(
             "SELECT read_at,mentioned,starred,pinned,created_at,updated_at "
-            "FROM messenger_user_message_states WHERE project_id=%s AND placement_uuid=%s",
-            (api.project_id, placement_uuid),
+            "FROM messenger_user_message_states WHERE project_id=%s AND placement_uuid=%s AND user_uuid=%s",
+            (api.project_id, placement_uuid, api.user_uuid),
         ).fetchone()
         == before
     )
