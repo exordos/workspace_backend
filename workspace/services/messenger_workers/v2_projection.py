@@ -51,7 +51,6 @@ EVENT_LOCK_CONTENTION_BASE_DELAY_SECONDS = 0.1
 EVENT_LOCK_CONTENTION_MAX_DELAY_SECONDS = 3.0
 GLOBAL_ADMISSION_LOCK_TIMEOUT = "500ms"
 REACTION_COALESCE_LIMIT = 128
-PREVIEW_CANDIDATE_LIMIT = 1000
 COUNTER_DELTA_BATCH_SIZE = 1000
 PROJECTION_PROJECT_GATE_PREFIX = "messenger-v2-projection-project-v1"
 PROJECTION_PROJECT_ADMISSION_PREFIX = "messenger-v2-projection-admission-v1"
@@ -1292,20 +1291,6 @@ def _refresh_recipient_counters(
             GROUP BY state.user_uuid
         """
 
-    visible_joins = """
-        JOIN messenger_topics AS topic
-          ON topic.project_id = placement.project_id AND topic.uuid = placement.topic_uuid
-         AND topic.deleted_at IS NULL
-        JOIN messenger_user_message_states AS personal
-          ON personal.project_id = placement.project_id
-         AND personal.placement_uuid = placement.uuid AND personal.user_uuid = target.user_uuid
-         AND personal.membership_generation = target.membership_generation
-        JOIN messenger_user_message_bindings AS access
-          ON access.project_id = personal.project_id AND access.user_uuid = personal.user_uuid
-         AND access.placement_uuid = personal.placement_uuid
-         AND access.membership_generation = personal.membership_generation
-         AND access.visibility = 'visible'
-    """
     # A standalone SELECT permits parallel aggregation; UPDATE would disable it.
     snapshots = session.execute(
         f"""
@@ -1313,98 +1298,41 @@ def _refresh_recipient_counters(
         SELECT target.uuid, target.stream_uuid, target.membership_generation,
                COALESCE(unread.unread_count, 0) AS unread_count,
                COALESCE(unread.active_unread_count, 0) AS active_unread_count,
-               COALESCE(recent_preview.uuid, older_preview.uuid) AS last_message_uuid
+               preview.uuid AS last_message_uuid
         FROM ({targets}) AS target
         LEFT JOIN unread ON unread.user_uuid = target.user_uuid
         LEFT JOIN LATERAL (
-            -- Bound the placement-first fast path. Empty/sparse recipients
-            -- must not walk the whole topic just to establish a date floor.
-            SELECT message.created_at
-            FROM (
-                SELECT placement.*
-                FROM messenger_message_placements AS placement
-                WHERE placement.project_id = target.project_id
-                  AND placement.{scope_column} = target.scope_uuid
-                ORDER BY placement.created_at DESC, placement.uuid DESC
-                LIMIT {PREVIEW_CANDIDATE_LIMIT}
-            ) AS placement
-            JOIN messenger_messages AS message
-              ON message.project_id = placement.project_id AND message.uuid = placement.message_uuid
-             AND message.deleted_at IS NULL
-            {visible_joins}
-            WHERE placement.project_id = target.project_id
-              AND placement.{scope_column} = target.scope_uuid
-            ORDER BY placement.created_at DESC, placement.uuid DESC
-            LIMIT 1
-        ) AS preview_floor ON true
-        LEFT JOIN LATERAL (
-            SELECT copy.uuid
-            FROM (
-                SELECT message.uuid, message.created_at
-                FROM messenger_messages AS message
-                WHERE message.project_id = target.project_id AND message.deleted_at IS NULL
-                  AND message.created_at >= preview_floor.created_at
-                ORDER BY message.created_at DESC
-                FETCH FIRST {PREVIEW_CANDIDATE_LIMIT} ROWS WITH TIES
-            ) AS recent
+            -- Seek this recipient's scope in canonical message order. Each
+            -- visibility check is a point lookup, including an empty scope.
+            SELECT personal.placement_uuid AS uuid
+            FROM messenger_user_message_states AS personal
             CROSS JOIN LATERAL (
-                SELECT placement.uuid
+                SELECT 1
                 FROM messenger_message_placements AS placement
-                {visible_joins}
-                WHERE placement.project_id = target.project_id
-                  AND placement.message_uuid = recent.uuid
-                  AND placement.stream_uuid = target.stream_uuid
-                  AND placement.{scope_column} = target.scope_uuid
-                ORDER BY placement.uuid DESC
-                LIMIT 1
-            ) AS copy
-            ORDER BY recent.created_at DESC, copy.uuid DESC
-            LIMIT 1
-        ) AS recent_preview ON true
-        LEFT JOIN LATERAL (
-            -- Start the fallback from this viewer's current personal state.
-            -- The lateral point lookup prevents an empty scope from driving
-            -- another complete scan of other recipients' topic placements.
-            WITH viewer AS MATERIALIZED (
-                SELECT personal.project_id, personal.placement_uuid,
-                       personal.user_uuid, personal.membership_generation
-                FROM messenger_user_message_states AS personal
-                WHERE recent_preview.uuid IS NULL
-                  AND personal.project_id = target.project_id
-                  AND personal.user_uuid = target.user_uuid
-                  AND personal.membership_generation = target.membership_generation
-            ), scoped AS MATERIALIZED (
-                SELECT placement.uuid, placement.message_uuid
-                FROM viewer AS personal
-                CROSS JOIN LATERAL (
-                    SELECT placement.uuid, placement.message_uuid, placement.topic_uuid
-                    FROM messenger_message_placements AS placement
-                    WHERE placement.project_id = personal.project_id
-                      AND placement.uuid = personal.placement_uuid
-                      AND placement.{scope_column} = target.scope_uuid
-                    LIMIT 1
-                ) AS placement
+                JOIN messenger_messages AS message
+                  ON message.project_id = placement.project_id
+                 AND message.uuid = placement.message_uuid AND message.deleted_at IS NULL
                 JOIN messenger_topics AS topic
-                  ON topic.project_id = personal.project_id AND topic.uuid = placement.topic_uuid
+                  ON topic.project_id = placement.project_id AND topic.uuid = placement.topic_uuid
                  AND topic.deleted_at IS NULL
                 JOIN messenger_user_message_bindings AS access
                   ON access.project_id = personal.project_id AND access.user_uuid = personal.user_uuid
                  AND access.placement_uuid = personal.placement_uuid
                  AND access.membership_generation = personal.membership_generation
                  AND access.visibility = 'visible'
-            )
-            SELECT scoped.uuid
-            FROM scoped
-            CROSS JOIN LATERAL (
-                SELECT message.created_at
-                FROM messenger_messages AS message
-                WHERE message.project_id = target.project_id AND message.uuid = scoped.message_uuid
-                  AND message.deleted_at IS NULL
+                WHERE placement.project_id = personal.project_id
+                  AND placement.uuid = personal.placement_uuid
+                  AND placement.{scope_column} = target.scope_uuid
                 LIMIT 1
-            ) AS message
-            ORDER BY message.created_at DESC, scoped.uuid DESC
+            ) AS visible
+            WHERE personal.project_id = target.project_id
+              AND personal.user_uuid = target.user_uuid
+              AND personal.membership_generation = target.membership_generation
+              AND personal.preview_{scope_column} = target.scope_uuid
+              AND personal.preview_created_at IS NOT NULL
+            ORDER BY personal.preview_created_at DESC, personal.placement_uuid DESC
             LIMIT 1
-        ) AS older_preview ON true
+        ) AS preview ON true
         """,
         (project_id, scope_uuid, recipients, project_id, scope_uuid, recipients),
     ).fetchall()

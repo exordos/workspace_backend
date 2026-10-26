@@ -113,7 +113,7 @@ jobs:
           WORKSPACE_TEST_DB_URL: "postgresql://workspace:pass@localhost:5432/workspace_test"
           WORKSPACE_REQUIRE_INTEGRATION_TESTS: "1"
           WORKSPACE_PRIVILEGED_NAMESPACE_TEST: "1"
-        run: tox -e 3.12-integration-nocoverage -- --integration-shard ${{ matrix.shard }} 4 --junitxml=integration-results.xml -ra
+        run: tox -e 3.12-integration-nocoverage -- --integration-shard ${{ matrix.shard }} 4 --junitxml=integration-results.xml -v -ra -o faulthandler_timeout=120
       - name: Verify namespace restriction after tests
         if: always()
         run: test "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns)" -eq 1
