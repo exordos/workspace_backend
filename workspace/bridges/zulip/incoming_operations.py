@@ -2251,7 +2251,9 @@ class Operations:
                     stream_uuid,
                     recipients=[row["viewer_user_uuid"] for row in snapshots],
                 )
-            context["files"][target] = f"urn:file:{values['uuid']}"
+            context["files"][target] = message_conversion.file_urn(
+                values["uuid"], values["content_type"]
+            )
         for remote, person in prepared["people"].items():
             user = str(await self.user(connection, account, remote))
             context["mention_uuids"][f"id:{remote}"] = user

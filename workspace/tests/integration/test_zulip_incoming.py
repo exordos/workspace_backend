@@ -4,6 +4,7 @@
 import asyncio
 import contextlib
 import json
+import importlib.util
 import os
 import pathlib
 import datetime
@@ -417,6 +418,128 @@ def test_downloaded_file_is_visible_and_announced(incoming, monkeypatch, tmp_pat
     assert response.status_code == 200, response.text
     assert response.content == b"example file"
     assert "file.created" in [item["kind"] for item in client_events(incoming)]
+
+
+@pytest.mark.parametrize(
+    ("content_type", "kind"),
+    [("image/png", "image"), ("video/mp4", "video"), ("text/plain", "file")],
+)
+def test_imported_attachment_urn_uses_mime_for_new_and_existing_files(
+    incoming, monkeypatch, tmp_path, content_type, kind
+):
+    api, db, account, http, _url = incoming
+    monkeypatch.setenv("WORKSPACE_FILE_STORAGE_PATH", str(tmp_path))
+    http.download = mock.AsyncMock(return_value=(b"attachment bytes", content_type))
+    markdown = "![attachment](/user_uploads/1/a/attachment)"
+    apply(incoming, event(markdown, 801))
+    apply(incoming, event(markdown, 802))
+    drain()
+    file_uuid = db.execute(
+        "SELECT uuid FROM m_workspace_files WHERE project_id=%s",
+        (account["project_id"],),
+    ).fetchone()[0]
+    messages = api.get("/v1/messenger/messages/").json()
+    assert len(messages) == 2
+    assert all(
+        message["payload"]["content"] == f"![attachment](urn:{kind}:{file_uuid})"
+        for message in messages
+    )
+    assert http.download.await_count == 1
+    assert db.execute(
+        "SELECT count(DISTINCT content_uuid) FROM messenger_messages WHERE project_id=%s",
+        (account["project_id"],),
+    ).fetchone() == (1,)
+    response = api.get(f"/v1/messenger/files/{file_uuid}/actions/download")
+    assert response.status_code == 200, response.text
+    assert response.content == b"attachment bytes"
+
+
+def test_media_reference_migration_preserves_pages_versions_and_replay(
+    incoming, monkeypatch, tmp_path
+):
+    api, db, account, http, _url = incoming
+    monkeypatch.setenv("WORKSPACE_FILE_STORAGE_PATH", str(tmp_path))
+    http.download = mock.AsyncMock(return_value=(b"image bytes", "image/png"))
+    markdown = "![image](/user_uploads/1/a/image.png)"
+    imported = (event(markdown, 811), event(markdown, 812))
+    with mock.patch.object(
+        message_conversion,
+        "file_urn",
+        side_effect=lambda identifier, _mime: f"urn:file:{identifier}",
+    ):
+        apply(incoming, *imported)
+    drain()
+    file_uuid = db.execute(
+        "SELECT uuid FROM m_workspace_files WHERE project_id=%s",
+        (account["project_id"],),
+    ).fetchone()[0]
+    before = db.execute(
+        "SELECT uuid,content_uuid,content_revision,content_updated_at "
+        "FROM messenger_messages WHERE project_id=%s ORDER BY uuid",
+        (account["project_id"],),
+    ).fetchall()
+    original = db.execute(
+        "SELECT workspace_content,provider_content FROM messenger_message_contents WHERE uuid=%s",
+        (before[0][1],),
+    ).fetchone()
+    assert original[0]["content"] == f"![image](urn:file:{file_uuid})"
+    outgoing_before = db.execute(
+        "SELECT count(*) FROM zulip_outgoing_intents"
+    ).fetchone()
+    events_before = len(client_events(incoming))
+    filename = next(conftest.MIGRATIONS_DIR.glob("0277-*media-reference-types*.py"))
+    spec = importlib.util.spec_from_file_location("tested_media_migration", filename)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    with contexts.Context().session_manager() as session:
+        module.migration_step.upgrade(session)
+    after = db.execute(
+        "SELECT uuid,content_uuid,content_revision,content_updated_at "
+        "FROM messenger_messages WHERE project_id=%s ORDER BY uuid",
+        (account["project_id"],),
+    ).fetchall()
+    expected = f"![image](urn:image:{file_uuid})"
+    assert all(
+        message["payload"]["content"] == expected
+        for message in api.get("/v1/messenger/messages/").json()
+    )
+    assert len({row[1] for row in after}) == 1
+    for old, new in zip(before, after, strict=True):
+        assert new[0] == old[0]
+        assert new[1] != old[1]
+        assert new[2:] == (old[2] + 1, old[3])
+        assert db.execute(
+            "SELECT previous_content_uuid FROM messenger_message_content_versions "
+            "WHERE project_id=%s AND message_uuid=%s AND revision=%s",
+            (account["project_id"], new[0], new[2]),
+        ).fetchone() == (old[1],)
+    assert (
+        db.execute(
+            "SELECT workspace_content,provider_content FROM messenger_message_contents WHERE uuid=%s",
+            (before[0][1],),
+        ).fetchone()
+        == original
+    )
+    assert db.execute(
+        "SELECT provider_content FROM messenger_message_contents WHERE uuid=%s",
+        (after[0][1],),
+    ).fetchone() == (original[1],)
+    with contexts.Context().session_manager() as session:
+        module.migration_step.upgrade(session)
+    apply(incoming, *imported)
+    assert (
+        db.execute(
+            "SELECT uuid,content_uuid,content_revision,content_updated_at "
+            "FROM messenger_messages WHERE project_id=%s ORDER BY uuid",
+            (account["project_id"],),
+        ).fetchall()
+        == after
+    )
+    assert (
+        db.execute("SELECT count(*) FROM zulip_outgoing_intents").fetchone()
+        == outgoing_before
+    )
+    assert len(client_events(incoming)) == events_before
 
 
 def test_receive_cursor_and_inbox_are_atomic_and_deduplicated(incoming):
