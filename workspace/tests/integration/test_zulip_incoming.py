@@ -143,13 +143,15 @@ def test_conversion_cache_collision_cannot_reuse_another_source(incoming):
     }
 
 
-def apply(incoming, *events):
+def apply(incoming, *events, reaction_user_limit=5):
     api, db, account, http, database_url = incoming
 
     async def run():
         database = zulip_outgoing.Database(database_url)
         await database.open()
-        operations = incoming_operations.Operations(database, http)
+        operations = incoming_operations.Operations(
+            database, http, reaction_user_limit=reaction_user_limit
+        )
         try:
             for value in events:
                 prepared = await prepare_dependencies(
@@ -4124,3 +4126,74 @@ def test_live_clients_receive_incoming_while_batched_counters_wait(
                     worker.result(10)
     finally:
         cfg.CONF.clear_override("v2_projection_workers", group=messenger_worker.DOMAIN)
+
+
+@pytest.mark.parametrize("limit", [0, 2, 5])
+def test_incoming_reaction_snapshots_omit_count_only_user_lists(incoming, limit):
+    api, db, account, *_ = incoming
+    apply(incoming, event())
+    message = api.get("/v1/messenger/messages/").json()[0]
+    canonical_uuid = db.execute(
+        "SELECT message_uuid FROM messenger_message_placements "
+        "WHERE project_id=%s AND uuid=%s",
+        (account["project_id"], message["uuid"]),
+    ).fetchone()[0]
+    users = [uuid.uuid4() for _index in range(limit)]
+    for user_uuid in users:
+        conftest.seed_workspace_user(db, user_uuid, f"reactor-{user_uuid}")
+        db.execute(
+            "SELECT messenger_v2_register_project_user(%s, %s)",
+            (account["project_id"], user_uuid),
+        )
+    for emoji_name, reactors in (
+        ("grin", users),
+        ("eyes", [account["owner_user_uuid"]]),
+    ):
+        for user_uuid in reactors:
+            db.execute(
+                "INSERT INTO messenger_message_reaction_facts "
+                "(uuid, project_id, canonical_message_uuid, placement_uuid, "
+                "user_uuid, emoji_name) VALUES (%s,%s,%s,%s,%s,%s)",
+                (
+                    uuid.uuid4(),
+                    account["project_id"],
+                    canonical_uuid,
+                    message["uuid"],
+                    user_uuid,
+                    emoji_name,
+                ),
+            )
+    reaction = {
+        "type": "reaction",
+        "op": "add",
+        "message_id": 101,
+        "user_id": 7,
+        "emoji_name": "grin",
+        "emoji_code": "1f601",
+        "reaction_type": "unicode_emoji",
+    }
+    apply(incoming, reaction, reaction_user_limit=limit)
+    expected_users = {"eyes": [str(account["owner_user_uuid"])]} if limit else {}
+    stored = db.execute(
+        "SELECT reactions, reaction_users FROM messenger_messages WHERE uuid=%s",
+        (canonical_uuid,),
+    ).fetchone()
+    assert stored == ({"grin": limit + 1, "eyes": 1}, expected_users)
+    response = api.get(f"/v1/messenger/messages/{message['uuid']}")
+    assert response.status_code == 200, response.text
+    assert response.json()["reaction_users"] == expected_users
+    snapshot = next(
+        row
+        for row in reversed(client_events(incoming))
+        if row["kind"] == "message.updated"
+    )
+    assert snapshot["reaction_users"] == expected_users
+
+    apply(incoming, {**reaction, "op": "remove"}, reaction_user_limit=limit)
+    if limit:
+        expected_users["grin"] = sorted(str(user) for user in users)
+    stored = db.execute(
+        "SELECT reaction_users FROM messenger_messages WHERE uuid=%s",
+        (canonical_uuid,),
+    ).fetchone()[0]
+    assert stored == expected_users
