@@ -536,7 +536,10 @@ def test_old_scope_preview_preserves_visibility_dates_and_uuid_ties(
 
 
 @pytest.mark.isolated_schema
-def test_personal_preview_scope_backfills_existing_states(api, db):
+@pytest.mark.parametrize("relocated_past_extent", [False, True])
+def test_personal_preview_scope_backfills_existing_states(
+    api, db, relocated_past_extent
+):
     db.execute(
         "DROP TRIGGER messenger_set_personal_preview_scope ON messenger_user_message_states"
     )
@@ -582,7 +585,26 @@ def test_personal_preview_scope_backfills_existing_states(api, db):
     spec.loader.exec_module(module)
     module.BATCH_BLOCKS = 1
     with contexts.Context().session_manager() as session:
-        module.migration_step.upgrade(session)
+        captured_extent = False
+
+        def execute(query, parameters=None):
+            nonlocal captured_extent
+            if (
+                relocated_past_extent
+                and not captured_extent
+                and query.startswith("SELECT ceil")
+            ):
+                # Emulate pre-existing rows relocating beyond the extent that
+                # was captured before a concurrent flag update.
+                captured_extent = True
+                return types.SimpleNamespace(fetchone=lambda: {"blocks": 0})
+            return session.execute(query, parameters)
+
+        module.migration_step.upgrade(
+            types.SimpleNamespace(
+                execute=execute, commit=session.commit, engine=session.engine
+            )
+        )
     assert db.execute(
         "SELECT count(*) FROM messenger_user_message_states "
         "WHERE project_id=%s AND preview_stream_uuid=%s AND preview_topic_uuid=%s "

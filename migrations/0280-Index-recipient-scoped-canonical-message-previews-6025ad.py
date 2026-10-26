@@ -186,7 +186,21 @@ def _backfill(session):
         # Parent changes are atomic, but a concurrent move/date update can race
         # a backfill snapshot. Another pass repairs any such stale overwrite.
         if repaired == 0:
-            return
+            # A concurrent flag update can relocate an unprocessed row behind
+            # the physical cursor. Verify the whole snapshot before finishing.
+            mismatch = session.execute("""
+                SELECT count(*) > 0 AS mismatch
+                    FROM messenger_user_message_states AS personal
+                    JOIN messenger_message_placements AS placement
+                      ON placement.project_id=personal.project_id AND placement.uuid=personal.placement_uuid
+                    JOIN messenger_messages AS message
+                      ON message.project_id=placement.project_id AND message.uuid=placement.message_uuid
+                    WHERE (personal.preview_stream_uuid,personal.preview_topic_uuid,personal.preview_created_at)
+                        IS DISTINCT FROM (placement.stream_uuid,placement.topic_uuid,message.created_at)
+            """).fetchone()["mismatch"]
+            session.commit()
+            if not mismatch:
+                return
 
 
 def _indexes(session, *, create):
