@@ -17,6 +17,7 @@ LOOKUP_SQL = """
     JOIN messenger_message_contents contents ON contents.uuid=cache.content_uuid
     WHERE cache.uuid=%s AND cache.provider_uuid=%s AND cache.direction=%s
       AND cache.context_hash=%s AND contents.{source}=%s
+    FOR KEY SHARE OF contents
 """
 SAVE_SQL = """
     INSERT INTO bridge_zulip_v5_content_snapshots

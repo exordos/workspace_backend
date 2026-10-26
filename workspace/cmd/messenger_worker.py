@@ -79,6 +79,9 @@ def build_worker_services() -> tuple[
             ),
             event_prune_interval_seconds=(CONF[DOMAIN].event_prune_interval_seconds),
             event_prune_batch_size=CONF[DOMAIN].event_prune_batch_size,
+            history_retention_seconds=CONF[DOMAIN].history_retention_seconds,
+            history_prune_interval_seconds=CONF[DOMAIN].history_prune_interval_seconds,
+            history_prune_batch_size=CONF[DOMAIN].history_prune_batch_size,
             v2_projection_enabled=projection_enabled,
             v2_projection_max_tasks_per_iteration=(
                 CONF[DOMAIN].v2_projection_max_tasks_per_iteration

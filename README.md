@@ -222,3 +222,41 @@ The Python 3.10–3.14 unit and functional jobs use the `nocoverage` tox factor.
 Coverage is still collected and reported separately with `tox -e begin,3.12,end`;
 other tox environments retain coverage by default. CI runs for every PR, pushes
 to `master`, and tags. A newer PR revision cancels that PR's obsolete run.
+
+## Completed service history retention
+
+The primary `workspace-messenger-worker` maintenance process collects successful
+service work in bounded transactions. Configure its lifetime in seconds:
+
+```ini
+[messenger_worker_agent]
+history_retention_seconds = 3600
+history_prune_interval_seconds = 60
+history_prune_batch_size = 1000
+```
+
+The default history lifetime is one hour. Each pass removes at most the configured
+batch size per category, with a maximum of 1000. Full batches continue on the next
+worker iteration until the backlog drains; otherwise maintenance waits for the
+configured interval. Projection-only processes do not run maintenance.
+
+Collection includes completed domain outbox aggregates (tasks and fanout rows
+cascade from their root), successful Zulip inbox events behind the durable queue
+cursor, completed outgoing intents, expired standalone conversion cache entries,
+and content pages without references. The outbox and all fanout descendants must
+have completed before the cutoff. Pending work, unresolved failures and dead
+letters remain available for recovery. Message content pages remain pinned by
+current messages, every edit revision and delivery snapshots. Outgoing conversion
+cache/pages are preserved while any unfinished message intent may still use them.
+
+The worker also deletes expired `history-imports/v1/<bridge>/<job>/batch.json`
+staging objects from the retired ingress protocol, using bounded paginated storage
+requests. Other object namespaces, file bytes, file metadata, migration archives,
+message history and recovery cursors are preserved. This staging collection needs
+`ListBucket` and `DeleteObject` access to the configured file bucket.
+
+Browser event replay retains its separate existing `event_retention_seconds`
+setting, and mutation receipt deduplication retains its separate
+`[messenger_mutations] receipt_retention_seconds` setting. Service history expiry
+does not shorten either contract. Deleted PostgreSQL rows become reusable space;
+this worker does not run table rewrites or index rebuilds.

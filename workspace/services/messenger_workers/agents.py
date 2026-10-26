@@ -35,6 +35,8 @@ from workspace.messenger_api import topic_summarization
 from workspace.messenger_api import publication
 from workspace.services.messenger_workers import projection_wakeup
 from workspace.services.messenger_workers import v2_projection
+from workspace.services.messenger_workers import retention
+from workspace.services.messenger_workers import import_retention
 
 if typing.TYPE_CHECKING:
     from workspace.services.messenger_workers import mutation_runtime
@@ -69,6 +71,9 @@ class MessengerWorkerAgent(basic.BasicService):
         event_retention: datetime.timedelta = (sql_canonical_store.EVENT_RETENTION),
         event_prune_interval_seconds: int = EVENT_PRUNE_INTERVAL_SECONDS,
         event_prune_batch_size: int = (sql_canonical_store.EVENT_PRUNE_BATCH_SIZE),
+        history_retention_seconds: int = retention.DEFAULT_RETENTION_SECONDS,
+        history_prune_interval_seconds: int = 60,
+        history_prune_batch_size: int = retention.DEFAULT_BATCH_SIZE,
         v2_projection_enabled: bool = False,
         v2_projection_max_tasks_per_iteration: int = 100,
         v2_fanout_batch_size: int = v2_projection.DEFAULT_FANOUT_BATCH_SIZE,
@@ -95,6 +100,11 @@ class MessengerWorkerAgent(basic.BasicService):
         self._event_retention = event_retention
         self._event_prune_interval_seconds = event_prune_interval_seconds
         self._event_prune_batch_size = event_prune_batch_size
+        self._history_retention_seconds = history_retention_seconds
+        self._history_prune_interval_seconds = history_prune_interval_seconds
+        self._history_prune_batch_size = history_prune_batch_size
+        self._last_history_prune: float | None = None
+        self._import_history_collector = import_retention.Collector()
         self._v2_projection_enabled = v2_projection_enabled
         self._v2_projection_max_tasks_per_iteration = (
             v2_projection_max_tasks_per_iteration
@@ -152,6 +162,47 @@ class MessengerWorkerAgent(basic.BasicService):
             return
         now = datetime.datetime.now(datetime.timezone.utc)
         monotonic_now = time.monotonic()
+        if (
+            self._last_history_prune is None
+            or monotonic_now - self._last_history_prune
+            >= self._history_prune_interval_seconds
+        ):
+            backlog = False
+            for category in retention.QUERIES:
+                try:
+                    with database_session_context() as session:
+                        removed = retention.prune(
+                            session,
+                            category,
+                            now,
+                            retention_seconds=self._history_retention_seconds,
+                            batch_size=self._history_prune_batch_size,
+                        )
+                    backlog |= removed == self._history_prune_batch_size
+                    if removed:
+                        LOG.info(
+                            "Pruned %d expired service history rows (%s)",
+                            removed,
+                            category,
+                        )
+                except Exception:
+                    LOG.exception(
+                        "Failed to prune expired service history (%s)", category
+                    )
+            try:
+                removed, more = self._import_history_collector.prune(
+                    now, self._history_retention_seconds, self._history_prune_batch_size
+                )
+                backlog |= more
+                if removed:
+                    LOG.info("Pruned %d retired history import batches", removed)
+            except Exception as error:
+                # Storage errors can include request keys and endpoints.
+                LOG.warning(
+                    "Failed to prune retired history batches: %s", type(error).__name__
+                )
+            if not backlog:
+                self._last_history_prune = monotonic_now
         prune_due = (
             self._last_event_prune is None
             or monotonic_now - self._last_event_prune
