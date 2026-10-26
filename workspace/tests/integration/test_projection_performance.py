@@ -19,6 +19,7 @@ from oslo_config import cfg
 from restalchemy.common import contexts
 from restalchemy.storage.sql import sessions
 
+from workspace.bridges.zulip import incoming_operations
 from workspace.common import messenger_reaction_opts
 from workspace.messenger_api import publication
 from workspace.messenger_api import events
@@ -130,6 +131,104 @@ def _plan_nodes(plan):
     yield plan
     for child in plan.get("Plans", []):
         yield from _plan_nodes(child)
+
+
+@pytest.mark.isolated_schema
+@pytest.mark.parametrize("plan_mode", ["force_custom_plan", "force_generic_plan"])
+def test_flag_snapshot_batch_stays_bounded_with_stale_statistics(api, db, plan_mode):
+    noise_user = sys_uuid.uuid4()
+    conftest.seed_workspace_user(db, noise_user, f"cassi-noise-{noise_user}")
+    noise_api = conftest.ApiClient(api.base_url, noise_user, sys_uuid.uuid4())
+    noise_stream, _ = _create_message(noise_api, "cassi-snapshot-plan-noise")
+
+    def seed_messages(client, stream, count):
+        return [
+            row[0]
+            for row in db.execute(
+                """
+                WITH content AS MATERIALIZED (
+                    SELECT messenger_resolve_message_content(
+                        '{"kind":"markdown","content":"Snapshot history"}'::jsonb,NULL) AS uuid
+                ), messages AS (
+                    INSERT INTO messenger_messages
+                        (uuid,project_id,author_uuid,content_uuid)
+                    SELECT gen_random_uuid(),%s,%s,content.uuid
+                    FROM generate_series(1,%s) CROSS JOIN content
+                    RETURNING uuid,project_id,created_at
+                ), placements AS (
+                    INSERT INTO messenger_message_placements
+                        (uuid,project_id,message_uuid,stream_uuid,topic_uuid,created_at)
+                    SELECT gen_random_uuid(),project_id,uuid,%s,%s,created_at FROM messages
+                    RETURNING uuid,project_id
+                ), access AS (
+                    INSERT INTO messenger_user_message_bindings
+                        (uuid,project_id,placement_uuid,user_uuid,membership_generation,
+                         relation_role,visibility,permissions)
+                    SELECT gen_random_uuid(),project_id,uuid,%s,1,'author','visible','{}'::jsonb
+                    FROM placements
+                    RETURNING uuid,project_id,placement_uuid,user_uuid,membership_generation
+                )
+                INSERT INTO messenger_user_message_states
+                    (uuid,project_id,placement_uuid,user_uuid,membership_generation,binding_uuid)
+                SELECT gen_random_uuid(),project_id,placement_uuid,user_uuid,membership_generation,uuid
+                FROM access RETURNING placement_uuid
+                """,
+                (
+                    client.project_id,
+                    client.user_uuid,
+                    count,
+                    stream["uuid"],
+                    stream["default_topic_uuid"],
+                    client.user_uuid,
+                ),
+            )
+        ]
+
+    noise = seed_messages(noise_api, noise_stream, 20000)
+    for table in (
+        "messenger_messages",
+        "messenger_message_contents",
+        "messenger_message_placements",
+        "messenger_user_message_bindings",
+        "messenger_user_message_states",
+        "messenger_stream_bindings",
+        "messenger_streams",
+        "messenger_topics",
+    ):
+        db.execute(f"ANALYZE {table}")
+
+    # A new recipient's batch is absent from the existing planner statistics.
+    stream, _ = _create_message(api, "cassi-snapshot-plan-target")
+    identifiers = seed_messages(api, stream, 1000)
+    db.execute(
+        "UPDATE messenger_user_message_bindings SET visibility='hidden' "
+        "WHERE project_id=%s AND placement_uuid=%s",
+        (api.project_id, identifiers[0]),
+    )
+    db.execute(
+        "UPDATE messenger_user_message_states SET membership_generation=2 "
+        "WHERE project_id=%s AND placement_uuid=%s",
+        (api.project_id, identifiers[1]),
+    )
+    requested = [*identifiers, identifiers[2], noise[0], sys_uuid.uuid4()]
+    db.execute(f"SET plan_cache_mode={plan_mode}")
+    db.execute("SET statement_timeout='5s'")
+    try:
+        snapshots = db.execute(
+            incoming_operations.SELECT_FLAG_SNAPSHOTS_SQL,
+            (api.project_id, api.user_uuid, requested),
+            prepare=True,
+        ).fetchall()
+        for empty in ([], None):
+            assert not db.execute(
+                incoming_operations.SELECT_FLAG_SNAPSHOTS_SQL,
+                (api.project_id, api.user_uuid, empty),
+                prepare=True,
+            ).fetchall()
+    finally:
+        db.execute("RESET statement_timeout; RESET plan_cache_mode")
+    assert len(snapshots) == 998
+    assert {row[1] for row in snapshots} == set(identifiers[2:])
 
 
 @pytest.mark.parametrize(

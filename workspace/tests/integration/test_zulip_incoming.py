@@ -2081,9 +2081,14 @@ def test_thousand_read_flags_use_one_exact_batch_and_one_counter_scope(incoming)
         "SELECT count(*) FROM messenger_domain_outbox_events WHERE project_id=%s",
         (account["project_id"],),
     ).fetchone()[0]
-    with mock.patch.object(
-        incoming_operations, "rows", wraps=incoming_operations.rows
-    ) as queries:
+    select_rows = incoming_operations.rows
+
+    async def bounded_rows(connection, statement, parameters=()):
+        if statement == incoming_operations.SELECT_FLAG_SNAPSHOTS_SQL:
+            await connection.execute("SET LOCAL statement_timeout='5s'")
+        return await select_rows(connection, statement, parameters)
+
+    with mock.patch.object(incoming_operations, "rows", wraps=bounded_rows) as queries:
         apply(
             incoming,
             {

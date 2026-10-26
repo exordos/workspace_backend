@@ -238,9 +238,18 @@ UPDATE_FLAGS_SQL = """
            OR (%s AND starred IS DISTINCT FROM %s))
     RETURNING *
 """
+# Each recipient has at most one visible state per placement. Keep batch size
+# out of the view's join order when a new recipient has no useful statistics.
 SELECT_FLAG_SNAPSHOTS_SQL = """
-    SELECT * FROM messenger_api_user_messages_v1
-    WHERE project_id=%s AND user_uuid=%s AND uuid=ANY(%s::uuid[])
+    SELECT snapshot.*
+    FROM (SELECT %s::uuid AS project_id, %s::uuid AS user_uuid) recipient
+    CROSS JOIN (SELECT DISTINCT unnest(%s::uuid[]) AS uuid) requested
+    CROSS JOIN LATERAL (
+        SELECT * FROM messenger_api_user_messages_v1
+        WHERE project_id=recipient.project_id AND user_uuid=recipient.user_uuid
+          AND uuid=requested.uuid
+        LIMIT 1
+    ) snapshot
 """
 SELECT_FILE_RECIPIENTS_SQL = """
     SELECT * FROM m_workspace_visible_files_v1 WHERE uuid = %s
