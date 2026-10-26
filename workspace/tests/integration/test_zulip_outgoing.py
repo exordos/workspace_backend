@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import datetime
 import importlib.util
+import json
 from unittest import mock
 
 import aiohttp
@@ -25,6 +26,7 @@ from restalchemy.dm import filters
 
 from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.dm import v2_models
+from workspace.services.messenger_workers import v2_projection
 from workspace.tests.integration import conftest
 
 
@@ -1278,6 +1280,424 @@ def test_send_uses_workspace_entity_uuid_as_local_id(outgoing, db, _test_databas
             assert len(sent) == 1
             assert sent[0]["local_id"] == str(canonical)
             assert sent[0]["queue_id"] == "sender-queue"
+
+    asyncio.run(run())
+
+
+@pytest.fixture
+def direct_outgoing(outgoing, db):
+    api, account, channel, *_ = outgoing
+    peer = external_models.ExternalAccount(
+        project_id=api.project_id,
+        owner_user_uuid=uuid.uuid4(),
+        provider="zulip",
+        provider_uuid=account.provider_uuid,
+        external_account_id="9",
+        settings={},
+    )
+    peer.insert()
+    conftest.seed_workspace_user(
+        db, peer.owner_user_uuid, f"zulip-{peer.owner_user_uuid}"
+    )
+    db.execute(
+        "SELECT messenger_v2_register_project_user(%s,%s)",
+        (api.project_id, peer.owner_user_uuid),
+    )
+    db.execute(
+        "UPDATE m_workspace_users SET source='zulip',status='offline' WHERE uuid=%s",
+        (peer.owner_user_uuid,),
+    )
+    db.execute(
+        "UPDATE messenger_streams SET private=true,direct_user_uuid=%s,"
+        "provider_identity=%s WHERE project_id=%s AND uuid=%s",
+        (
+            peer.owner_user_uuid,
+            f"dm:{channel.stream_uuid}",
+            api.project_id,
+            channel.stream_uuid,
+        ),
+    )
+    yield outgoing, peer
+    peer.delete()
+
+
+def test_private_send_captures_imported_peer_without_local_binding(
+    direct_outgoing, db, _test_database_url
+):
+    outgoing, peer = direct_outgoing
+    api, account, channel, *_ = outgoing
+    assert peer.status == "new"
+    assert peer.settings == {}
+    assert db.execute(
+        "SELECT user_uuid FROM messenger_stream_bindings "
+        "WHERE project_id=%s AND stream_uuid=%s AND active",
+        (api.project_id, channel.stream_uuid),
+    ).fetchall() == [(account.owner_user_uuid,)]
+    create(outgoing)
+    assert intents(db, account)[0][3]["recipient_ids"] == [9]
+
+    async def run():
+        async with sender(account, _test_database_url) as (service, server):
+            await drain(service)
+            sent = [
+                data
+                for method, path, data in server.calls
+                if method == "POST" and path == "/api/v1/messages"
+            ]
+            assert len(sent) == 1
+            assert sent[0]["type"] == "direct"
+            assert json.loads(sent[0]["to"]) == [9]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("recipient_ids", [None, [7]])
+@pytest.mark.parametrize("route_snapshot", [False, True])
+def test_private_sender_resolves_peer_for_old_unprepared_intents(
+    direct_outgoing, db, _test_database_url, recipient_ids, route_snapshot
+):
+    outgoing, _peer = direct_outgoing
+    _api, account, *_ = outgoing
+    create(outgoing)
+    data = intents(db, account)[0][3]
+    data["recipient_ids"] = recipient_ids
+    if not route_snapshot:
+        del data["channel_type"]
+        del data["direct_user_uuid"]
+    db.execute(
+        "UPDATE zulip_outgoing_intents SET data=%s WHERE external_account_uuid=%s",
+        (pg_json.Jsonb(data), account.uuid),
+    )
+
+    async def run():
+        async with sender(account, _test_database_url) as (service, server):
+            await drain(service)
+            sent = [
+                json.loads(data["to"])
+                for method, path, data in server.calls
+                if method == "POST" and path == "/api/v1/messages"
+            ]
+            assert sent == [[9]]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("other_scope", [None, "project", "provider", "kind"])
+def test_private_send_waits_for_missing_peer_identity(
+    direct_outgoing, db, _test_database_url, other_scope
+):
+    outgoing, peer = direct_outgoing
+    _api, account, *_ = outgoing
+    create(outgoing)
+    db.execute(
+        "UPDATE m_external_accounts_v2 SET external_account_id=NULL WHERE uuid=%s",
+        (peer.uuid,),
+    )
+    other = None
+    if other_scope is not None:
+        other = external_models.ExternalAccount(
+            project_id=uuid.uuid4() if other_scope == "project" else peer.project_id,
+            owner_user_uuid=peer.owner_user_uuid,
+            provider="other" if other_scope == "kind" else "zulip",
+            provider_uuid=account.provider_uuid
+            if other_scope in ("project", "kind")
+            else external_models.Provider.register("other.example.com").uuid,
+            external_account_id="99",
+            settings={},
+        )
+        other.insert()
+
+    async def run():
+        async with sender(account, _test_database_url) as (service, server):
+            await service.dispatch()
+            await asyncio.gather(*list(service.tasks.values()))
+            assert not any(
+                method == "POST" and path == "/api/v1/messages"
+                for method, path, _data in server.calls
+            )
+            rows = intents(db, account)
+            assert rows[0][2] == "new"
+            assert db.execute(
+                "SELECT request FROM zulip_outgoing_intents WHERE external_account_uuid=%s",
+                (account.uuid,),
+            ).fetchone() == (None,)
+
+    try:
+        asyncio.run(run())
+    finally:
+        if other is not None:
+            other.delete()
+
+
+@pytest.mark.parametrize("kind", ["group", "self"])
+def test_direct_recipient_fix_preserves_group_and_self_messages(
+    direct_outgoing, db, _test_database_url, kind
+):
+    outgoing, peer = direct_outgoing
+    api, account, channel, *_ = outgoing
+    if kind == "group":
+        conftest.seed_user_stream_binding(
+            db, api.project_id, channel.stream_uuid, peer.owner_user_uuid
+        )
+        db.execute(
+            "UPDATE messenger_streams SET private=false,direct_user_uuid=NULL "
+            "WHERE uuid=%s",
+            (channel.stream_uuid,),
+        )
+        expected = [7, 9]
+    else:
+        db.execute(
+            "UPDATE messenger_streams SET direct_user_uuid=%s WHERE uuid=%s",
+            (account.owner_user_uuid, channel.stream_uuid),
+        )
+        expected = [7]
+    create(outgoing)
+    assert sorted(intents(db, account)[0][3]["recipient_ids"]) == expected
+
+    async def run():
+        async with sender(account, _test_database_url) as (service, server):
+            await drain(service)
+            sent = [
+                sorted(json.loads(data["to"]))
+                for method, path, data in server.calls
+                if method == "POST" and path == "/api/v1/messages"
+            ]
+            assert sent == [expected]
+
+    asyncio.run(run())
+
+
+@pytest.mark.isolated_schema
+def test_direct_recipient_migration_replaces_only_recipient_capture(
+    direct_outgoing, db
+):
+    outgoing, _peer = direct_outgoing
+    _api, account, *_ = outgoing
+    path = next(conftest.MIGRATIONS_DIR.glob("0280-*.py"))
+    spec = importlib.util.spec_from_file_location("direct_recipient_migration", path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    current = db.execute(
+        "SELECT pg_get_functiondef('zulip_capture_outgoing()'::regprocedure)"
+    ).fetchone()[0]
+    with contexts.Context().session_manager() as session:
+        migration.migration_step.downgrade(session)
+    create(outgoing)
+    assert intents(db, account)[0][3]["recipient_ids"] == [7]
+    with contexts.Context().session_manager() as session:
+        migration.migration_step.upgrade(session)
+        migration.migration_step.upgrade(session)
+    create(outgoing)
+    assert intents(db, account)[-1][3]["recipient_ids"] == [9]
+    assert (
+        db.execute(
+            "SELECT pg_get_functiondef('zulip_capture_outgoing()'::regprocedure)"
+        ).fetchone()[0]
+        == current
+    )
+
+
+@pytest.mark.parametrize("peer_state", ["imported", "connected", "pending", "unlinked"])
+@pytest.mark.parametrize(
+    "stream_kind",
+    [
+        "private",
+        "group",
+        "channel",
+        "invite_only_channel",
+        "announcement_channel",
+        pytest.param("native_private", marks=pytest.mark.isolated_schema),
+        pytest.param("native_group", marks=pytest.mark.isolated_schema),
+        pytest.param("native_channel", marks=pytest.mark.isolated_schema),
+        pytest.param("native_invite_only_channel", marks=pytest.mark.isolated_schema),
+        pytest.param("native_announcement_channel", marks=pytest.mark.isolated_schema),
+    ],
+)
+def test_recipient_matrix_for_stream_type_and_import_state(
+    direct_outgoing, db, _test_database_url, peer_state, stream_kind
+):
+    outgoing, peer = direct_outgoing
+    api, account, channel, *_ = outgoing
+    native = stream_kind.startswith("native_")
+    kind = stream_kind.removeprefix("native_")
+    if peer_state != "imported":
+        db.execute(
+            "UPDATE m_workspace_users SET source='iam',status='active' WHERE uuid=%s",
+            (peer.owner_user_uuid,),
+        )
+    if peer_state == "connected":
+        db.execute(
+            "UPDATE m_external_accounts_v2 SET status='active',settings=%s WHERE uuid=%s",
+            (
+                pg_json.Jsonb(
+                    {
+                        "server_url": "https://zulip.example.com",
+                        "email": "peer@example.com",
+                        "api_key": "peer-key",
+                    }
+                ),
+                peer.uuid,
+            ),
+        )
+    elif peer_state == "pending":
+        db.execute(
+            "UPDATE m_external_accounts_v2 SET external_account_id=NULL WHERE uuid=%s",
+            (peer.uuid,),
+        )
+    elif peer_state == "unlinked":
+        db.execute(
+            "UPDATE m_external_accounts_v2 SET owner_user_uuid=%s WHERE uuid=%s",
+            (uuid.uuid4(), peer.uuid),
+        )
+    if native and kind == "private":
+        conftest.seed_user_stream_binding(
+            db, api.project_id, channel.stream_uuid, peer.owner_user_uuid
+        )
+    if kind != "private":
+        conftest.seed_user_stream_binding(
+            db, api.project_id, channel.stream_uuid, peer.owner_user_uuid
+        )
+        db.execute(
+            "UPDATE messenger_streams SET private=false,direct_user_uuid=NULL,"
+            "provider_identity=%s,invite_only=%s,announce=%s WHERE uuid=%s",
+            (
+                f"dm:{channel.stream_uuid}" if kind == "group" else "42",
+                kind == "invite_only_channel",
+                kind == "announcement_channel",
+                channel.stream_uuid,
+            ),
+        )
+    third = None
+    if kind == "group":
+        third = external_models.ExternalAccount(
+            project_id=api.project_id,
+            owner_user_uuid=uuid.uuid4(),
+            provider="zulip",
+            provider_uuid=account.provider_uuid,
+            external_account_id="11",
+            settings={},
+        )
+        third.insert()
+        conftest.seed_workspace_user(
+            db, third.owner_user_uuid, f"zulip-{third.owner_user_uuid}"
+        )
+        conftest.seed_user_stream_binding(
+            db, api.project_id, channel.stream_uuid, third.owner_user_uuid
+        )
+    if native:
+        for table, where, identifier in [
+            ("messenger_streams", "uuid", channel.stream_uuid),
+            ("messenger_topics", "stream_uuid", channel.stream_uuid),
+            ("messenger_stream_bindings", "stream_uuid", channel.stream_uuid),
+            ("messenger_user_topic_bindings", "project_id", api.project_id),
+        ]:
+            db.execute(
+                f"UPDATE {table} SET source_name='native',provider_uuid=NULL,"
+                f"provider_identity=NULL,status='active' WHERE {where}=%s",
+                (identifier,),
+            )
+    try:
+        public = create(outgoing)
+
+        async def run():
+            async with sender(account, _test_database_url) as (service, server):
+                if native:
+                    assert public["source_name"] == "native"
+                    assert not intents(db, account)
+                    with contexts.Context().session_manager() as session:
+                        v2_projection.drain_projection_queue(
+                            session, f"cassi:{uuid.uuid4()}"
+                        )
+                    for user_uuid in [peer.owner_user_uuid] + (
+                        [third.owner_user_uuid] if third is not None else []
+                    ):
+                        received = api.get(
+                            f"/v1/messenger/messages/{public['uuid']}", user=user_uuid
+                        )
+                        assert received.status_code == 200, received.text
+                        assert received.json()["payload"] == public["payload"]
+                elif peer_state in ("pending", "unlinked") and kind in (
+                    "private",
+                    "group",
+                ):
+                    await service.dispatch()
+                    await asyncio.gather(*list(service.tasks.values()))
+                    assert not any(
+                        method == "POST" and path == "/api/v1/messages"
+                        for method, path, _data in server.calls
+                    )
+                    db.execute(
+                        "UPDATE m_external_accounts_v2 SET external_account_id='9',owner_user_uuid=%s WHERE uuid=%s",
+                        (peer.owner_user_uuid, peer.uuid),
+                    )
+                    db.execute(
+                        "UPDATE zulip_outgoing_intents SET next_attempt_at=now() WHERE external_account_uuid=%s",
+                        (account.uuid,),
+                    )
+                await drain(service)
+                sent = [
+                    data
+                    for method, path, data in server.calls
+                    if method == "POST" and path == "/api/v1/messages"
+                ]
+                if native:
+                    assert not sent
+                else:
+                    assert len(sent) == 1
+                    if kind in ("private", "group"):
+                        assert sent[0]["type"] == "direct"
+                        assert sorted(json.loads(sent[0]["to"])) == (
+                            [9] if kind == "private" else [7, 9, 11]
+                        )
+                    else:
+                        assert sent[0]["type"] == "channel"
+                        assert sent[0]["to"] == "42"
+                        assert sent[0]["topic"] == "General"
+
+        asyncio.run(run())
+    finally:
+        if peer_state == "unlinked":
+            db.execute(
+                "UPDATE m_external_accounts_v2 SET owner_user_uuid=%s WHERE uuid=%s",
+                (peer.owner_user_uuid, peer.uuid),
+            )
+        if third is not None:
+            third.delete()
+
+
+def test_group_send_never_falls_back_to_sender_only(
+    direct_outgoing, db, _test_database_url
+):
+    outgoing, peer = direct_outgoing
+    api, account, channel, *_ = outgoing
+    db.execute(
+        "UPDATE messenger_streams SET private=false,direct_user_uuid=NULL WHERE uuid=%s",
+        (channel.stream_uuid,),
+    )
+    create(outgoing)
+
+    async def run():
+        async with sender(account, _test_database_url) as (service, server):
+            await service.dispatch()
+            await asyncio.gather(*list(service.tasks.values()))
+            assert not any(
+                method == "POST" and path == "/api/v1/messages"
+                for method, path, _data in server.calls
+            )
+            conftest.seed_user_stream_binding(
+                db, api.project_id, channel.stream_uuid, peer.owner_user_uuid
+            )
+            db.execute(
+                "UPDATE zulip_outgoing_intents SET next_attempt_at=now() WHERE external_account_uuid=%s",
+                (account.uuid,),
+            )
+            await drain(service)
+            sent = [
+                json.loads(data["to"])
+                for method, path, data in server.calls
+                if method == "POST" and path == "/api/v1/messages"
+            ]
+            assert sent == [[7, 9]]
 
     asyncio.run(run())
 
