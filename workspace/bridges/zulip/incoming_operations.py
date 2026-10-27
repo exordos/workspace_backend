@@ -20,6 +20,7 @@ from workspace.bridges.zulip import content_cache
 from workspace.common import emoji
 from workspace.messenger_api import file_storage
 from workspace.messenger_api import publication
+from workspace.messenger_api.dm import base
 
 
 ENQUEUE_FILE_CLEANUP_SQL = """
@@ -287,7 +288,8 @@ SAVE_ATTACHMENT_LINK_SQL = """
         external_account_uuid, provider_identity, data
     ) VALUES (%s, 'file', %s, %s, %s, %s, %s)
     ON CONFLICT (entity_type, entity_uuid, provider_uuid, external_account_uuid)
-    DO UPDATE SET data = zulip_entity_links.data || EXCLUDED.data
+    DO UPDATE SET provider_identity=EXCLUDED.provider_identity,
+                  data = zulip_entity_links.data || EXCLUDED.data
 """
 SAVE_RECIPIENT_ATTACHMENT_LINKS_SQL = """
     INSERT INTO zulip_entity_links (
@@ -306,7 +308,8 @@ SAVE_RECIPIENT_ATTACHMENT_LINKS_SQL = """
     WHERE account.project_id=%s AND account.provider_uuid=%s
       AND account.external_account_id IS NOT NULL
     ON CONFLICT (entity_type, entity_uuid, provider_uuid, external_account_uuid)
-    DO UPDATE SET data=zulip_entity_links.data || EXCLUDED.data
+    DO UPDATE SET provider_identity=EXCLUDED.provider_identity,
+                  data=zulip_entity_links.data || EXCLUDED.data
 """
 SELECT_ATTACHMENT_LINK_SQL = """
     SELECT to_jsonb(file) AS file
@@ -1443,9 +1446,17 @@ class Operations:
                     or not endpoint.path.startswith("/user_uploads/")
                 ):
                     continue
-                path = endpoint.path
+                path = message_conversion.zulip_upload_path(endpoint.path)
+                if path is None:
+                    key = (file_stream, endpoint.path)
+                    message["_files"].append((target, endpoint.path))
+                    prepared["files"][key] = {"missing": 403}
+                    continue
                 key = (file_stream, path)
                 message["_files"].append((target, path))
+                if not base.FileProviderIdentity().validate(path):
+                    prepared["files"][key] = {"missing": "path_too_long"}
+                    continue
                 if key in prepared["files"]:
                     continue
                 existing = await self.db.sql(
@@ -1457,8 +1468,20 @@ class Operations:
                         path,
                     ),
                 )
+                if not existing and path != endpoint.path:
+                    existing = await self.db.sql(
+                        SELECT_SCOPED_FILE_SQL,
+                        (
+                            account["project_id"],
+                            file_stream,
+                            account["provider_uuid"],
+                            endpoint.path,
+                        ),
+                    )
                 if existing:
-                    prepared["files"][key] = {"existing": existing[0]}
+                    prepared["files"][key] = {
+                        "existing": {**existing[0], "provider_identity": path}
+                    }
                     continue
                 try:
                     content, content_type = await self.http.download(account, path)
@@ -2206,10 +2229,11 @@ class Operations:
         for target, path in data.get("_files", []):
             file = prepared["files"][(stream_uuid, path)]
             if "missing" in file:
-                context.setdefault(
-                    "deleted_files" if file["missing"] == 404 else "inaccessible_files",
-                    set(),
-                ).add(target)
+                reason = {
+                    404: "deleted_files",
+                    "path_too_long": "oversized_file_paths",
+                }.get(file["missing"], "inaccessible_files")
+                context.setdefault(reason, set()).add(target)
                 continue
             values = file.get("existing") or {
                 **file,
@@ -2901,6 +2925,9 @@ class Operations:
                 or not endpoint.path.startswith("/user_uploads/")
             ):
                 continue
+            path = message_conversion.zulip_upload_path(endpoint.path)
+            if path is None or not base.FileProviderIdentity().validate(path):
+                continue
             files = await rows(
                 connection,
                 SELECT_SCOPED_FILE_SQL,
@@ -2908,9 +2935,20 @@ class Operations:
                     account["project_id"],
                     stream["uuid"],
                     account["provider_uuid"],
-                    endpoint.path,
+                    path,
                 ),
             )
+            if not files and path != endpoint.path:
+                files = await rows(
+                    connection,
+                    SELECT_SCOPED_FILE_SQL,
+                    (
+                        account["project_id"],
+                        stream["uuid"],
+                        account["provider_uuid"],
+                        endpoint.path,
+                    ),
+                )
             if not files:
                 continue
             file = files[0]
@@ -2933,7 +2971,7 @@ class Operations:
                         file["uuid"],
                         account["provider_uuid"],
                         account["uuid"],
-                        endpoint.path,
+                        file["provider_identity"],
                         json_value(
                             {"account_identity": account["external_account_id"]}
                         ),

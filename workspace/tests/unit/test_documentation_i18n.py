@@ -89,3 +89,11 @@ def test_local_documentation_links_resolve():
                 failures.append(f"{markdown.relative_to(PROJECT_ROOT)}: {destination}")
 
     assert not failures
+
+
+def test_added_file_identity_contract_is_english_in_every_language_tree():
+    for language in LANGUAGES:
+        text = (DOCS_ROOT / language / "workspace_api.md").read_text()
+        paragraph = text.split("{#files}", 1)[1].strip().split("\n\n", 1)[0]
+        assert paragraph.startswith("Imported file `provider_identity`")
+        assert paragraph.isascii()

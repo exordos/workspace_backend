@@ -123,6 +123,34 @@ def parse_url(target: str, base_url: str = "") -> urllib.parse.SplitResult | Non
         return None
 
 
+def zulip_upload_path(path: str) -> str | None:
+    """Recover an upload identity; the authenticated download checks access."""
+    if not path.startswith("/user_uploads/temporary/"):
+        return path
+    try:
+        _, _, _, token, filename = path.split("/", 4)
+        original, timestamp, signature = (
+            base64.b16decode(token, casefold=True).decode().rsplit(":", 2)
+        )
+    except (ValueError, UnicodeError):
+        return None
+    decoded = urllib.parse.unquote(original)
+    parts = decoded.split("/")
+    if (
+        not re.fullmatch(r"[0-9A-Za-z]+", timestamp)
+        or not re.fullmatch(r"[A-Za-z0-9_-]+", signature)
+        or len(parts) < 3
+        or not parts[0].isdigit()
+        or any(part in ("", ".", "..") for part in parts)
+        or re.search(r"[\x00-\x1f\x7f\\]", decoded)
+        or urllib.parse.unquote(filename) != original.rsplit("/", 1)[-1]
+    ):
+        return None
+    # The old signature grants no access here. Use only its path, under the
+    # selected account's current authenticated attachment permissions.
+    return "/user_uploads/" + urllib.parse.quote(original, safe="/")
+
+
 def _workspace_reference(target: str) -> tuple[str, str, str] | None:
     match = _REFERENCE_URN.fullmatch(target)
     if match is None:
@@ -299,6 +327,8 @@ class _ZulipToWorkspace:
             reason = "access denied"
         elif target in self.context.get("deleted_files", ()):
             reason = "file deleted"
+        elif target in self.context.get("oversized_file_paths", ()):
+            reason = "file path too long"
         else:
             return None
         if not label:

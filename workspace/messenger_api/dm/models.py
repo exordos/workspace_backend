@@ -327,6 +327,9 @@ class WorkspaceFile(
 ):
     __tablename__ = "m_workspace_files"
 
+    provider_identity = properties.property(
+        types.AllowNone(base.FileProviderIdentity()), default=None
+    )
     user_uuid = properties.property(
         types.UUID(),
         required=True,
