@@ -964,6 +964,42 @@ class Operations:
                 account["owner_user_uuid"],
             ),
         )
+        legacy_users = {uuid.uuid5(account["provider_uuid"], f"user:{identity}")}
+        if merged:
+            legacy_users.add(target["owner_user_uuid"])
+        for legacy in sorted(legacy_users, key=str):
+            changed_streams = await rows(
+                connection,
+                "SELECT zulip_rebind_direct_user(%s,%s,%s,%s) AS uuid",
+                (
+                    account["project_id"],
+                    account["provider_uuid"],
+                    legacy,
+                    account["owner_user_uuid"],
+                ),
+            )
+            for stream in changed_streams:
+                await self.snapshot(
+                    connection,
+                    values,
+                    "stream",
+                    stream["uuid"],
+                    "updated",
+                    stream["uuid"],
+                )
+                for topic in await rows(
+                    connection,
+                    SELECT_STREAM_TOPICS_SQL,
+                    (account["project_id"], stream["uuid"]),
+                ):
+                    await self.snapshot(
+                        connection,
+                        values,
+                        "topic",
+                        topic["uuid"],
+                        "created",
+                        stream["uuid"],
+                    )
         if changed:
             await self.account_snapshot(
                 connection,
