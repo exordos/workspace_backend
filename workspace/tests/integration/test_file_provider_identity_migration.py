@@ -133,6 +133,29 @@ def test_file_identity_migration_preserves_rows_views_permissions_and_full_paths
                 (long_path, file.uuid),
             )
 
+            for entity_type in ["message", "stream", "message_state"]:
+                connection.execute(
+                    "INSERT INTO zulip_entity_links(project_id,entity_type,entity_uuid,provider_uuid,external_account_uuid,provider_identity) VALUES (%s,%s,%s,%s,%s,%s)",
+                    (
+                        project,
+                        entity_type,
+                        file.uuid,
+                        provider,
+                        account.uuid,
+                        "x" * 255,
+                    ),
+                )
+                connection.execute(
+                    "UPDATE zulip_entity_links SET provider_identity=%s WHERE entity_type=%s AND entity_uuid=%s",
+                    ("я" * 255, entity_type, file.uuid),
+                )
+                for value in ["x" * 256, "я" * 256]:
+                    with pytest.raises(psycopg.errors.CheckViolation):
+                        connection.execute(
+                            "UPDATE zulip_entity_links SET provider_identity=%s WHERE entity_type=%s AND entity_uuid=%s",
+                            (value, entity_type, file.uuid),
+                        )
+
             spec = importlib.util.spec_from_file_location(
                 "file_identity_migration", conftest.MIGRATIONS_DIR / MIGRATION
             )

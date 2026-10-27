@@ -87,7 +87,7 @@ def _alter_identity(session, *, upgrade):
             "ALTER TABLE m_workspace_files ADD CONSTRAINT m_workspace_files_provider_identity_bytes_check CHECK (octet_length(provider_identity)<=2048)"
         )
         session.execute(
-            "ALTER TABLE zulip_entity_links ADD CONSTRAINT zulip_file_provider_identity_bytes_check CHECK (entity_type<>'file' OR octet_length(provider_identity)<=2048)"
+            "ALTER TABLE zulip_entity_links ADD CONSTRAINT zulip_file_provider_identity_bytes_check CHECK ((entity_type='file' AND octet_length(provider_identity)<=2048) OR (entity_type<>'file' AND char_length(provider_identity)<=255))"
         )
     for view in views:
         options = (

@@ -1677,11 +1677,14 @@ If-Match: "1"
 
 ## 文件 {#files}
 
-导入文件的 `provider_identity` 可以包含提供方的完整上传路径，最多为
-2048 个 UTF-8 字节。已保存的文件关联也受此限制，以确保不超过数据库索引项的大小上限。
-路径过长时显示 `file path too long`，消息同步仍会完成。文件 UUID 保持不变，
-其他实体的标识长度限制不变。Zulip 临时链接会转换为上传路径，并使用当前账号验证访问权限。
-无法访问或已删除的附件会显示明确提示，不会阻止消息同步。
+Imported file `provider_identity` values may contain complete provider upload
+paths and can exceed 255 characters, up to 2048 bytes in UTF-8. The byte limit
+also applies to stored file links and keeps the full path below the database index
+entry limit. Oversized paths render a `file path too long` notice without preventing
+message synchronization. File UUIDs remain stable. Other entity identity limits
+are unchanged. Temporary Zulip download links are resolved to authenticated
+upload paths; a currently inaccessible or deleted attachment renders an explicit
+notice without preventing message synchronization.
 
 文件字节和一个独立的 JSON 侧车通过配置的存储
 S3 是部署后端;本地后端

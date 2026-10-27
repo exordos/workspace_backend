@@ -234,3 +234,73 @@ def test_upload_path_byte_limit_keeps_message_synchronization(
         assert files.json() == []
         assert text == "Text survives file (file path too long)"
         download.assert_not_awaited()
+
+
+@pytest.mark.parametrize("legacy_identity", [False, True])
+def test_personal_delivery_of_temporary_attachment_links_the_late_recipient(
+    incoming, tmp_path, monkeypatch, legacy_identity
+):
+    api, db, account, http, _ = incoming
+    monkeypatch.setenv("WORKSPACE_FILE_STORAGE_PATH", str(tmp_path))
+    original = "/user_uploads/1/shared/file.pdf"
+    temporary = temporary_url("1/shared/file.pdf")
+    http.download = mock.AsyncMock(return_value=(b"shared bytes", "application/pdf"))
+    value = incoming_tests.event(f"[shared]({temporary})", 501)
+    value["message"]["timestamp"] = 1700000000
+    incoming_tests.apply(incoming, value)
+    file = api.get("/v1/messenger/files/").json()[0]
+    assert file["provider_identity"] == original
+    stored_identity = temporary if legacy_identity else original
+    if legacy_identity:
+        db.execute(
+            "UPDATE m_workspace_files SET provider_identity=%s WHERE uuid=%s",
+            (temporary, file["uuid"]),
+        )
+        db.execute(
+            "UPDATE zulip_entity_links SET provider_identity=%s WHERE entity_type='file' AND entity_uuid=%s",
+            (temporary, file["uuid"]),
+        )
+    linked, peer = incoming_tests.peer_account(incoming)
+    try:
+        incoming_tests.apply(
+            peer,
+            {
+                "type": "subscription",
+                "op": "add",
+                "subscriptions": [{"stream_id": 42, "name": "Channel"}],
+            },
+        )
+        incoming_tests.apply(peer, incoming_tests.event("Recipient joins", 502))
+        assert not db.execute(
+            "SELECT 1 FROM zulip_entity_links WHERE entity_type='file' AND entity_uuid=%s AND external_account_uuid=%s",
+            (file["uuid"], linked.uuid),
+        ).fetchall()
+        assert (
+            api.get(
+                f"/v1/messenger/files/{file['uuid']}", user=linked.owner_user_uuid
+            ).status_code
+            == 404
+        )
+        incoming_tests.apply(peer, {**value, "_personal_only": True})
+        incoming_tests.drain()
+        response = api.get(
+            f"/v1/messenger/files/{file['uuid']}/actions/download",
+            user=linked.owner_user_uuid,
+        )
+        assert response.status_code == 200, response.text
+        assert response.content == b"shared bytes"
+        assert db.execute(
+            "SELECT provider_identity FROM zulip_entity_links WHERE entity_type='file' AND entity_uuid=%s AND external_account_uuid=%s",
+            (file["uuid"], linked.uuid),
+        ).fetchall() == [(stored_identity,)]
+        assert "file.created" in [
+            item["kind"] for item in incoming_tests.client_events(peer)
+        ]
+        incoming_tests.apply(peer, {**value, "_personal_only": True})
+        incoming_tests.drain()
+        assert [item["kind"] for item in incoming_tests.client_events(peer)].count(
+            "file.created"
+        ) == 1
+        http.download.assert_awaited_once_with(account, original)
+    finally:
+        linked.delete()

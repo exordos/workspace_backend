@@ -2925,6 +2925,9 @@ class Operations:
                 or not endpoint.path.startswith("/user_uploads/")
             ):
                 continue
+            path = message_conversion.zulip_upload_path(endpoint.path)
+            if path is None or not base.FileProviderIdentity().validate(path):
+                continue
             files = await rows(
                 connection,
                 SELECT_SCOPED_FILE_SQL,
@@ -2932,9 +2935,20 @@ class Operations:
                     account["project_id"],
                     stream["uuid"],
                     account["provider_uuid"],
-                    endpoint.path,
+                    path,
                 ),
             )
+            if not files and path != endpoint.path:
+                files = await rows(
+                    connection,
+                    SELECT_SCOPED_FILE_SQL,
+                    (
+                        account["project_id"],
+                        stream["uuid"],
+                        account["provider_uuid"],
+                        endpoint.path,
+                    ),
+                )
             if not files:
                 continue
             file = files[0]
@@ -2957,7 +2971,7 @@ class Operations:
                         file["uuid"],
                         account["provider_uuid"],
                         account["uuid"],
-                        endpoint.path,
+                        file["provider_identity"],
                         json_value(
                             {"account_identity": account["external_account_id"]}
                         ),
