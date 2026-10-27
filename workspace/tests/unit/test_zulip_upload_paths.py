@@ -104,6 +104,14 @@ def test_history_does_not_retry_a_permanent_length_failure(error, permanent):
         ("😀" * 512, True),
         ("😀" * 513, False),
     ],
+    ids=[
+        "ascii-boundary",
+        "ascii-overflow",
+        "cyrillic-boundary",
+        "cyrillic-overflow",
+        "emoji-boundary",
+        "emoji-overflow",
+    ],
 )
 def test_file_identity_is_bounded_by_utf8_bytes(value, valid):
     identity_type = models.WorkspaceFile.properties.properties[

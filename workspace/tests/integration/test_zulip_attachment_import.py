@@ -219,7 +219,17 @@ def test_upload_path_byte_limit_keeps_message_synchronization(
         assert "urn:file:" in text
         response = api.get(f"/v1/messenger/files/{file['uuid']}/actions/download")
         assert response.status_code == 200 and response.content == b"bounded path bytes"
-        download.assert_awaited_once_with(account, path)
+        download.assert_awaited_once()
+        selected, downloaded_path = download.await_args.args
+        assert downloaded_path == path
+        for key in (
+            "uuid",
+            "project_id",
+            "provider_uuid",
+            "owner_user_uuid",
+            "settings",
+        ):
+            assert selected[key] == account[key]
     else:
         assert files.json() == []
         assert text == "Text survives file (file path too long)"
