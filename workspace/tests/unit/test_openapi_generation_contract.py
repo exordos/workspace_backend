@@ -283,11 +283,12 @@ def test_file_upload_identity_is_not_limited_to_255_characters():
         "provider_identity"
     ]
     assert identity["minLength"] == 1
-    assert "maxLength" not in identity
+    assert identity["maxLength"] == 2048
+    assert "2048 UTF-8 bytes" in identity["description"]
     parameter = specification["components"]["parameters"][
         "WorkspaceFile_provider_identity"
     ]["schema"]
-    assert "maxLength" not in parameter
+    assert parameter["maxLength"] == 2048
 
 
 def test_generated_openapi_references_are_self_contained():

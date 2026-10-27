@@ -70,10 +70,24 @@ def _alter_identity(session, *, upgrade):
     grants = {view["name"]: _grants(session, view["name"]) for view in views}
     for view in reversed(views):
         session.execute(f"DROP VIEW {view['name']}")
+    if not upgrade:
+        session.execute(
+            "ALTER TABLE m_workspace_files DROP CONSTRAINT m_workspace_files_provider_identity_bytes_check"
+        )
+        session.execute(
+            "ALTER TABLE zulip_entity_links DROP CONSTRAINT zulip_file_provider_identity_bytes_check"
+        )
     identity_type = "TEXT" if upgrade else "VARCHAR(255)"
     for table in TABLES:
         session.execute(
             f"ALTER TABLE {table} ALTER COLUMN provider_identity TYPE {identity_type}"
+        )
+    if upgrade:
+        session.execute(
+            "ALTER TABLE m_workspace_files ADD CONSTRAINT m_workspace_files_provider_identity_bytes_check CHECK (octet_length(provider_identity)<=2048)"
+        )
+        session.execute(
+            "ALTER TABLE zulip_entity_links ADD CONSTRAINT zulip_file_provider_identity_bytes_check CHECK (entity_type<>'file' OR octet_length(provider_identity)<=2048)"
         )
     for view in views:
         options = (

@@ -431,6 +431,8 @@ components:
           type: string
           example: any_string
           minLength: 1
+          maxLength: 2048
+          description: Provider upload path, at most 2048 UTF-8 bytes.
           nullable: true
         uuid:
           type: string
@@ -2568,6 +2570,8 @@ components:
         type: string
         example: any_string
         minLength: 1
+        maxLength: 2048
+        description: Provider upload path, at most 2048 UTF-8 bytes.
         nullable: true
     WorkspaceFile_uuid:
       name: uuid

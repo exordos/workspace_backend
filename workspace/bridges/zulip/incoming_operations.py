@@ -20,6 +20,7 @@ from workspace.bridges.zulip import content_cache
 from workspace.common import emoji
 from workspace.messenger_api import file_storage
 from workspace.messenger_api import publication
+from workspace.messenger_api.dm import base
 
 
 ENQUEUE_FILE_CLEANUP_SQL = """
@@ -1453,6 +1454,9 @@ class Operations:
                     continue
                 key = (file_stream, path)
                 message["_files"].append((target, path))
+                if not base.FileProviderIdentity().validate(path):
+                    prepared["files"][key] = {"missing": "path_too_long"}
+                    continue
                 if key in prepared["files"]:
                     continue
                 existing = await self.db.sql(
@@ -2225,10 +2229,11 @@ class Operations:
         for target, path in data.get("_files", []):
             file = prepared["files"][(stream_uuid, path)]
             if "missing" in file:
-                context.setdefault(
-                    "deleted_files" if file["missing"] == 404 else "inaccessible_files",
-                    set(),
-                ).add(target)
+                reason = {
+                    404: "deleted_files",
+                    "path_too_long": "oversized_file_paths",
+                }.get(file["missing"], "inaccessible_files")
+                context.setdefault(reason, set()).add(target)
                 continue
             values = file.get("existing") or {
                 **file,

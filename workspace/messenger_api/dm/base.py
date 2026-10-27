@@ -38,6 +38,23 @@ def random_color() -> int:
     return random.randint(0, COLOR_MAX_VALUE)
 
 
+class FileProviderIdentity(types.String):
+    """Bound upload paths below the PostgreSQL index tuple size limit."""
+
+    def __init__(self) -> None:
+        super().__init__(min_length=1, max_length=2048)
+
+    def validate(self, value: typing.Any) -> bool:
+        return super().validate(value) and len(value.encode("utf-8")) <= 2048
+
+    def to_openapi_spec(
+        self, prop_kwargs: dict[str, typing.Any]
+    ) -> dict[str, typing.Any]:
+        spec = super().to_openapi_spec(prop_kwargs)
+        spec["description"] = "Provider upload path, at most 2048 UTF-8 bytes."
+        return spec
+
+
 class StrictBoolean(types.Boolean):
     def from_simple_type(self, value: typing.Any) -> bool:
         if not self.validate(value):

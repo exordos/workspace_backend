@@ -163,3 +163,64 @@ def test_malformed_temporary_link_does_not_block_the_message(
     message = api.get("/v1/messenger/messages/").json()[0]
     assert message["payload"]["content"] == "Text file (access denied)"
     http.download.assert_not_awaited()
+
+
+@pytest.mark.parametrize("direction", ["realtime", "history"])
+@pytest.mark.parametrize("form", ["regular", "temporary", "unicode"])
+@pytest.mark.parametrize("size", [2048, 2049])
+def test_upload_path_byte_limit_keeps_message_synchronization(
+    incoming, tmp_path, monkeypatch, direction, form, size
+):
+    api, db, account, http, _ = incoming
+    monkeypatch.setenv("WORKSPACE_FILE_STORAGE_PATH", str(tmp_path))
+    prefix, suffix = "/user_uploads/1/", "/file.pdf"
+    remaining = size - len(prefix + suffix)
+    middle = (
+        "я" * (remaining // 2) + "x" * (remaining % 2)
+        if form == "unicode"
+        else "x" * remaining
+    )
+    path = prefix + middle + suffix
+    assert len(path.encode("utf-8")) == size
+    target = (
+        temporary_url(path.removeprefix("/user_uploads/"))
+        if form == "temporary"
+        else path
+    )
+    content = f"Text survives [file]({target})"
+    download = mock.AsyncMock(return_value=(b"bounded path bytes", "application/pdf"))
+    if direction == "realtime":
+        http.download = download
+        incoming_tests.apply(incoming, incoming_tests.event(content))
+        incoming_tests.apply(incoming, incoming_tests.event(content))
+    else:
+        history_tests.request(db, account)
+
+        async def run():
+            async with history_tests.worker(
+                incoming, {101: history_tests.message(content=content)}
+            ) as (service, _):
+                service.http.download = download
+                await history_tests.drain(service, account)
+                assert not await service.db.sql("SELECT 1 FROM zulip_history_intents")
+
+        asyncio.run(run())
+    incoming_tests.drain()
+    response = api.get("/v1/messenger/messages/")
+    assert response.status_code == 200, response.text
+    assert len(response.json()) == 1
+    text = response.json()[0]["payload"]["content"]
+    files = api.get("/v1/messenger/files/")
+    assert files.status_code == 200, files.text
+    if size == 2048:
+        assert len(files.json()) == 1
+        file = files.json()[0]
+        assert file["provider_identity"] == path
+        assert "urn:file:" in text
+        response = api.get(f"/v1/messenger/files/{file['uuid']}/actions/download")
+        assert response.status_code == 200 and response.content == b"bounded path bytes"
+        download.assert_awaited_once_with(account, path)
+    else:
+        assert files.json() == []
+        assert text == "Text survives file (file path too long)"
+        download.assert_not_awaited()

@@ -1695,8 +1695,11 @@ They never expose raw `provider_metadata` or `delivery_metadata`. For
 ## Files {#files}
 
 Imported file `provider_identity` values may contain complete provider upload
-paths and can exceed 255 characters. File UUIDs remain stable. Other entity identity
-limits are unchanged. Temporary Zulip download links are resolved to authenticated
+paths and can exceed 255 characters, up to 2048 bytes in UTF-8. The byte limit
+also applies to stored file links and keeps the full path below the database index
+entry limit. Oversized paths render a `file path too long` notice without preventing
+message synchronization. File UUIDs remain stable. Other entity identity limits
+are unchanged. Temporary Zulip download links are resolved to authenticated
 upload paths; a currently inaccessible or deleted attachment renders an explicit
 notice without preventing message synchronization.
 

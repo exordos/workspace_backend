@@ -10,6 +10,7 @@ import pytest
 from restalchemy.storage.sql import migrations
 
 from workspace.messenger_api.dm import models
+from workspace.messenger_api.dm import external_models
 from workspace.tests.integration import conftest
 
 
@@ -85,6 +86,53 @@ def test_file_identity_migration_preserves_rows_views_permissions_and_full_paths
                 "WHERE table_name='messenger_messages' AND column_name='provider_identity'"
             ).fetchone() == (255,)
 
+            account = external_models.ExternalAccount(
+                project_id=project,
+                owner_user_uuid=user,
+                provider="zulip",
+                external_account_id="7",
+                status="active",
+                settings={
+                    "server_url": "https://zulip.example.com",
+                    "email": "user@example.com",
+                    "api_key": "test-key",
+                },
+            )
+            account.insert()
+            connection.execute(
+                "INSERT INTO zulip_entity_links(project_id,entity_type,entity_uuid,provider_uuid,external_account_uuid,provider_identity) VALUES (%s,'file',%s,%s,%s,%s)",
+                (project, file.uuid, provider, account.uuid, long_path),
+            )
+            for value in ["x" * 2048, "я" * 1024]:
+                connection.execute(
+                    "UPDATE m_workspace_files SET provider_identity=%s WHERE uuid=%s",
+                    (value, file.uuid),
+                )
+                connection.execute(
+                    "UPDATE zulip_entity_links SET provider_identity=%s WHERE entity_uuid=%s",
+                    (value, file.uuid),
+                )
+            for value in ["x" * 2049, "я" * 1025]:
+                for table in ["m_workspace_files", "zulip_entity_links"]:
+                    column = "uuid" if table == "m_workspace_files" else "entity_uuid"
+                    with pytest.raises(psycopg.errors.CheckViolation) as rejected:
+                        connection.execute(
+                            f"UPDATE {table} SET provider_identity=%s WHERE {column}=%s",
+                            (value, file.uuid),
+                        )
+                    assert (
+                        "provider_identity_bytes_check"
+                        in rejected.value.diag.constraint_name
+                    )
+            connection.execute(
+                "UPDATE m_workspace_files SET provider_identity=%s WHERE uuid=%s",
+                (long_path, file.uuid),
+            )
+            connection.execute(
+                "UPDATE zulip_entity_links SET provider_identity=%s WHERE entity_uuid=%s",
+                (long_path, file.uuid),
+            )
+
             spec = importlib.util.spec_from_file_location(
                 "file_identity_migration", conftest.MIGRATIONS_DIR / MIGRATION
             )
@@ -100,6 +148,10 @@ def test_file_identity_migration_preserves_rows_views_permissions_and_full_paths
             assert views(connection) == original_views
             file.provider_identity = "/user_uploads/1/key/file.pdf"
             file.update()
+            connection.execute(
+                "UPDATE zulip_entity_links SET provider_identity=%s WHERE entity_uuid=%s",
+                (file.provider_identity, file.uuid),
+            )
             engine.rollback_migration(MIGRATION)
             assert views(connection) == original_views
             assert connection.execute(

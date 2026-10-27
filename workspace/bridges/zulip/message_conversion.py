@@ -327,6 +327,8 @@ class _ZulipToWorkspace:
             reason = "access denied"
         elif target in self.context.get("deleted_files", ()):
             reason = "file deleted"
+        elif target in self.context.get("oversized_file_paths", ()):
+            reason = "file path too long"
         else:
             return None
         if not label:

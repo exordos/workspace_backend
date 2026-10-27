@@ -12,6 +12,7 @@ import pytest
 
 from workspace.bridges.zulip import message_conversion
 from workspace.services import zulip_history
+from workspace.messenger_api.dm import models
 
 
 def temporary_url(path, filename=None):
@@ -91,3 +92,21 @@ def test_history_does_not_retry_a_permanent_length_failure(error, permanent):
         )
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "value,valid",
+    [
+        ("x" * 2048, True),
+        ("x" * 2049, False),
+        ("я" * 1024, True),
+        ("я" * 1025, False),
+        ("😀" * 512, True),
+        ("😀" * 513, False),
+    ],
+)
+def test_file_identity_is_bounded_by_utf8_bytes(value, valid):
+    identity_type = models.WorkspaceFile.properties.properties[
+        "provider_identity"
+    ].get_property_type()
+    assert identity_type.validate(value) is valid
