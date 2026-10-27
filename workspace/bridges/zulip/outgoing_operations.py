@@ -115,6 +115,12 @@ SELECT_PEER_ACCOUNT_SQL = """
       AND external_account_id IS NOT NULL
 """
 
+SELECT_DIRECT_RECIPIENTS_SQL = """
+    SELECT jsonb_array_elements_text(
+        zulip_direct_message_recipients(%s,%s,%s,%s)
+    )::bigint AS id
+"""
+
 SELECT_STREAM_NAME_SQL = """
     SELECT name
     FROM messenger_streams
@@ -716,16 +722,17 @@ class Operations:
             topic = data["topic_name"]
         elif route["channel_type"] == "private":
             peers = await self.db.sql(
-                SELECT_PEER_ACCOUNT_SQL,
+                SELECT_DIRECT_RECIPIENTS_SQL,
                 (
                     intent["project_id"],
-                    route["direct_user_uuid"],
                     account["provider_uuid"],
+                    data["stream_uuid"],
+                    account["owner_user_uuid"],
                 ),
             )
             if not peers:
                 raise Pending("Waiting for the direct message recipient")
-            recipient = [int(peers[0]["external_account_id"])]
+            recipient = [row["id"] for row in peers]
             topic = None
         else:
             peers = await self.db.sql(

@@ -164,8 +164,13 @@ def create(outgoing, canonical_uuid=None):
 
 
 class Server:
-    def __init__(self, db_url):
+    def __init__(self, db_url, account=None):
         self.db_url = db_url
+        self.sender_id = int(account.external_account_id) if account else 7
+        self.auth = aiohttp.BasicAuth(
+            account.settings["email"] if account else "sender@example.com",
+            account.settings["api_key"] if account else "sender-key",
+        ).encode()
         self.calls = []
         self.messages = {}
         self.attachments = []
@@ -181,10 +186,7 @@ class Server:
         data = dict(http.query) if http.method == "GET" else dict(await http.post())
         self.calls.append((http.method, http.path, data))
         self.transports.add(http.transport)
-        assert (
-            http.headers["Authorization"]
-            == aiohttp.BasicAuth("sender@example.com", "sender-key").encode()
-        )
+        assert http.headers["Authorization"] == self.auth
         with psycopg.connect(self.db_url) as connection:
             assert not connection.execute(
                 "SELECT 1 FROM pg_stat_activity WHERE application_name='workspace-zulip-outgoing' AND state='idle in transaction'"
@@ -229,6 +231,7 @@ class Server:
                 remote = self.next_id
                 self.messages[remote] = {
                     "id": remote,
+                    "sender_id": self.sender_id,
                     "content": data["content"],
                     "flags": [],
                     "reactions": [],
@@ -252,7 +255,7 @@ class Server:
                         {"result": "error", "msg": "Not found"}, status=404
                     )
                 if path.endswith("/reactions"):
-                    reaction = {**data, "user_id": 7}
+                    reaction = {**data, "user_id": self.sender_id}
                     if http.method == "POST":
                         self.messages[remote]["reactions"].append(reaction)
                     else:
@@ -273,7 +276,7 @@ class Server:
 
 @contextlib.asynccontextmanager
 async def sender(account, db_url, **options):
-    server = Server(db_url)
+    server = Server(db_url, account)
     app = web.Application()
     app.router.add_route("*", "/api/v1/{path:.*}", server.handle)
     runner = web.AppRunner(app)
@@ -1189,18 +1192,23 @@ def test_native_file_reference_never_schedules_an_upload(
     )
     assert file.status_code == 201, file.text
     assert file.json()["source_name"] == "native"
-    with contexts.Context().session_manager():
-        with pytest.raises(ValueError, match="different source"):
-            export(
-                account,
-                {
-                    "kind": "markdown",
-                    "content": f"[file](urn:file:{file.json()['uuid']})",
-                },
-                channel.stream_uuid,
-                outgoing[4],
-            )
-    assert not intents(db, account)
+    try:
+        with contexts.Context().session_manager():
+            with pytest.raises(ValueError, match="different source"):
+                export(
+                    account,
+                    {
+                        "kind": "markdown",
+                        "content": f"[file](urn:file:{file.json()['uuid']})",
+                    },
+                    channel.stream_uuid,
+                    outgoing[4],
+                )
+        assert not intents(db, account)
+    finally:
+        db.execute(
+            "DELETE FROM m_workspace_files WHERE uuid=%s", (file.json()["uuid"],)
+        )
 
 
 @pytest.mark.isolated_schema
@@ -1483,13 +1491,23 @@ def test_direct_recipient_migration_replaces_only_recipient_capture(
     current = db.execute(
         "SELECT pg_get_functiondef('zulip_capture_outgoing()'::regprocedure)"
     ).fetchone()[0]
+    repair_spec = importlib.util.spec_from_file_location(
+        "direct_identity_migration",
+        conftest.MIGRATIONS_DIR
+        / "0283-Repair-linked-Zulip-direct-participant-identities-6b50ae.py",
+    )
+    repair = importlib.util.module_from_spec(repair_spec)
+    repair_spec.loader.exec_module(repair)
     with contexts.Context().session_manager() as session:
+        repair.migration_step.downgrade(session)
         migration.migration_step.downgrade(session)
     create(outgoing)
     assert intents(db, account)[0][3]["recipient_ids"] == [7]
     with contexts.Context().session_manager() as session:
         migration.migration_step.upgrade(session)
         migration.migration_step.upgrade(session)
+        repair.migration_step.upgrade(session)
+        repair.migration_step.upgrade(session)
     create(outgoing)
     assert intents(db, account)[-1][3]["recipient_ids"] == [9]
     assert (

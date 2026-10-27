@@ -83,3 +83,26 @@ event after a lost HTTP response. The authoritative remote ID remains
 `provider_identity`; `local_id` is not a persistent lookup key or a provider
 idempotency guarantee. If neither a response nor a definitive receipt survives,
 the worker keeps the send uncertain instead of blindly creating a duplicate.
+
+## Linked users in imported direct conversations
+
+A provider import can create a user before that person links an IAM account.
+Linking adopts the imported external account while retaining the IAM user UUID.
+For imported direct conversations, initialization replaces the old participant
+reference in `owner_uuid` and `direct_user_uuid` and restores missing membership
+and topic access for the linked user. Existing membership preferences take
+precedence, including inactive membership. The superseded imported membership
+becomes inactive; its historical references remain available. Conversation UUIDs, message history, and native conversations keep their identities.
+
+Direct sends resolve the other endpoint relative to the current sender, scoped
+to the project and provider. They also recognize deterministic imported user
+aliases when an account was linked before participant repair was available.
+A stale queued recipient snapshot is not authoritative. Group conversations
+continue to resolve active membership, and channels use their provider stream ID.
+An unresolved participant remains pending; it is never guessed from a name.
+
+Migration 0283 repairs existing deterministic aliases and refreshes unprepared
+queued direct sends. Prepared requests, uncertain sends, and delivery receipts
+are preserved to avoid changing a request that might already have reached Zulip.
+Downgrading restores the prior recipient resolver but retains repaired identity
+references; it does not reconstruct obsolete aliases.
