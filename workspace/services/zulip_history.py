@@ -902,7 +902,15 @@ class ZulipHistoryService:
             raise
         except Exception as error:
             LOG.warning("Cannot apply history intent %s: %s", intent["id"], error)
-            permanent = isinstance(error, (KeyError, TypeError, ValueError)) or (
+            permanent = isinstance(
+                error,
+                (
+                    KeyError,
+                    TypeError,
+                    ValueError,
+                    psycopg.errors.StringDataRightTruncation,
+                ),
+            ) or (
                 isinstance(error, outgoing_operations.ApiError)
                 and 400 <= error.status < 500
                 and error.status not in (408, 429)

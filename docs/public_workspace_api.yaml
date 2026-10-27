@@ -431,7 +431,6 @@ components:
           type: string
           example: any_string
           minLength: 1
-          maxLength: 255
           nullable: true
         uuid:
           type: string
@@ -2569,7 +2568,6 @@ components:
         type: string
         example: any_string
         minLength: 1
-        maxLength: 255
         nullable: true
     WorkspaceFile_uuid:
       name: uuid

@@ -287,7 +287,8 @@ SAVE_ATTACHMENT_LINK_SQL = """
         external_account_uuid, provider_identity, data
     ) VALUES (%s, 'file', %s, %s, %s, %s, %s)
     ON CONFLICT (entity_type, entity_uuid, provider_uuid, external_account_uuid)
-    DO UPDATE SET data = zulip_entity_links.data || EXCLUDED.data
+    DO UPDATE SET provider_identity=EXCLUDED.provider_identity,
+                  data = zulip_entity_links.data || EXCLUDED.data
 """
 SAVE_RECIPIENT_ATTACHMENT_LINKS_SQL = """
     INSERT INTO zulip_entity_links (
@@ -306,7 +307,8 @@ SAVE_RECIPIENT_ATTACHMENT_LINKS_SQL = """
     WHERE account.project_id=%s AND account.provider_uuid=%s
       AND account.external_account_id IS NOT NULL
     ON CONFLICT (entity_type, entity_uuid, provider_uuid, external_account_uuid)
-    DO UPDATE SET data=zulip_entity_links.data || EXCLUDED.data
+    DO UPDATE SET provider_identity=EXCLUDED.provider_identity,
+                  data=zulip_entity_links.data || EXCLUDED.data
 """
 SELECT_ATTACHMENT_LINK_SQL = """
     SELECT to_jsonb(file) AS file
@@ -1443,7 +1445,12 @@ class Operations:
                     or not endpoint.path.startswith("/user_uploads/")
                 ):
                     continue
-                path = endpoint.path
+                path = message_conversion.zulip_upload_path(endpoint.path)
+                if path is None:
+                    key = (file_stream, endpoint.path)
+                    message["_files"].append((target, endpoint.path))
+                    prepared["files"][key] = {"missing": 403}
+                    continue
                 key = (file_stream, path)
                 message["_files"].append((target, path))
                 if key in prepared["files"]:
@@ -1457,8 +1464,20 @@ class Operations:
                         path,
                     ),
                 )
+                if not existing and path != endpoint.path:
+                    existing = await self.db.sql(
+                        SELECT_SCOPED_FILE_SQL,
+                        (
+                            account["project_id"],
+                            file_stream,
+                            account["provider_uuid"],
+                            endpoint.path,
+                        ),
+                    )
                 if existing:
-                    prepared["files"][key] = {"existing": existing[0]}
+                    prepared["files"][key] = {
+                        "existing": {**existing[0], "provider_identity": path}
+                    }
                     continue
                 try:
                     content, content_type = await self.http.download(account, path)

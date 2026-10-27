@@ -277,6 +277,19 @@ def _assert_all_local_references_resolve(specification):
             pending.extend(value)
 
 
+def test_file_upload_identity_is_not_limited_to_255_characters():
+    specification = _build_openapi(workspace_app)
+    identity = _component_schema(specification, "WorkspaceFile_Get")["properties"][
+        "provider_identity"
+    ]
+    assert identity["minLength"] == 1
+    assert "maxLength" not in identity
+    parameter = specification["components"]["parameters"][
+        "WorkspaceFile_provider_identity"
+    ]["schema"]
+    assert "maxLength" not in parameter
+
+
 def test_generated_openapi_references_are_self_contained():
     specification = _build_openapi(workspace_app)
     schemas = specification["components"]["schemas"]

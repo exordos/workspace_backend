@@ -1,0 +1,165 @@
+# Copyright 2026 Genesis Corporation.
+# Licensed under the Apache License, Version 2.0 (the "License").
+
+import asyncio
+import base64
+import urllib.parse
+from unittest import mock
+
+import pytest
+
+from workspace.bridges.zulip import outgoing_operations
+from workspace.tests.integration import test_zulip_history as history_tests
+from workspace.tests.integration import test_zulip_incoming as incoming_tests
+
+
+incoming = incoming_tests.incoming
+
+
+def temporary_url(path):
+    token = base64.b16encode(f"{path}:1:example-signature".encode()).decode()
+    return (
+        f"/user_uploads/temporary/{token}/{urllib.parse.quote(path.rsplit('/', 1)[-1])}"
+    )
+
+
+@pytest.mark.parametrize("direction", ["realtime", "history"])
+@pytest.mark.parametrize("status", [200, 403, 404])
+def test_expired_file_link_uses_current_account_access(
+    incoming, tmp_path, monkeypatch, direction, status
+):
+    api, db, account, http, _ = incoming
+    monkeypatch.setenv("WORKSPACE_FILE_STORAGE_PATH", str(tmp_path))
+    path = "1/key/file.pdf"
+    original = "/user_uploads/" + path
+    temporary = temporary_url(path)
+    content = f"Text survives [file]({temporary})"
+    downloaded = []
+
+    async def download(selected, url):
+        downloaded.append(url)
+        assert selected["uuid"] == account["uuid"]
+        if url != original:
+            raise outgoing_operations.ApiError(400, {"msg": "Invalid token"})
+        if status != 200:
+            raise outgoing_operations.ApiError(status, {"msg": "Unavailable"})
+        return b"attachment bytes", "application/pdf"
+
+    if direction == "realtime":
+        http.download = mock.AsyncMock(side_effect=download)
+        incoming_tests.apply(incoming, incoming_tests.event(content))
+        incoming_tests.apply(incoming, incoming_tests.event(content))
+    else:
+        history_tests.request(db, account)
+
+        async def run():
+            async with history_tests.worker(
+                incoming, {101: history_tests.message(content=content)}
+            ) as (service, _):
+                service.http.download = mock.AsyncMock(side_effect=download)
+                await history_tests.drain(service, account)
+                assert not await service.db.sql("SELECT 1 FROM zulip_history_intents")
+
+        asyncio.run(run())
+    incoming_tests.drain()
+    response = api.get("/v1/messenger/messages/")
+    assert response.status_code == 200, response.text
+    messages = response.json()
+    assert len(messages) == 1
+    text = messages[0]["payload"]["content"]
+    assert text.startswith("Text survives ")
+    assert temporary not in text
+    files = api.get("/v1/messenger/files/")
+    assert files.status_code == 200, files.text
+    if status == 200:
+        assert len(files.json()) == 1
+        file = files.json()[0]
+        assert file["provider_identity"] == original
+        response = api.get(f"/v1/messenger/files/{file['uuid']}/actions/download")
+        assert response.status_code == 200, response.text
+        assert response.content == b"attachment bytes"
+        assert "urn:file:" in text
+        assert downloaded == [original]
+    else:
+        assert files.json() == []
+        assert ("access denied" if status == 403 else "file deleted") in text
+        assert downloaded and set(downloaded) == {original}
+
+
+def test_long_upload_identity_survives_storage_api_and_replay(
+    incoming, tmp_path, monkeypatch
+):
+    api, db, account, http, _ = incoming
+    monkeypatch.setenv("WORKSPACE_FILE_STORAGE_PATH", str(tmp_path))
+    path = "/user_uploads/1/ab/" + "k" * 24 + "/" + "f" * 249 + ".pdf"
+    assert len(path) == 297
+    content = f"[long file]({path})"
+    http.download = mock.AsyncMock(return_value=(b"long path file", "application/pdf"))
+    incoming_tests.apply(incoming, incoming_tests.event(content))
+    first = api.get("/v1/messenger/files/")
+    assert first.status_code == 200, first.text
+    file = first.json()[0]
+    assert file["provider_identity"] == path
+    assert db.execute(
+        "SELECT provider_identity FROM zulip_entity_links "
+        "WHERE entity_type='file' AND entity_uuid=%s",
+        (file["uuid"],),
+    ).fetchall() == [(path,)]
+    incoming_tests.apply(incoming, incoming_tests.event(content))
+    incoming_tests.drain()
+    assert api.get("/v1/messenger/files/").json() == [file]
+    response = api.get(f"/v1/messenger/files/{file['uuid']}/actions/download")
+    assert response.status_code == 200, response.text
+    assert response.content == b"long path file"
+    http.download.assert_awaited_once_with(account, path)
+
+
+def test_old_temporary_file_identity_keeps_its_uuid_when_reimported(
+    incoming, tmp_path, monkeypatch
+):
+    api, db, account, http, _ = incoming
+    monkeypatch.setenv("WORKSPACE_FILE_STORAGE_PATH", str(tmp_path))
+    original = "/user_uploads/1/key/file.pdf"
+    temporary = temporary_url("1/key/file.pdf")
+    http.download = mock.AsyncMock(return_value=(b"existing file", "application/pdf"))
+    incoming_tests.apply(incoming, incoming_tests.event(f"[file]({original})"))
+    file = api.get("/v1/messenger/files/").json()[0]
+    db.execute(
+        "UPDATE m_workspace_files SET provider_identity=%s WHERE uuid=%s",
+        (temporary, file["uuid"]),
+    )
+    db.execute(
+        "UPDATE zulip_entity_links SET provider_identity=%s "
+        "WHERE entity_type='file' AND entity_uuid=%s",
+        (temporary, file["uuid"]),
+    )
+    incoming_tests.apply(incoming, incoming_tests.event(f"[file]({temporary})", 102))
+    incoming_tests.apply(incoming, incoming_tests.event(f"[file]({original})", 103))
+    files = api.get("/v1/messenger/files/").json()
+    assert len(files) == 1
+    assert files[0]["uuid"] == file["uuid"]
+    assert files[0]["provider_identity"] == original
+    assert db.execute(
+        "SELECT provider_identity FROM zulip_entity_links "
+        "WHERE entity_type='file' AND entity_uuid=%s",
+        (file["uuid"],),
+    ).fetchall() == [(original,)]
+    http.download.assert_awaited_once_with(account, original)
+
+
+def test_malformed_temporary_link_does_not_block_the_message(
+    incoming, tmp_path, monkeypatch
+):
+    api, _db, _account, http, _ = incoming
+    monkeypatch.setenv("WORKSPACE_FILE_STORAGE_PATH", str(tmp_path))
+    http.download = mock.AsyncMock(
+        side_effect=outgoing_operations.ApiError(400, {"msg": "Invalid token"})
+    )
+    incoming_tests.apply(
+        incoming,
+        incoming_tests.event("Text [file](/user_uploads/temporary/not-hex/file.pdf)"),
+    )
+    incoming_tests.drain()
+    message = api.get("/v1/messenger/messages/").json()[0]
+    assert message["payload"]["content"] == "Text file (access denied)"
+    http.download.assert_not_awaited()
