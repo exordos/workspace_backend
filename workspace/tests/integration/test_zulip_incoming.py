@@ -1342,7 +1342,7 @@ def test_first_message_uses_membership_at_observation_not_after_rejoin(incoming)
         linked.delete()
 
 
-def test_provider_membership_does_not_grant_unobserved_messages_or_files(
+def test_workspace_membership_grants_stored_files_before_personal_message_observation(
     incoming, monkeypatch, tmp_path
 ):
     api, db, account, http, _url = incoming
@@ -1369,12 +1369,11 @@ def test_provider_membership_does_not_grant_unobserved_messages_or_files(
         assert (
             api.get("/v1/messenger/messages/", user=linked.owner_user_uuid).json() == []
         )
-        assert (
-            api.get(
-                f"/v1/messenger/files/{file}", user=linked.owner_user_uuid
-            ).status_code
-            == 404
+        response = api.get(
+            f"/v1/messenger/files/{file}/actions/download", user=linked.owner_user_uuid
         )
+        assert response.status_code == 200, response.text
+        assert response.content == b"private file"
         before = sum(
             item["kind"] == "message.created" for item in client_events(incoming)
         )

@@ -29,8 +29,10 @@ Clients cannot choose or change this inherited provenance. The former JSON
 
 The canonical object owns its provider identity. Sending and receiving resolve
 that identity directly; a native object does not acquire a separate remote copy.
-File links retain account-scoped access observations, and reaction links retain
-custom emoji metadata. Technical placements, message-access bindings, and
+File links retain account-scoped synchronization observations, and reaction links
+retain custom emoji metadata. File authorization uses Workspace ACLs and active
+stream membership, independently of linked provider accounts or receipts.
+Technical placements, message-access bindings, and
 file-access rows inherit context through their existing foreign keys.
 
 `ExternalAccount.provider_uuid` references the same provider table.

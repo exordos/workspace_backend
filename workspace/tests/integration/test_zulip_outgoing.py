@@ -1811,10 +1811,12 @@ def test_capture_and_send_do_not_depend_on_retired_channel_routes(
     asyncio.run(run())
 
 
-def test_file_receipt_never_temporarily_revokes_the_uploaders_access(
+def test_file_receipt_never_temporarily_revokes_workspace_members_access(
     outgoing, db, _test_database_url, tmp_path, monkeypatch
 ):
     api, account, channel, *_ = outgoing
+    peer = uuid.uuid4()
+    conftest.seed_user_stream_binding(db, api.project_id, channel.stream_uuid, peer)
     monkeypatch.setenv("WORKSPACE_FILE_STORAGE_PATH", str(tmp_path))
     response = api.post(
         "/v1/messenger/files/",
@@ -1847,13 +1849,14 @@ def test_file_receipt_never_temporarily_revokes_the_uploaders_access(
 
             async def observe_committed_step(query, parameters=()):
                 result = await original_sql(query, parameters)
-                visible = db.execute(
-                    "SELECT 1 FROM m_workspace_visible_files_v1 WHERE uuid=%s AND viewer_user_uuid=%s",
-                    (identifier, account.owner_user_uuid),
-                ).fetchall()
-                assert visible, (
-                    "A concurrent message converter loses file access after a receipt commit"
-                )
+                for user in (account.owner_user_uuid, peer):
+                    visible = db.execute(
+                        "SELECT 1 FROM m_workspace_visible_files_v1 WHERE uuid=%s AND viewer_user_uuid=%s",
+                        (identifier, user),
+                    ).fetchall()
+                    assert visible, (
+                        "A concurrent message converter loses file access after a receipt commit"
+                    )
                 return result
 
             database.sql = observe_committed_step
@@ -1868,6 +1871,15 @@ def test_file_receipt_never_temporarily_revokes_the_uploaders_access(
             await database.close()
 
     asyncio.run(run())
+    # Opening a new worker connection and replaying the completed operation must
+    # leave the local UUID and permissions intact.
+    asyncio.run(run())
+    for user in (account.owner_user_uuid, peer):
+        response = api.get(
+            f"/v1/messenger/files/{identifier}/actions/download", user=user
+        )
+        assert response.status_code == 200, response.text
+        assert response.content == b"receipt"
 
 
 def test_canonical_message_has_one_destination_and_copy_gets_new_uuid(
