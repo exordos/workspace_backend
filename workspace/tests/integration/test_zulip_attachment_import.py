@@ -275,12 +275,14 @@ def test_personal_delivery_of_temporary_attachment_links_the_late_recipient(
             "SELECT 1 FROM zulip_entity_links WHERE entity_type='file' AND entity_uuid=%s AND external_account_uuid=%s",
             (file["uuid"], linked.uuid),
         ).fetchall()
-        assert (
-            api.get(
-                f"/v1/messenger/files/{file['uuid']}", user=linked.owner_user_uuid
-            ).status_code
-            == 404
+        # Workspace membership grants access to the stored file immediately,
+        # before this account's personal provider receipt arrives.
+        response = api.get(
+            f"/v1/messenger/files/{file['uuid']}/actions/download",
+            user=linked.owner_user_uuid,
         )
+        assert response.status_code == 200, response.text
+        assert response.content == b"shared bytes"
         incoming_tests.apply(peer, {**value, "_personal_only": True})
         incoming_tests.drain()
         response = api.get(

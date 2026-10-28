@@ -1729,6 +1729,14 @@ current canonical PostgreSQL stream bindings. A newly added
 participant gains access immediately; a removed participant loses it
 immediately without an S3 rewrite.
 
+The same Workspace authorization applies to native chats and chats synchronized
+with a provider. A locally uploaded file is readable by Workspace participants
+as soon as the upload commits, including participants without a linked provider
+account. Imported files use the same rule once their bytes are stored locally.
+Provider upload identities and personal receipts record synchronization only;
+they neither grant access nor delay or revoke Workspace access. No provider
+request or worker round trip is required to authorize a local download.
+
 Files intentionally visible throughout the authenticated Workspace use this
 ACL instead:
 
