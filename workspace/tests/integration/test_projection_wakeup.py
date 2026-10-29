@@ -3,6 +3,9 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
+import signal
+import subprocess
+import sys
 import threading
 import time
 import types
@@ -217,3 +220,49 @@ def test_idle_timeout_polls_and_shutdown_leaves_no_connection_or_thread(db, list
     before = len(listener.connections)
     assert listener.wakeup.wait(0.1) is False
     assert len(listener.connections) == before
+
+
+def test_sigterm_during_idle_wait_exits_and_closes_listener(db):
+    name = f"cassi-wakeup-sigterm-{sys_uuid.uuid4()}"
+    url = database.connection_url_for_process(conftest.TEST_DB_URL, name)
+    program = """
+import signal
+import sys
+from workspace.services.messenger_workers import agents
+
+worker = agents.MessengerWorkerAgent(
+    v2_projection_enabled=True, v2_projection_db_url=sys.argv[1]
+)
+signal.signal(signal.SIGTERM, lambda *_: worker.stop())
+worker._v2_projection_wakeup.wait(0.5)
+"""
+    process = subprocess.Popen(
+        [sys.executable, "-c", program, url],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while not db.execute(
+            "SELECT EXISTS(SELECT 1 FROM pg_stat_activity "
+            "WHERE application_name=%s AND state='idle' "
+            "AND query='LISTEN workspace_projection_tasks')",
+            (name,),
+        ).fetchone()[0]:
+            assert process.poll() is None, "Worker exited before LISTEN"
+            assert time.monotonic() < deadline, "LISTEN did not become ready"
+            time.sleep(0.01)
+        process.send_signal(signal.SIGTERM)
+        output, _ = process.communicate(timeout=2)
+        assert process.returncode == 0, output.decode()
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate(timeout=5)
+    deadline = time.monotonic() + 2
+    while db.execute(
+        "SELECT count(*) FROM pg_stat_activity WHERE application_name=%s",
+        (name,),
+    ).fetchone()[0]:
+        assert time.monotonic() < deadline, "LISTEN backend survived shutdown"
+        time.sleep(0.01)
