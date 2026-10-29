@@ -2,7 +2,7 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
-"""Kill the real owning process between topic commit and parent invalidation."""
+"""Kill the owning process after a read commits and before the counter worker runs."""
 
 import os
 import select
@@ -47,7 +47,7 @@ while True:
 """
 
 
-def test_process_death_after_topic_commit_repairs_lost_parent_intention(
+def test_process_death_after_read_commit_keeps_durable_counter_job(
     api, db, conversation
 ):
     stream, messages, peer = conversation
@@ -91,9 +91,24 @@ def test_process_death_after_topic_commit_repairs_lost_parent_intention(
                 "SELECT unread_count FROM messenger_user_topic_bindings WHERE project_id=%s AND topic_uuid=%s AND user_uuid=%s",
                 (api.project_id, stream["default_topic_uuid"], peer),
             ).fetchone()[0]
+            == 2
+        )
+        assert (
+            db.execute(
+                "SELECT count(*) FROM messenger_user_message_unreads WHERE project_id=%s AND user_uuid=%s AND topic_uuid=%s",
+                (api.project_id, peer, stream["default_topic_uuid"]),
+            ).fetchone()[0]
             == 0
         )
-        # The invalidation existed only in the killed thread's return value.
+        assert (
+            db.execute(
+                "SELECT count(*) FROM messenger_counter_updates WHERE project_id=%s AND user_uuid=%s AND topic_uuid=%s",
+                (api.project_id, peer, stream["default_topic_uuid"]),
+            ).fetchone()[0]
+            == 1
+        )
+        # Both cached scopes wait for the separate counter process. Its durable
+        # invalidation committed with the read and survives the killed executor.
         assert (
             db.execute(
                 "SELECT unread_count FROM messenger_stream_bindings WHERE project_id=%s AND stream_uuid=%s AND user_uuid=%s",

@@ -10,14 +10,17 @@ import uuid
 import psycopg
 import pytest
 from oslo_config import cfg
+from restalchemy.common import contexts
 
 from workspace.common import mutation_journal_opts
-from workspace.services.messenger_workers import keyed_dispatcher
-from workspace.services.messenger_workers import mutation_runtime
-from workspace.services.messenger_workers import v2_projection
+from workspace.messenger_api import events
+from workspace.services.messenger_workers import (
+    counters,
+    keyed_dispatcher,
+    mutation_runtime,
+)
 from workspace.tests.integration import conftest
 from workspace.tests.integration import test_messenger_v2 as native
-
 
 if mutation_journal_opts.DOMAIN not in cfg.CONF:
     mutation_journal_opts.register_opts()
@@ -64,9 +67,17 @@ def drain(runtime, db, timeout=15):
     deadline = time.monotonic() + timeout
     while True:
         runtime.tick()
+        try:
+            with contexts.Context().session_manager() as session:
+                counters.process_pending(session, limit=100)
+        except events.ProjectEventLockUnavailableError:
+            # Match the counter process: its durable queue survives a busy
+            # publication turn and is retried on the next tick.
+            pass
         pending = db.execute("""SELECT
             (SELECT count(*) FROM messenger_mutation_commands WHERE status='pending') +
             (SELECT count(*) FROM messenger_publication_outbox) +
+            (SELECT count(*) FROM messenger_counter_updates) +
             (SELECT count(*) FROM messenger_projection_tasks WHERE status IN ('pending','failed','running'))""").fetchone()[
             0
         ]
@@ -78,14 +89,14 @@ def drain(runtime, db, timeout=15):
         time.sleep(0.002)
 
 
-def test_http_read_admission_avoids_locked_state_and_converges_all_counters(
+def test_http_read_admission_avoids_locked_unread_and_converges_all_counters(
     api, db, conversation
 ):
     stream, messages, peer = conversation
     placement = messages[-1]["uuid"]
     with psycopg.connect(conftest.TEST_DB_URL) as blocker:
         blocker.execute(
-            "SELECT uuid FROM messenger_user_message_states WHERE project_id=%s AND placement_uuid=%s AND user_uuid=%s FOR UPDATE",
+            "SELECT placement_uuid FROM messenger_user_message_unreads WHERE project_id=%s AND placement_uuid=%s AND user_uuid=%s FOR UPDATE",
             (api.project_id, placement, peer),
         )
         with concurrent.futures.ThreadPoolExecutor(1) as pool:
@@ -98,10 +109,10 @@ def test_http_read_admission_avoids_locked_state_and_converges_all_counters(
         assert response.status_code == 200, response.text
         assert (
             db.execute(
-                "SELECT read_at FROM messenger_user_message_states WHERE project_id=%s AND placement_uuid=%s AND user_uuid=%s",
+                "SELECT EXISTS(SELECT 1 FROM messenger_user_message_unreads WHERE project_id=%s AND placement_uuid=%s AND user_uuid=%s)",
                 (api.project_id, placement, peer),
             ).fetchone()[0]
-            is None
+            is True
         )
         assert (
             db.execute(
@@ -141,10 +152,10 @@ def test_http_read_admission_avoids_locked_state_and_converges_all_counters(
     )
 
 
-def test_command_topic_snapshot_and_ack_rollback_together(
+def test_unread_dirty_queue_and_command_ack_rollback_together(
     api, db, conversation, monkeypatch
 ):
-    _stream, messages, peer = conversation
+    stream, messages, peer = conversation
     placement = messages[-1]["uuid"]
     response = api.post(
         f"{native.MESSAGES}{placement}/actions/read_up_to/invoke", user=peer
@@ -154,13 +165,20 @@ def test_command_topic_snapshot_and_ack_rollback_together(
         "SELECT uuid,scope_key FROM messenger_mutation_commands WHERE project_id=%s",
         (api.project_id,),
     ).fetchone()
+    dirty_before = db.execute(
+        "SELECT * FROM messenger_counter_updates WHERE project_id=%s ORDER BY user_uuid,topic_uuid",
+        (api.project_id,),
+    ).fetchall()
     runtime = mutation_runtime.MutationRuntime()
-    original = v2_projection._emit_unread_snapshots
+    original = mutation_runtime.MutationStore._enqueue_counter_projections
 
-    def fail(*args, **kwargs):
-        raise RuntimeError("injected before counter commit")
+    def fail(store, **payload):
+        original(store, **payload)
+        raise RuntimeError("injected after unread deletion")
 
-    monkeypatch.setattr(v2_projection, "_emit_unread_snapshots", fail)
+    monkeypatch.setattr(
+        mutation_runtime.MutationStore, "_enqueue_counter_projections", fail
+    )
     try:
         with pytest.raises(RuntimeError, match="injected"):
             runtime._execute(
@@ -170,17 +188,22 @@ def test_command_topic_snapshot_and_ack_rollback_together(
                     frozenset(
                         runtime._topic_reservations(
                             api.project_id,
-                            [{"topic_uuid": _stream["default_topic_uuid"]}],
+                            [{"topic_uuid": stream["default_topic_uuid"]}],
                         )
                     ),
                 )
             )
+        assert db.execute(
+            "SELECT EXISTS(SELECT 1 FROM messenger_user_message_unreads "
+            "WHERE project_id=%s AND placement_uuid=%s AND user_uuid=%s)",
+            (api.project_id, placement, peer),
+        ).fetchone()[0]
         assert (
             db.execute(
-                "SELECT read_at FROM messenger_user_message_states WHERE project_id=%s AND placement_uuid=%s AND user_uuid=%s",
-                (api.project_id, placement, peer),
-            ).fetchone()[0]
-            is None
+                "SELECT * FROM messenger_counter_updates WHERE project_id=%s ORDER BY user_uuid,topic_uuid",
+                (api.project_id,),
+            ).fetchall()
+            == dirty_before
         )
         assert (
             db.execute(
@@ -189,7 +212,9 @@ def test_command_topic_snapshot_and_ack_rollback_together(
             ).fetchone()[0]
             == "pending"
         )
-        monkeypatch.setattr(v2_projection, "_emit_unread_snapshots", original)
+        monkeypatch.setattr(
+            mutation_runtime.MutationStore, "_enqueue_counter_projections", original
+        )
         drain(runtime, db)
     finally:
         runtime.close()
@@ -267,54 +292,80 @@ def test_reaction_can_be_removed_before_create_command_is_applied(
         runtime.close()
 
 
-def test_topic_mutation_continues_during_stream_snapshot_and_requests_rerun(
-    api, db, conversation, monkeypatch
+def test_read_commits_during_counter_count_and_preserves_new_dirty_revision(
+    api, db, conversation
 ):
     stream, messages, peer = conversation
     runtime = mutation_runtime.MutationRuntime()
-    snapshot_ready, release = threading.Event(), threading.Event()
-    parent_finished = threading.Event()
-    original = runtime._stream
-    held = False
+    counting, release = threading.Event(), threading.Event()
 
-    def hold(session, project_id, stream_uuid, users):
-        nonlocal held
-        result = original(session, project_id, stream_uuid, users)
-        if str(stream_uuid) == stream["uuid"] and not held:
-            held = True
-            snapshot_ready.set()
-            assert release.wait(10)
-            parent_finished.set()
-        return result
+    class SlowCountSession:
+        def __init__(self, session):
+            self.session = session
+
+        def execute(self, statement, values=()):
+            if statement == counters.COUNT_TOPIC_SQL:
+                counting.set()
+                assert release.wait(10)
+            return self.session.execute(statement, values)
+
+        def __getattr__(self, name):
+            return getattr(self.session, name)
+
+    def count():
+        with contexts.Context().session_manager() as session:
+            return counters.process_pending(SlowCountSession(session))
 
     try:
         drain(runtime, db)
         api._user_seeder = None
-        monkeypatch.setattr(runtime, "_stream", hold)
-        runtime._dispatcher.trigger(
-            ("stream", uuid.UUID(api.project_id), uuid.UUID(stream["uuid"])), [peer]
+        db.execute(
+            "SELECT messenger_queue_counters(%s,%s,%s,%s)",
+            (api.project_id, peer, stream["uuid"], stream["default_topic_uuid"]),
         )
-        runtime.tick()
-        assert snapshot_ready.wait(3)
-        response = api.post(
-            f"{native.MESSAGES}{messages[-1]['uuid']}/actions/read_up_to/invoke",
-            user=peer,
-        )
-        assert response.status_code == 200, response.text
-        deadline = time.monotonic() + 3
-        while (
+        with concurrent.futures.ThreadPoolExecutor(1) as pool:
+            counter = pool.submit(count)
+            assert counting.wait(3)
+            response = api.post(
+                f"{native.MESSAGES}{messages[-1]['uuid']}/actions/read_up_to/invoke",
+                user=peer,
+            )
+            assert response.status_code == 200, response.text
+            deadline = time.monotonic() + 3
+            while (
+                db.execute(
+                    "SELECT count(*) FROM messenger_mutation_commands WHERE project_id=%s AND status='applied'",
+                    (api.project_id,),
+                ).fetchone()[0]
+                == 0
+            ):
+                runtime.tick()
+                assert time.monotonic() < deadline
+            assert not counter.done()
+            assert (
+                db.execute(
+                    "SELECT count(*) FROM messenger_user_message_unreads WHERE project_id=%s AND user_uuid=%s",
+                    (api.project_id, peer),
+                ).fetchone()[0]
+                == 0
+            )
+            # Numeric projections have a separate commit and cannot hold the
+            # read command or its realtime acknowledgement behind COUNT.
+            assert (
+                api.get(f"{native.STREAMS}{stream['uuid']}", user=peer).json()[
+                    "unread_count"
+                ]
+                == 2
+            )
+            release.set()
+            assert counter.result(timeout=5) == 1
+        assert (
             db.execute(
-                "SELECT count(*) FROM messenger_mutation_commands WHERE project_id=%s AND status='applied'",
-                (api.project_id,),
+                "SELECT count(*) FROM messenger_counter_updates WHERE project_id=%s AND user_uuid=%s AND topic_uuid=%s",
+                (api.project_id, peer, stream["default_topic_uuid"]),
             ).fetchone()[0]
-            == 0
-        ):
-            runtime.tick()
-            assert time.monotonic() < deadline
-        # The child commits while the parent's transaction is still open.
-        assert not release.is_set()
-        assert not parent_finished.is_set()
-        release.set()
+            == 1
+        )
         drain(runtime, db)
         assert (
             api.get(f"{native.STREAMS}{stream['uuid']}", user=peer).json()[
@@ -504,8 +555,8 @@ def test_stream_preview_tracks_newest_topic_placement_and_delete(api, db, conver
         assert (
             str(
                 db.execute(
-                    "SELECT last_message_uuid FROM messenger_stream_bindings WHERE project_id=%s AND stream_uuid=%s AND user_uuid=%s",
-                    (api.project_id, stream["uuid"], api.user_uuid),
+                    "SELECT placement_uuid FROM messenger_stream_last_messages WHERE project_id=%s AND stream_uuid=%s",
+                    (api.project_id, stream["uuid"]),
                 ).fetchone()[0]
             )
             == target
@@ -516,11 +567,87 @@ def test_stream_preview_tracks_newest_topic_placement_and_delete(api, db, conver
         assert (
             str(
                 db.execute(
-                    "SELECT last_message_uuid FROM messenger_stream_bindings WHERE project_id=%s AND stream_uuid=%s AND user_uuid=%s",
-                    (api.project_id, stream["uuid"], api.user_uuid),
+                    "SELECT placement_uuid FROM messenger_stream_last_messages WHERE project_id=%s AND stream_uuid=%s",
+                    (api.project_id, stream["uuid"]),
                 ).fetchone()[0]
             )
             == messages[-1]["uuid"]
         )
+    finally:
+        runtime.close()
+
+
+def test_admitted_read_boundary_does_not_read_messages_arriving_later(
+    api, db, conversation
+):
+    stream, messages, peer = conversation
+    response = api.post(
+        f"{native.MESSAGES}{messages[-1]['uuid']}/actions/read_up_to/invoke", user=peer
+    )
+    assert response.status_code == 200, response.text
+    later = api.post(
+        native.MESSAGES,
+        json={
+            "stream_uuid": stream["uuid"],
+            "topic_uuid": stream["default_topic_uuid"],
+            "payload": {"kind": "markdown", "content": "arrived after admission"},
+        },
+    )
+    assert later.status_code == 201, later.text
+    runtime = mutation_runtime.MutationRuntime()
+    try:
+        drain(runtime, db)
+        for message in messages:
+            assert (
+                api.get(f"{native.MESSAGES}{message['uuid']}", user=peer).json()["read"]
+                is True
+            )
+        assert (
+            api.get(f"{native.MESSAGES}{later.json()['uuid']}", user=peer).json()[
+                "read"
+            ]
+            is False
+        )
+        assert (
+            api.get(f"{native.STREAMS}{stream['uuid']}", user=peer).json()[
+                "unread_count"
+            ]
+            == 1
+        )
+    finally:
+        runtime.close()
+
+
+def test_queued_flag_command_cannot_change_rejoined_membership(api, db, conversation):
+    stream, messages, peer = conversation
+    response = api.post(
+        f"{native.MESSAGES}{messages[0]['uuid']}/actions/star/invoke", user=peer
+    )
+    assert response.status_code == 200, response.text
+    binding_uuid = db.execute(
+        "SELECT uuid FROM messenger_stream_bindings WHERE project_id=%s AND user_uuid=%s AND stream_uuid=%s",
+        (api.project_id, peer, stream["uuid"]),
+    ).fetchone()[0]
+    removed = api.delete(f"{native.STREAM_BINDINGS}{binding_uuid}")
+    assert removed.status_code == 204, removed.text
+    rejoined = api.post(
+        f"{native.STREAMS}{stream['uuid']}/actions/add_users/invoke",
+        json={"member": [str(peer)]},
+    )
+    assert rejoined.status_code == 200, rejoined.text
+    runtime = mutation_runtime.MutationRuntime()
+    try:
+        drain(runtime, db)
+        assert (
+            db.execute(
+                "SELECT status FROM messenger_mutation_commands WHERE project_id=%s",
+                (api.project_id,),
+            ).fetchone()[0]
+            == "rejected"
+        )
+        actual = api.get(f"{native.MESSAGES}{messages[0]['uuid']}", user=peer)
+        assert actual.status_code == 200, actual.text
+        assert actual.json()["starred"] is False
+        assert actual.json()["read"] is True
     finally:
         runtime.close()

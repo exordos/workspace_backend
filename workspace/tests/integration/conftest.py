@@ -476,6 +476,9 @@ def pytest_configure(config):
     if shard is not None and not 0 <= shard[0] < shard[1]:
         raise pytest.UsageError("--integration-shard requires 0 <= INDEX < COUNT")
     config.addinivalue_line(
+        "markers", "pre_sparse_schema: verify a published migration before sparse flags"
+    )
+    config.addinivalue_line(
         "markers",
         "pre_outgoing_schema: test published outgoing migrations before their removal",
     )
@@ -506,6 +509,12 @@ def pytest_collection_modifyitems(config, items):
 
 @pytest.fixture(autouse=True)
 def _test_database_url(_database, request, monkeypatch):
+    if request.node.get_closest_marker("pre_sparse_schema") is not None:
+        with isolated_migration_database(
+            "0284-Authorize-files-through-Workspace-membership-59b5ff.py"
+        ) as database_url:
+            yield database_url
+        return
     if request.node.get_closest_marker("pre_outgoing_schema") is not None:
         with isolated_migration_database(
             "0264-Add-synchronization-status-to-provider-entities-ca9efd.py"

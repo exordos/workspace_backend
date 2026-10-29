@@ -249,55 +249,6 @@ class WorkspaceMessageChange(
         )
 
 
-class WorkspaceMessageCounterChange(
-    models.ModelWithID,
-    models.ModelWithProject,
-    orm.SQLStorableMixin,
-):
-    __tablename__ = "messenger_message_counter_changes"
-
-    project_id = properties.property(
-        types.UUID(), required=True, read_only=True, id_property=True
-    )
-    user_uuid = properties.property(
-        types.UUID(), required=True, read_only=True, id_property=True
-    )
-    placement_uuid = properties.property(
-        types.UUID(), required=True, read_only=True, id_property=True
-    )
-    stream_uuid = properties.property(
-        types.UUID(), required=True, read_only=True, id_property=True
-    )
-    topic_uuid = properties.property(types.UUID(), required=True, read_only=True)
-    revision = properties.property(
-        types.Integer(min_value=1), required=True, read_only=True
-    )
-
-    @classmethod
-    def get_id_property(cls) -> dict[str, typing.Any]:
-        return cls.id_properties.copy()
-
-    def get_id(
-        self,
-    ) -> tuple[sys_uuid.UUID, sys_uuid.UUID, sys_uuid.UUID, sys_uuid.UUID]:
-        return self.project_id, self.user_uuid, self.stream_uuid, self.placement_uuid
-
-    @classmethod
-    def reconcile_batch(
-        cls, project_id: object, user_uuid: object, stream_uuid: object, limit: int
-    ) -> bool:
-        result = (
-            contexts.Context()
-            .get_session()
-            .execute(
-                "SELECT * FROM messenger_apply_message_counter_changes(%s, %s, %s, %s)",
-                (project_id, user_uuid, stream_uuid, limit),
-            )
-            .fetchone()
-        )
-        return result["pending"]
-
-
 class WorkspaceMessagePlacement(
     models.ModelWithUUID,
     models.ModelWithProject,
@@ -321,59 +272,6 @@ class WorkspaceUserMessageBinding(
 
     placement_uuid = properties.property(types.UUID(), required=True, read_only=True)
     user_uuid = properties.property(types.UUID(), required=True, read_only=True)
-    membership_generation = properties.property(
-        types.Integer(min_value=1), required=True, read_only=True
-    )
-    relation_role = properties.property(types.String(max_length=64), required=True)
-    visibility = properties.property(types.String(max_length=64), required=True)
-    permissions = properties.property(types.Dict(), required=True)
-
-
-class WorkspaceUserMessageState(
-    base.WorkspaceProviderBase,
-    models.ModelWithUUID,
-    models.ModelWithProject,
-    models.ModelWithTimestamp,
-    orm.SQLStorableMixin,
-):
-    __tablename__ = "messenger_user_message_states"
-
-    placement_uuid = properties.property(types.UUID(), required=True, read_only=True)
-    user_uuid = properties.property(types.UUID(), required=True, read_only=True)
-    membership_generation = properties.property(
-        types.Integer(min_value=1), required=True, read_only=True
-    )
-    binding_uuid = properties.property(
-        types.AllowNone(types.UUID()), default=None, read_only=True
-    )
-    zulip_source_uuid = properties.property(
-        types.AllowNone(types.UUID()), default=None, read_only=True
-    )
-    zulip_flags_updated_at = properties.property(
-        types.AllowNone(types.UTCDateTimeZ()), default=None, read_only=True
-    )
-    created_at = properties.property(
-        common_types.UTCDateTimeWithOffset(),
-        read_only=True,
-        default=lambda: datetime.datetime.now(datetime.timezone.utc),
-    )
-    updated_at = properties.property(
-        common_types.UTCDateTimeWithOffset(),
-        read_only=True,
-        default=lambda: datetime.datetime.now(datetime.timezone.utc),
-    )
-    read_at = properties.property(
-        types.AllowNone(common_types.UTCDateTimeWithOffset()), default=None
-    )
-    read_updated_at = properties.property(
-        types.AllowNone(types.UTCDateTimeZ()), default=None
-    )
-    starred_updated_at = properties.property(
-        types.AllowNone(types.UTCDateTimeZ()), default=None
-    )
-    mentioned = properties.property(types.Boolean(), default=False)
-    starred = properties.property(types.Boolean(), default=False)
-    pinned = properties.property(types.Boolean(), default=False)
 
 
 class WorkspaceUserMessage(
@@ -382,6 +280,9 @@ class WorkspaceUserMessage(
 ):
     __tablename__ = "messenger_api_user_messages_v1"
 
+    membership_generation = properties.property(
+        types.Integer(min_value=1), read_only=True
+    )
     binding_uuid = properties.property(types.UUID(), required=True, read_only=True)
     canonical_message_uuid = properties.property(
         types.UUID(), required=True, read_only=True
@@ -489,7 +390,6 @@ class WorkspaceStreamBinding(
     unread_count = properties.property(types.Integer(min_value=0), default=0)
     active_unread_count = properties.property(types.Integer(min_value=0), default=0)
     passive_unread_count = properties.property(types.Integer(min_value=0), default=0)
-    last_message_uuid = properties.property(types.AllowNone(types.UUID()), default=None)
 
 
 class WorkspaceUserStream(
@@ -573,7 +473,6 @@ class WorkspaceUserTopicBinding(
     unread_count = properties.property(types.Integer(min_value=0), default=0)
     active_unread_count = properties.property(types.Integer(min_value=0), default=0)
     passive_unread_count = properties.property(types.Integer(min_value=0), default=0)
-    last_message_uuid = properties.property(types.AllowNone(types.UUID()), default=None)
     summary_has_new_messages = properties.property(
         types.AllowNone(types.Boolean()), default=None
     )

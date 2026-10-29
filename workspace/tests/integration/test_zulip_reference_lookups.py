@@ -10,7 +10,6 @@ from workspace.tests.integration import test_projection_performance as projectio
 from workspace.tests.integration import test_zulip_bounded_lookups as bounded_tests
 from workspace.tests.integration import test_zulip_incoming as incoming_tests
 
-
 incoming = incoming_tests.incoming
 large_history = bounded_tests.large_history
 
@@ -44,7 +43,7 @@ def test_message_reference_lookup_does_not_scan_unrelated_history(large_history)
             "messenger_messages",
             "messenger_message_placements",
             "messenger_user_message_bindings",
-            "messenger_user_message_states",
+            "messenger_user_message_unreads",
         }
     )
     assert scanned < 100, plan
@@ -59,8 +58,8 @@ def test_message_reference_lookup_does_not_scan_unrelated_history(large_history)
         "deleted_topic",
         "deleted_stream",
         "inactive_membership",
-        "stale_binding",
-        "stale_state",
+        "membership_reset",
+        "empty_flags",
         "other_project",
         "other_user",
         "other_provider",
@@ -79,7 +78,7 @@ def test_message_references_keep_the_complete_visibility_rules(incoming, case):
     args = list(parameters(account))
     if case == "hidden":
         db.execute(
-            "UPDATE messenger_user_message_bindings SET visibility='hidden' "
+            "DELETE FROM messenger_user_message_bindings "
             "WHERE project_id=%s AND user_uuid=%s AND placement_uuid=%s",
             (account["project_id"], account["owner_user_uuid"], placement),
         )
@@ -99,21 +98,23 @@ def test_message_references_keep_the_complete_visibility_rules(incoming, case):
             "WHERE project_id=%s AND user_uuid=%s AND stream_uuid=%s",
             (account["project_id"], account["owner_user_uuid"], stream),
         )
-    elif case in ("stale_binding", "stale_state"):
-        table = (
-            "messenger_user_message_bindings"
-            if case == "stale_binding"
-            else "messenger_user_message_states"
-        )
+    elif case == "membership_reset":
         db.execute(
-            f"UPDATE {table} SET membership_generation=membership_generation+1 "
-            "WHERE project_id=%s AND user_uuid=%s AND placement_uuid=%s",
-            (account["project_id"], account["owner_user_uuid"], placement),
+            "UPDATE messenger_stream_bindings SET membership_generation=membership_generation+1 "
+            "WHERE project_id=%s AND user_uuid=%s AND stream_uuid=%s",
+            (account["project_id"], account["owner_user_uuid"], stream),
         )
+    elif case == "empty_flags":
+        for table in ("unreads", "stars", "pins", "mentions"):
+            db.execute(
+                f"DELETE FROM messenger_user_message_{table} "
+                "WHERE project_id=%s AND user_uuid=%s AND placement_uuid=%s",
+                (account["project_id"], account["owner_user_uuid"], placement),
+            )
     elif case in ("other_project", "other_user", "other_provider"):
         args[{"other_project": 0, "other_user": 1, "other_provider": 3}[case]] = (
             uuid.uuid4()
         )
     assert db.execute(
         incoming_operations.SELECT_MESSAGE_REFERENCES_SQL, args
-    ).fetchall() == ([(placement, "101")] if case == "visible" else [])
+    ).fetchall() == ([(placement, "101")] if case in ("visible", "empty_flags") else [])

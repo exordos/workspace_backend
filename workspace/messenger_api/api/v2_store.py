@@ -14,6 +14,8 @@ from restalchemy.common import contexts
 from restalchemy.common import exceptions as ra_exceptions
 from restalchemy.dm import filters as dm_filters
 
+from workspace.messenger_api import message_flags
+from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api.api import outgoing
 from workspace.messenger_api.api import resource_projection
 from workspace.messenger_api.api import sql_canonical_store
@@ -37,6 +39,7 @@ CORE_RESOURCE_MODELS: dict[str, typing.Any] = {
 }
 CORE_RESOURCES = frozenset(CORE_RESOURCE_MODELS)
 _INTERNAL_FIELDS = {
+    "membership_generation",
     "binding_uuid",
     "canonical_message_uuid",
     "viewer_user_uuid",
@@ -252,26 +255,15 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         placement_uuid: object | None = None,
         emit_message_read: bool = False,
     ) -> None:
-        common = {
-            "source_kind": source_kind,
-            "user_uuid": user_uuid,
-            "stream_uuid": stream_uuid,
-            "topic_uuid": topic_uuid,
-        }
-        if placement_uuid is not None:
-            common["placement_uuid"] = placement_uuid
-        self._enqueue(
-            "read_counters",
-            "user-stream",
-            f"{self.project_uuid}:{user_uuid}:{stream_uuid}",
-            common,
+        session = contexts.Context().get_session()
+        session.execute(
+            "SELECT messenger_queue_counters(%s,%s,%s,%s)",
+            (self.project_uuid, user_uuid, stream_uuid, topic_uuid),
         )
-        self._enqueue(
-            "read_counters",
-            "user-topic",
-            f"{self.project_uuid}:{user_uuid}:{topic_uuid}",
-            {**common, "emit_message_read": emit_message_read},
-        )
+        if emit_message_read:
+            messenger_events.create_message_read_event(
+                self._message(placement_uuid), session=session
+            )
 
     def _require_project_user(self, user_uuid: object) -> sys_uuid.UUID:
         value = sys_uuid.UUID(str(user_uuid))
@@ -1008,63 +1000,13 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 session,
             )
             self._enqueue_stream_snapshot(stream.uuid, source_kind="stream.updated")
-        content = message_payloads.markdown_content(canonical_payload)
-        mentioned = f"](urn:user:{str(self.user_uuid).lower()})" in content.lower()
-        binding_uuid = sys_uuid.uuid5(placement_uuid, str(self.user_uuid))
         session.execute(
-            """
-            INSERT INTO messenger_user_message_bindings (
-                uuid, project_id, placement_uuid, user_uuid,
-                membership_generation, relation_role, visibility,
-                permissions, created_at, updated_at
-            )
-            SELECT %s, %s, %s, %s, membership_generation,
-                   'author', 'visible',
-                   '{"read":true,"react":true,"star":true,"pin":true}'::jsonb,
-                   %s, %s
-            FROM messenger_stream_bindings
-            WHERE project_id = %s AND stream_uuid = %s
-              AND user_uuid = %s AND active
-            """,
+            """INSERT INTO messenger_user_message_bindings(uuid,project_id,placement_uuid,user_uuid)
+               VALUES(%s,%s,%s,%s) ON CONFLICT(project_id,placement_uuid,user_uuid) DO NOTHING""",
             (
-                binding_uuid,
+                sys_uuid.uuid5(placement_uuid, str(self.user_uuid)),
                 self.project_uuid,
                 placement_uuid,
-                self.user_uuid,
-                now,
-                now,
-                self.project_uuid,
-                stream.uuid,
-                self.user_uuid,
-            ),
-        )
-        session.execute(
-            """
-            INSERT INTO messenger_user_message_states (
-                uuid, project_id, placement_uuid, user_uuid,
-                membership_generation, read_at, mentioned,
-                created_at, updated_at, source_name, provider_uuid, status
-            )
-            SELECT %s, %s, %s, %s, membership_generation,
-                   %s, %s, %s, %s, %s, %s, %s
-            FROM messenger_stream_bindings
-            WHERE project_id = %s AND stream_uuid = %s
-              AND user_uuid = %s AND active
-            """,
-            (
-                binding_uuid,
-                self.project_uuid,
-                placement_uuid,
-                self.user_uuid,
-                now,
-                mentioned,
-                now,
-                now,
-                stream.source_name,
-                stream.provider_uuid,
-                "active" if stream.source_name == "native" else "new",
-                self.project_uuid,
-                stream.uuid,
                 self.user_uuid,
             ),
         )
@@ -1390,40 +1332,6 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                     "stream_uuid": binding.stream_uuid,
                 },
             )
-            if "notification_mode" in updates:
-                topics = session.execute(
-                    """
-                    SELECT uuid FROM messenger_topics
-                    WHERE project_id = %s AND stream_uuid = %s
-                    ORDER BY created_at, uuid
-                    """,
-                    (self.project_uuid, binding.stream_uuid),
-                ).fetchall()
-                if topics:
-                    self._enqueue(
-                        "read_counters",
-                        "user-stream",
-                        f"{self.project_uuid}:{binding.user_uuid}:"
-                        f"{binding.stream_uuid}",
-                        {
-                            "source_kind": "stream_binding.updated",
-                            "user_uuid": binding.user_uuid,
-                            "stream_uuid": binding.stream_uuid,
-                            "topic_uuid": topics[0]["uuid"],
-                        },
-                    )
-                for topic in topics:
-                    self._enqueue(
-                        "read_counters",
-                        "user-topic",
-                        f"{self.project_uuid}:{binding.user_uuid}:{topic['uuid']}",
-                        {
-                            "source_kind": "stream_binding.updated",
-                            "user_uuid": binding.user_uuid,
-                            "stream_uuid": binding.stream_uuid,
-                            "topic_uuid": topic["uuid"],
-                        },
-                    )
             return self.get_resource(resource, binding.uuid)
         return super().update_resource(resource, resource_uuid, values)
 
@@ -1660,51 +1568,22 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         return super().delete_resource(resource, resource_uuid)
 
     def _mark_message_state(
-        self,
-        message_uuid: object,
-        field: str,
-        value: bool,
+        self, message_uuid: object, field: str, value: bool
     ) -> dict[str, typing.Any]:
-        if field not in {"starred", "pinned"}:
-            raise ValueError(field)
         message = self._message(message_uuid)
         session = contexts.Context().get_session()
-        changed = session.execute(
-            f"""
-            UPDATE messenger_user_message_states
-            SET {field} = %s, updated_at = NOW()
-            WHERE project_id = %s AND placement_uuid = %s AND user_uuid = %s
-              AND {field} IS DISTINCT FROM %s
-            RETURNING uuid
-            """,
-            (value, self.project_uuid, message.uuid, self.user_uuid, value),
-        ).fetchone()
-        if changed is None:
-            return _public(self._message(message.uuid), "messages")
-        self._enqueue(
-            "delivery_snapshot_event",
-            "message",
-            f"{self.project_uuid}:{message.canonical_message_uuid}",
-            {
-                "source_kind": "message.updated",
-                "placement_uuid": message.uuid,
-                "recipient_uuid": self.user_uuid,
-            },
-        )
+        if message_flags.set_flag(session, message, field, value):
+            self._enqueue(
+                "delivery_snapshot_event",
+                "message",
+                f"{self.project_uuid}:{message.canonical_message_uuid}",
+                {
+                    "source_kind": "message.updated",
+                    "placement_uuid": message.uuid,
+                    "recipient_uuid": self.user_uuid,
+                },
+            )
         return _public(self._message(message.uuid), "messages")
-
-    def _has_unread_candidates(
-        self,
-        *,
-        candidate_sql: str,
-        candidate_values: typing.Sequence[object],
-    ) -> bool:
-        """Check exact unread placements without materializing them in Python."""
-        session = contexts.Context().get_session()
-        return session.execute(
-            f"SELECT EXISTS ({candidate_sql}) AS present",
-            candidate_values,
-        ).fetchone()["present"]
 
     @outgoing.api_change
     def perform_action(
@@ -1913,88 +1792,26 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             ]
         if resource == "messages" and action == "read":
             message = self._message(resource_uuid)
-            changed = session.execute(
-                """
-                UPDATE messenger_user_message_states
-                SET read_at = NOW(), updated_at = NOW()
-                WHERE project_id = %s AND placement_uuid = %s AND user_uuid = %s
-                  AND read_at IS NULL
-                RETURNING placement_uuid
-                """,
-                (self.project_uuid, message.uuid, self.user_uuid),
-            ).fetchone()
+            changed = message_flags.mark_read(
+                session, self.project_uuid, self.user_uuid, placement_uuid=message.uuid
+            )
             self._enqueue_counter_projections(
                 source_kind="message.read",
                 placement_uuid=message.uuid,
                 user_uuid=self.user_uuid,
                 stream_uuid=message.stream_uuid,
                 topic_uuid=message.topic_uuid,
-                emit_message_read=changed is not None,
+                emit_message_read=bool(changed),
             )
             return _public(self._message(message.uuid), "messages")
         if resource == "messages" and action == "read_up_to":
             message = self._message(resource_uuid)
-            candidate_sql = """
-                SELECT placement.uuid, canonical.created_at
-                FROM messenger_user_message_states AS state
-                JOIN messenger_message_placements AS placement
-                  ON placement.project_id = state.project_id
-                 AND placement.uuid = state.placement_uuid
-                JOIN messenger_messages AS canonical
-                  ON canonical.project_id = placement.project_id
-                 AND canonical.uuid = placement.message_uuid
-                JOIN messenger_message_placements AS boundary
-                  ON boundary.project_id = placement.project_id
-                 AND boundary.uuid = %s
-                JOIN messenger_messages AS boundary_message
-                  ON boundary_message.project_id = boundary.project_id
-                 AND boundary_message.uuid = boundary.message_uuid
-                WHERE state.project_id = %s AND state.user_uuid = %s
-                  AND (%s::boolean OR state.read_at IS NULL)
-                  AND placement.topic_uuid = %s
-                  AND (canonical.created_at, placement.uuid)
-                      <= (boundary_message.created_at, boundary.uuid)
-                ORDER BY canonical.created_at, placement.uuid
-            """
-            candidate_values = (
-                message.uuid,
+            changed = message_flags.mark_read(
+                session,
                 self.project_uuid,
                 self.user_uuid,
-                False,
-                message.topic_uuid,
-            )
-            changed = self._has_unread_candidates(
-                candidate_sql=candidate_sql,
-                candidate_values=candidate_values,
-            )
-            session.execute(
-                """
-                UPDATE messenger_user_message_states AS state
-                SET read_at = COALESCE(state.read_at, NOW()), updated_at = NOW()
-                FROM messenger_message_placements AS placement,
-                     messenger_messages AS canonical,
-                     messenger_message_placements AS boundary,
-                     messenger_messages AS boundary_message
-                WHERE state.project_id = %s AND state.user_uuid = %s
-                  AND placement.project_id = state.project_id
-                  AND placement.uuid = state.placement_uuid
-                  AND placement.topic_uuid = %s
-                  AND canonical.project_id = placement.project_id
-                  AND canonical.uuid = placement.message_uuid
-                  AND boundary.project_id = %s AND boundary.uuid = %s
-                  AND boundary_message.project_id = boundary.project_id
-                  AND boundary_message.uuid = boundary.message_uuid
-                  AND state.read_at IS NULL
-                  AND (canonical.created_at, placement.uuid)
-                      <= (boundary_message.created_at, boundary.uuid)
-                """,
-                (
-                    self.project_uuid,
-                    self.user_uuid,
-                    message.topic_uuid,
-                    self.project_uuid,
-                    message.uuid,
-                ),
+                topic_uuid=message.topic_uuid,
+                boundary=(message.created_at, message.uuid),
             )
             self._enqueue_counter_projections(
                 source_kind="messages.read",
@@ -2002,7 +1819,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 user_uuid=self.user_uuid,
                 stream_uuid=message.stream_uuid,
                 topic_uuid=message.topic_uuid,
-                emit_message_read=changed,
+                emit_message_read=bool(changed),
             )
             return _public(self._message(message.uuid), "messages")
         if resource == "messages" and action in {"star", "unstar"}:
@@ -2044,75 +1861,15 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             return _public(self._stream(stream.uuid), "streams")
         if resource == "streams" and action == "read":
             stream = self._stream(resource_uuid)
-            candidate_sql = """
-                SELECT placement.uuid, canonical.created_at
-                FROM messenger_user_message_states AS state
-                JOIN messenger_message_placements AS placement
-                  ON placement.project_id = state.project_id
-                 AND placement.uuid = state.placement_uuid
-                JOIN messenger_messages AS canonical
-                  ON canonical.project_id = placement.project_id
-                 AND canonical.uuid = placement.message_uuid
-                WHERE state.project_id = %s AND state.user_uuid = %s
-                  AND (%s::boolean OR state.read_at IS NULL)
-                  AND placement.stream_uuid = %s
-                ORDER BY canonical.created_at, placement.uuid
-            """
-            stream_read_candidate_values = (
-                self.project_uuid,
-                self.user_uuid,
-                False,
-                stream.uuid,
-            )
-            changed = self._has_unread_candidates(
-                candidate_sql=candidate_sql,
-                candidate_values=stream_read_candidate_values,
+            message_flags.mark_read(
+                session, self.project_uuid, self.user_uuid, stream_uuid=stream.uuid
             )
             session.execute(
-                """
-                UPDATE messenger_user_message_states AS state
-                SET read_at = COALESCE(state.read_at, NOW()), updated_at = NOW()
-                FROM messenger_message_placements AS placement
-                WHERE state.project_id = %s AND state.user_uuid = %s
-                  AND placement.project_id = state.project_id
-                  AND placement.uuid = state.placement_uuid
-                  AND placement.stream_uuid = %s
-                  AND state.read_at IS NULL
-                """,
-                (self.project_uuid, self.user_uuid, stream.uuid),
+                """INSERT INTO messenger_counter_updates(project_id,user_uuid,stream_uuid,topic_uuid)
+                   SELECT project_id,%s,stream_uuid,uuid FROM messenger_topics WHERE project_id=%s AND stream_uuid=%s
+                   ON CONFLICT(project_id,user_uuid,topic_uuid) DO UPDATE SET revision=EXCLUDED.revision,publish_updates=messenger_counter_updates.publish_updates OR EXCLUDED.publish_updates,next_retry_at=NULL""",
+                (self.user_uuid, self.project_uuid, stream.uuid),
             )
-            topics = session.execute(
-                """
-                SELECT uuid FROM messenger_topics
-                WHERE project_id = %s AND stream_uuid = %s
-                ORDER BY created_at, uuid
-                """,
-                (self.project_uuid, stream.uuid),
-            ).fetchall()
-            if topics:
-                self._enqueue(
-                    "read_counters",
-                    "user-stream",
-                    f"{self.project_uuid}:{self.user_uuid}:{stream.uuid}",
-                    {
-                        "source_kind": "stream.read",
-                        "user_uuid": self.user_uuid,
-                        "stream_uuid": stream.uuid,
-                        "topic_uuid": topics[0]["uuid"],
-                    },
-                )
-            for topic in topics:
-                self._enqueue(
-                    "read_counters",
-                    "user-topic",
-                    f"{self.project_uuid}:{self.user_uuid}:{topic['uuid']}",
-                    {
-                        "source_kind": "stream.read",
-                        "user_uuid": self.user_uuid,
-                        "stream_uuid": stream.uuid,
-                        "topic_uuid": topic["uuid"],
-                    },
-                )
             return _public(self._stream(stream.uuid), "streams")
         if resource == "streams" and action == "notifications":
             stream = self._stream(resource_uuid)
@@ -2140,38 +1897,6 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 """,
                 (self.project_uuid, stream.uuid, self.user_uuid),
             ).fetchone()
-            topics = session.execute(
-                """
-                SELECT uuid FROM messenger_topics
-                WHERE project_id = %s AND stream_uuid = %s
-                ORDER BY created_at, uuid
-                """,
-                (self.project_uuid, stream.uuid),
-            ).fetchall()
-            if topics:
-                self._enqueue(
-                    "read_counters",
-                    "user-stream",
-                    f"{self.project_uuid}:{self.user_uuid}:{stream.uuid}",
-                    {
-                        "source_kind": "stream.updated",
-                        "user_uuid": self.user_uuid,
-                        "stream_uuid": stream.uuid,
-                        "topic_uuid": topics[0]["uuid"],
-                    },
-                )
-            for topic in topics:
-                self._enqueue(
-                    "read_counters",
-                    "user-topic",
-                    f"{self.project_uuid}:{self.user_uuid}:{topic['uuid']}",
-                    {
-                        "source_kind": "stream.updated",
-                        "user_uuid": self.user_uuid,
-                        "stream_uuid": stream.uuid,
-                        "topic_uuid": topic["uuid"],
-                    },
-                )
             row = _public(self._stream(stream.uuid), "streams")
             return row
         if resource == "stream_topics" and action == "toggle_done":
@@ -2194,42 +1919,8 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             return _public(self._topic(topic.uuid), "stream_topics")
         if resource == "stream_topics" and action == "read":
             topic = self._topic(resource_uuid)
-            candidate_sql = """
-                SELECT placement.uuid, canonical.created_at
-                FROM messenger_user_message_states AS state
-                JOIN messenger_message_placements AS placement
-                  ON placement.project_id = state.project_id
-                 AND placement.uuid = state.placement_uuid
-                JOIN messenger_messages AS canonical
-                  ON canonical.project_id = placement.project_id
-                 AND canonical.uuid = placement.message_uuid
-                WHERE state.project_id = %s AND state.user_uuid = %s
-                  AND (%s::boolean OR state.read_at IS NULL)
-                  AND placement.topic_uuid = %s
-                ORDER BY canonical.created_at, placement.uuid
-            """
-            topic_read_candidate_values = (
-                self.project_uuid,
-                self.user_uuid,
-                False,
-                topic.uuid,
-            )
-            changed = self._has_unread_candidates(
-                candidate_sql=candidate_sql,
-                candidate_values=topic_read_candidate_values,
-            )
-            session.execute(
-                """
-                UPDATE messenger_user_message_states AS state
-                SET read_at = COALESCE(state.read_at, NOW()), updated_at = NOW()
-                FROM messenger_message_placements AS placement
-                WHERE state.project_id = %s AND state.user_uuid = %s
-                  AND placement.project_id = state.project_id
-                  AND placement.uuid = state.placement_uuid
-                  AND placement.topic_uuid = %s
-                  AND state.read_at IS NULL
-                """,
-                (self.project_uuid, self.user_uuid, topic.uuid),
+            message_flags.mark_read(
+                session, self.project_uuid, self.user_uuid, topic_uuid=topic.uuid
             )
             self._enqueue_counter_projections(
                 source_kind="topic.read",

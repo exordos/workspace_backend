@@ -25,33 +25,14 @@ def _no_pending_publications(monkeypatch):
     monkeypatch.setattr(agents.publication, "publish_pending", lambda _session: 0)
 
 
-def test_stream_counter_snapshot_accepts_no_default_topic(monkeypatch):
+def test_legacy_stream_counter_task_only_queues_independent_recount():
     project_uuid = sys_uuid.uuid4()
     stream_uuid = sys_uuid.uuid4()
     user_uuid = sys_uuid.uuid4()
     calls = []
-    monkeypatch.setattr(
-        v2_projection,
-        "_refresh_recipient_counters",
-        lambda *args: calls.append(("refresh", args)),
+    session = types.SimpleNamespace(
+        execute=lambda query, values: calls.append((query, values))
     )
-    monkeypatch.setattr(
-        v2_projection,
-        "_emit_unread_snapshots",
-        lambda *args: calls.append(("emit", args)),
-    )
-    monkeypatch.setattr(
-        v2_projection,
-        "_enqueue_folder_outbox_events",
-        lambda *args, **kwargs: calls.append(("folder", args, kwargs)),
-    )
-    monkeypatch.setattr(
-        v2_projection,
-        "_try_lock_project_event_tail",
-        lambda *args: calls.append(("lock", args)),
-    )
-    cursor = types.SimpleNamespace(fetchall=lambda: [])
-    session = types.SimpleNamespace(execute=lambda *_args, **_kwargs: cursor)
 
     v2_projection._process_read_counters(
         session,
@@ -70,10 +51,12 @@ def test_stream_counter_snapshot_accepts_no_default_topic(monkeypatch):
         },
     )
 
-    assert calls[0][0] == "refresh"
-    assert calls[0][1][3] is None
-    assert calls[-1][0] == "emit"
-    assert calls[-1][1][3] is None
+    assert len(calls) == 1
+    query, values = calls[0]
+    assert "INSERT INTO messenger_counter_updates" in query
+    assert "count(" not in query.lower()
+    assert "last_message_uuid" not in query
+    assert values == (True, project_uuid, user_uuid, stream_uuid)
 
 
 def test_projection_worker_count_is_bounded_and_defaults_to_four():
@@ -114,8 +97,9 @@ def test_worker_entrypoint_builds_one_primary_and_projection_only_peers():
             "v2_projection_workers", group=messenger_worker.DOMAIN
         )
 
-    assert len(services) == 5
-    *services, publisher = services
+    assert len(services) == 6
+    *services, publisher, counter = services
+    assert isinstance(counter, agents.MessengerCounterAgent)
     assert isinstance(publisher, agents.MessengerPublicationAgent)
     assert [service._projection_only for service in services] == [
         False,
@@ -155,7 +139,8 @@ def test_owned_dispatcher_cannot_run_slow_summary_or_presence_maintenance(monkey
     )
     try:
         services = messenger_worker.build_worker_services()
-        dispatcher, maintenance = services
+        dispatcher, maintenance, counter = services
+        assert isinstance(counter, agents.MessengerCounterAgent)
         assert dispatcher._v2_projection_enabled and dispatcher._projection_only
         assert (
             not maintenance._v2_projection_enabled and not maintenance._projection_only
@@ -643,7 +628,7 @@ def test_publication_has_an_independent_service_even_with_one_projection_worker(
         ]
         assert len(publishers) == 1
         assert publishers[0]._iter_min_period == 0.1
-        assert len(services) == 2
+        assert len(services) == 3
     finally:
         messenger_worker.CONF.clear_override(
             "v2_projection_workers", group=messenger_worker.DOMAIN

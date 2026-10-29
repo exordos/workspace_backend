@@ -13,8 +13,6 @@ import typing
 @dataclasses.dataclass
 class Changes:
     topics: dict = dataclasses.field(default_factory=dict)
-    streams: dict = dataclasses.field(default_factory=dict)
-    folders: dict = dataclasses.field(default_factory=dict)
     projects: set = dataclasses.field(default_factory=set)
 
     def topic(
@@ -27,11 +25,6 @@ class Changes:
         self.topics.setdefault((project_id, stream_uuid, topic_uuid), set()).update(
             users
         )
-
-    def stream(
-        self, project_id: object, stream_uuid: object, users: typing.Iterable[object]
-    ) -> None:
-        self.streams.setdefault((project_id, stream_uuid), set()).update(users)
 
 
 CURRENT: contextvars.ContextVar[Changes | None] = contextvars.ContextVar(

@@ -11,11 +11,9 @@ import uuid
 
 from psycopg.types import json as pg_json
 
-from workspace.bridges.zulip import message_conversion
-from workspace.bridges.zulip import content_cache
+from workspace.bridges.zulip import content_cache, message_conversion
 from workspace.common import emoji
 from workspace.messenger_api import file_storage
-
 
 TABLES = {
     "stream": "messenger_streams",
@@ -23,7 +21,6 @@ TABLES = {
     "topic": "messenger_topics",
     "topic_binding": "messenger_user_topic_bindings",
     "message": "messenger_messages",
-    "message_state": "messenger_user_message_states",
     "reaction": "messenger_message_reaction_facts",
     "file": "m_workspace_files",
 }
@@ -312,6 +309,8 @@ class Operations:
         self.http = http
 
     async def status(self, intent: dict, status: str) -> None:
+        if intent["entity_type"] == "message_state":
+            return
         table = TABLES[intent["entity_type"]]
         await self.db.sql(
             UPDATE_ENTITY_STATUS_SQL.format(table=table),
@@ -449,18 +448,26 @@ class Operations:
                     present=operation != "delete",
                     user_id=int(account["external_account_id"]),
                 )
-            before = data["before"]
-            flags = {"read": data["read_at"] is not None, "starred": data["starred"]}
-            changed = {
-                key: value
-                for key, value in flags.items()
-                if value
-                != (
-                    before.get("read_at") is not None
-                    if key == "read"
-                    else before.get("starred", False)
-                )
-            }
+            if "flags" in data:
+                changed = data["flags"]
+            else:
+                # Intentions queued before the sparse-flag migration retain
+                # their captured before/after state until delivery completes.
+                before = data["before"]
+                flags = {
+                    "read": data["read_at"] is not None,
+                    "starred": data["starred"],
+                }
+                changed = {
+                    key: value
+                    for key, value in flags.items()
+                    if value
+                    != (
+                        before.get("read_at") is not None
+                        if key == "read"
+                        else before.get("starred", False)
+                    )
+                }
             return request(
                 "flags",
                 "POST",
@@ -1234,7 +1241,7 @@ class Operations:
                     pg_json.Jsonb({"account_identity": account["external_account_id"]}),
                 ),
             )
-        if identity is not None:
+        if identity is not None and intent["entity_type"] != "message_state":
             await self.db.sql(
                 UPDATE_ENTITY_IDENTITY_SQL.format(table=TABLES[intent["entity_type"]]),
                 (

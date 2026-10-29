@@ -2,41 +2,42 @@
 # Licensed under the Apache License, Version 2.0 (the "License").
 
 import asyncio
+import concurrent.futures
 import contextlib
-import json
+import datetime
 import importlib.util
+import json
 import os
 import pathlib
-import datetime
-import concurrent.futures
-import time
-import threading
 import socket
+import threading
+import time
 import uuid
 from unittest import mock
 
 import psycopg
-from psycopg import rows
 import pytest
 from oslo_config import cfg
+from psycopg import rows
 from restalchemy.common import contexts
+from restalchemy.storage.sql import sessions
 
-from workspace.bridges.zulip import incoming_operations
-from workspace.bridges.zulip import content_cache
-from workspace.bridges.zulip import message_conversion
-from workspace.common import mutation_journal_opts
+from workspace.bridges.zulip import (
+    content_cache,
+    incoming_operations,
+    message_conversion,
+)
 from workspace.cmd import messenger_worker
-from workspace.messenger_api import websocket_service
-from workspace.messenger_api import file_storage
-from workspace.messenger_api import publication
+from workspace.common import mutation_journal_opts
+from workspace.messenger_api import file_storage, publication, websocket_service
 from workspace.messenger_api.dm import external_models
-from workspace.services import zulip_history
-from workspace.services import zulip_incoming
-from workspace.services import zulip_outgoing
-from workspace.services.messenger_workers import v2_projection
-from workspace.services.messenger_workers import mutation_runtime
+from workspace.services import zulip_history, zulip_incoming, zulip_outgoing
+from workspace.services.messenger_workers import (
+    counters,
+    mutation_runtime,
+    v2_projection,
+)
 from workspace.tests.integration import conftest
-from workspace.tests.integration import test_projection_performance as projection_tests
 from workspace.tests.integration import test_mutation_journal as journal_tests
 
 
@@ -177,7 +178,7 @@ def publish():
         while True:
             with contexts.Context().session_manager() as session:
                 count = publication.publish(session, row["project_id"])
-            if count < 256:
+            if not count:
                 break
 
 
@@ -204,6 +205,14 @@ def drain():
             "SELECT task_kind,last_error FROM messenger_projection_tasks WHERE status IN ('failed','dead_letter')"
         ).fetchall()
         assert not failures, failures
+    # Counter snapshots are committed by a separate worker process.
+    for _ in range(1000):
+        with contexts.Context().session_manager() as session:
+            counted = counters.process_pending(session, limit=100)
+        if not counted:
+            break
+    else:
+        raise AssertionError("Counter worker did not converge")
     # The real worker publishes in a separate committed transaction.
     publish()
 
@@ -821,8 +830,9 @@ def test_long_polling_reaches_an_actual_websocket_client(incoming, monkeypatch):
     import json
     import socket
 
-    from aiohttp import web
     import websockets
+    from aiohttp import web
+
     from workspace.messenger_api import websocket_service
 
     _api, db, account, _http, url = incoming
@@ -1114,17 +1124,18 @@ def test_incoming_counter_invalidations_are_partitioned_by_recipient(incoming):
     try:
         apply(incoming, subscription)
         apply(peer, subscription)
+        drain()
         apply(incoming, *(event(identifier=value) for value in range(201, 205)))
         invalidations = db.execute(
-            """SELECT payload FROM messenger_domain_outbox_events
-            WHERE project_id=%s AND event_kind='read_counters'
-              AND payload->>'source_kind'='zulip.incoming'""",
+            "SELECT user_uuid,topic_uuid FROM messenger_counter_updates WHERE project_id=%s",
             (account["project_id"],),
         ).fetchall()
-        assert len(invalidations) == 8
-        for user in (account["owner_user_uuid"], linked.owner_user_uuid):
-            assert sum(item[0]["user_uuid"] == str(user) for item in invalidations) == 4
-        assert all("user_uuids" not in item[0] for item in invalidations)
+        assert len(invalidations) == 2
+        assert {row[0] for row in invalidations} == {
+            account["owner_user_uuid"],
+            linked.owner_user_uuid,
+        }
+        assert len({row[1] for row in invalidations}) == 1
     finally:
         linked.delete()
 
@@ -1154,24 +1165,24 @@ def test_counter_consumers_coalesce_each_recipient_without_losing_updates(
             packet["message"]["timestamp"] += 2
         apply(incoming, *packets)
         topic_uuid = api.get("/v1/messenger/messages/").json()[0]["topic_uuid"]
-        with mock.patch.object(
-            v2_projection,
-            "_refresh_recipient_counters",
-            wraps=v2_projection._refresh_recipient_counters,
-        ) as refresh:
+        counted = []
+        execute = sessions.PgSQLSession.execute
+
+        def record_counts(session, statement, values=()):
+            if statement == counters.COUNT_TOPIC_SQL:
+                counted.append(values)
+            return execute(session, statement, values)
+
+        with mock.patch.object(sessions.PgSQLSession, "execute", record_counts):
             if runtime is not None:
                 journal_tests.drain(runtime, db)
             else:
                 drain()
-        refreshed = [
-            call
-            for call in refresh.call_args_list
-            if str(call.args[3]) == topic_uuid and call.args[5] == "user-topic"
-        ]
-        assert len(refreshed) == 2
-        assert {tuple(call.args[4]) for call in refreshed} == {
-            (account["owner_user_uuid"],),
-            (linked.owner_user_uuid,),
+        topic_counts = [values for values in counted if str(values[2]) == topic_uuid]
+        assert len(topic_counts) == 2
+        assert {values[1] for values in topic_counts} == {
+            account["owner_user_uuid"],
+            linked.owner_user_uuid,
         }
         for user in (account["owner_user_uuid"], linked.owner_user_uuid):
             assert (
@@ -1220,12 +1231,15 @@ def test_failed_recipient_does_not_block_other_recipient_counters(
         "op": "add",
         "subscriptions": [{"stream_id": 42, "name": "Channel"}],
     }
-    refresh = v2_projection._refresh_recipient_counters
+    execute = sessions.PgSQLSession.execute
 
-    def fail_peer(session, project, stream, topic, users, scope):
-        if linked.owner_user_uuid in users:
+    def fail_peer(session, statement, values=()):
+        if (
+            statement == counters.COUNT_TOPIC_SQL
+            and values[1] == linked.owner_user_uuid
+        ):
             raise RuntimeError("cassi regression: recipient counter failed")
-        return refresh(session, project, stream, topic, users, scope)
+        return execute(session, statement, values)
 
     try:
         apply(incoming, subscription)
@@ -1234,34 +1248,29 @@ def test_failed_recipient_does_not_block_other_recipient_counters(
         before = len(client_events(incoming))
         apply(incoming, event(identifier=211))
         message = api.get("/v1/messenger/messages/").json()[0]
-        monkeypatch.setattr(v2_projection, "_refresh_recipient_counters", fail_peer)
-        for _ in range(50):
-            # A worker commits one durable task, including its events, at a time.
-            with contexts.Context().session_manager() as session:
-                v2_projection.process_one_projection_task(
-                    session, "cassi-counter-isolation"
-                )
-            failed = db.execute(
-                "SELECT count(*) FROM messenger_projection_tasks WHERE project_id=%s "
-                "AND status='failed' AND payload->>'source_kind'='zulip.incoming'",
-                (api.project_id,),
-            ).fetchone()[0]
-            counters = db.execute(
-                "SELECT unread_count FROM messenger_stream_bindings WHERE project_id=%s "
-                "AND stream_uuid=%s AND user_uuid=%s",
-                (api.project_id, message["stream_uuid"], account["owner_user_uuid"]),
-            ).fetchone()[0]
-            folder = db.execute(
-                "SELECT unread_count FROM messenger_user_folder_bindings "
-                "WHERE project_id=%s AND user_uuid=%s "
-                "AND folder_uuid='00000000-0000-0000-0000-000000000000'",
-                (api.project_id, account["owner_user_uuid"]),
-            ).fetchone()
-            if failed and counters == 1 and folder == (1,):
-                break
-        assert failed == 1
-        assert counters == 1
-        assert folder == (1,)
+        # The failing recipient is oldest, so it must not starve a later scope.
+        db.execute(
+            "UPDATE messenger_counter_updates SET revision=nextval('messenger_counter_update_revision') "
+            "WHERE project_id=%s AND user_uuid=%s",
+            (api.project_id, account["owner_user_uuid"]),
+        )
+        monkeypatch.setattr(sessions.PgSQLSession, "execute", fail_peer)
+        with contexts.Context().session_manager() as session:
+            assert counters.process_pending(session, limit=100) == 2
+        failed = db.execute(
+            "SELECT user_uuid,next_retry_at>NOW() FROM messenger_counter_updates WHERE project_id=%s",
+            (api.project_id,),
+        ).fetchall()
+        assert failed == [(linked.owner_user_uuid, True)]
+        assert db.execute(
+            "SELECT unread_count FROM messenger_stream_bindings WHERE project_id=%s AND stream_uuid=%s AND user_uuid=%s",
+            (api.project_id, message["stream_uuid"], account["owner_user_uuid"]),
+        ).fetchone() == (1,)
+        assert db.execute(
+            "SELECT unread_count FROM messenger_user_folder_bindings WHERE project_id=%s AND user_uuid=%s "
+            "AND folder_uuid='00000000-0000-0000-0000-000000000000'",
+            (api.project_id, account["owner_user_uuid"]),
+        ).fetchone() == (1,)
         assert (
             api.get("/v1/messenger/stream_topics/" + message["topic_uuid"]).json()[
                 "unread_count"
@@ -1274,11 +1283,10 @@ def test_failed_recipient_does_not_block_other_recipient_counters(
                 value["kind"] == event_type
                 for value in client_events(incoming)[before:]
             )
-        # The failed user's work remains durable; recovery must converge too.
-        monkeypatch.setattr(v2_projection, "_refresh_recipient_counters", refresh)
+        # Retry is durable, and no artificial sleep is needed to exercise it.
+        monkeypatch.setattr(sessions.PgSQLSession, "execute", execute)
         db.execute(
-            "UPDATE messenger_projection_tasks SET next_retry_at=NOW() "
-            "WHERE project_id=%s AND status='failed'",
+            "UPDATE messenger_counter_updates SET next_retry_at=NOW() WHERE project_id=%s",
             (api.project_id,),
         )
         drain()
@@ -1714,6 +1722,7 @@ def test_cutover_keeps_live_events_and_cursor_and_removes_history_tasks(
     _database, placement_references
 ):
     import importlib.util
+
     import psycopg
 
     with conftest.isolated_migration_database(
@@ -1886,6 +1895,7 @@ def test_topic_edit_skips_already_deleted_messages_in_the_event(incoming, messag
 
 def test_journal_read_enqueues_the_provider_flag_change(incoming):
     from oslo_config import cfg
+
     from workspace.common import mutation_journal_opts
     from workspace.services.messenger_workers import mutation_runtime
     from workspace.tests.integration import test_mutation_journal as journal_tests
@@ -1909,11 +1919,11 @@ def test_journal_read_enqueues_the_provider_flag_change(incoming):
             api.get("/v1/messenger/messages/" + message["uuid"]).json()["read"] is True
         )
         intents = db.execute(
-            "SELECT data->>'source_name',data->>'read_at',data->>'actor_uuid' FROM zulip_outgoing_intents WHERE entity_type='message_state' AND external_account_uuid=%s",
+            "SELECT data->>'source_name',data->'flags',data->>'actor_uuid' FROM zulip_outgoing_intents WHERE entity_type='message_state' AND external_account_uuid=%s",
             (account["uuid"],),
         ).fetchall()
         assert len(intents) == 1
-        assert intents[0][0] == "zulip" and intents[0][1] is not None
+        assert intents[0][0] == "zulip" and intents[0][1] == {"read": True}
         assert intents[0][2] == str(account["owner_user_uuid"])
     finally:
         runtime.close()
@@ -1976,7 +1986,7 @@ def test_flags_do_not_recreate_a_state_deleted_with_its_message(incoming):
     assert api.get("/v1/messenger/messages/" + message["uuid"]).status_code == 404
     assert (
         db.execute(
-            "SELECT count(*) FROM messenger_user_message_states WHERE project_id=%s",
+            "SELECT count(*) FROM messenger_user_message_unreads WHERE project_id=%s",
             (account["project_id"],),
         ).fetchone()[0]
         == 0
@@ -2036,8 +2046,7 @@ def test_empty_flag_list_only_applies_globally_with_explicit_all(
     ).fetchone()[0]
     apply(incoming, values)
     states = db.execute(
-        "SELECT read_at IS NOT NULL,starred FROM messenger_user_message_states "
-        "WHERE project_id=%s",
+        "SELECT read,starred FROM messenger_api_user_messages_v1 WHERE project_id=%s",
         (account["project_id"],),
     ).fetchall()
     expected = all_messages is True
@@ -2075,6 +2084,7 @@ def test_ready_incoming_event_reaches_clients_without_projection_drain(incoming)
 def test_thousand_read_flags_use_one_exact_batch_and_one_counter_scope(incoming):
     api, db, account, _http, _url = incoming
     apply(incoming, *(event(identifier=value) for value in range(1, 1002)))
+    drain()
     before_events = len(client_events(incoming))
     before_counters = db.execute(
         "SELECT count(*) FROM messenger_domain_outbox_events WHERE project_id=%s",
@@ -2099,9 +2109,9 @@ def test_thousand_read_flags_use_one_exact_batch_and_one_counter_scope(incoming)
             },
         )
     states = db.execute(
-        "SELECT message.provider_identity,state.read_at IS NOT NULL "
-        "FROM messenger_user_message_states state "
-        "JOIN messenger_message_placements place ON place.uuid=state.placement_uuid "
+        "SELECT message.provider_identity,state.read "
+        "FROM messenger_api_user_messages_v1 state "
+        "JOIN messenger_message_placements place ON place.uuid=state.uuid "
         "JOIN messenger_messages message ON message.uuid=place.message_uuid "
         "WHERE state.project_id=%s",
         (account["project_id"],),
@@ -2114,8 +2124,8 @@ def test_thousand_read_flags_use_one_exact_batch_and_one_counter_scope(incoming)
     expected = {
         str(row[0])
         for row in db.execute(
-            "SELECT placement_uuid FROM messenger_user_message_states "
-            "WHERE project_id=%s AND read_at IS NOT NULL",
+            "SELECT uuid FROM messenger_api_user_messages_v1 "
+            "WHERE project_id=%s AND read",
             (account["project_id"],),
         )
     }
@@ -2126,7 +2136,14 @@ def test_thousand_read_flags_use_one_exact_batch_and_one_counter_scope(incoming)
             "SELECT count(*) FROM messenger_domain_outbox_events WHERE project_id=%s",
             (account["project_id"],),
         ).fetchone()[0]
-        == before_counters + 1
+        == before_counters
+    )
+    assert (
+        db.execute(
+            "SELECT count(*) FROM messenger_counter_updates WHERE project_id=%s AND user_uuid=%s",
+            (account["project_id"], account["owner_user_uuid"]),
+        ).fetchone()[0]
+        == 1
     )
     assert api.get("/v1/events/").status_code == 200
 
@@ -2190,9 +2207,9 @@ def test_batched_flags_preserve_pending_personal_changes_and_exact_scope(
         },
     )
     states = db.execute(
-        "SELECT message.provider_identity,state.read_at IS NOT NULL,state.starred "
-        "FROM messenger_user_message_states state "
-        "JOIN messenger_message_placements place ON place.uuid=state.placement_uuid "
+        "SELECT message.provider_identity,state.read,state.starred "
+        "FROM messenger_api_user_messages_v1 state "
+        "JOIN messenger_message_placements place ON place.uuid=state.uuid "
         "JOIN messenger_messages message ON message.uuid=place.message_uuid "
         "WHERE state.project_id=%s",
         (account["project_id"],),
@@ -3098,7 +3115,7 @@ def test_provider_identity_collisions_do_not_cross_message_or_read_state(incomin
             },
         )
         found = db.execute(
-            "SELECT message.provider_uuid,message.payload->>'content',state.read_at IS NOT NULL FROM messenger_messages_with_content_v1 message JOIN messenger_message_placements placement ON placement.message_uuid=message.uuid AND placement.project_id=message.project_id JOIN messenger_user_message_states state ON state.placement_uuid=placement.uuid AND state.project_id=placement.project_id WHERE message.project_id=%s",
+            "SELECT message.provider_uuid,message.payload->>'content',state.read FROM messenger_messages_with_content_v1 message JOIN messenger_message_placements placement ON placement.message_uuid=message.uuid AND placement.project_id=message.project_id JOIN messenger_api_user_messages_v1 state ON state.uuid=placement.uuid AND state.project_id=placement.project_id WHERE message.project_id=%s",
             (account["project_id"],),
         ).fetchall()
         assert set(found) == {
@@ -3129,19 +3146,21 @@ def test_dependency_enqueue_and_parent_deferral_rollback_together(incoming):
                     [{"id": 1, **event()}],
                 )
             ready = (await service.db.sql(zulip_incoming.SELECT_EVENT_SQL, ([], 10)))[0]
-            with mock.patch.object(
-                zulip_incoming,
-                "RETRY_EVENT_SQL",
-                "SELECT 1/0 FROM (SELECT %s::text,%s::float,%s::bigint) ignored",
+            with (
+                mock.patch.object(
+                    zulip_incoming,
+                    "RETRY_EVENT_SQL",
+                    "SELECT 1/0 FROM (SELECT %s::text,%s::float,%s::bigint) ignored",
+                ),
+                pytest.raises(psycopg.errors.DivisionByZero),
             ):
-                with pytest.raises(psycopg.errors.DivisionByZero):
-                    await service.defer_dependency(
-                        ready,
-                        account,
-                        incoming_operations.MissingDependency(
-                            {"kind": "stream", "identity": "42"}
-                        ),
-                    )
+                await service.defer_dependency(
+                    ready,
+                    account,
+                    incoming_operations.MissingDependency(
+                        {"kind": "stream", "identity": "42"}
+                    ),
+                )
             assert not await service.db.sql(
                 "SELECT 1 FROM zulip_incoming_events WHERE payload->>'type'='ensure_dependency'"
             )
@@ -3380,7 +3399,7 @@ def test_shared_message_copies_keep_every_accounts_personal_effects(
 
         asyncio.run(run())
         found = db.execute(
-            "SELECT state.user_uuid,state.read_at IS NOT NULL,state.starred FROM messenger_user_message_states state JOIN messenger_message_placements placement ON placement.uuid=state.placement_uuid JOIN messenger_messages message ON message.uuid=placement.message_uuid WHERE message.project_id=%s AND message.provider_identity='201'",
+            "SELECT state.user_uuid,state.read,state.starred FROM messenger_api_user_messages_v1 state JOIN messenger_message_placements placement ON placement.uuid=state.uuid JOIN messenger_messages message ON message.uuid=placement.message_uuid WHERE message.project_id=%s AND message.provider_identity='201'",
             (account["project_id"],),
         ).fetchall()
         assert set(found) == {
@@ -3704,7 +3723,7 @@ def test_registry_restores_unfinished_shared_work_and_personal_copies_after_rest
             assert (
                 len(
                     await restarted.db.sql(
-                        "SELECT 1 FROM messenger_user_message_states WHERE project_id=%s",
+                        "SELECT 1 FROM messenger_user_message_bindings WHERE project_id=%s",
                         (account["project_id"],),
                     )
                 )
@@ -3815,7 +3834,7 @@ def test_shared_edit_keeps_personal_flags_and_admits_a_previously_unobserved_rec
     try:
         asyncio.run(run())
         states = db.execute(
-            "SELECT state.user_uuid,state.read_at IS NOT NULL,state.starred FROM messenger_user_message_states state JOIN messenger_message_placements placement ON placement.uuid=state.placement_uuid JOIN messenger_messages message ON message.uuid=placement.message_uuid WHERE message.project_id=%s AND message.provider_identity='201'",
+            "SELECT state.user_uuid,state.read,state.starred FROM messenger_api_user_messages_v1 state JOIN messenger_message_placements placement ON placement.uuid=state.uuid JOIN messenger_messages message ON message.uuid=placement.message_uuid WHERE message.project_id=%s AND message.provider_identity='201'",
             (account["project_id"],),
         ).fetchall()
         assert set(states) == {
@@ -3958,7 +3977,7 @@ def test_shared_incoming_database_benchmark(incoming, tmp_path, enabled):
             == 16
         )
         states = db.execute(
-            "SELECT state.user_uuid,state.read_at IS NOT NULL,state.starred FROM messenger_user_message_states state JOIN messenger_message_placements placement ON placement.uuid=state.placement_uuid JOIN messenger_messages message ON message.uuid=placement.message_uuid WHERE message.project_id=%s AND message.provider_identity::integer BETWEEN 201 AND 216",
+            "SELECT state.user_uuid,state.read,state.starred FROM messenger_api_user_messages_v1 state JOIN messenger_message_placements placement ON placement.uuid=state.uuid JOIN messenger_messages message ON message.uuid=placement.message_uuid WHERE message.project_id=%s AND message.provider_identity::integer BETWEEN 201 AND 216",
             (account["project_id"],),
         ).fetchall()
         assert len(states) == 64
@@ -4113,7 +4132,7 @@ def test_shared_content_edits_refresh_each_recipients_mention_state(incoming):
                         )
                 await drain_incoming(service)
                 states = await service.db.sql(
-                    "SELECT user_uuid,mentioned,starred FROM messenger_user_message_states WHERE project_id=%s",
+                    "SELECT user_uuid,mentioned,starred FROM messenger_api_user_messages_v1 WHERE project_id=%s",
                     (account["project_id"],),
                 )
                 assert {row["user_uuid"]: row["mentioned"] for row in states} == {
@@ -4284,31 +4303,23 @@ def test_live_clients_receive_incoming_while_batched_counters_wait(
     outsider = uuid.uuid4()
     conftest.seed_workspace_user(db, outsider, f"cassi-outsider-{outsider}")
     entered, release = threading.Event(), threading.Event()
-    original = v2_projection._refresh_recipient_counters
+    execute = sessions.PgSQLSession.execute
 
-    def slow(*args):
-        if not entered.is_set():
+    def slow(session, statement, values=()):
+        if statement == counters.COUNT_TOPIC_SQL and not entered.is_set():
             entered.set()
             assert release.wait(10)
-        return original(*args)
+        return execute(session, statement, values)
 
-    monkeypatch.setattr(v2_projection, "_refresh_recipient_counters", slow)
-    projection_tests._seed_partition_claim_tasks(
-        api,
-        [
-            {
-                "task_kind": "read_counters",
-                "scope_kind": "user-topic",
-                "scope_key": "cassi-slow-counter",
-                "payload": {
-                    "source_kind": "message.created",
-                    "user_uuids": [api.user_uuid],
-                    "stream_uuid": message["stream_uuid"],
-                    "topic_uuid": message["topic_uuid"],
-                    "emit_public_event": False,
-                },
-            }
-        ],
+    monkeypatch.setattr(sessions.PgSQLSession, "execute", slow)
+    db.execute(
+        "SELECT messenger_queue_counters(%s,%s,%s,%s)",
+        (
+            account["project_id"],
+            account["owner_user_uuid"],
+            message["stream_uuid"],
+            message["topic_uuid"],
+        ),
     )
     cfg.CONF.set_override("v2_projection_workers", 1, group=messenger_worker.DOMAIN)
     services = messenger_worker.build_worker_services()
@@ -4366,12 +4377,22 @@ def test_live_clients_receive_incoming_while_batched_counters_wait(
                         pass
                     clients.append(client)
                 assert await asyncio.to_thread(entered.wait, 5)
+                started_at = time.monotonic()
                 await asyncio.to_thread(
                     apply, incoming, event("during slow counter", 302)
                 )
                 frames = await asyncio.wait_for(
                     asyncio.gather(*(receive_marker(client) for client in clients[:2])),
                     2,
+                )
+                print(
+                    json.dumps(
+                        {
+                            "websocket_during_blocked_count_ms": round(
+                                (time.monotonic() - started_at) * 1000, 2
+                            )
+                        }
+                    )
                 )
                 assert frames[0]["uuid"] == frames[1]["uuid"]
                 assert not release.is_set()

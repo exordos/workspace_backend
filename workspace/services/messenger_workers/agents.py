@@ -33,6 +33,7 @@ from workspace.messenger_api.dm import schema
 from workspace.messenger_api.api import sql_canonical_store
 from workspace.messenger_api import topic_summarization
 from workspace.messenger_api import publication
+from workspace.services.messenger_workers import counters
 from workspace.services.messenger_workers import projection_wakeup
 from workspace.services.messenger_workers import v2_projection
 from workspace.services.messenger_workers import retention
@@ -63,6 +64,16 @@ class MessengerPublicationAgent(basic.BasicService):
     def _iteration(self) -> None:
         with database_session_context() as session:
             publication.publish_pending(session)
+
+
+class MessengerCounterAgent(basic.BasicService):
+    """One independent process owns unread counts; delivery never waits on it."""
+
+    def _iteration(self) -> None:
+        with database_session_context() as session:
+            processed = counters.process_pending(session)
+        if not processed:
+            time.sleep(0.1)
 
 
 class MessengerWorkerAgent(basic.BasicService):

@@ -14,14 +14,14 @@ import uuid
 
 from psycopg.types import json as pg_json
 
-from workspace.bridges.zulip import message_conversion
-from workspace.bridges.zulip import outgoing_operations
-from workspace.bridges.zulip import content_cache
+from workspace.bridges.zulip import (
+    content_cache,
+    message_conversion,
+    outgoing_operations,
+)
 from workspace.common import emoji
-from workspace.messenger_api import file_storage
-from workspace.messenger_api import publication
+from workspace.messenger_api import file_storage, publication
 from workspace.messenger_api.dm import base
-
 
 ENQUEUE_FILE_CLEANUP_SQL = """
     INSERT INTO zulip_outgoing_intents (
@@ -193,11 +193,7 @@ SELECT_SNAPSHOT_SQL = """
 SELECT_PROJECT_USERS_SQL = """
     SELECT user_uuid FROM messenger_project_users WHERE project_id = %s
 """
-ENQUEUE_COUNTERS_SQL = """
-    INSERT INTO messenger_domain_outbox_events (
-        uuid, project_id, event_kind, scope_kind, scope_key, payload
-    ) VALUES (%s, %s, 'read_counters', 'user-topic', %s, %s)
-"""
+ENQUEUE_COUNTERS_SQL = "SELECT messenger_queue_counters(%s,%s,%s,%s)"
 SELECT_TOPIC_SQL = """
     SELECT * FROM messenger_topics
     WHERE project_id = %s AND stream_uuid = %s
@@ -208,38 +204,82 @@ SELECT_STREAM_TOPICS_SQL = """
     SELECT * FROM messenger_topics WHERE project_id = %s AND stream_uuid = %s
 """
 SELECT_STATES_SQL = """
-    SELECT state.*, placement.message_uuid, placement.stream_uuid, placement.topic_uuid
-    FROM messenger_user_message_states state
+    SELECT binding.uuid,binding.project_id,binding.user_uuid,binding.placement_uuid,
+           placement.message_uuid,placement.stream_uuid,placement.topic_uuid,
+           NOT EXISTS(SELECT 1 FROM messenger_user_message_unreads flag
+               WHERE (flag.project_id,flag.user_uuid,flag.placement_uuid)=
+                   (binding.project_id,binding.user_uuid,binding.placement_uuid)) AS read,
+           EXISTS(SELECT 1 FROM messenger_user_message_stars flag
+               WHERE (flag.project_id,flag.user_uuid,flag.placement_uuid)=
+                   (binding.project_id,binding.user_uuid,binding.placement_uuid)) AS starred
+    FROM messenger_user_message_bindings binding
     JOIN messenger_message_placements placement
-      ON placement.project_id = state.project_id AND placement.uuid = state.placement_uuid
+      ON placement.project_id=binding.project_id AND placement.uuid=binding.placement_uuid
+    JOIN messenger_stream_bindings member
+      ON member.project_id=binding.project_id AND member.user_uuid=binding.user_uuid
+     AND member.stream_uuid=placement.stream_uuid AND member.active
     JOIN messenger_streams stream
-      ON stream.project_id = placement.project_id AND stream.uuid = placement.stream_uuid
+      ON stream.project_id=placement.project_id AND stream.uuid=placement.stream_uuid
     JOIN messenger_messages message
-      ON message.project_id = placement.project_id AND message.uuid = placement.message_uuid
-    WHERE state.project_id = %s AND state.user_uuid = %s
-      AND (%s::text[] IS NULL OR message.provider_identity = ANY(%s::text[]))
+      ON message.project_id=placement.project_id AND message.uuid=placement.message_uuid
+    WHERE binding.project_id=%s AND binding.user_uuid=%s
+      AND (%s::text[] IS NULL OR message.provider_identity=ANY(%s::text[]))
       AND stream.source_name='zulip' AND stream.provider_uuid=%s
       AND message.source_name='zulip' AND message.provider_uuid=stream.provider_uuid
       AND NOT EXISTS (
           SELECT 1 FROM zulip_outgoing_intents intent
-          WHERE intent.project_id=state.project_id AND intent.entity_type='message_state'
+          WHERE intent.project_id=binding.project_id AND intent.entity_type='message_state'
             AND intent.status<>'done'
             AND intent.data->>'message_uuid'=placement.message_uuid::text
-            AND intent.data->>'user_uuid'=state.user_uuid::text
+            AND intent.data->>'user_uuid'=binding.user_uuid::text
       )
 """
 UPDATE_FLAGS_SQL = """
-    UPDATE messenger_user_message_states
-    SET read_at=CASE WHEN %s THEN
-            CASE WHEN %s THEN COALESCE(read_at,now()) ELSE NULL END ELSE read_at END,
-        starred=CASE WHEN %s THEN %s ELSE starred END,
-        updated_at=now()
-    WHERE project_id=%s AND uuid=ANY(%s::uuid[])
-      AND ((%s AND (read_at IS NOT NULL) IS DISTINCT FROM %s)
-           OR (%s AND starred IS DISTINCT FROM %s))
-    RETURNING *
+    WITH desired(read_set,read_value,star_set,star_value,project_id,user_uuid,bindings) AS (
+        VALUES(%s::boolean,%s::boolean,%s::boolean,%s::boolean,%s::uuid,%s::uuid,%s::uuid[])
+    ), targets AS MATERIALIZED (
+        SELECT binding.*,placement.stream_uuid,placement.topic_uuid,
+               desired.read_set,desired.read_value,desired.star_set,desired.star_value
+        FROM desired JOIN messenger_user_message_bindings binding
+          ON binding.project_id=desired.project_id AND binding.user_uuid=desired.user_uuid
+         AND binding.uuid=ANY(desired.bindings)
+        JOIN messenger_message_placements placement
+          ON placement.project_id=binding.project_id AND placement.uuid=binding.placement_uuid
+        JOIN messenger_stream_bindings member ON member.project_id=binding.project_id
+          AND member.user_uuid=binding.user_uuid AND member.stream_uuid=placement.stream_uuid
+          AND member.active
+        FOR KEY SHARE OF member
+    ), read_removed AS (
+        DELETE FROM messenger_user_message_unreads flag USING targets
+        WHERE targets.read_set AND targets.read_value
+          AND (flag.project_id,flag.user_uuid,flag.placement_uuid)=
+              (targets.project_id,targets.user_uuid,targets.placement_uuid)
+        RETURNING flag.placement_uuid
+    ), read_added AS (
+        INSERT INTO messenger_user_message_unreads
+        SELECT project_id,user_uuid,placement_uuid,stream_uuid,topic_uuid
+        FROM targets WHERE read_set AND NOT read_value
+        ON CONFLICT DO NOTHING RETURNING placement_uuid
+    ), star_removed AS (
+        DELETE FROM messenger_user_message_stars flag USING targets
+        WHERE targets.star_set AND NOT targets.star_value
+          AND (flag.project_id,flag.user_uuid,flag.placement_uuid)=
+              (targets.project_id,targets.user_uuid,targets.placement_uuid)
+        RETURNING flag.placement_uuid
+    ), star_added AS (
+        INSERT INTO messenger_user_message_stars
+        SELECT project_id,user_uuid,placement_uuid,stream_uuid,topic_uuid
+        FROM targets WHERE star_set AND star_value
+        ON CONFLICT DO NOTHING RETURNING placement_uuid
+    ), changed AS (
+        SELECT placement_uuid FROM read_removed UNION
+        SELECT placement_uuid FROM read_added UNION
+        SELECT placement_uuid FROM star_removed UNION
+        SELECT placement_uuid FROM star_added
+    )
+    SELECT targets.uuid,targets.placement_uuid FROM targets JOIN changed USING(placement_uuid)
 """
-# Each recipient has at most one visible state per placement. Keep batch size
+# Each recipient has at most one binding per placement. Keep batch size
 # out of the view's join order when a new recipient has no useful statistics.
 SELECT_FLAG_SNAPSHOTS_SQL = """
     SELECT snapshot.*
@@ -336,67 +376,42 @@ SELECT_MESSAGE_AUDIENCE_SQL = """
     ORDER BY user_uuid
 """
 ENSURE_MESSAGE_BINDINGS_SQL = """
-    INSERT INTO messenger_user_message_bindings (
-        uuid, project_id, placement_uuid, user_uuid, membership_generation,
-        relation_role, visibility, permissions
+    WITH members AS MATERIALIZED (
+        SELECT member.project_id,member.user_uuid
+        FROM messenger_stream_bindings member
+        JOIN unnest(%s::uuid[],%s::integer[]) AS target(user_uuid,membership_generation)
+          ON target.user_uuid=member.user_uuid
+         AND target.membership_generation=member.membership_generation
+        WHERE member.project_id=%s AND member.stream_uuid=%s AND member.active
+        FOR KEY SHARE OF member
     )
-    SELECT messenger_uuid_v5(%s, member.user_uuid::text), member.project_id,
-           %s, member.user_uuid, member.membership_generation,
-           CASE WHEN member.user_uuid = %s THEN 'author' ELSE 'member' END,
-           'visible', '{"read":true,"react":true,"star":true,"pin":true}'::jsonb
-    FROM messenger_stream_bindings member
-    JOIN unnest(%s::uuid[],%s::integer[]) AS target(user_uuid,membership_generation)
-      ON target.user_uuid=member.user_uuid
-     AND target.membership_generation=member.membership_generation
-    WHERE member.project_id = %s AND member.stream_uuid = %s AND member.active
-      AND NOT EXISTS (
-          SELECT 1 FROM messenger_user_message_bindings existing
-          WHERE existing.project_id=member.project_id
-            AND existing.placement_uuid=%s AND existing.user_uuid=member.user_uuid
-            AND existing.membership_generation=member.membership_generation
-      )
-    ON CONFLICT (project_id, placement_uuid, user_uuid) DO UPDATE SET
-        membership_generation = EXCLUDED.membership_generation,
-        relation_role = EXCLUDED.relation_role, visibility = EXCLUDED.visibility,
-        permissions = EXCLUDED.permissions, updated_at = now()
-    WHERE messenger_user_message_bindings.membership_generation
-          <> EXCLUDED.membership_generation
-       OR messenger_user_message_bindings.visibility <> EXCLUDED.visibility
+    INSERT INTO messenger_user_message_bindings(uuid,project_id,placement_uuid,user_uuid)
+    SELECT messenger_uuid_v5(%s,member.user_uuid::text),member.project_id,%s,member.user_uuid
+    FROM members member
+    ON CONFLICT(project_id,placement_uuid,user_uuid) DO NOTHING
     RETURNING user_uuid
 """
-ENSURE_MESSAGE_STATES_SQL = """
-    INSERT INTO messenger_user_message_states (
-        uuid, project_id, placement_uuid, user_uuid, membership_generation,
-        binding_uuid, mentioned, source_name, provider_uuid, provider_identity, status
+ENSURE_MESSAGE_MENTIONS_SQL = """
+    WITH targets AS MATERIALIZED (
+        SELECT binding.project_id,binding.user_uuid,binding.placement_uuid,
+               placement.stream_uuid,placement.topic_uuid,
+               position('](urn:user:' || binding.user_uuid::text || ')' IN %s)>0 AS mentioned
+        FROM messenger_user_message_bindings binding
+        JOIN messenger_message_placements placement
+          ON placement.project_id=binding.project_id AND placement.uuid=binding.placement_uuid
+        WHERE binding.project_id=%s AND binding.placement_uuid=%s
+          AND binding.user_uuid=ANY(%s::uuid[])
+    ), removed AS (
+        DELETE FROM messenger_user_message_mentions flag USING targets
+        WHERE NOT targets.mentioned AND (flag.project_id,flag.user_uuid,flag.placement_uuid)=
+              (targets.project_id,targets.user_uuid,targets.placement_uuid)
+        RETURNING flag.user_uuid
+    ), added AS (
+        INSERT INTO messenger_user_message_mentions
+        SELECT project_id,user_uuid,placement_uuid,stream_uuid,topic_uuid FROM targets
+        WHERE mentioned ON CONFLICT DO NOTHING RETURNING user_uuid
     )
-    SELECT messenger_uuid_v5(access.placement_uuid, access.user_uuid::text),
-           access.project_id, access.placement_uuid, access.user_uuid,
-           access.membership_generation, access.uuid,
-           position('](urn:user:' || access.user_uuid::text || ')' in %s) > 0,
-           'zulip', parent.provider_uuid, %s || ':' || actor.external_account_id,
-           CASE WHEN actor.external_account_id IS NULL THEN 'new' ELSE 'active' END
-    FROM messenger_user_message_bindings access
-    JOIN messenger_message_placements placement ON placement.project_id=access.project_id AND placement.uuid=access.placement_uuid
-    JOIN messenger_messages parent ON parent.project_id=placement.project_id AND parent.uuid=placement.message_uuid
-    LEFT JOIN LATERAL (
-        SELECT provider_uuid, external_account_id FROM m_external_accounts_v2
-        WHERE project_id = access.project_id AND owner_user_uuid = access.user_uuid
-          AND provider_uuid = %s AND external_account_id IS NOT NULL
-        ORDER BY uuid LIMIT 1
-    ) actor ON true
-    WHERE access.project_id = %s AND access.placement_uuid = %s AND access.user_uuid=ANY(%s::uuid[])
-    ON CONFLICT (project_id, user_uuid, placement_uuid) DO UPDATE SET
-        membership_generation = EXCLUDED.membership_generation,
-        binding_uuid = EXCLUDED.binding_uuid,
-        read_at = CASE WHEN messenger_user_message_states.membership_generation <> EXCLUDED.membership_generation THEN NULL ELSE messenger_user_message_states.read_at END,
-        mentioned = EXCLUDED.mentioned,
-        starred = CASE WHEN messenger_user_message_states.membership_generation <> EXCLUDED.membership_generation THEN false ELSE messenger_user_message_states.starred END,
-        source_name=EXCLUDED.source_name,provider_uuid=EXCLUDED.provider_uuid,
-        provider_identity=EXCLUDED.provider_identity,status=EXCLUDED.status,updated_at=now()
-    WHERE messenger_user_message_states.membership_generation <> EXCLUDED.membership_generation
-       OR messenger_user_message_states.provider_identity IS DISTINCT FROM EXCLUDED.provider_identity
-       OR messenger_user_message_states.mentioned IS DISTINCT FROM EXCLUDED.mentioned
-    RETURNING *
+    SELECT user_uuid FROM removed UNION SELECT user_uuid FROM added
 """
 ENSURE_TOPIC_BINDINGS_SQL = """
     INSERT INTO messenger_user_topic_bindings (
@@ -820,6 +835,7 @@ class Operations:
                 recipients,
                 json_value(common),
                 json_value(overrides),
+                False,
             ),
         )
         if stream_uuid is not None:
@@ -2061,19 +2077,10 @@ class Operations:
             await connection.execute(
                 ENQUEUE_COUNTERS_SQL,
                 (
-                    uuid.uuid4(),
                     account["project_id"],
-                    f"{account['project_id']}:{user_uuid}:{placement['topic_uuid']}",
-                    json_value(
-                        {
-                            "source_kind": "zulip.incoming",
-                            "emit_public_event": self.emit_public_event,
-                            "user_uuid": user_uuid,
-                            "stream_uuid": placement["stream_uuid"],
-                            "topic_uuid": placement["topic_uuid"],
-                            "placement_uuid": placement["uuid"],
-                        }
-                    ),
+                    user_uuid,
+                    placement["stream_uuid"],
+                    placement["topic_uuid"],
                 ),
             )
 
@@ -2456,13 +2463,11 @@ class Operations:
         access_cursor = await connection.execute(
             ENSURE_MESSAGE_BINDINGS_SQL,
             (
-                placement["uuid"],
-                placement["uuid"],
-                author,
                 recipient_users,
                 recipient_generations,
                 account["project_id"],
                 stream_uuid,
+                placement["uuid"],
                 placement["uuid"],
             ),
         )
@@ -2496,7 +2501,7 @@ class Operations:
                 stream_uuid,
             )
         await connection.execute(
-            ENSURE_MESSAGE_STATES_SQL,
+            ENSURE_MESSAGE_MENTIONS_SQL,
             (
                 (
                     old[0]["payload"]
@@ -2504,8 +2509,6 @@ class Operations:
                     and edited < old[0]["content_updated_at"].replace(tzinfo=None)
                     else payload
                 )["content"].lower(),
-                str(data["id"]),
-                account["provider_uuid"],
                 account["project_id"],
                 placement["uuid"],
                 recipient_users,
@@ -2513,7 +2516,16 @@ class Operations:
         )
         if "flags" in data:
             await self.flags(
-                connection, account, [data["id"]], data["flags"], snapshot=True
+                connection,
+                account,
+                [data["id"]],
+                data["flags"],
+                snapshot=True,
+                created_placements=[placement["uuid"]]
+                if any(
+                    row["user_uuid"] == account["owner_user_uuid"] for row in new_access
+                )
+                else [],
             )
         if event.get("history") and "reactions" in data:
             await self.reaction_snapshot(connection, account, data)
@@ -2569,6 +2581,7 @@ class Operations:
         *,
         snapshot: bool = False,
         present: bool = True,
+        created_placements: typing.Collection[uuid.UUID] = (),
     ) -> None:
         if identifiers == []:
             return
@@ -2600,11 +2613,8 @@ class Operations:
                 star_set,
                 star_value,
                 account["project_id"],
+                account["owner_user_uuid"],
                 [state["uuid"] for state in states],
-                read_set,
-                read_value,
-                star_set,
-                star_value,
             ),
         )
         if not saved:
@@ -2628,18 +2638,18 @@ class Operations:
                     streams.setdefault(state["stream_uuid"], []).append(
                         state["placement_uuid"]
                     )
-            for stream, identifiers in streams.items():
-                for offset in range(0, len(identifiers), 1000):
+            for stream, placement_ids in streams.items():
+                for offset in range(0, len(placement_ids), 1000):
                     await self.publish(
                         connection,
                         account,
                         "messages.read",
-                        identifiers[offset],
+                        placement_ids[offset],
                         [
                             {
                                 "user_uuid": account["owner_user_uuid"],
                                 "project_id": account["project_id"],
-                                "message_uuids": identifiers[offset : offset + 1000],
+                                "message_uuids": placement_ids[offset : offset + 1000],
                             }
                         ],
                         stream,
@@ -2647,10 +2657,13 @@ class Operations:
         else:
             for state in states:
                 item = visible.get(state["placement_uuid"])
-                if item is not None:
+                if (
+                    item is not None
+                    and state["placement_uuid"] not in created_placements
+                ):
                     kind = (
                         "message.read"
-                        if state["read_at"] != changed[state["uuid"]]["read_at"]
+                        if read_set and state["read"] != read_value
                         else "message.updated"
                     )
                     await self.publish(
@@ -2666,19 +2679,10 @@ class Operations:
             await connection.execute(
                 ENQUEUE_COUNTERS_SQL,
                 (
-                    uuid.uuid4(),
                     account["project_id"],
-                    f"{account['project_id']}:{account['owner_user_uuid']}:{state['topic_uuid']}",
-                    json_value(
-                        {
-                            "source_kind": "zulip.incoming",
-                            "emit_public_event": self.emit_public_event,
-                            "user_uuid": account["owner_user_uuid"],
-                            "stream_uuid": state["stream_uuid"],
-                            "topic_uuid": state["topic_uuid"],
-                            "placement_uuid": state["placement_uuid"],
-                        }
-                    ),
+                    account["owner_user_uuid"],
+                    state["stream_uuid"],
+                    state["topic_uuid"],
                 ),
             )
 
@@ -3033,23 +3037,19 @@ class Operations:
         cursor = await connection.execute(
             ENSURE_MESSAGE_BINDINGS_SQL,
             (
-                placement["uuid"],
-                placement["uuid"],
-                message["author_uuid"],
                 [account["owner_user_uuid"]],
                 [membership["membership_generation"]],
                 account["project_id"],
                 stream["uuid"],
                 placement["uuid"],
+                placement["uuid"],
             ),
         )
         fresh = await cursor.fetchall()
         state_cursor = await connection.execute(
-            ENSURE_MESSAGE_STATES_SQL,
+            ENSURE_MESSAGE_MENTIONS_SQL,
             (
                 message["payload"]["content"].lower(),
-                str(identifier),
-                account["provider_uuid"],
                 account["project_id"],
                 placement["uuid"],
                 [account["owner_user_uuid"]],
@@ -3058,7 +3058,14 @@ class Operations:
         changed_states = await state_cursor.fetchall()
         flags = event.get("flags", data.get("flags"))
         if flags is not None:
-            await self.flags(connection, account, [identifier], flags, snapshot=True)
+            await self.flags(
+                connection,
+                account,
+                [identifier],
+                flags,
+                snapshot=True,
+                created_placements=[placement["uuid"]] if fresh else [],
+            )
         if fresh or changed_states:
             snapshots = await rows(
                 connection,

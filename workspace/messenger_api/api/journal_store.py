@@ -13,16 +13,12 @@ import typing
 import uuid
 
 from oslo_config import cfg
-from restalchemy.common import contexts
-from restalchemy.common import exceptions
+from restalchemy.common import contexts, exceptions
 
-from workspace.common import emoji
-from workspace.common import mutation_journal_opts
+from workspace.common import emoji, mutation_journal_opts
 from workspace.messenger_api import exceptions as messenger_exceptions
-from workspace.messenger_api.api import resource_projection
-from workspace.messenger_api.api import v2_store
-from workspace.messenger_api.dm import base
-from workspace.messenger_api.dm import v2_models
+from workspace.messenger_api.api import resource_projection, v2_store
+from workspace.messenger_api.dm import base, v2_models
 
 
 class JournalStore(v2_store.MessengerV2Store):
@@ -48,32 +44,38 @@ class JournalStore(v2_store.MessengerV2Store):
             request_context.messenger_mutation_uuid = request_uuid
             request_context.request.environ["workspace.mutation_uuid"] = request_uuid
         if operation in {"read", "read_up_to", "star", "unstar", "pin", "unpin"}:
-            state = (
+            admission = (
                 contexts.Context()
                 .get_session()
                 .execute(
-                    """SELECT state.membership_generation,placement.message_uuid AS canonical_message_uuid,
-                          canonical.ingest_sequence,placement.topic_uuid
-                   FROM messenger_user_message_states AS state
+                    """SELECT membership.membership_generation,placement.message_uuid AS canonical_message_uuid,
+                          canonical.ingest_sequence,placement.topic_uuid,placement.stream_uuid
+                   FROM messenger_user_message_bindings AS binding
                    JOIN messenger_message_placements AS placement
-                     ON placement.project_id=state.project_id AND placement.uuid=state.placement_uuid
+                     ON placement.project_id=binding.project_id AND placement.uuid=binding.placement_uuid
                    JOIN messenger_messages AS canonical
                      ON canonical.project_id=placement.project_id AND canonical.uuid=placement.message_uuid
-                   WHERE state.project_id=%s AND state.placement_uuid=%s AND state.user_uuid=%s""",
+                   JOIN messenger_stream_bindings AS membership
+                     ON membership.project_id=binding.project_id AND membership.user_uuid=binding.user_uuid
+                    AND membership.stream_uuid=placement.stream_uuid AND membership.active
+                   WHERE binding.project_id=%s AND binding.placement_uuid=%s AND binding.user_uuid=%s""",
                     (self.project_uuid, resource_uuid, self.user_uuid),
                 )
                 .fetchone()
             )
+            if admission is None:
+                raise exceptions.ValidationErrorException()
             values = {
                 **values,
-                "_membership_generation": state["membership_generation"],
-                "_topic_uuid": str(state["topic_uuid"]),
+                "_membership_generation": admission["membership_generation"],
+                "_stream_uuid": str(admission["stream_uuid"]),
+                "_topic_uuid": str(admission["topic_uuid"]),
             }
             topics = [
                 {
                     **dict(topic),
-                    "canonical_message_uuid": state["canonical_message_uuid"],
-                    "ingest_sequence": state["ingest_sequence"],
+                    "canonical_message_uuid": admission["canonical_message_uuid"],
+                    "ingest_sequence": admission["ingest_sequence"],
                 }
                 for topic in topics
             ]
@@ -259,18 +261,14 @@ class JournalStore(v2_store.MessengerV2Store):
                     """SELECT placement.uuid FROM messenger_message_placements AS placement
                        JOIN messenger_messages AS message
                          ON message.project_id=placement.project_id AND message.uuid=placement.message_uuid
-                       JOIN messenger_user_message_states AS state
-                         ON state.project_id=placement.project_id AND state.placement_uuid=placement.uuid
-                        AND state.user_uuid=%s
                        JOIN messenger_user_message_bindings AS access
-                         ON access.project_id=state.project_id AND access.user_uuid=state.user_uuid
-                        AND access.placement_uuid=placement.uuid AND access.visibility='visible'
-                        AND access.membership_generation=state.membership_generation
+                         ON access.project_id=placement.project_id AND access.user_uuid=%s
+                        AND access.placement_uuid=placement.uuid
                        JOIN messenger_stream_bindings AS membership
-                         ON membership.project_id=state.project_id AND membership.user_uuid=state.user_uuid
+                         ON membership.project_id=access.project_id AND membership.user_uuid=access.user_uuid
                         AND membership.stream_uuid=placement.stream_uuid AND membership.active
-                        AND membership.membership_generation=state.membership_generation
                        WHERE placement.project_id=%s AND placement.topic_uuid=%s
+                         AND message.deleted_at IS NULL
                        ORDER BY message.created_at DESC, placement.uuid DESC LIMIT 1""",
                     (self.user_uuid, self.project_uuid, topic["topic_uuid"]),
                 ).fetchone()

@@ -11,21 +11,19 @@ import threading
 import time
 import uuid
 
-import pytest
 import psycopg
-from restalchemy.common import contexts
+import pytest
 from oslo_config import cfg
+from restalchemy.common import contexts
 
 from workspace.common import mutation_journal_opts
 from workspace.messenger_api import exceptions as messenger_exceptions
 from workspace.messenger_api import publication
 from workspace.messenger_api.api import journal_store
-from workspace.services.messenger_workers import keyed_dispatcher
-from workspace.services.messenger_workers import mutation_runtime
-from workspace.tests.integration import test_mutation_journal as journal_tests
+from workspace.services.messenger_workers import keyed_dispatcher, mutation_runtime
 from workspace.tests.integration import conftest
 from workspace.tests.integration import test_messenger_v2 as native
-
+from workspace.tests.integration import test_mutation_journal as journal_tests
 
 conversation = journal_tests.conversation
 
@@ -40,13 +38,13 @@ def journal(conversation, db):
         runtime.close()
 
 
-def test_read_up_to_leaves_hidden_personal_states_unchanged(
+def test_read_up_to_leaves_hidden_unread_facts_unchanged(
     api, db, conversation, record_property
 ):
-    stream, messages, peer = conversation
+    _stream, messages, peer = conversation
     hidden, boundary = messages
     changed = db.execute(
-        "UPDATE messenger_user_message_bindings SET visibility='hidden' WHERE project_id=%s AND placement_uuid=%s AND user_uuid=%s RETURNING uuid",
+        "DELETE FROM messenger_user_message_bindings WHERE project_id=%s AND placement_uuid=%s AND user_uuid=%s RETURNING uuid",
         (api.project_id, hidden["uuid"], peer),
     ).fetchall()
     assert len(changed) == 1
@@ -62,7 +60,7 @@ def test_read_up_to_leaves_hidden_personal_states_unchanged(
     finally:
         runtime.close()
     state = db.execute(
-        "SELECT read_at IS NOT NULL FROM messenger_user_message_states WHERE project_id=%s AND placement_uuid=%s AND user_uuid=%s",
+        "SELECT NOT EXISTS(SELECT 1 FROM messenger_user_message_unreads WHERE project_id=%s AND placement_uuid=%s AND user_uuid=%s)",
         (api.project_id, hidden["uuid"], peer),
     ).fetchone()[0]
     record_property("hidden_state_marked_read", state)
@@ -361,16 +359,18 @@ def test_tombstone_migration_backfills_and_guards_unsafe_downgrade():
                 ).fetchone()[0]
                 == 0
             )
-            with pytest.raises(RuntimeError, match="consistent pre-upgrade snapshot"):
-                with contexts.Context().session_manager() as session:
-                    module.migration_step.downgrade(session)
+            with (
+                pytest.raises(RuntimeError, match="consistent pre-upgrade snapshot"),
+                contexts.Context().session_manager() as session,
+            ):
+                module.migration_step.downgrade(session)
 
 
 @pytest.mark.parametrize("resource", ["streams", "stream_topics"])
 def test_scope_read_uses_a_visible_boundary(api, db, conversation, resource):
     stream, messages, peer = conversation
     db.execute(
-        "UPDATE messenger_user_message_bindings SET visibility='hidden' WHERE project_id=%s AND user_uuid=%s AND placement_uuid=%s",
+        "DELETE FROM messenger_user_message_bindings WHERE project_id=%s AND user_uuid=%s AND placement_uuid=%s",
         (api.project_id, peer, messages[-1]["uuid"]),
     )
     resource_uuid = (
@@ -393,7 +393,7 @@ def test_scope_read_uses_a_visible_boundary(api, db, conversation, resource):
     for message, visible in zip(messages, [True, False]):
         assert (
             db.execute(
-                "SELECT read_at IS NOT NULL FROM messenger_user_message_states WHERE project_id=%s AND user_uuid=%s AND placement_uuid=%s",
+                "SELECT NOT EXISTS(SELECT 1 FROM messenger_user_message_unreads WHERE project_id=%s AND user_uuid=%s AND placement_uuid=%s)",
                 (api.project_id, peer, message["uuid"]),
             ).fetchone()[0]
             is visible

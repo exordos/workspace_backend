@@ -25,9 +25,9 @@ from workspace.common import database
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.api import store_factory
 from workspace.messenger_api.dm import models as messenger_models
-from workspace.services.messenger_workers import v2_projection
+from workspace.messenger_api import publication
+from workspace.services.messenger_workers import counters, v2_projection
 from workspace.tests.integration import conftest
-
 
 V1 = "/v1"
 STREAMS = f"{V1}/messenger/streams/"
@@ -122,7 +122,15 @@ def _drain() -> int:
             (),
         ).fetchall()
         assert failures == []
-        return processed
+    for _ in range(1000):
+        with contexts.Context().session_manager() as session:
+            counted = counters.process_pending(session, limit=100)
+        processed += counted
+        if not counted:
+            with contexts.Context().session_manager() as session:
+                publication.publish_pending(session)
+            return processed
+    raise AssertionError("Counter worker did not converge")
 
 
 def _register_project_user(db, project_uuid, user_uuid):
@@ -448,9 +456,9 @@ def test_native_v2_deletion_before_stream_purge_drains_snapshots(
     assert _drain() >= 1
     with db.cursor() as cursor:
         cursor.execute(
-            "SELECT last_message_uuid FROM messenger_stream_bindings "
-            "WHERE project_id = %s AND stream_uuid = %s AND user_uuid = %s",
-            (api.project_id, stream["uuid"], api.user_uuid),
+            "SELECT placement_uuid FROM messenger_stream_last_messages "
+            "WHERE project_id = %s AND stream_uuid = %s",
+            (api.project_id, stream["uuid"]),
         )
         assert cursor.fetchone() == (sys_uuid.UUID(message_uuid),)
     if resource == "message":
@@ -934,13 +942,13 @@ def test_native_v2_membership_generation_fences_fanout_and_rebuilds_history(api,
             """
             SELECT count(*)
             FROM messenger_user_message_bindings AS binding
-            JOIN messenger_user_message_states AS state
-              ON state.project_id = binding.project_id
-             AND state.placement_uuid = binding.placement_uuid
-             AND state.user_uuid = binding.user_uuid
+            JOIN messenger_message_placements AS placement
+              ON placement.project_id=binding.project_id AND placement.uuid=binding.placement_uuid
+            JOIN messenger_stream_bindings AS membership
+              ON membership.project_id=binding.project_id AND membership.user_uuid=binding.user_uuid
+             AND membership.stream_uuid=placement.stream_uuid AND membership.active
             WHERE binding.project_id = %s AND binding.user_uuid = %s
-              AND binding.membership_generation = 3
-              AND state.membership_generation = 3
+              AND membership.membership_generation = 3
             """,
             (api.project_id, peer_uuid),
         )
@@ -1184,13 +1192,7 @@ def test_native_v2_idempotent_reads_repair_stale_counters(api, db):
         f"{STREAM_TOPICS}{topic_uuid}/actions/read/invoke",
         f"{STREAMS}{stream['uuid']}/actions/read/invoke",
     )
-    expected_source_kinds = (
-        "message.read",
-        "messages.read",
-        "topic.read",
-        "stream.read",
-    )
-    for path, source_kind in zip(actions, expected_source_kinds, strict=True):
+    for path in actions:
         corrupt_ready_counters()
         repaired = api.post(path, user=peer_uuid)
         assert repaired.status_code == 200, repaired.text
@@ -1198,15 +1200,12 @@ def test_native_v2_idempotent_reads_repair_stale_counters(api, db):
             cursor.execute(
                 """
                 SELECT count(*)
-                FROM messenger_domain_outbox_events
-                WHERE project_id=%s
-                  AND event_kind='read_counters'
-                  AND payload->>'source_kind'=%s
-                  AND payload->>'user_uuid'=%s
+                FROM messenger_counter_updates
+                WHERE project_id=%s AND user_uuid=%s AND topic_uuid=%s
                 """,
-                (api.project_id, source_kind, str(peer_uuid)),
+                (api.project_id, peer_uuid, topic_uuid),
             )
-            assert cursor.fetchone()[0] >= 2
+            assert cursor.fetchone()[0] == 1
         _drain()
         topic = api.get(f"{STREAM_TOPICS}{topic_uuid}", user=peer_uuid).json()
         current_stream = api.get(f"{STREAMS}{stream['uuid']}", user=peer_uuid).json()
@@ -2054,178 +2053,78 @@ def test_native_v2_coalesces_legacy_folder_snapshot_bursts(api, db):
         assert cursor.fetchone()[0] == snapshot_version + 2
 
 
-def test_native_v2_coalesces_snapshot_only_read_counter_bursts(api, db):
-    stream_response = api.post(
-        STREAMS,
-        json={
-            "name": "Read counter snapshot burst",
-            "description": "",
-            "source_name": "native",
-        },
-    )
-    assert stream_response.status_code == 201, stream_response.text
-    stream = stream_response.json()
+def test_legacy_read_counter_tasks_collapse_into_one_durable_dirty_scope(api, db):
+    stream = api.post(STREAMS, json={"name": "Legacy counter queue"}).json()
     _drain()
-    event_uuids = [sys_uuid.uuid4() for _ in range(4)]
+    event_uuids = sorted(sys_uuid.uuid4() for _ in range(4))
     scope_key = f"{api.project_id}:{api.user_uuid}:{stream['uuid']}"
-    common_payload = {
-        "user_uuid": api.user_uuid,
+    payload = {
+        "user_uuid": str(api.user_uuid),
         "stream_uuid": stream["uuid"],
         "topic_uuid": stream["default_topic_uuid"],
+        "source_kind": "message.updated",
     }
-    payloads = [
-        {**common_payload, "source_kind": "message.created"},
-        {**common_payload, "source_kind": "message.updated"},
-        {**common_payload, "source_kind": "stream_binding.created"},
-        {
-            **common_payload,
-            "source_kind": "message.read",
-            "placement_uuid": str(sys_uuid.uuid4()),
-            "emit_message_read": True,
-        },
-    ]
     with db.cursor() as cursor:
         cursor.executemany(
-            """
-            INSERT INTO messenger_domain_outbox_events (
-                uuid, project_id, event_kind, scope_kind, scope_key,
-                payload, created_at, updated_at
-            ) VALUES (
-                %s, %s, 'read_counters', 'user-stream', %s, %s::jsonb,
-                NOW() + %s * INTERVAL '1 second',
-                NOW() + %s * INTERVAL '1 second'
-            )
-            """,
+            """INSERT INTO messenger_domain_outbox_events (
+                   uuid,project_id,event_kind,scope_kind,scope_key,payload,created_at,updated_at
+               ) VALUES (%s,%s,'read_counters','user-stream',%s,%s::jsonb,NOW(),NOW())""",
             [
-                (
-                    event_uuid,
-                    api.project_id,
-                    scope_key,
-                    json.dumps(payload),
-                    position,
-                    position,
-                )
-                for position, (event_uuid, payload) in enumerate(
-                    zip(event_uuids, payloads, strict=True)
-                )
+                (event, api.project_id, scope_key, json.dumps(payload))
+                for event in event_uuids
             ],
-        )
-    with contexts.Context().session_manager() as session:
-        assert v2_projection.derive_projection_tasks(session) == 0
-    with db.cursor() as cursor:
-        cursor.execute(
-            """
-            UPDATE messenger_projection_tasks
-            SET created_at = CASE
-                WHEN (payload->>'emit_message_read')::boolean
-                    THEN NOW()
-                ELSE NOW() - INTERVAL '1 hour'
-            END
-            WHERE project_id = %s AND outbox_event_uuid = ANY(%s)
-            """,
-            (api.project_id, event_uuids),
         )
     competing_claim = psycopg.connect(conftest.TEST_DB_URL)
     try:
-        with competing_claim.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT uuid
-                FROM messenger_projection_tasks
-                WHERE project_id = %s
-                  AND outbox_event_uuid = ANY(%s::uuid[])
-                  AND COALESCE(
-                      (payload->>'emit_message_read')::boolean,
-                      FALSE
-                  ) = FALSE
-                ORDER BY created_at DESC, ordering_created_at DESC,
-                         outbox_event_uuid DESC
-                LIMIT 1
-                FOR UPDATE
-                """,
-                (api.project_id, event_uuids),
-            )
-            assert cursor.fetchone() is not None
+        # Lock a known non-head task. Earlier snapshots must remain claimable;
+        # locking a random FIFO head would correctly fence its successors.
+        competing_claim.execute(
+            """SELECT uuid FROM messenger_projection_tasks
+               WHERE project_id=%s AND outbox_event_uuid=%s FOR UPDATE""",
+            (api.project_id, event_uuids[-1]),
+        )
         with contexts.Context().session_manager() as session:
-            session.execute("SET LOCAL lock_timeout = '100ms'")
+            session.execute("SET LOCAL lock_timeout='100ms'")
             assert v2_projection.process_one_projection_task(
-                session,
-                "integration:read-counter-coalesce",
+                session, "integration:legacy-counter"
             )
+        assert (
+            db.execute(
+                """SELECT count(*) FROM messenger_projection_tasks
+               WHERE project_id=%s AND outbox_event_uuid=ANY(%s) AND status='completed'""",
+                (api.project_id, event_uuids),
+            ).fetchone()[0]
+            == 1
+        )
     finally:
         competing_claim.rollback()
         competing_claim.close()
-    with db.cursor() as cursor:
-        cursor.execute(
-            """
-            SELECT count(*) FILTER (WHERE status = 'completed'),
-                   count(*) FILTER (WHERE status = 'pending'),
-                   count(*) FILTER (WHERE attempts = 1),
-                   count(*) FILTER (WHERE attempts = 0),
-                   count(*) FILTER (
-                       WHERE status = 'pending'
-                         AND (payload->>'emit_message_read')::boolean
-                   )
-            FROM messenger_projection_tasks
-            WHERE project_id = %s AND outbox_event_uuid = ANY(%s)
-            """,
-            (api.project_id, event_uuids),
-        )
-        # The overdue snapshot batch gets one bounded turn before the fresh
-        # interactive read. Its unlocked sibling coalesces while the row held
-        # by a competing claim remains pending without blocking this worker.
-        assert cursor.fetchone() == (2, 2, 1, 3, 1)
     with contexts.Context().session_manager() as session:
-        assert v2_projection.process_one_projection_task(
-            session,
-            "integration:read-counter-coalesce",
-        )
-    with db.cursor() as cursor:
-        cursor.execute(
-            """
-            SELECT count(*) FILTER (WHERE status = 'completed'),
-                   count(*) FILTER (WHERE status = 'pending'),
-                   count(*) FILTER (WHERE attempts = 1),
-                   count(*) FILTER (WHERE attempts = 0)
-            FROM messenger_projection_tasks
-            WHERE project_id = %s AND outbox_event_uuid = ANY(%s)
-            """,
+        v2_projection.drain_projection_queue(session, "integration:legacy-counter")
+    assert (
+        db.execute(
+            """SELECT count(*) FROM messenger_projection_tasks
+           WHERE project_id=%s AND outbox_event_uuid=ANY(%s) AND status='completed'""",
             (api.project_id, event_uuids),
-        )
-        assert cursor.fetchone() == (3, 1, 2, 2)
-    with contexts.Context().session_manager() as session:
-        assert v2_projection.process_one_projection_task(
-            session,
-            "integration:read-counter-coalesce",
-        )
-        # Atomic enqueue also schedules folder snapshots for these reads.
-        v2_projection.drain_projection_queue(
-            session,
-            "integration:read-counter-coalesce",
-        )
-        assert not v2_projection.process_one_projection_task(
-            session,
-            "integration:read-counter-coalesce",
-        )
-    with db.cursor() as cursor:
-        cursor.execute(
-            """
-            SELECT count(*) FILTER (WHERE status = 'completed'),
-                   count(*) FILTER (WHERE attempts = 1),
-                   count(*) FILTER (WHERE attempts = 0)
-            FROM messenger_projection_tasks
-            WHERE project_id = %s AND outbox_event_uuid = ANY(%s)
-            """,
-            (api.project_id, event_uuids),
-        )
-        assert cursor.fetchone() == (4, 3, 1)
-    # Current migrations enqueue the resulting folder snapshots atomically.
+        ).fetchone()[0]
+        == 4
+    )
+    assert (
+        db.execute(
+            """SELECT count(*) FROM messenger_counter_updates
+           WHERE project_id=%s AND user_uuid=%s AND topic_uuid=%s""",
+            (api.project_id, api.user_uuid, stream["default_topic_uuid"]),
+        ).fetchone()[0]
+        == 1
+    )
     _drain()
-    with contexts.Context().session_manager() as session:
-        assert not v2_projection.process_one_projection_task(
-            session,
-            "integration:read-counter-coalesce",
-        )
+    assert (
+        db.execute(
+            "SELECT count(*) FROM messenger_counter_updates WHERE project_id=%s",
+            (api.project_id,),
+        ).fetchone()[0]
+        == 0
+    )
 
 
 def test_native_v2_fanout_supports_more_than_five_thousand_recipients(api, db):
@@ -2338,7 +2237,10 @@ def test_native_v2_fanout_supports_more_than_five_thousand_recipients(api, db):
         # statistics, especially after earlier tests truncated the same tables.
         for table in (
             "messenger_user_message_bindings",
-            "messenger_user_message_states",
+            "messenger_user_message_unreads",
+            "messenger_user_message_stars",
+            "messenger_user_message_pins",
+            "messenger_user_message_mentions",
             "messenger_stream_bindings",
             "messenger_message_placements",
             "messenger_messages",

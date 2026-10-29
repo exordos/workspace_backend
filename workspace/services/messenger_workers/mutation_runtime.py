@@ -5,12 +5,12 @@
 """Experimental sole-dispatcher runtime for the real Messenger schema.
 
 The dispatcher reads durable input only. Executors commit application writes,
-topic snapshots, event outbox and input acknowledgements together. Parent
-invalidations cross the thread boundary only after that commit succeeds.
+sparse flag facts, durable counter invalidations, event outbox and input
+acknowledgements together. Counts are computed by an independent process.
 """
 
-import json
 import fcntl
+import json
 import logging
 import os
 import pathlib
@@ -18,21 +18,18 @@ import time
 import typing
 import uuid
 
-from restalchemy.common import contexts
-from restalchemy.common import exceptions
+from restalchemy.common import contexts, exceptions
 from restalchemy.dm import filters as dm_filters
 from restalchemy.storage.sql import sessions
 
-from workspace.messenger_api import events
-from workspace.messenger_api import publication
+from workspace.messenger_api import events, message_flags, publication
 from workspace.messenger_api.api import v2_store
-from workspace.messenger_api.dm import message_payloads
-from workspace.messenger_api.dm import synchronization
-from workspace.messenger_api.dm import v2_models
-from workspace.services.messenger_workers import keyed_dispatcher
-from workspace.services.messenger_workers import owned_projection
-from workspace.services.messenger_workers import v2_projection
-
+from workspace.messenger_api.dm import message_payloads, synchronization, v2_models
+from workspace.services.messenger_workers import (
+    keyed_dispatcher,
+    owned_projection,
+    v2_projection,
+)
 
 LOG = logging.getLogger(__name__)
 
@@ -68,14 +65,30 @@ class MutationStore(v2_store.MessengerV2Store):
         # Only changed mention flags affect counters. Ordinary text edits do
         # not need to recount every member's entire history.
         changed = session.execute(
-            """UPDATE messenger_user_message_states SET
-                 mentioned=position(('](urn:user:'||lower(user_uuid::text)||')')
-                     IN lower(%s))>0,updated_at=NOW()
-               WHERE project_id=%s AND placement_uuid=%s
-                 AND mentioned IS DISTINCT FROM
-                     (position(('](urn:user:'||lower(user_uuid::text)||')') IN lower(%s))>0)
-               RETURNING user_uuid""",
-            (content, self.project_uuid, message.uuid, content),
+            """WITH removed AS (
+                 DELETE FROM messenger_user_message_mentions
+                 WHERE project_id=%s AND placement_uuid=%s
+                   AND position(('](urn:user:'||lower(user_uuid::text)||')') IN lower(%s))=0
+                 RETURNING user_uuid
+               ), added AS (
+                 INSERT INTO messenger_user_message_mentions
+                     (project_id,user_uuid,placement_uuid,stream_uuid,topic_uuid)
+                 SELECT binding.project_id,binding.user_uuid,binding.placement_uuid,%s,%s
+                 FROM messenger_user_message_bindings AS binding
+                 WHERE binding.project_id=%s AND binding.placement_uuid=%s
+                   AND position(('](urn:user:'||lower(binding.user_uuid::text)||')') IN lower(%s))>0
+                 ON CONFLICT DO NOTHING RETURNING user_uuid
+               ) SELECT user_uuid FROM removed UNION SELECT user_uuid FROM added""",
+            (
+                self.project_uuid,
+                message.uuid,
+                content,
+                message.stream_uuid,
+                message.topic_uuid,
+                self.project_uuid,
+                message.uuid,
+                content,
+            ),
         ).fetchall()
         if changed:
             typing.cast(owned_projection.Changes, owned_projection.CURRENT.get()).topic(
@@ -99,10 +112,10 @@ class MutationStore(v2_store.MessengerV2Store):
             contexts.Context()
             .get_session()
             .execute(
-                """SELECT placement.stream_uuid,placement.topic_uuid,array_agg(state.user_uuid) AS users
+                """SELECT placement.stream_uuid,placement.topic_uuid,array_agg(binding.user_uuid) AS users
                FROM messenger_message_placements AS placement
-               JOIN messenger_user_message_states AS state
-                 ON state.project_id=placement.project_id AND state.placement_uuid=placement.uuid
+               JOIN messenger_user_message_bindings AS binding
+                 ON binding.project_id=placement.project_id AND binding.placement_uuid=placement.uuid
                WHERE placement.project_id=%s AND placement.message_uuid=%s
                GROUP BY placement.stream_uuid,placement.topic_uuid""",
                 (self.project_uuid, message.canonical_message_uuid),
@@ -169,9 +182,6 @@ class MutationRuntime:
         self._receipt_retention_seconds = receipt_retention_seconds
         self._started = False
         self._last_scan = 0.0
-        self._recovery_due = False
-        self._initial_topics: set[tuple] | None = None
-        self._initializing = False
 
     def _topic_reservations(
         self,
@@ -181,48 +191,6 @@ class MutationRuntime:
         return [
             ("topic", _uuid(project_id), _uuid(topic["topic_uuid"])) for topic in topics
         ]
-
-    def _recover(self, session: sessions.PgSQLSession) -> None:
-        initialized = session.execute(
-            "SELECT initialized FROM messenger_mutation_projection_state WHERE singleton",
-            (),
-        ).fetchone()["initialized"]
-        if not initialized:
-            self._initial_topics = set()
-            for row in session.execute(
-                """SELECT topic.project_id, topic.uuid, topic.stream_uuid,
-                          array_agg(binding.user_uuid) AS users
-                   FROM messenger_topics AS topic
-                   JOIN messenger_user_topic_bindings AS binding
-                     ON binding.project_id=topic.project_id AND binding.topic_uuid=topic.uuid
-                   GROUP BY topic.project_id, topic.uuid, topic.stream_uuid""",
-                (),
-            ).fetchall():
-                self._initial_topics.add(("topic", row["project_id"], row["uuid"]))
-                self._dispatcher.trigger(
-                    ("topic", row["project_id"], row["uuid"]),
-                    [(row["stream_uuid"], user) for user in row["users"]],
-                )
-        # Include empty streams and project owners, not just nonzero scopes.
-        for row in session.execute(
-            "SELECT project_id, stream_uuid, user_uuid FROM messenger_stream_bindings",
-            (),
-        ).fetchall():
-            self._dispatcher.trigger(
-                ("stream", row["project_id"], row["stream_uuid"]), [row["user_uuid"]]
-            )
-        for row in session.execute(
-            "SELECT project_id, user_uuid, folder_uuid FROM messenger_user_folder_bindings",
-            (),
-        ).fetchall():
-            self._dispatcher.trigger(
-                ("folder", row["project_id"], row["user_uuid"], row["folder_uuid"])
-            )
-
-        for row in session.execute(
-            "SELECT project_id,user_uuid FROM messenger_project_users", ()
-        ).fetchall():
-            self._dispatcher.trigger(("project", row["project_id"], row["user_uuid"]))
 
     def _scan(self, session: sessions.PgSQLSession) -> None:
         if (
@@ -324,39 +292,21 @@ class MutationRuntime:
                     # complete catalog rebuild for this normal retry path.
                     LOG.info("Retrying rolled-back Messenger job key=%s", work.key)
                     continue
-                self._recovery_due = True
                 LOG.error(
                     "Owned Messenger job failed key=%s",
                     work.key,
                     exc_info=(type(error), error, error.__traceback__),
                 )
                 continue
-            if self._initial_topics is not None and work.key[0] == "topic":
-                self._initial_topics.discard(work.key)
-            if work.key[0] == "initialize":
-                self._initial_topics = None
-                self._initializing = False
             changes = typing.cast(owned_projection.Changes, changes)
-            for (project_id, stream_uuid), users in changes.streams.items():
-                self._dispatcher.trigger(
-                    ("stream", _uuid(project_id), _uuid(stream_uuid)), users
-                )
-            for key in changes.folders:
-                self._dispatcher.trigger(("folder", *key))
             for key in changes.projects:
                 self._dispatcher.trigger(("project", *key))
         now = time.monotonic()
         if not self._started or self._dispatcher.idle or now - self._last_scan >= 0.02:
             with contexts.Context().session_manager() as session:
-                if not self._started or self._recovery_due:
-                    self._recover(session)
-                    self._started = True
-                    self._recovery_due = False
                 self._scan(session)
+                self._started = True
             self._last_scan = now
-        if self._initial_topics == set() and not self._initializing:
-            self._dispatcher.trigger(("initialize",))
-            self._initializing = True
         if not completed and not self._dispatcher.idle:
             time.sleep(0.002)
         return not self._dispatcher.idle
@@ -381,14 +331,26 @@ class MutationRuntime:
             ):
                 raise exceptions.ValidationErrorException()
         if "_membership_generation" in values:
-            state = session.execute(
-                """SELECT membership_generation FROM messenger_user_message_states
-                   WHERE project_id=%s AND placement_uuid=%s AND user_uuid=%s""",
+            membership = session.execute(
+                """SELECT membership.membership_generation,placement.stream_uuid
+                   FROM messenger_user_message_bindings AS binding
+                   JOIN messenger_message_placements AS placement
+                     ON placement.project_id=binding.project_id AND placement.uuid=binding.placement_uuid
+                   JOIN messenger_stream_bindings AS membership
+                     ON membership.project_id=binding.project_id AND membership.user_uuid=binding.user_uuid
+                    AND membership.stream_uuid=placement.stream_uuid AND membership.active
+                   WHERE binding.project_id=%s AND binding.placement_uuid=%s AND binding.user_uuid=%s
+                   FOR KEY SHARE OF membership""",
                 (store.project_uuid, resource_uuid, store.user_uuid),
             ).fetchone()
             if (
-                state is None
-                or state["membership_generation"] != values["_membership_generation"]
+                membership is None
+                or membership["membership_generation"]
+                != values["_membership_generation"]
+                or (
+                    "_stream_uuid" in values
+                    and str(membership["stream_uuid"]) != values["_stream_uuid"]
+                )
             ):
                 raise exceptions.ValidationErrorException()
         if operation == "edit":
@@ -422,112 +384,31 @@ class MutationRuntime:
             "SELECT set_config('workspace.outgoing_actor',%s,true)",
             (str(store.user_uuid),),
         )
-        session.execute("SELECT set_config('workspace.batch_flags', 'on', true)", ())
-        changed = session.execute(
-            """UPDATE messenger_user_message_states AS state
-               SET read_at=NOW(), updated_at=NOW()
-               FROM messenger_message_placements AS placement,
-                    messenger_messages AS canonical,
-                    messenger_stream_bindings AS membership,
-                    messenger_user_message_bindings AS access
-               WHERE state.project_id=%s AND state.user_uuid=%s AND state.read_at IS NULL
-                 AND placement.project_id=state.project_id AND placement.uuid=state.placement_uuid
-                 AND placement.topic_uuid=%s
-                 AND canonical.project_id=placement.project_id AND canonical.uuid=placement.message_uuid AND canonical.deleted_at IS NULL
-                 AND membership.project_id=state.project_id AND membership.user_uuid=state.user_uuid
-                 AND membership.stream_uuid=placement.stream_uuid AND membership.active
-                 AND membership.membership_generation=state.membership_generation
-                 AND access.project_id=state.project_id AND access.user_uuid=state.user_uuid
-                 AND access.placement_uuid=state.placement_uuid AND access.visibility='visible'
-                 AND access.membership_generation=state.membership_generation
-                 AND (%s='read_up_to' OR placement.uuid=%s)
-                 AND (canonical.created_at, placement.uuid)<=(%s::timestamptz,%s::uuid)
-               RETURNING state.uuid, state.placement_uuid, state.mentioned,
-                         state.membership_generation""",
-            (
-                store.project_uuid,
-                store.user_uuid,
-                message.topic_uuid,
-                command["operation"],
-                message.uuid,
-                message.created_at,
-                message.uuid,
-            ),
-        ).fetchall()
-        session.execute("SELECT set_config('workspace.batch_flags', 'off', true)", ())
+        changed = message_flags.mark_read(
+            session,
+            store.project_uuid,
+            store.user_uuid,
+            topic_uuid=message.topic_uuid,
+            placement_uuid=message.uuid if command["operation"] == "read" else None,
+            boundary=(message.created_at, message.uuid),
+        )
         session.execute(
             "SELECT set_config('workspace.outgoing_actor',%s,true)", (actor or "",)
         )
-        changes = typing.cast(owned_projection.Changes, owned_projection.CURRENT.get())
-        if not changed:
-            # Preserve the public idempotent repair behavior.
-            changes.topic(
-                store.project_uuid,
-                message.stream_uuid,
-                message.topic_uuid,
-                [store.user_uuid],
-            )
-            return v2_store._public(store._message(message.uuid), "messages")
-        session.execute(
-            """WITH delta AS (
-                 SELECT count(*) AS unread,
-                        count(*) FILTER (WHERE CASE
-                          WHEN personal.notification_mode='mute' THEN stream.source_name='zulip' AND changed.mentioned
-                          WHEN personal.notification_mode='follow' THEN true
-                          WHEN personal.notification_mode='unmute' THEN stream.source_name='zulip' OR changed.mentioned
-                          WHEN membership.notification_mode='all_messages' THEN true
-                          WHEN membership.notification_mode='mentions_only' THEN changed.mentioned
-                          ELSE false END) AS active
-                 FROM unnest(%s::uuid[],%s::boolean[],%s::integer[])
-                   AS changed(placement_uuid,mentioned,membership_generation)
-                 JOIN messenger_user_message_bindings AS access
-                   ON access.project_id=%s AND access.user_uuid=%s
-                  AND access.placement_uuid=changed.placement_uuid AND access.visibility='visible'
-                  AND access.membership_generation=changed.membership_generation
-                 JOIN messenger_stream_bindings AS membership
-                   ON membership.project_id=access.project_id AND membership.user_uuid=access.user_uuid
-                  AND membership.stream_uuid=%s AND membership.active
-                  AND membership.membership_generation=changed.membership_generation
-                 JOIN messenger_streams AS stream ON stream.project_id=membership.project_id AND stream.uuid=membership.stream_uuid
-                 LEFT JOIN messenger_user_topic_bindings AS personal
-                   ON personal.project_id=membership.project_id AND personal.user_uuid=membership.user_uuid
-                  AND personal.topic_uuid=%s
-               ) UPDATE messenger_user_topic_bindings AS binding
-               SET unread_count=binding.unread_count-delta.unread,
-                   active_unread_count=binding.active_unread_count-delta.active,
-                   passive_unread_count=binding.passive_unread_count-delta.unread+delta.active,
-                   updated_at=NOW()
-               FROM delta WHERE binding.project_id=%s AND binding.user_uuid=%s AND binding.topic_uuid=%s""",
-            (
-                [row["placement_uuid"] for row in changed],
-                [row["mentioned"] for row in changed],
-                [row["membership_generation"] for row in changed],
-                store.project_uuid,
-                store.user_uuid,
-                message.stream_uuid,
-                message.topic_uuid,
-                store.project_uuid,
-                store.user_uuid,
-                message.topic_uuid,
-            ),
-        )
-        v2_projection._emit_unread_snapshots(
-            session,
-            store.project_uuid,
-            message.stream_uuid,
-            message.topic_uuid,
-            [store.user_uuid],
-            "user-topic",
-        )
-        changes.stream(store.project_uuid, message.stream_uuid, [store.user_uuid])
-        updated = store._message(message.uuid)
-        emitted = events.create_message_read_event(updated, session=session)
-        v2_projection._guard_emitted_events(
-            session,
-            emitted,
-            project_id=store.project_uuid,
+        store._enqueue_counter_projections(
             stream_uuid=message.stream_uuid,
+            topic_uuid=message.topic_uuid,
+            user_uuid=store.user_uuid,
         )
+        updated = store._message(message.uuid)
+        if changed:
+            emitted = events.create_message_read_event(updated, session=session)
+            v2_projection._guard_emitted_events(
+                session,
+                emitted,
+                project_id=store.project_uuid,
+                stream_uuid=message.stream_uuid,
+            )
         return v2_store._public(updated, "messages")
 
     def _commands(
@@ -590,29 +471,7 @@ class MutationRuntime:
                ORDER BY task.created_at, task.uuid""",
             (list(work.values),),
         ).fetchall():
-            if task["task_kind"] == "read_counters" and task["payload"].get(
-                "emit_public_event", True
-            ):
-                payload = task["payload"]
-                changes = typing.cast(
-                    owned_projection.Changes, owned_projection.CURRENT.get()
-                )
-                if task["scope_kind"] == "user-topic":
-                    changes.topic(
-                        task["project_id"],
-                        _uuid(payload["stream_uuid"]),
-                        _uuid(payload["topic_uuid"]),
-                        v2_projection._counter_users(payload),
-                    )
-                else:
-                    changes.stream(
-                        task["project_id"],
-                        _uuid(payload["stream_uuid"]),
-                        v2_projection._counter_users(payload),
-                    )
-                completed = True
-            else:
-                completed = v2_projection._process_task(session, task, 1000)
+            completed = v2_projection._process_task(session, task, 1000)
             session.execute(
                 """UPDATE messenger_projection_tasks SET status=%s, lease_owner=NULL,
                    lease_expires_at=NULL, next_retry_at=NULL, last_error=NULL, updated_at=NOW()
@@ -633,57 +492,6 @@ class MutationRuntime:
                 ).projects.add(
                     (task["project_id"], _uuid(task["payload"]["user_uuid"]))
                 )
-
-    def _stream(
-        self,
-        session: sessions.PgSQLSession,
-        project_id: uuid.UUID,
-        stream_uuid: uuid.UUID,
-        users: typing.Iterable[uuid.UUID],
-    ) -> None:
-        users = [_uuid(user) for user in users]
-        session.execute(
-            """WITH totals AS (
-                 SELECT membership.uuid,
-                        COALESCE(sum(topic_binding.unread_count),0) AS unread,
-                        COALESCE(sum(topic_binding.active_unread_count),0) AS active,
-                        (array_agg(topic_binding.last_message_uuid
-                            ORDER BY preview.created_at DESC NULLS LAST,
-                                     topic_binding.last_message_uuid DESC NULLS LAST)
-                            FILTER (WHERE preview.uuid IS NOT NULL))[1] AS last_message_uuid
-                 FROM messenger_stream_bindings AS membership
-                 LEFT JOIN messenger_topics AS topic ON topic.project_id=membership.project_id
-                   AND topic.stream_uuid=membership.stream_uuid AND topic.deleted_at IS NULL
-                 LEFT JOIN messenger_user_topic_bindings AS topic_binding
-                   ON topic_binding.project_id=topic.project_id AND topic_binding.topic_uuid=topic.uuid
-                  AND topic_binding.user_uuid=membership.user_uuid
-                 LEFT JOIN messenger_message_placements AS last_placement
-                   ON last_placement.project_id=topic_binding.project_id
-                  AND last_placement.uuid=topic_binding.last_message_uuid
-                 LEFT JOIN messenger_messages AS preview
-                   ON preview.project_id=last_placement.project_id
-                  AND preview.uuid=last_placement.message_uuid AND preview.deleted_at IS NULL
-                 WHERE membership.project_id=%s AND membership.stream_uuid=%s
-                   AND membership.user_uuid=ANY(%s::uuid[]) AND membership.active
-                 GROUP BY membership.uuid
-               ) UPDATE messenger_stream_bindings AS binding
-                 SET unread_count=totals.unread, active_unread_count=totals.active,
-                     passive_unread_count=totals.unread-totals.active,
-                     last_message_uuid=totals.last_message_uuid, updated_at=NOW()
-               FROM totals WHERE binding.project_id=%s AND binding.uuid=totals.uuid""",
-            (project_id, stream_uuid, users, project_id),
-        )
-        v2_projection._emit_unread_snapshots(
-            session, project_id, stream_uuid, None, users, "user-stream"
-        )
-        for row in session.execute(
-            """SELECT user_uuid, folder_uuid FROM messenger_user_folder_bindings
-               WHERE project_id=%s AND user_uuid=ANY(%s::uuid[])""",
-            (project_id, users),
-        ).fetchall():
-            typing.cast(
-                owned_projection.Changes, owned_projection.CURRENT.get()
-            ).folders[(project_id, row["user_uuid"], row["folder_uuid"])] = True
 
     def _publish(self, session: sessions.PgSQLSession, project_id: uuid.UUID) -> None:
         publication.publish(session, project_id)
@@ -725,11 +533,6 @@ class MutationRuntime:
                             self._receipt_retention_seconds,
                         ),
                     )
-                elif kind == "initialize":
-                    session.execute(
-                        "UPDATE messenger_mutation_projection_state SET initialized=TRUE WHERE singleton",
-                        (),
-                    )
                 elif kind == "command":
                     self._commands(session, work)
                 elif kind == "projection":
@@ -738,37 +541,18 @@ class MutationRuntime:
                     project_id, topic_uuid = work.key[1:]
                     for stream_uuid, user in work.values:
                         changes.topic(project_id, stream_uuid, topic_uuid, [user])
-                elif kind == "stream":
-                    self._stream(session, work.key[1], work.key[2], work.values)
-                elif kind == "folder":
-                    project_id, user_uuid, folder_uuid = work.key[1:]
-                    v2_projection._process_folder_projection(
-                        session,
-                        {
-                            "project_id": project_id,
-                            "payload": {
-                                "source_kind": "counters.updated",
-                                "user_uuid": user_uuid,
-                                "folder_uuid": folder_uuid,
-                            },
-                        },
-                    )
-                    changes.projects.add((project_id, user_uuid))
                 elif kind == "project":
-                    project_id, user_uuid = work.key[1:]
+                    project_id, user_uuid = work.key[1:3]
                     session.execute(
-                        """WITH total AS (
-                             SELECT COALESCE(sum(binding.unread_count),0) AS unread,
-                                    COALESCE(sum(binding.active_unread_count),0) AS active
-                             FROM messenger_stream_bindings AS binding
-                             JOIN messenger_streams AS stream ON stream.project_id=binding.project_id
-                               AND stream.uuid=binding.stream_uuid AND stream.deleted_at IS NULL
-                               AND NOT stream.is_archived
-                             WHERE binding.project_id=%s AND binding.user_uuid=%s AND binding.active
-                           ) UPDATE messenger_project_users SET unread_count=total.unread,
-                             active_unread_count=total.active, passive_unread_count=total.unread-total.active
-                           FROM total WHERE project_id=%s AND user_uuid=%s""",
-                        (project_id, user_uuid, project_id, user_uuid),
+                        """INSERT INTO messenger_counter_updates(project_id,user_uuid,stream_uuid,topic_uuid)
+                           SELECT binding.project_id,binding.user_uuid,topic.stream_uuid,binding.topic_uuid
+                           FROM messenger_user_topic_bindings AS binding
+                           JOIN messenger_topics AS topic
+                             ON topic.project_id=binding.project_id AND topic.uuid=binding.topic_uuid
+                           WHERE binding.project_id=%s AND binding.user_uuid=%s
+                           ON CONFLICT(project_id,user_uuid,topic_uuid) DO UPDATE
+                             SET stream_uuid=EXCLUDED.stream_uuid,revision=EXCLUDED.revision,publish_updates=messenger_counter_updates.publish_updates OR EXCLUDED.publish_updates,next_retry_at=NULL""",
+                        (project_id, user_uuid),
                     )
                 elif kind == "publish":
                     self._publish(session, work.key[1])
@@ -777,23 +561,11 @@ class MutationRuntime:
                     stream_uuid,
                     topic_uuid,
                 ), users in changes.topics.items():
-                    v2_projection._refresh_recipient_counters(
-                        session,
-                        project_id,
-                        stream_uuid,
-                        topic_uuid,
-                        users,
-                        "user-topic",
-                    )
-                    v2_projection._emit_unread_snapshots(
-                        session,
-                        project_id,
-                        stream_uuid,
-                        topic_uuid,
-                        users,
-                        "user-topic",
-                    )
-                    changes.stream(project_id, stream_uuid, users)
+                    for user in users:
+                        session.execute(
+                            "SELECT messenger_queue_counters(%s,%s,%s,%s)",
+                            (project_id, user, stream_uuid, topic_uuid),
+                        )
         return changes
 
     def _check_reservations(
