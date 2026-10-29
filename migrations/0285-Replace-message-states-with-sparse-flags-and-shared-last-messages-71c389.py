@@ -67,7 +67,8 @@ JOIN messenger_topics topic ON topic.project_id=placement.project_id AND topic.u
 """
 
 FACTS = """
-CREATE FUNCTION messenger_initialize_message_flags() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE FUNCTION messenger_initialize_message_flags() RETURNS trigger LANGUAGE plpgsql
+SET enable_seqscan TO off AS $$
 DECLARE previous_batch_flags text := current_setting('workspace.batch_flags',true);
 BEGIN
     -- Initial facts belong to the binding batch. Capture their provider work
@@ -77,7 +78,9 @@ BEGIN
     SELECT binding.project_id,binding.user_uuid,binding.placement_uuid,placement.stream_uuid,placement.topic_uuid
     FROM new_bindings binding
     JOIN messenger_message_placements placement ON placement.project_id=binding.project_id AND placement.uuid=binding.placement_uuid
-    JOIN messenger_messages message ON message.project_id=placement.project_id AND message.uuid=placement.message_uuid
+    -- Keep canonical lookups keyed even if statistics predate this batch.
+    JOIN LATERAL (SELECT * FROM messenger_messages
+        WHERE project_id=placement.project_id AND uuid=placement.message_uuid LIMIT 1) message ON true
     LEFT JOIN messenger_stream_bindings membership ON membership.project_id=binding.project_id AND membership.user_uuid=binding.user_uuid
         AND membership.stream_uuid=placement.stream_uuid AND membership.active
     WHERE current_setting('workspace.zulip_incoming',true)='on'
@@ -88,7 +91,8 @@ BEGIN
     SELECT binding.project_id,binding.user_uuid,binding.placement_uuid,placement.stream_uuid,placement.topic_uuid
     FROM new_bindings binding
     JOIN messenger_message_placements placement ON placement.project_id=binding.project_id AND placement.uuid=binding.placement_uuid
-    JOIN messenger_messages message ON message.project_id=placement.project_id AND message.uuid=placement.message_uuid
+    JOIN LATERAL (SELECT * FROM messenger_messages
+        WHERE project_id=placement.project_id AND uuid=placement.message_uuid LIMIT 1) message ON true
     JOIN messenger_message_contents contents ON contents.uuid=message.content_uuid
     WHERE contents.workspace_content->>'kind'='markdown'
       AND position('](urn:user:'||binding.user_uuid::text||')' IN lower(contents.workspace_content->>'content'))>0
@@ -155,15 +159,18 @@ CREATE TRIGGER messenger_reset_message_membership AFTER UPDATE OF membership_gen
 
 LAST_MESSAGES = """
 CREATE FUNCTION messenger_set_last_message(p_project uuid,p_stream uuid,p_topic uuid,p_placement uuid,p_created timestamp)
-RETURNS void LANGUAGE plpgsql AS $$
+RETURNS void LANGUAGE plpgsql SET enable_seqscan TO off AS $$
+DECLARE placement record;
 BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM messenger_message_placements placement
-        JOIN messenger_messages message ON message.project_id=placement.project_id AND message.uuid=placement.message_uuid AND message.deleted_at IS NULL
-        JOIN messenger_topics topic ON topic.project_id=placement.project_id AND topic.uuid=placement.topic_uuid AND topic.deleted_at IS NULL
-        JOIN messenger_streams stream ON stream.project_id=placement.project_id AND stream.uuid=placement.stream_uuid AND stream.deleted_at IS NULL
-        WHERE placement.project_id=p_project AND placement.uuid=p_placement
-    ) THEN RETURN; END IF;
+    -- Separate point lookups avoid a cached project-wide join scan when a
+    -- bulk insert grows tables that were nearly empty at the last ANALYZE.
+    SELECT message_uuid,topic_uuid,stream_uuid INTO placement
+    FROM messenger_message_placements WHERE project_id=p_project AND uuid=p_placement;
+    IF NOT FOUND THEN RETURN; END IF;
+    IF NOT EXISTS (SELECT 1 FROM messenger_messages WHERE project_id=p_project AND uuid=placement.message_uuid AND deleted_at IS NULL)
+       OR NOT EXISTS (SELECT 1 FROM messenger_topics WHERE project_id=p_project AND uuid=placement.topic_uuid AND deleted_at IS NULL)
+       OR NOT EXISTS (SELECT 1 FROM messenger_streams WHERE project_id=p_project AND uuid=placement.stream_uuid AND deleted_at IS NULL)
+    THEN RETURN; END IF;
     INSERT INTO messenger_stream_last_messages VALUES(p_project,p_stream,p_placement,p_created)
     ON CONFLICT(project_id,stream_uuid) DO UPDATE SET placement_uuid=EXCLUDED.placement_uuid,created_at=EXCLUDED.created_at
     WHERE (EXCLUDED.created_at,EXCLUDED.placement_uuid)>(messenger_stream_last_messages.created_at,messenger_stream_last_messages.placement_uuid);
@@ -389,6 +396,10 @@ class MigrationStep(migrations.AbstractMigrationStep):
         return False
 
     def upgrade(self, session):
+        # Normalize the known legacy spelling before typed counter snapshots.
+        session.execute(
+            "UPDATE messenger_stream_bindings SET role='member' WHERE role='members'"
+        )
         session.execute(SCHEMA)
         for suffix, predicate in FLAGS.items():
             session.execute(f"""

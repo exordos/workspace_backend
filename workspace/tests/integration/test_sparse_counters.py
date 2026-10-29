@@ -14,7 +14,7 @@ from oslo_config import cfg
 from restalchemy.common import contexts
 
 from workspace.common import mutation_journal_opts
-from workspace.messenger_api import message_flags, publication
+from workspace.messenger_api import events, message_flags, publication
 from workspace.messenger_api.api import v2_store
 from workspace.services.messenger_workers import counters, v2_projection
 from workspace.tests.integration import conftest
@@ -29,13 +29,79 @@ def _count_one():
         return counters.process_pending(session)
 
 
+def test_counters_keep_publishing_when_facts_change_during_every_count(
+    api, db, conversation
+):
+    stream, messages, peer = conversation
+    cfg.CONF.set_override("enabled", False, group=mutation_journal_opts.DOMAIN)
+    response = api.post(
+        f"{native.MESSAGES}{messages[-1]['uuid']}/actions/read_up_to/invoke",
+        user=peer,
+    )
+    assert response.status_code == 200, response.text
+    native._drain()
+    for _ in range(2):
+        assert _create_and_deliver(api, peer, stream)
+    assert _project_count(db, api, peer) == (0, 0, 0)
+    db.execute(
+        "DELETE FROM messenger_counter_updates WHERE project_id=%s AND user_uuid<>%s",
+        (api.project_id, peer),
+    )
+    placement = db.execute(
+        "SELECT placement_uuid FROM messenger_user_message_unreads "
+        "WHERE project_id=%s AND user_uuid=%s LIMIT 1",
+        (api.project_id, peer),
+    ).fetchone()[0]
+
+    class ChangingCountSession:
+        def __init__(self, session):
+            self.session = session
+
+        def execute(self, statement, values=()):
+            result = self.session.execute(statement, values)
+            if statement == counters.COUNT_TOPIC_SQL:
+                removed = db.execute(
+                    "DELETE FROM messenger_user_message_unreads "
+                    "WHERE project_id=%s AND user_uuid=%s AND placement_uuid=%s RETURNING placement_uuid",
+                    (api.project_id, peer, placement),
+                ).fetchone()
+                if removed is None:
+                    db.execute(
+                        "INSERT INTO messenger_user_message_unreads VALUES(%s,%s,%s,%s,%s)",
+                        (
+                            api.project_id,
+                            peer,
+                            placement,
+                            stream["uuid"],
+                            stream["default_topic_uuid"],
+                        ),
+                    )
+            return result
+
+        def __getattr__(self, name):
+            return getattr(self.session, name)
+
+    for expected in (2, 1, 2):
+        with contexts.Context().session_manager() as session:
+            assert counters.process_pending(ChangingCountSession(session)) == 1
+        # A committed COUNT snapshot must make progress even if another
+        # revision is already waiting; it must not require a quiet interval.
+        assert _project_count(db, api, peer) == (expected, expected, 0)
+        assert db.execute(
+            "SELECT count(*) FROM messenger_counter_updates WHERE project_id=%s AND user_uuid=%s",
+            (api.project_id, peer),
+        ).fetchone() == (1,)
+    native._drain()
+    assert _project_count(db, api, peer) == (1, 1, 0)
+
+
 def _star(api, peer, placement):
     with contexts.Context().session_manager():
         store = v2_store.MessengerV2Store(api.project_id, peer)
         return store.perform_action("messages", uuid.UUID(placement), "star", {})
 
 
-def _create_and_deliver(api, peer, stream):
+def _create_and_deliver(api, peer, stream, *, publish_events=True):
     response = api.post(
         native.MESSAGES,
         json={
@@ -60,8 +126,9 @@ def _create_and_deliver(api, peer, stream):
             "UPDATE messenger_projection_tasks SET status='completed' WHERE uuid=%s",
             (task["uuid"],),
         )
-    with contexts.Context().session_manager() as session:
-        publication.publish_pending(session)
+    if publish_events:
+        with contexts.Context().session_manager() as session:
+            publication.publish_pending(session)
     with contexts.Context().session_manager() as session:
         return session.execute(
             "SELECT EXISTS(SELECT 1 FROM m_workspace_visible_events "
@@ -69,6 +136,115 @@ def _create_and_deliver(api, peer, stream):
             "AND action='created' AND payload->>'uuid'=%s) AS visible",
             (api.project_id, peer, placement),
         ).fetchone()["visible"]
+
+
+def _counter_snapshot_backlog(api, db, stream, peer):
+    db.execute(
+        """WITH topics AS (
+             INSERT INTO messenger_topics(uuid,project_id,stream_uuid,name)
+             SELECT gen_random_uuid(),%s,%s,'Counter backlog '||number
+             FROM generate_series(1,80) number RETURNING uuid
+           ) INSERT INTO messenger_user_topic_bindings(uuid,project_id,user_uuid,topic_uuid)
+             SELECT gen_random_uuid(),%s,%s,uuid FROM topics""",
+        (api.project_id, stream["uuid"], api.project_id, peer),
+    )
+    with contexts.Context().session_manager() as session:
+        assert counters.process_pending(session, 1000) == 80
+    assert (
+        db.execute(
+            "SELECT count(*) FROM messenger_publication_outbox WHERE project_id=%s",
+            (api.project_id,),
+        ).fetchone()[0]
+        > 256
+    )
+
+
+def test_live_fanout_bypasses_the_committed_counter_snapshot_backlog(
+    api, db, conversation
+):
+    stream, _messages, peer = conversation
+    _counter_snapshot_backlog(api, db, stream, peer)
+    assert _create_and_deliver(api, peer, stream) is True, (
+        "Committed counter snapshots delayed a new message's live feed"
+    )
+    assert (
+        db.execute(
+            "SELECT count(*) FROM messenger_publication_outbox WHERE project_id=%s",
+            (api.project_id,),
+        ).fetchone()[0]
+        > 0
+    )
+
+
+def test_counter_snapshot_publication_releases_the_epoch_lock_after_a_short_batch(
+    api, db, conversation, monkeypatch
+):
+    stream, _messages, peer = conversation
+    _counter_snapshot_backlog(api, db, stream, peer)
+    cfg.CONF.set_override("enabled", False, group=mutation_journal_opts.DOMAIN)
+    publishing, release = threading.Event(), threading.Event()
+    original = events.create_broadcast_event
+    published = 0
+
+    def bounded_broadcast(*args, **kwargs):
+        nonlocal published
+        if kwargs.get("owned_publication"):
+            published += 1
+            publishing.set()
+            # An oversized batch retains the project epoch lock here. A live
+            # fanout must get its turn before this 33rd background snapshot.
+            if published == 33:
+                assert release.wait(5), "Oversized publication was not released"
+        return original(*args, **kwargs)
+
+    def publish_batch():
+        with contexts.Context().session_manager() as session:
+            return publication.publish(session, uuid.UUID(api.project_id))
+
+    monkeypatch.setattr(events, "create_broadcast_event", bounded_broadcast)
+    with concurrent.futures.ThreadPoolExecutor(2) as pool:
+        publisher = pool.submit(publish_batch)
+        try:
+            assert publishing.wait(3)
+            live = pool.submit(
+                _create_and_deliver, api, peer, stream, publish_events=False
+            )
+            assert live.result(timeout=0.75) is True
+        finally:
+            release.set()
+        assert publisher.result(timeout=5) <= 32
+
+
+def test_live_publication_preserves_earlier_background_updates_for_the_entity(
+    api, db, conversation
+):
+    stream, _messages, peer = conversation
+    with contexts.Context().session_manager() as session:
+        with publication.defer():
+            publication.enqueue(
+                session,
+                api.project_id,
+                stream["uuid"],
+                [peer],
+                "stream.updated",
+                {"uuid": stream["uuid"], "name": "earlier counter snapshot"},
+            )
+        publication.enqueue(
+            session,
+            api.project_id,
+            stream["uuid"],
+            [peer],
+            "stream.updated",
+            {"uuid": stream["uuid"], "name": "later live snapshot"},
+        )
+    with contexts.Context().session_manager() as session:
+        assert publication.publish(session, uuid.UUID(api.project_id)) == 2
+    assert db.execute(
+        "SELECT payload->>'name' FROM m_workspace_visible_events "
+        "WHERE project_id=%s AND user_uuid=%s AND payload->>'name' "
+        "IN ('earlier counter snapshot','later live snapshot') ORDER BY epoch_version",
+        (api.project_id, peer),
+    ).fetchall() == [("earlier counter snapshot",), ("later live snapshot",)]
 
 
 @pytest.mark.parametrize("journal_enabled", [False, True])

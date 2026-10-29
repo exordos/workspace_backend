@@ -780,6 +780,7 @@ def test_publication_prioritizes_realtime_and_preserves_each_entity_order(incomi
                 [],
                 "{}",
                 "{}",
+                False,
             ),
         )
     db.execute("SELECT set_config('workspace.zulip_history','off',false)")
@@ -794,6 +795,7 @@ def test_publication_prioritizes_realtime_and_preserves_each_entity_order(incomi
                 [],
                 "{}",
                 "{}",
+                False,
             ),
         )
     with db.cursor() as cursor:

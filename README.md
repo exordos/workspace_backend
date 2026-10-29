@@ -38,6 +38,11 @@ The generated public Workspace and Messenger specification uses OpenAPI 3.0.3.
 - History import and recovery: `workspace-zulip-history`
 - Outgoing Zulip intentions: `workspace-zulip-outgoing`
 
+Run one `workspace-messenger-worker` instance per database, as declared by the
+element manifest. It creates one independent unread-counter process regardless
+of the projection-worker count. Counter scopes are processed sequentially;
+producers only advance their queued revision while COUNT is running.
+
 Run each Zulip service as one separate process with
 `--config-file /etc/workspace/workspace.conf`. They use asyncio, direct PostgreSQL
 and persistent aiohttp connections. SQL transactions end before HTTP or waits.

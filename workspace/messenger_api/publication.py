@@ -36,7 +36,7 @@ ENQUEUE_SQL = """
         INSERT INTO messenger_publication_outbox
             (uuid, project_id, entity_uuid, kind, recipients, payload, recipient_payloads, priority)
         VALUES (%s, %s, %s, %s, %s::uuid[], %s::jsonb, %s::jsonb,
-                CASE WHEN current_setting('workspace.zulip_history',true)='on' THEN 1 ELSE 0 END)
+                CASE WHEN %s OR current_setting('workspace.zulip_history',true)='on' THEN 1 ELSE 0 END)
         RETURNING uuid
     )
     SELECT uuid, pg_notify('workspace_projection_tasks', '') FROM queued
@@ -46,7 +46,7 @@ SELECT_PENDING_SQL = """
     WITH selected AS MATERIALIZED (
         SELECT project_id,entity_uuid,priority,sequence
         FROM messenger_publication_outbox WHERE project_id=%s
-        ORDER BY priority,sequence LIMIT 256
+        ORDER BY priority,sequence LIMIT 32
     ), heads AS (
         SELECT project_id,entity_uuid,min(priority) AS priority,max(sequence) AS last_sequence
         FROM selected GROUP BY project_id,entity_uuid
@@ -57,9 +57,9 @@ SELECT_PENDING_SQL = """
         WHERE candidate.project_id=heads.project_id
           AND candidate.entity_uuid=heads.entity_uuid
           AND candidate.sequence<=heads.last_sequence
-        ORDER BY sequence LIMIT 256
+        ORDER BY sequence LIMIT 32
     ) pending
-    ORDER BY heads.priority,pending.sequence LIMIT 256
+    ORDER BY heads.priority,pending.sequence LIMIT 32
 """
 
 
@@ -90,6 +90,7 @@ def enqueue(
             recipients,
             json.dumps(resource_projection.simple(payload)),
             json.dumps(resource_projection.simple(overrides)),
+            DEFERRED.get(),
         ),
     )
     # Membership guards refer to the final event UUID, not a temporary epoch.
@@ -97,7 +98,7 @@ def enqueue(
 
 
 def publish(session: sessions.PgSQLSession, project_id: object) -> int:
-    """Allocate ordered client epochs only for already committed snapshots."""
+    """Allocate ordered epochs in short turns so live fanout can acquire the lock."""
     from workspace.messenger_api import events
 
     locked = session.execute(

@@ -9,7 +9,10 @@ import uuid
 import pytest
 from psycopg.types import json as pg_json
 from restalchemy.common import contexts
+from restalchemy.dm import filters
 
+from workspace.messenger_api.dm import v2_models
+from workspace.services.messenger_workers import counters
 from workspace.tests.integration import conftest
 
 
@@ -118,3 +121,45 @@ def test_sparse_migration_preserves_flags_and_rekeys_pending_provider_work(db):
         db.execute("SELECT to_regclass('messenger_user_message_states')").fetchone()[0]
         is None
     )
+
+
+@pytest.mark.pre_sparse_schema
+def test_sparse_migration_normalizes_the_legacy_members_role_before_recount(db):
+    project, user = uuid.uuid4(), uuid.uuid4()
+    stream = conftest.seed_user_stream(db, project, user, "Legacy role")
+    topic = conftest.seed_stream_topic(db, project, stream, user, "Unread", True)
+    db.execute(
+        "UPDATE messenger_stream_bindings SET role='members' "
+        "WHERE project_id=%s AND stream_uuid=%s AND user_uuid=%s",
+        (project, stream, user),
+    )
+    stream_filters = {
+        "project_id": filters.EQ(project),
+        "uuid": filters.EQ(uuid.UUID(stream)),
+        "user_uuid": filters.EQ(user),
+    }
+    # The copied pre-upgrade row already fails typed API/snapshot reads.
+    with pytest.raises(TypeError, match="members"):
+        with contexts.Context().session_manager() as session:
+            v2_models.WorkspaceUserStream.objects.get_all(
+                filters=stream_filters, session=session
+            )
+    filename = next(conftest.MIGRATIONS_DIR.glob("0285-Replace-message-states-*.py"))
+    spec = importlib.util.spec_from_file_location("sparse_role_migration", filename)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    with contexts.Context().session_manager() as session:
+        migration.migration_step.upgrade(session)
+    with contexts.Context().session_manager() as session:
+        assert counters.process_pending(session, 10) == 1
+    assert db.execute(
+        "SELECT next_retry_at FROM messenger_counter_updates "
+        "WHERE project_id=%s AND user_uuid=%s AND topic_uuid=%s",
+        (project, user, topic),
+    ).fetchall() == []
+    with contexts.Context().session_manager() as session:
+        streams = v2_models.WorkspaceUserStream.objects.get_all(
+            filters=stream_filters, session=session
+        )
+        assert len(streams) == 1
+        assert streams[0].role == "member"

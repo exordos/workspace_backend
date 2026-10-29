@@ -317,28 +317,33 @@ def test_shared_preview_does_not_scan_message_history(api, db, scope):
 def test_count_unreads_does_not_scan_read_message_history(api, db):
     stream, original = _create_message(api, "sparse-unread-count")
     count = int(os.environ.get("WORKSPACE_PREVIEW_SCOPE_ROWS", "30000"))
-    db.execute(
-        """WITH content AS MATERIALIZED (
-               SELECT content_uuid FROM messenger_messages WHERE project_id=%s LIMIT 1
-           ), messages AS (
-               INSERT INTO messenger_messages(uuid,project_id,author_uuid,content_uuid)
-               SELECT gen_random_uuid(),%s,%s,content_uuid FROM generate_series(1,%s) CROSS JOIN content
-               RETURNING uuid,project_id,created_at
-           ), placements AS (
-               INSERT INTO messenger_message_placements(uuid,project_id,message_uuid,stream_uuid,topic_uuid,created_at)
-               SELECT gen_random_uuid(),project_id,uuid,%s,%s,created_at FROM messages RETURNING *
-           ) INSERT INTO messenger_user_message_bindings(uuid,project_id,placement_uuid,user_uuid)
-             SELECT gen_random_uuid(),project_id,uuid,%s FROM placements""",
-        (
-            api.project_id,
-            api.project_id,
-            api.user_uuid,
-            count,
-            stream["uuid"],
-            stream["default_topic_uuid"],
-            api.user_uuid,
-        ),
-    )
+    # Cache plans while this project has only its first message. A bulk insert
+    # must keep keyed canonical lookups as the tables grow within the statement.
+    db.execute("ANALYZE messenger_messages,messenger_message_placements")
+    with db.transaction():
+        db.execute("SET LOCAL statement_timeout='30s'")
+        db.execute(
+            """WITH content AS MATERIALIZED (
+                   SELECT content_uuid FROM messenger_messages WHERE project_id=%s LIMIT 1
+               ), messages AS (
+                   INSERT INTO messenger_messages(uuid,project_id,author_uuid,content_uuid)
+                   SELECT gen_random_uuid(),%s,%s,content_uuid FROM generate_series(1,%s) CROSS JOIN content
+                   RETURNING uuid,project_id,created_at
+               ), placements AS (
+                   INSERT INTO messenger_message_placements(uuid,project_id,message_uuid,stream_uuid,topic_uuid,created_at)
+                   SELECT gen_random_uuid(),project_id,uuid,%s,%s,created_at FROM messages RETURNING *
+               ) INSERT INTO messenger_user_message_bindings(uuid,project_id,placement_uuid,user_uuid)
+                 SELECT gen_random_uuid(),project_id,uuid,%s FROM placements""",
+            (
+                api.project_id,
+                api.project_id,
+                api.user_uuid,
+                count,
+                stream["uuid"],
+                stream["default_topic_uuid"],
+                api.user_uuid,
+            ),
+        )
     # Own/read history has no unread facts; a single unread remains a point lookup.
     db.execute(
         "INSERT INTO messenger_user_message_unreads VALUES(%s,%s,%s,%s,%s)",
