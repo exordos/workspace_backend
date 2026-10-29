@@ -7,6 +7,8 @@ import base64
 import enum
 import typing
 
+from cryptography.hazmat.primitives.asymmetric import x25519
+
 from restalchemy.common import exceptions as ra_exc
 from restalchemy.dm import models
 from restalchemy.dm import properties
@@ -102,3 +104,13 @@ class PushDevice(
         PUSH_DEVICE_ENCRYPTION_TYPE,
         required=True,
     )
+
+    def validate_registration_key(self) -> None:
+        # Validate new writes without making previously stored low-order keys unreadable.
+        public_key = x25519.X25519PublicKey.from_public_bytes(
+            _decode_x25519_public_key(self.encryption.public_key)
+        )
+        try:
+            x25519.X25519PrivateKey.generate().exchange(public_key)
+        except ValueError:
+            raise ra_exc.ValidationErrorException() from None

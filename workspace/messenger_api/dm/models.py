@@ -284,14 +284,39 @@ class WorkspaceUser(
                 "SELECT pg_advisory_xact_lock(hashtextextended(%s::text, 0))",
                 (user_uuid,),
             )
+            session.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (f"workspace-iam-username:{username}",),
+            )
+            if email:
+                session.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (f"workspace-iam-email:{email}",),
+                )
             workspace_user = cls.objects.get_one_or_none(
                 filters={"uuid": dm_filters.EQ(user_uuid)},
             )
         if workspace_user is None:
-            workspace_user = cls.objects.get_one_or_none(
+            stale_users = {}
+            stale_username = cls.objects.get_one_or_none(
                 filters={"username": dm_filters.EQ(username)},
             )
-        if workspace_user is None:
+            if stale_username is not None:
+                stale_users[stale_username.uuid] = stale_username
+            if email:
+                stale_email = cls.objects.get_one_or_none(
+                    filters={"email": dm_filters.EQ(email)},
+                )
+                if stale_email is not None:
+                    stale_users[stale_email.uuid] = stale_email
+            for stale_user in stale_users.values():
+                stale_values: dict[str, typing.Any] = {}
+                if stale_user.username == username:
+                    stale_values["username"] = f"{username[:91]}~{stale_user.uuid}"
+                if stale_user.email == email:
+                    stale_values["email"] = None
+                stale_user.update_dm(values=stale_values)
+                stale_user.save()
             workspace_user = cls(
                 uuid=user_uuid,
                 status=status,

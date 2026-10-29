@@ -525,7 +525,8 @@ def _create_workspace_event(
         action=action,
         payload=_payload_with_kind(kind, payload),
     )
-    return event.insert(session=session)
+    result = event.insert(session=session)
+    return result
 
 
 def _create_personal_message_events(
