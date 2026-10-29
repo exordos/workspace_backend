@@ -239,8 +239,6 @@ class MessengerWorkerAgent(basic.BasicService):
     def _run_v2_projection_tasks(self) -> bool:
         if mutation_journal_opts.enabled():
             if self._mutation_runtime is None:
-                if self._v2_projection_wakeup is not None:
-                    self._v2_projection_wakeup.wait(0)
                 from workspace.services.messenger_workers import mutation_runtime
 
                 self._mutation_runtime = mutation_runtime.MutationRuntime(

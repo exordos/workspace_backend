@@ -5,7 +5,7 @@
 
 import contextlib
 import logging
-import time
+import threading
 import typing
 
 import psycopg
@@ -16,40 +16,50 @@ CHANNEL = "workspace_projection_tasks"
 
 
 class ProjectionQueueWakeup:
-    """Wake a projection worker while retaining timeout-based retry polling."""
+    """Own a LISTEN connection only while its worker is waiting for work.
+
+    Notifications are hints: work committed between an empty queue check and
+    LISTEN is recovered by timeout-based polling. Never leave an unread listener
+    behind while the worker processes its durable queues.
+    """
 
     def __init__(self, db_url: str, *, mutations: bool = False) -> None:
         self._db_url = db_url
         self._mutations = mutations
-        self._connection: typing.Any | None = None
+        self._closed = threading.Event()
+        self._wait_lock = threading.Lock()
 
     def _connect(self) -> typing.Any:
-        connection = psycopg.connect(self._db_url, autocommit=True)
-        connection.execute(f"LISTEN {CHANNEL}")
-        if self._mutations:
-            connection.execute("LISTEN workspace_mutation_commands")
+        connection = psycopg.connect(self._db_url, autocommit=True, connect_timeout=5)
+        try:
+            connection.execute(f"LISTEN {CHANNEL}")
+            if self._mutations:
+                connection.execute("LISTEN workspace_mutation_commands")
+        except BaseException:
+            connection.close()
+            raise
         return connection
 
     def wait(self, timeout: float) -> bool:
-        try:
-            if self._connection is None:
-                self._connection = self._connect()
-            notified = False
-            for _notification in self._connection.notifies(
-                timeout=timeout,
-                stop_after=1,
-            ):
-                notified = True
-            return notified
-        except Exception:
-            LOG.exception("Failed to wait for Messenger projection queue wakeup")
-            self.close()
-            time.sleep(timeout)
-            return False
+        with self._wait_lock:
+            if self._closed.is_set() or timeout <= 0:
+                return False
+            try:
+                with contextlib.closing(self._connect()) as connection:
+                    if self._closed.is_set():
+                        return False
+                    with contextlib.closing(
+                        connection.notifies(timeout=timeout, stop_after=1)
+                    ) as notifications:
+                        return next(notifications, None) is not None
+            except Exception:
+                LOG.exception("Failed to wait for Messenger projection queue wakeup")
+                self._closed.wait(timeout)
+                return False
 
     def close(self) -> None:
-        if self._connection is None:
-            return
-        with contextlib.suppress(Exception):
-            self._connection.close()
-        self._connection = None
+        self._closed.set()
+        # The wait caller alone owns and closes its connection. Shutdown waits
+        # for that bounded idle wait rather than using psycopg from two threads.
+        with self._wait_lock:
+            pass
