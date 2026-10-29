@@ -6,6 +6,7 @@
 import contextlib
 import datetime
 import logging
+import threading
 import types
 import uuid as sys_uuid
 
@@ -193,7 +194,9 @@ def test_projection_worker_waits_for_database_notification(monkeypatch):
 
 
 @pytest.mark.parametrize("mutations", [False, True])
-def test_projection_queue_wakeup_reuses_listener_connection(monkeypatch, mutations):
+def test_projection_queue_wakeup_closes_listener_before_returning(
+    monkeypatch, mutations
+):
     executed = []
     closed = []
     delivered = []
@@ -215,7 +218,7 @@ def test_projection_queue_wakeup_reuses_listener_connection(monkeypatch, mutatio
     connection = Connection()
     connections = []
 
-    def connect(db_url, *, autocommit):
+    def connect(db_url, *, autocommit, **kwargs):
         connections.append((db_url, autocommit))
         return connection
 
@@ -225,15 +228,125 @@ def test_projection_queue_wakeup_reuses_listener_connection(monkeypatch, mutatio
     )
 
     assert wakeup.wait(0.5) is True
+    assert closed == [True]
     assert wakeup.wait(0.5) is True
     wakeup.close()
 
-    assert connections == [("postgresql://test", True)]
-    assert executed == [f"LISTEN {projection_wakeup.CHANNEL}"] + (
-        ["LISTEN workspace_mutation_commands"] if mutations else []
+    assert connections == [("postgresql://test", True)] * 2
+    assert (
+        executed
+        == (
+            [f"LISTEN {projection_wakeup.CHANNEL}"]
+            + (["LISTEN workspace_mutation_commands"] if mutations else [])
+        )
+        * 2
     )
-    assert delivered == ["1", "1", "4", "1", "1", "4"]
-    assert closed == [True]
+    assert delivered == ["1", "1"]
+    assert closed == [True, True]
+
+
+@pytest.mark.parametrize("fail_at", ["projection", "mutation", "notifies"])
+def test_projection_wakeup_closes_failed_connection_and_resubscribes(
+    monkeypatch, fail_at
+):
+    connections = []
+    subscriptions = []
+
+    class Connection:
+        closed = False
+
+        def execute(self, query):
+            subscriptions.append(query)
+            if len(connections) == 1 and fail_at in query:
+                raise RuntimeError("disconnected during LISTEN")
+
+        def notifies(self, **kwargs):
+            if len(connections) == 1 and fail_at == "notifies":
+                raise RuntimeError("disconnected while waiting")
+            yield object()
+
+        def close(self):
+            self.closed = True
+
+    def connect(*args, **kwargs):
+        connection = Connection()
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(projection_wakeup.psycopg, "connect", connect)
+    wakeup = projection_wakeup.ProjectionQueueWakeup(
+        "postgresql://test", mutations=True
+    )
+    assert wakeup.wait(0.001) is False
+    assert connections[0].closed
+    assert wakeup.wait(0.001) is True
+    assert all(connection.closed for connection in connections)
+    assert subscriptions[-2:] == [
+        "LISTEN workspace_projection_tasks",
+        "LISTEN workspace_mutation_commands",
+    ]
+
+
+def test_projection_wakeup_close_waits_for_owner_and_prevents_new_connections(
+    monkeypatch,
+):
+    waiting = threading.Event()
+    release = threading.Event()
+    closed_by = []
+
+    class Connection:
+        def execute(self, query):
+            pass
+
+        def notifies(self, **kwargs):
+            waiting.set()
+            assert release.wait(2)
+            yield from ()
+
+        def close(self):
+            closed_by.append(threading.get_ident())
+
+    monkeypatch.setattr(
+        projection_wakeup.psycopg, "connect", lambda *a, **k: Connection()
+    )
+    wakeup = projection_wakeup.ProjectionQueueWakeup("postgresql://test")
+    owner = threading.Thread(target=wakeup.wait, args=(0.5,))
+    closer = threading.Thread(target=wakeup.close)
+    owner.start()
+    try:
+        assert waiting.wait(2)
+        closer.start()
+        closer.join(0.02)
+        assert closer.is_alive()
+    finally:
+        release.set()
+        owner.join(2)
+        if closer.ident is not None:
+            closer.join(2)
+    assert not owner.is_alive() and not closer.is_alive()
+    assert closed_by == [owner.ident]
+    assert wakeup.wait(0.5) is False
+    assert closed_by == [owner.ident]
+
+
+def test_mutation_runtime_initialization_does_not_open_listener(monkeypatch):
+    from workspace.services.messenger_workers import mutation_runtime
+
+    connects = []
+    monkeypatch.setattr(agents.mutation_journal_opts, "enabled", lambda: True)
+    runtime = types.SimpleNamespace(tick=lambda: True, close=lambda: None)
+    monkeypatch.setattr(mutation_runtime, "MutationRuntime", lambda **kwargs: runtime)
+    monkeypatch.setattr(
+        projection_wakeup.psycopg, "connect", lambda *a, **k: connects.append(True)
+    )
+    worker = agents.MessengerWorkerAgent(
+        v2_projection_enabled=True,
+        projection_only=True,
+        v2_projection_db_url="postgresql://test",
+    )
+    assert worker._run_v2_projection_tasks() is True
+    assert connects == []
+    worker.stop()
 
 
 def test_projection_pass_keeps_earlier_progress_after_event_lock_contention(
