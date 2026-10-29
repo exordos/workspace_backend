@@ -2056,7 +2056,7 @@ def test_native_v2_coalesces_legacy_folder_snapshot_bursts(api, db):
 def test_legacy_read_counter_tasks_collapse_into_one_durable_dirty_scope(api, db):
     stream = api.post(STREAMS, json={"name": "Legacy counter queue"}).json()
     _drain()
-    event_uuids = [sys_uuid.uuid4() for _ in range(4)]
+    event_uuids = sorted(sys_uuid.uuid4() for _ in range(4))
     scope_key = f"{api.project_id}:{api.user_uuid}:{stream['uuid']}"
     payload = {
         "user_uuid": str(api.user_uuid),
@@ -2076,12 +2076,12 @@ def test_legacy_read_counter_tasks_collapse_into_one_durable_dirty_scope(api, db
         )
     competing_claim = psycopg.connect(conftest.TEST_DB_URL)
     try:
-        # Pending tasks made by the previous version must still drain. One
-        # locked task cannot block unrelated pending work in the same scope.
+        # Lock a known non-head task. Earlier snapshots must remain claimable;
+        # locking a random FIFO head would correctly fence its successors.
         competing_claim.execute(
             """SELECT uuid FROM messenger_projection_tasks
                WHERE project_id=%s AND outbox_event_uuid=%s FOR UPDATE""",
-            (api.project_id, event_uuids[0]),
+            (api.project_id, event_uuids[-1]),
         )
         with contexts.Context().session_manager() as session:
             session.execute("SET LOCAL lock_timeout='100ms'")

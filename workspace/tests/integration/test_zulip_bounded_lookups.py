@@ -156,13 +156,27 @@ def test_unread_count_preserves_visibility_mentions_and_membership(incoming):
             (deleted, account["project_id"], message),
         )
         count(expected)
-    for active, expected in ((False, (0, 0)), (True, (1, 1))):
+    for active, expected in ((False, (0, 0)), (True, (0, 0))):
         db.execute(
             "UPDATE messenger_stream_bindings SET active=%s "
             "WHERE project_id=%s AND user_uuid=%s AND stream_uuid=%s",
             (active, account["project_id"], account["owner_user_uuid"], stream),
         )
         count(expected)
+    # Revocation removes visibility and all old facts. Reactivating membership
+    # alone does not regrant messages; new deliveries establish their own facts.
+    db.execute(
+        "INSERT INTO messenger_user_message_bindings(uuid,project_id,user_uuid,placement_uuid) "
+        "VALUES(gen_random_uuid(),%s,%s,%s)",
+        fact[:3],
+    )
+    for suffix in ("unreads", "mentions"):
+        db.execute(
+            f"INSERT INTO messenger_user_message_{suffix} VALUES(%s,%s,%s,%s,%s) "
+            "ON CONFLICT DO NOTHING",
+            fact,
+        )
+    count((1, 1))
     db.execute(
         "UPDATE messenger_stream_bindings SET membership_generation=membership_generation+1 "
         "WHERE project_id=%s AND user_uuid=%s AND stream_uuid=%s",

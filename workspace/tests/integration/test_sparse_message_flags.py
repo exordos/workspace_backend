@@ -359,3 +359,48 @@ def test_stream_restore_rebuilds_only_live_shared_previews(api, db):
             ]
             == first["uuid"]
         )
+
+
+def test_bulk_bindings_coalesce_initial_counter_work_by_scope(api, db):
+    stream, _peer = _shared_scope(api, db)
+    before = db.execute(
+        "SELECT last_value FROM messenger_counter_update_revision"
+    ).fetchone()[0]
+    db.execute(
+        """WITH content AS MATERIALIZED (
+             SELECT messenger_resolve_message_content(
+                 '{"kind":"markdown","content":"Read bulk history"}'::jsonb,NULL) AS uuid
+           ), messages AS (
+             INSERT INTO messenger_messages(uuid,project_id,author_uuid,content_uuid)
+             SELECT gen_random_uuid(),%s,%s,uuid FROM generate_series(1,500) CROSS JOIN content
+             RETURNING uuid,project_id,created_at
+           ), placements AS (
+             INSERT INTO messenger_message_placements(uuid,project_id,message_uuid,stream_uuid,topic_uuid,created_at)
+             SELECT gen_random_uuid(),project_id,uuid,%s,%s,created_at FROM messages RETURNING uuid,project_id
+           ) INSERT INTO messenger_user_message_bindings(uuid,project_id,user_uuid,placement_uuid)
+             SELECT gen_random_uuid(),project_id,%s,uuid FROM placements""",
+        (
+            api.project_id,
+            api.user_uuid,
+            stream["uuid"],
+            stream["default_topic_uuid"],
+            api.user_uuid,
+        ),
+    )
+    after = db.execute(
+        "SELECT last_value FROM messenger_counter_update_revision"
+    ).fetchone()[0]
+    # A large binding batch must dirty its one scope a constant number of times.
+    assert 0 < after - before <= 3
+    assert db.execute(
+        "SELECT count(*) FROM messenger_counter_updates WHERE project_id=%s",
+        (api.project_id,),
+    ).fetchone() == (1,)
+    assert db.execute(
+        "SELECT count(*) FROM messenger_user_message_bindings WHERE project_id=%s",
+        (api.project_id,),
+    ).fetchone() == (500,)
+    assert db.execute(
+        "SELECT count(*) FROM messenger_user_message_unreads WHERE project_id=%s",
+        (api.project_id,),
+    ).fetchone() == (0,)

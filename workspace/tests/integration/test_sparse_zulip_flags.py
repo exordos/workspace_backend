@@ -1,8 +1,10 @@
 # Copyright 2026 Genesis Corporation.
 # Licensed under the Apache License, Version 2.0 (the "License").
 
+import concurrent.futures
 import uuid
 
+import psycopg
 import pytest
 
 from workspace.tests.integration import test_zulip_incoming
@@ -64,3 +66,31 @@ def test_remote_sparse_flags_are_idempotent_and_do_not_recreate_bindings(
         ).fetchone()[0]
         == 0
     )
+
+
+def test_remote_flags_do_not_wait_for_the_counter_cache_row(incoming):
+    api, _db, account, _http, url = incoming
+    test_zulip_incoming.apply(incoming, test_zulip_incoming.event())
+    stream = uuid.UUID(api.get("/v1/messenger/messages/").json()[0]["stream_uuid"])
+    with psycopg.connect(url) as counter:
+        counter.execute(
+            "UPDATE messenger_stream_bindings SET unread_count=unread_count "
+            "WHERE project_id=%s AND stream_uuid=%s AND user_uuid=%s",
+            (account["project_id"], stream, account["owner_user_uuid"]),
+        )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            remote = pool.submit(
+                test_zulip_incoming.apply,
+                incoming,
+                {
+                    "type": "update_message_flags",
+                    "messages": [101],
+                    "flag": "read",
+                    "op": "add",
+                },
+            )
+            try:
+                remote.result(timeout=2)
+            finally:
+                counter.rollback()
+    assert api.get("/v1/messenger/messages/").json()[0]["read"] is True

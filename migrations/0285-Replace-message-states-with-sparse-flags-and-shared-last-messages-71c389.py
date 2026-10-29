@@ -68,32 +68,50 @@ JOIN messenger_topics topic ON topic.project_id=placement.project_id AND topic.u
 
 FACTS = """
 CREATE FUNCTION messenger_initialize_message_flags() RETURNS trigger LANGUAGE plpgsql AS $$
-DECLARE placement record; message record;
+DECLARE previous_batch_flags text := current_setting('workspace.batch_flags',true);
 BEGIN
-    SELECT * INTO placement FROM messenger_message_placements WHERE project_id=NEW.project_id AND uuid=NEW.placement_uuid;
-    SELECT author_uuid,canonical.created_at,contents.workspace_content AS payload INTO message
-    FROM messenger_messages canonical JOIN messenger_message_contents contents ON contents.uuid=canonical.content_uuid
-    WHERE canonical.project_id=placement.project_id AND canonical.uuid=placement.message_uuid;
-    IF current_setting('workspace.zulip_incoming',true)='on' OR (message.author_uuid<>NEW.user_uuid AND message.created_at >= (
-        SELECT membership_started_at FROM messenger_stream_bindings
-        WHERE project_id=NEW.project_id AND user_uuid=NEW.user_uuid AND stream_uuid=placement.stream_uuid AND active
-    )) THEN
-        INSERT INTO messenger_user_message_unreads VALUES(NEW.project_id,NEW.user_uuid,NEW.placement_uuid,placement.stream_uuid,placement.topic_uuid)
-        ON CONFLICT DO NOTHING;
-    END IF;
-    IF message.payload->>'kind'='markdown' AND position('](urn:user:'||NEW.user_uuid::text||')' IN lower(message.payload->>'content'))>0 THEN
-        INSERT INTO messenger_user_message_mentions VALUES(NEW.project_id,NEW.user_uuid,NEW.placement_uuid,placement.stream_uuid,placement.topic_uuid)
-        ON CONFLICT DO NOTHING;
-    END IF;
-    PERFORM messenger_queue_counters(NEW.project_id,NEW.user_uuid,placement.stream_uuid,placement.topic_uuid);
+    -- Initial facts belong to the binding batch. Capture their provider work
+    -- once below rather than scheduling it again for every inserted flag.
+    PERFORM set_config('workspace.batch_flags','on',true);
+    INSERT INTO messenger_user_message_unreads(project_id,user_uuid,placement_uuid,stream_uuid,topic_uuid)
+    SELECT binding.project_id,binding.user_uuid,binding.placement_uuid,placement.stream_uuid,placement.topic_uuid
+    FROM new_bindings binding
+    JOIN messenger_message_placements placement ON placement.project_id=binding.project_id AND placement.uuid=binding.placement_uuid
+    JOIN messenger_messages message ON message.project_id=placement.project_id AND message.uuid=placement.message_uuid
+    LEFT JOIN messenger_stream_bindings membership ON membership.project_id=binding.project_id AND membership.user_uuid=binding.user_uuid
+        AND membership.stream_uuid=placement.stream_uuid AND membership.active
+    WHERE current_setting('workspace.zulip_incoming',true)='on'
+        OR (message.author_uuid<>binding.user_uuid AND message.created_at>=membership.membership_started_at)
+    ORDER BY binding.project_id,binding.user_uuid,binding.placement_uuid
+    ON CONFLICT DO NOTHING;
+    INSERT INTO messenger_user_message_mentions(project_id,user_uuid,placement_uuid,stream_uuid,topic_uuid)
+    SELECT binding.project_id,binding.user_uuid,binding.placement_uuid,placement.stream_uuid,placement.topic_uuid
+    FROM new_bindings binding
+    JOIN messenger_message_placements placement ON placement.project_id=binding.project_id AND placement.uuid=binding.placement_uuid
+    JOIN messenger_messages message ON message.project_id=placement.project_id AND message.uuid=placement.message_uuid
+    JOIN messenger_message_contents contents ON contents.uuid=message.content_uuid
+    WHERE contents.workspace_content->>'kind'='markdown'
+      AND position('](urn:user:'||binding.user_uuid::text||')' IN lower(contents.workspace_content->>'content'))>0
+    ORDER BY binding.project_id,binding.user_uuid,binding.placement_uuid
+    ON CONFLICT DO NOTHING;
+    PERFORM set_config('workspace.batch_flags',COALESCE(previous_batch_flags,''),true);
+    INSERT INTO messenger_counter_updates(project_id,user_uuid,stream_uuid,topic_uuid)
+    SELECT DISTINCT binding.project_id,binding.user_uuid,placement.stream_uuid,placement.topic_uuid
+    FROM new_bindings binding JOIN messenger_message_placements placement
+      ON placement.project_id=binding.project_id AND placement.uuid=binding.placement_uuid ORDER BY 1,2,4
+    ON CONFLICT(project_id,user_uuid,topic_uuid) DO UPDATE SET stream_uuid=EXCLUDED.stream_uuid,revision=EXCLUDED.revision,
+        publish_updates=messenger_counter_updates.publish_updates OR EXCLUDED.publish_updates,next_retry_at=NULL;
     INSERT INTO bridge_zulip_v5_flag_changes(project_id,state_uuid)
-    SELECT NEW.project_id,NEW.uuid FROM messenger_streams
-    WHERE project_id=NEW.project_id AND uuid=placement.stream_uuid AND source_name='zulip'
+    SELECT binding.project_id,binding.uuid FROM new_bindings binding
+    JOIN messenger_message_placements placement ON placement.project_id=binding.project_id AND placement.uuid=binding.placement_uuid
+    JOIN messenger_streams stream ON stream.project_id=placement.project_id AND stream.uuid=placement.stream_uuid AND stream.source_name='zulip'
+    ORDER BY binding.project_id,binding.uuid
     ON CONFLICT(project_id,state_uuid) DO UPDATE SET revision=EXCLUDED.revision;
+    PERFORM pg_notify('workspace_counters','');
     RETURN NULL;
 END $$;
 CREATE TRIGGER messenger_initialize_message_flags AFTER INSERT ON messenger_user_message_bindings
-    FOR EACH ROW EXECUTE FUNCTION messenger_initialize_message_flags();
+    REFERENCING NEW TABLE AS new_bindings FOR EACH STATEMENT EXECUTE FUNCTION messenger_initialize_message_flags();
 CREATE FUNCTION messenger_track_sparse_counter_change() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
     IF TG_OP<>'INSERT' THEN
