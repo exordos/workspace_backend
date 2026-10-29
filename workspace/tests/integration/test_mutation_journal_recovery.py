@@ -2,14 +2,14 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
+import time
+
 import psycopg
 from restalchemy.storage.sql import sessions
 
-from workspace.services.messenger_workers import mutation_runtime
-from workspace.services.messenger_workers import v2_projection
-from workspace.tests.integration import test_mutation_journal as journal_tests
+from workspace.services.messenger_workers import counters, mutation_runtime
 from workspace.tests.integration import test_messenger_v2 as native
-
+from workspace.tests.integration import test_mutation_journal as journal_tests
 
 conversation = journal_tests.conversation
 
@@ -40,27 +40,41 @@ def test_async_request_status_is_scoped_and_reports_committed_commands(
         runtime.close()
 
 
-def test_restart_rebuilds_parents_from_durable_topics_without_history_scan(
-    api, db, conversation, monkeypatch
+def test_restart_counts_durable_invalidations_after_command_commit(
+    api, db, conversation
 ):
-    stream, _messages, peer = conversation
+    stream, messages, peer = conversation
+    response = api.post(
+        f"{native.MESSAGES}{messages[-1]['uuid']}/actions/read_up_to/invoke", user=peer
+    )
+    assert response.status_code == 200, response.text
     first = mutation_runtime.MutationRuntime()
     try:
-        journal_tests.drain(first, db)
+        deadline = time.monotonic() + 3
+        while (
+            db.execute(
+                "SELECT status FROM messenger_mutation_commands WHERE request_uuid=%s",
+                (response.headers["X-Workspace-Mutation-Id"],),
+            ).fetchone()[0]
+            == "pending"
+        ):
+            first.tick()
+            assert time.monotonic() < deadline
     finally:
         first.close()
-    assert db.execute(
-        "SELECT initialized FROM messenger_mutation_projection_state"
-    ).fetchone()[0]
-    db.execute(
-        "UPDATE messenger_stream_bindings SET unread_count=999,active_unread_count=999 WHERE project_id=%s AND stream_uuid=%s AND user_uuid=%s",
-        (api.project_id, stream["uuid"], peer),
+    # Stop after mutation commit, before the independent counter process has
+    # consumed the durable invalidation. A restart must not lose that work.
+    assert (
+        db.execute(
+            "SELECT count(*) FROM messenger_counter_updates WHERE project_id=%s AND user_uuid=%s",
+            (api.project_id, peer),
+        ).fetchone()[0]
+        > 0
     )
-
-    def forbidden(*args, **kwargs):
-        raise AssertionError("Normal restart must not scan raw message states")
-
-    monkeypatch.setattr(v2_projection, "_refresh_recipient_counters", forbidden)
+    assert (
+        api.get(f"{native.STREAMS}{stream['uuid']}", user=peer).json()["unread_count"]
+        == 2
+    )
     restarted = mutation_runtime.MutationRuntime()
     try:
         journal_tests.drain(restarted, db)
@@ -68,27 +82,27 @@ def test_restart_rebuilds_parents_from_durable_topics_without_history_scan(
             api.get(f"{native.STREAMS}{stream['uuid']}", user=peer).json()[
                 "unread_count"
             ]
-            == 2
+            == 0
         )
     finally:
         restarted.close()
 
 
 def test_admitted_flags_do_not_cross_a_membership_generation(api, db, conversation):
-    _stream, messages, peer = conversation
+    stream, messages, peer = conversation
     target = messages[-1]["uuid"]
     response = api.post(f"{native.MESSAGES}{target}/actions/star/invoke", user=peer)
     assert response.status_code == 200
     db.execute(
-        "UPDATE messenger_user_message_states SET membership_generation=membership_generation+1 WHERE project_id=%s AND placement_uuid=%s AND user_uuid=%s",
-        (api.project_id, target, peer),
+        "UPDATE messenger_stream_bindings SET membership_generation=membership_generation+1 WHERE project_id=%s AND stream_uuid=%s AND user_uuid=%s",
+        (api.project_id, stream["uuid"], peer),
     )
     runtime = mutation_runtime.MutationRuntime()
     try:
         journal_tests.drain(runtime, db)
         assert (
             db.execute(
-                "SELECT starred FROM messenger_user_message_states WHERE project_id=%s AND placement_uuid=%s AND user_uuid=%s",
+                "SELECT EXISTS(SELECT 1 FROM messenger_user_message_stars WHERE project_id=%s AND placement_uuid=%s AND user_uuid=%s)",
                 (api.project_id, target, peer),
             ).fetchone()[0]
             is False
@@ -142,12 +156,14 @@ def test_healthy_runtime_does_not_start_full_catalog_repair_after_five_minutes(
     try:
         journal_tests.drain(runtime, db)
 
-        def forbidden(*args, **kwargs):
-            raise AssertionError(
-                "Healthy live mutations must not wait behind full-catalog repair"
-            )
+        execute = sessions.PgSQLSession.execute
 
-        monkeypatch.setattr(runtime, "_recover", forbidden)
+        def forbid_recount(session, statement, *args, **kwargs):
+            if statement == counters.COUNT_TOPIC_SQL:
+                raise AssertionError("A star mutation must not start a catalog recount")
+            return execute(session, statement, *args, **kwargs)
+
+        monkeypatch.setattr(sessions.PgSQLSession, "execute", forbid_recount)
         response = api.post(
             f"{native.MESSAGES}{messages[-1]['uuid']}/actions/star/invoke", user=peer
         )
@@ -179,6 +195,8 @@ def test_known_transaction_rollback_retries_without_full_catalog_repair(
 
         def inject(session, statement, *args, **kwargs):
             nonlocal failed
+            if statement == counters.COUNT_TOPIC_SQL:
+                raise AssertionError("A transaction retry must not recount the catalog")
             if not failed and statement.lstrip().startswith(
                 "UPDATE messenger_mutation_commands SET status="
             ):
@@ -188,13 +206,7 @@ def test_known_transaction_rollback_retries_without_full_catalog_repair(
                 )
             return original(session, statement, *args, **kwargs)
 
-        def forbidden(*args, **kwargs):
-            raise AssertionError(
-                "A known rollback needs retry, not whole-catalog repair"
-            )
-
         monkeypatch.setattr(sessions.PgSQLSession, "execute", inject)
-        monkeypatch.setattr(runtime, "_recover", forbidden)
         response = api.post(
             f"{native.MESSAGES}{messages[-1]['uuid']}/actions/star/invoke", user=peer
         )

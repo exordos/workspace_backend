@@ -3,14 +3,12 @@
 # you may not use this file except in compliance with the License.
 
 import datetime
-import uuid
 
 import pytest
 from restalchemy.common import contexts
-from restalchemy.storage.sql import sessions
 
-from workspace.messenger_api import topic_summarization
-from workspace.messenger_api.api import v2_store
+from workspace.messenger_api import message_flags, topic_summarization
+from workspace.tests.integration import conftest
 
 
 def _walk(node):
@@ -20,46 +18,98 @@ def _walk(node):
 
 
 @pytest.mark.parametrize("has_unread", [False, True])
-def test_unread_existence_probe_does_not_order_candidates(db, monkeypatch, has_unread):
-    store = v2_store.MessengerV2Store(uuid.uuid4(), uuid.uuid4())
+def test_mark_read_deletes_only_the_requested_unread_scope(api, db, has_unread):
+    stream = conftest.seed_user_stream(db, api.project_id, api.user_uuid, "Read target")
+    topic = conftest.seed_stream_topic(
+        db, api.project_id, stream, api.user_uuid, "Target", is_default=True
+    )
+    noise_stream = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Read noise"
+    )
+    noise_topic = conftest.seed_stream_topic(
+        db, api.project_id, noise_stream, api.user_uuid, "Noise", is_default=True
+    )
+    for target_stream, target_topic, count in (
+        (stream, topic, 10 if has_unread else 0),
+        (noise_stream, noise_topic, 1500),
+    ):
+        db.execute(
+            """WITH content AS MATERIALIZED (
+                 SELECT messenger_resolve_message_content('{"kind":"markdown","content":"Read plan"}'::jsonb,NULL) AS uuid
+               ), messages AS (
+                 INSERT INTO messenger_messages(uuid,project_id,author_uuid,content_uuid)
+                 SELECT gen_random_uuid(),%s,%s,uuid FROM generate_series(1,%s) CROSS JOIN content RETURNING *
+               ), placements AS (
+                 INSERT INTO messenger_message_placements(uuid,project_id,message_uuid,stream_uuid,topic_uuid,created_at)
+                 SELECT gen_random_uuid(),project_id,uuid,%s,%s,created_at FROM messages RETURNING *
+               ) INSERT INTO messenger_user_message_bindings(uuid,project_id,user_uuid,placement_uuid)
+                 SELECT gen_random_uuid(),project_id,%s,uuid FROM placements""",
+            (
+                api.project_id,
+                api.user_uuid,
+                count,
+                target_stream,
+                target_topic,
+                api.user_uuid,
+            ),
+        )
+        db.execute(
+            "INSERT INTO messenger_user_message_unreads SELECT project_id,%s,uuid,stream_uuid,topic_uuid "
+            "FROM messenger_message_placements WHERE project_id=%s AND topic_uuid=%s",
+            (api.user_uuid, api.project_id, target_topic),
+        )
+    for table in (
+        "messenger_user_message_unreads",
+        "messenger_user_message_bindings",
+        "messenger_messages",
+        "messenger_message_placements",
+    ):
+        db.execute(f"ANALYZE {table}")
     plans = []
-    execute = sessions.PgSQLSession.execute
+
+    class ExplainDelete:
+        def __init__(self, session):
+            self.session = session
+
+        def execute(self, statement, values):
+            with db.transaction(force_rollback=True):
+                plans.append(
+                    db.execute(
+                        "EXPLAIN (ANALYZE,BUFFERS,TIMING OFF,FORMAT JSON) " + statement,
+                        values,
+                    ).fetchone()[0][0]["Plan"]
+                )
+            return self.session.execute(statement, values)
 
     with contexts.Context().session_manager() as session:
-        session.execute("""
-            CREATE TEMP TABLE cassi_read_probe ON COMMIT DROP AS
-            SELECT value AS placement_uuid, value AS created_at
-            FROM generate_series(1, 10000) AS value;
-            ANALYZE cassi_read_probe;
-        """)
-
-        def explain(current, statement, values=None):
-            if current is session and "cassi_read_probe" in statement:
-                plan = execute(
-                    current,
-                    "EXPLAIN (ANALYZE, FORMAT JSON, TIMING OFF) " + statement,
-                    values,
-                ).fetchone()["QUERY PLAN"][0]["Plan"]
-                plans.append(plan)
-            return execute(current, statement, values)
-
-        monkeypatch.setattr(sessions.PgSQLSession, "execute", explain)
-        assert (
-            store._has_unread_candidates(
-                candidate_sql="""
-                SELECT placement_uuid, created_at FROM cassi_read_probe
-                WHERE %s ORDER BY created_at, placement_uuid
-            """,
-                candidate_values=(has_unread,),
-            )
-            is has_unread
+        deleted = message_flags.mark_read(
+            ExplainDelete(session), api.project_id, api.user_uuid, topic_uuid=topic
         )
-
+    assert len(deleted) == (10 if has_unread else 0)
     assert len(plans) == 1
-    assert not any(node["Node Type"] == "Sort" for node in _walk(plans[0]))
-    if has_unread:
-        scanned = [node for node in _walk(plans[0]) if "Relation Name" in node]
-        assert sum(node["Actual Rows"] * node["Actual Loops"] for node in scanned) <= 1
+    unread_scans = [
+        node
+        for node in _walk(plans[0])
+        if node.get("Relation Name") == "messenger_user_message_unreads"
+        and node["Node Type"] != "ModifyTable"
+    ]
+    assert unread_scans, plans
+    assert all(
+        node["Node Type"] in {"Index Scan", "Index Only Scan", "Bitmap Heap Scan"}
+        for node in unread_scans
+    ), plans
+    assert (
+        sum(
+            (node["Actual Rows"] + node.get("Rows Removed by Filter", 0))
+            * node["Actual Loops"]
+            for node in unread_scans
+        )
+        < 50
+    ), plans
+    assert db.execute(
+        "SELECT count(*) FROM messenger_user_message_unreads WHERE project_id=%s AND topic_uuid=%s",
+        (api.project_id, noise_topic),
+    ).fetchone() == (1500,)
 
 
 @pytest.mark.isolated_schema

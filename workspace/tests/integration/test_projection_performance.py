@@ -10,7 +10,6 @@ import json
 import os
 import threading
 import time
-import types
 import uuid as sys_uuid
 
 import psycopg
@@ -27,6 +26,7 @@ from workspace.services.messenger_workers import agents
 from workspace.tests.integration import legacy_store
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.api import store_factory
+from workspace.services.messenger_workers import counters
 from workspace.services.messenger_workers import v2_projection
 from workspace.tests.integration import conftest
 
@@ -52,6 +52,7 @@ def _isolate_projection_queue(_database):
         with contexts.Context().session_manager() as session:
             session.execute("DELETE FROM messenger_projection_scope_leases", ())
             session.execute("DELETE FROM messenger_domain_outbox_events", ())
+            session.execute("DELETE FROM messenger_counter_updates", ())
 
     cleanup()
     try:
@@ -62,11 +63,16 @@ def _isolate_projection_queue(_database):
 
 def _drain() -> int:
     with contexts.Context().session_manager() as session:
-        return v2_projection.drain_projection_queue(
+        projected = v2_projection.drain_projection_queue(
             session,
             f"integration-performance:{sys_uuid.uuid4()}",
             limit=10000,
         )
+    while True:
+        with contexts.Context().session_manager() as session:
+            count = counters.process_pending(session)
+        if not count:
+            return projected
 
 
 def _create_message(api, name):
@@ -160,18 +166,10 @@ def test_flag_snapshot_batch_stays_bounded_with_stale_statistics(api, db, plan_m
                         (uuid,project_id,message_uuid,stream_uuid,topic_uuid,created_at)
                     SELECT gen_random_uuid(),project_id,uuid,%s,%s,created_at FROM messages
                     RETURNING uuid,project_id
-                ), access AS (
-                    INSERT INTO messenger_user_message_bindings
-                        (uuid,project_id,placement_uuid,user_uuid,membership_generation,
-                         relation_role,visibility,permissions)
-                    SELECT gen_random_uuid(),project_id,uuid,%s,1,'author','visible','{}'::jsonb
-                    FROM placements
-                    RETURNING uuid,project_id,placement_uuid,user_uuid,membership_generation
-                )
-                INSERT INTO messenger_user_message_states
-                    (uuid,project_id,placement_uuid,user_uuid,membership_generation,binding_uuid)
-                SELECT gen_random_uuid(),project_id,placement_uuid,user_uuid,membership_generation,uuid
-                FROM access RETURNING placement_uuid
+                ) INSERT INTO messenger_user_message_bindings
+                    (uuid,project_id,placement_uuid,user_uuid)
+                  SELECT gen_random_uuid(),project_id,uuid,%s FROM placements
+                  RETURNING placement_uuid
                 """,
                 (
                     client.project_id,
@@ -190,7 +188,6 @@ def test_flag_snapshot_batch_stays_bounded_with_stale_statistics(api, db, plan_m
         "messenger_message_contents",
         "messenger_message_placements",
         "messenger_user_message_bindings",
-        "messenger_user_message_states",
         "messenger_stream_bindings",
         "messenger_streams",
         "messenger_topics",
@@ -201,12 +198,12 @@ def test_flag_snapshot_batch_stays_bounded_with_stale_statistics(api, db, plan_m
     stream, _ = _create_message(api, "cassi-snapshot-plan-target")
     identifiers = seed_messages(api, stream, 1000)
     db.execute(
-        "UPDATE messenger_user_message_bindings SET visibility='hidden' "
+        "DELETE FROM messenger_user_message_bindings "
         "WHERE project_id=%s AND placement_uuid=%s",
         (api.project_id, identifiers[0]),
     )
     db.execute(
-        "UPDATE messenger_user_message_states SET membership_generation=2 "
+        "DELETE FROM messenger_user_message_bindings "
         "WHERE project_id=%s AND placement_uuid=%s",
         (api.project_id, identifiers[1]),
     )
@@ -294,672 +291,125 @@ def test_claim_without_users_does_not_scan_unrelated_user_predecessors(
     assert all(node["Actual Loops"] == 0 for node in scanned), json.dumps(scanned)
 
 
-@pytest.mark.parametrize("scope_kind", ["user-stream", "user-topic"])
-def test_old_scope_preview_does_not_scan_unrelated_project_history(
-    api, db, monkeypatch, scope_kind
-):
-    stream, message = _create_message(api, "old-preview-target")
-    noise_stream, _noise_message = _create_message(api, "recent-preview-noise")
-    db.execute(
-        "UPDATE messenger_messages SET created_at='2020-01-01' "
-        "WHERE project_id=%s AND uuid=(SELECT message_uuid FROM messenger_message_placements WHERE project_id=%s AND uuid=%s)",
-        (api.project_id, api.project_id, message["uuid"]),
-    )
-    db.execute(
-        "UPDATE messenger_message_placements SET created_at='2020-01-01' WHERE project_id=%s AND uuid=%s",
-        (api.project_id, message["uuid"]),
-    )
-    noise_rows = int(os.environ.get("WORKSPACE_PREVIEW_NOISE_ROWS", "20000"))
-    for offset in range(0, noise_rows, 5000):
-        db.execute(
-            """
-            WITH content AS MATERIALIZED (
-                SELECT messenger_resolve_message_content(
-                    '{"kind":"markdown","content":"Recent unrelated message"}'::jsonb,NULL) AS uuid
-            ), messages AS (
-                INSERT INTO messenger_messages
-                    (uuid,project_id,author_uuid,content_uuid,source_name,created_at)
-                SELECT gen_random_uuid(),%s,%s,
-                       content.uuid,
-                       'native',
-                       NOW()+number*interval '1 millisecond'
-                FROM generate_series(1,%s) AS input(number) CROSS JOIN content
-                RETURNING uuid,project_id,created_at
-            ), placements AS (
-                INSERT INTO messenger_message_placements
-                    (uuid,project_id,message_uuid,stream_uuid,topic_uuid,created_at)
-                SELECT gen_random_uuid(),project_id,uuid,%s,%s,created_at FROM messages
-                RETURNING uuid,project_id
-            ), access AS (
-                INSERT INTO messenger_user_message_bindings
-                    (uuid,project_id,placement_uuid,user_uuid,membership_generation,
-                     relation_role,visibility,permissions)
-                SELECT gen_random_uuid(),project_id,uuid,%s,1,'author','visible','{}'::jsonb
-                FROM placements
-                RETURNING uuid,project_id,placement_uuid,user_uuid,membership_generation
-            )
-            INSERT INTO messenger_user_message_states
-                (uuid,project_id,placement_uuid,user_uuid,membership_generation,binding_uuid,read_at)
-            SELECT gen_random_uuid(),project_id,placement_uuid,user_uuid,membership_generation,uuid,NOW()
-            FROM access
-            """,
-            (
-                api.project_id,
-                api.user_uuid,
-                min(5000, noise_rows - offset),
-                noise_stream["uuid"],
-                noise_stream["default_topic_uuid"],
-                api.user_uuid,
-            ),
-        )
-    for table in (
-        "messenger_messages",
-        "messenger_message_placements",
-        "messenger_user_message_states",
-        "messenger_user_message_bindings",
-    ):
-        db.execute(f"ANALYZE {table}")
-
-    snapshots = []
-    with contexts.Context().session_manager() as session:
-
-        def execute(query, parameters=None):
-            if query.lstrip().startswith("WITH unread AS"):
-                snapshots.append((query, parameters))
-            return session.execute(query, parameters)
-
-        v2_projection._refresh_recipient_counters(
-            types.SimpleNamespace(execute=execute),
-            api.project_id,
-            sys_uuid.UUID(stream["uuid"]),
-            sys_uuid.UUID(stream["default_topic_uuid"]),
-            [api.user_uuid],
-            scope_kind,
-        )
-    table, column, scope_uuid = (
-        ("messenger_stream_bindings", "stream_uuid", stream["uuid"])
-        if scope_kind == "user-stream"
-        else (
-            "messenger_user_topic_bindings",
-            "topic_uuid",
-            stream["default_topic_uuid"],
-        )
-    )
-    assert db.execute(
-        f"SELECT last_message_uuid FROM {table} WHERE project_id=%s AND {column}=%s AND user_uuid=%s",
-        (api.project_id, scope_uuid, api.user_uuid),
-    ).fetchone() == (sys_uuid.UUID(message["uuid"]),)
-    ((query, parameters),) = snapshots
+@pytest.mark.parametrize("scope", ["stream", "topic"])
+def test_shared_preview_does_not_scan_message_history(api, db, scope):
+    stream, message = _create_message(api, "shared-preview-point-lookup")
+    table = f"messenger_{scope}_last_messages"
+    column = f"{scope}_uuid"
+    scope_uuid = stream["uuid"] if scope == "stream" else stream["default_topic_uuid"]
+    query = f"SELECT placement_uuid FROM {table} WHERE project_id=%s AND {column}=%s"
+    values = (api.project_id, scope_uuid)
+    assert db.execute(query, values).fetchone() == (sys_uuid.UUID(message["uuid"]),)
     plan = db.execute(
-        "EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) " + query, parameters
+        "EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) " + query, values
     ).fetchone()[0][0]
-    examined_project_messages = sum(
-        node["Actual Rows"] * node["Actual Loops"]
+    assert not any(
+        node.get("Relation Name")
+        in {
+            "messenger_messages",
+            "messenger_message_placements",
+            "messenger_user_message_bindings",
+        }
         for node in _plan_nodes(plan["Plan"])
-        if node.get("Relation Name") == "messenger_messages"
-    )
-    examined_personal_states = sum(
-        node["Actual Rows"] * node["Actual Loops"]
-        for node in _plan_nodes(plan["Plan"])
-        if node.get("Relation Name") == "messenger_user_message_states"
-    )
-    assert examined_personal_states <= 4, plan
-    assert examined_project_messages <= 4
+    ), plan
 
 
-@pytest.mark.isolated_schema
-def test_counter_preview_bounds_empty_and_sparse_recipient_history(
-    api, db, monkeypatch
-):
-    stream, original = _create_message(api, "cassi-preview-large-topic")
-    noise, _ = _create_message(api, "cassi-preview-other-topic")
-    peer = sys_uuid.uuid4()
-    for scope in (stream, noise):
-        conftest.seed_user_stream_binding(db, api.project_id, scope["uuid"], peer)
+def test_count_unreads_does_not_scan_read_message_history(api, db):
+    stream, original = _create_message(api, "sparse-unread-count")
+    count = int(os.environ.get("WORKSPACE_PREVIEW_SCOPE_ROWS", "30000"))
     db.execute(
-        "INSERT INTO messenger_user_topic_bindings (uuid,project_id,user_uuid,topic_uuid) "
-        "VALUES (gen_random_uuid(),%s,%s,%s) ON CONFLICT DO NOTHING",
-        (api.project_id, peer, stream["default_topic_uuid"]),
-    )
-    for scope, user, count in (
+        """WITH content AS MATERIALIZED (
+               SELECT content_uuid FROM messenger_messages WHERE project_id=%s LIMIT 1
+           ), messages AS (
+               INSERT INTO messenger_messages(uuid,project_id,author_uuid,content_uuid)
+               SELECT gen_random_uuid(),%s,%s,content_uuid FROM generate_series(1,%s) CROSS JOIN content
+               RETURNING uuid,project_id,created_at
+           ), placements AS (
+               INSERT INTO messenger_message_placements(uuid,project_id,message_uuid,stream_uuid,topic_uuid,created_at)
+               SELECT gen_random_uuid(),project_id,uuid,%s,%s,created_at FROM messages RETURNING *
+           ) INSERT INTO messenger_user_message_bindings(uuid,project_id,placement_uuid,user_uuid)
+             SELECT gen_random_uuid(),project_id,uuid,%s FROM placements""",
         (
-            stream,
-            api.user_uuid,
-            int(os.environ.get("WORKSPACE_PREVIEW_SCOPE_ROWS", "30000")),
-        ),
-        (noise, peer, int(os.environ.get("WORKSPACE_PREVIEW_PEER_ROWS", "30000"))),
-        (
-            noise,
-            api.user_uuid,
-            int(os.environ.get("WORKSPACE_PREVIEW_OWNER_ROWS", "300")),
-        ),
-    ):
-        for offset in range(0, count, 5000):
-            db.execute(
-                """
-                WITH messages AS (
-                    INSERT INTO messenger_messages
-                        (uuid,project_id,author_uuid,content_uuid,source_name,created_at)
-                    SELECT gen_random_uuid(),%s,%s,content_uuid,'native',
-                           NOW()+number*interval '1 millisecond'
-                    FROM generate_series(1,%s) AS input(number)
-                    CROSS JOIN (SELECT content_uuid FROM messenger_messages
-                                WHERE project_id=%s LIMIT 1) AS content
-                    RETURNING uuid,project_id,created_at
-                ), placements AS (
-                    INSERT INTO messenger_message_placements
-                        (uuid,project_id,message_uuid,stream_uuid,topic_uuid,created_at)
-                    SELECT gen_random_uuid(),project_id,uuid,%s,%s,created_at FROM messages
-                    RETURNING uuid,project_id
-                ), access AS (
-                    INSERT INTO messenger_user_message_bindings
-                        (uuid,project_id,placement_uuid,user_uuid,membership_generation,
-                         relation_role,visibility,permissions)
-                    SELECT gen_random_uuid(),project_id,uuid,%s,1,'member','visible','{}'::jsonb
-                    FROM placements
-                    RETURNING uuid,project_id,placement_uuid,user_uuid,membership_generation
-                )
-                INSERT INTO messenger_user_message_states
-                    (uuid,project_id,placement_uuid,user_uuid,membership_generation,binding_uuid,read_at)
-                SELECT gen_random_uuid(),project_id,placement_uuid,user_uuid,membership_generation,uuid,NOW()
-                FROM access
-                """,
-                (
-                    api.project_id,
-                    user,
-                    min(5000, count - offset),
-                    api.project_id,
-                    scope["uuid"],
-                    scope["default_topic_uuid"],
-                    user,
-                ),
-            )
-    db.execute(
-        "UPDATE messenger_user_message_states SET read_at=NOW() WHERE project_id=%s AND read_at IS NULL",
-        (api.project_id,),
-    )
-    for table in (
-        "messenger_messages",
-        "messenger_message_placements",
-        "messenger_user_message_states",
-        "messenger_user_message_bindings",
-    ):
-        db.execute(f"ANALYZE {table}")
-    full_preview = db.execute(
-        "SELECT placement.uuid FROM messenger_message_placements placement "
-        "JOIN messenger_messages message ON message.project_id=placement.project_id "
-        "AND message.uuid=placement.message_uuid WHERE placement.project_id=%s "
-        "AND placement.topic_uuid=%s ORDER BY message.created_at DESC,placement.uuid DESC LIMIT 1",
-        (api.project_id, stream["default_topic_uuid"]),
-    ).fetchone()[0]
-    for sparse in (False, True):
-        if sparse:
-            db.execute(
-                """WITH access AS (
-                    INSERT INTO messenger_user_message_bindings
-                        (uuid,project_id,placement_uuid,user_uuid,membership_generation,
-                         relation_role,visibility,permissions)
-                    VALUES (gen_random_uuid(),%s,%s,%s,1,'member','visible','{}'::jsonb)
-                    RETURNING *
-                ) INSERT INTO messenger_user_message_states
-                    (uuid,project_id,placement_uuid,user_uuid,membership_generation,binding_uuid,read_at)
-                SELECT gen_random_uuid(),project_id,placement_uuid,user_uuid,membership_generation,uuid,NOW()
-                FROM access""",
-                (api.project_id, original["uuid"], peer),
-            )
-        for scope_kind, table, column, scope_uuid in (
-            (
-                "user-topic",
-                "messenger_user_topic_bindings",
-                "topic_uuid",
-                stream["default_topic_uuid"],
-            ),
-            ("user-stream", "messenger_stream_bindings", "stream_uuid", stream["uuid"]),
-        ):
-            # A recipient must receive a corrected empty snapshot, not be skipped.
-            db.execute(
-                f"UPDATE {table} SET unread_count=9,active_unread_count=9,last_message_uuid=%s "
-                f"WHERE project_id=%s AND {column}=%s AND user_uuid=%s",
-                (original["uuid"], api.project_id, scope_uuid, peer),
-            )
-            snapshots = []
-            with contexts.Context().session_manager() as session:
-
-                def execute(query, parameters=None):
-                    if query.lstrip().startswith("WITH unread AS"):
-                        snapshots.append((query, parameters))
-                    return session.execute(query, parameters)
-
-                v2_projection._refresh_recipient_counters(
-                    types.SimpleNamespace(execute=execute),
-                    api.project_id,
-                    stream["uuid"],
-                    stream["default_topic_uuid"],
-                    [api.user_uuid, peer],
-                    scope_kind,
-                )
-            for user, preview in (
-                (api.user_uuid, full_preview),
-                (peer, sys_uuid.UUID(original["uuid"]) if sparse else None),
-            ):
-                assert db.execute(
-                    f"SELECT unread_count,active_unread_count,last_message_uuid FROM {table} "
-                    f"WHERE project_id=%s AND {column}=%s AND user_uuid=%s",
-                    (api.project_id, scope_uuid, user),
-                ).fetchone() == (0, 0, preview)
-            ((query, parameters),) = snapshots
-            plan = db.execute(
-                "EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) " + query, parameters
-            ).fetchone()[0][0]
-            examined = sum(
-                node["Actual Rows"] * node["Actual Loops"]
-                for node in _plan_nodes(plan["Plan"])
-                if node.get("Relation Name") == "messenger_message_placements"
-            )
-            assert examined < 1000, plan
-            assert (
-                plan["Plan"]["Shared Hit Blocks"] + plan["Plan"]["Shared Read Blocks"]
-                < 25000
-            ), plan
-
-
-@pytest.mark.parametrize("scope_kind", ["user-stream", "user-topic"])
-def test_old_scope_preview_preserves_visibility_dates_and_uuid_ties(
-    api, db, monkeypatch, scope_kind
-):
-    stream, original = _create_message(api, "preview-visibility-target")
-    messages = []
-    for label in ("visible-a", "visible-b", "hidden", "old-generation", "deleted"):
-        response = api.post(
-            MESSAGES,
-            json={
-                "stream_uuid": stream["uuid"],
-                "topic_uuid": stream["default_topic_uuid"],
-                "payload": {"kind": "markdown", "content": label},
-            },
-        )
-        assert response.status_code == 201, response.text
-        messages.append(sys_uuid.UUID(response.json()["uuid"]))
-        _drain()
-    _create_message(api, "preview-visibility-noise")
-    for position, placement_uuid in enumerate(messages):
-        db.execute(
-            "UPDATE messenger_messages SET created_at='2020-01-01'::timestamptz+%s*interval '1 day' "
-            "WHERE project_id=%s AND uuid=(SELECT message_uuid FROM messenger_message_placements WHERE project_id=%s AND uuid=%s)",
-            (max(1, position), api.project_id, api.project_id, placement_uuid),
-        )
-    db.execute(
-        "UPDATE messenger_user_message_bindings SET visibility='hidden' "
-        "WHERE project_id=%s AND placement_uuid=ANY(%s::uuid[])",
-        (api.project_id, [sys_uuid.UUID(original["uuid"]), messages[2]]),
-    )
-    for table in ("messenger_user_message_states", "messenger_user_message_bindings"):
-        db.execute(
-            f"UPDATE {table} SET membership_generation=2 WHERE project_id=%s AND placement_uuid=%s",
-            (api.project_id, messages[3]),
-        )
-    db.execute(
-        "UPDATE messenger_messages SET deleted_at=NOW() "
-        "WHERE project_id=%s AND uuid=(SELECT message_uuid FROM messenger_message_placements WHERE project_id=%s AND uuid=%s)",
-        (api.project_id, api.project_id, messages[4]),
-    )
-    table, column, scope_uuid = (
-        ("messenger_stream_bindings", "stream_uuid", stream["uuid"])
-        if scope_kind == "user-stream"
-        else (
-            "messenger_user_topic_bindings",
-            "topic_uuid",
-            stream["default_topic_uuid"],
-        )
-    )
-    for expected in (*sorted(messages[:2], reverse=True), None):
-        with contexts.Context().session_manager() as session:
-            v2_projection._refresh_recipient_counters(
-                session,
-                api.project_id,
-                sys_uuid.UUID(stream["uuid"]),
-                sys_uuid.UUID(stream["default_topic_uuid"]),
-                [api.user_uuid],
-                scope_kind,
-            )
-        assert db.execute(
-            f"SELECT last_message_uuid FROM {table} WHERE project_id=%s AND {column}=%s AND user_uuid=%s",
-            (api.project_id, scope_uuid, api.user_uuid),
-        ).fetchone() == (expected,)
-        if expected is not None:
-            db.execute(
-                "UPDATE messenger_user_message_bindings SET visibility='hidden' "
-                "WHERE project_id=%s AND placement_uuid=%s",
-                (api.project_id, expected),
-            )
-
-
-@pytest.mark.isolated_schema
-@pytest.mark.parametrize("relocated_past_extent", [False, True])
-def test_personal_preview_scope_backfills_existing_states(
-    api, db, relocated_past_extent
-):
-    db.execute(
-        "DROP TRIGGER messenger_set_personal_preview_scope ON messenger_user_message_states"
-    )
-    stream, message = _create_message(api, "preview-before-migration")
-    placement_uuid = sys_uuid.UUID(message["uuid"])
-    assert db.execute(
-        "SELECT preview_stream_uuid,preview_topic_uuid,preview_created_at "
-        "FROM messenger_user_message_states WHERE project_id=%s AND placement_uuid=%s",
-        (api.project_id, placement_uuid),
-    ).fetchone() == (None, None, None)
-    db.execute(
-        """WITH users AS (
-            INSERT INTO m_workspace_users
-                (uuid,username,source,status,avatar,created_at,updated_at)
-            SELECT gen_random_uuid(),'preview-peer-'||number,'iam','active',
-                   avatar,NOW(),NOW()
-            FROM m_workspace_users CROSS JOIN generate_series(1,128) AS input(number)
-            WHERE uuid=%s RETURNING uuid
-        ), members AS (
-            INSERT INTO messenger_project_users(project_id,user_uuid)
-            SELECT %s,uuid FROM users RETURNING user_uuid
-        ), access AS (
-            INSERT INTO messenger_user_message_bindings
-                (uuid,project_id,placement_uuid,user_uuid,membership_generation,
-                 relation_role,visibility,permissions)
-            SELECT gen_random_uuid(),%s,%s,user_uuid,1,
-                   'member','visible','{}'::jsonb FROM members
-            RETURNING uuid,project_id,placement_uuid,user_uuid,membership_generation
-        ) INSERT INTO messenger_user_message_states
-            (uuid,project_id,placement_uuid,user_uuid,membership_generation,binding_uuid,read_at)
-          SELECT gen_random_uuid(),project_id,placement_uuid,user_uuid,
-                 membership_generation,uuid,NOW() FROM access""",
-        (api.user_uuid, api.project_id, api.project_id, placement_uuid),
-    )
-    before = db.execute(
-        "SELECT read_at,mentioned,starred,pinned,created_at,updated_at "
-        "FROM messenger_user_message_states WHERE project_id=%s AND placement_uuid=%s AND user_uuid=%s",
-        (api.project_id, placement_uuid, api.user_uuid),
-    ).fetchone()
-    filename = (
-        conftest.MIGRATIONS_DIR
-        / "0280-Index-recipient-scoped-canonical-message-previews-6025ad.py"
-    )
-    spec = importlib.util.spec_from_file_location("personal_preview_scope", filename)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    module.BATCH_BLOCKS = 1
-    with contexts.Context().session_manager() as session:
-        captured_extent = False
-
-        def execute(query, parameters=None):
-            nonlocal captured_extent
-            if (
-                relocated_past_extent
-                and not captured_extent
-                and query.startswith("SELECT ceil")
-            ):
-                # Emulate pre-existing rows relocating beyond the extent that
-                # was captured before a concurrent flag update.
-                captured_extent = True
-                return types.SimpleNamespace(fetchone=lambda: {"blocks": 0})
-            return session.execute(query, parameters)
-
-        module.migration_step.upgrade(
-            types.SimpleNamespace(
-                execute=execute, commit=session.commit, engine=session.engine
-            )
-        )
-    assert db.execute(
-        "SELECT count(*) FROM messenger_user_message_states "
-        "WHERE project_id=%s AND preview_stream_uuid=%s AND preview_topic_uuid=%s "
-        "AND preview_created_at IS NOT NULL",
-        (api.project_id, stream["uuid"], stream["default_topic_uuid"]),
-    ).fetchone() == (129,)
-    assert db.execute(
-        "SELECT personal.preview_stream_uuid=placement.stream_uuid,"
-        "personal.preview_topic_uuid=placement.topic_uuid,"
-        "personal.preview_created_at=message.created_at "
-        "FROM messenger_user_message_states personal "
-        "JOIN messenger_message_placements placement ON placement.project_id=personal.project_id "
-        "AND placement.uuid=personal.placement_uuid "
-        "JOIN messenger_messages message ON message.project_id=placement.project_id "
-        "AND message.uuid=placement.message_uuid "
-        "WHERE personal.project_id=%s AND personal.placement_uuid=%s",
-        (api.project_id, placement_uuid),
-    ).fetchone() == (True, True, True)
-    assert (
-        db.execute(
-            "SELECT read_at,mentioned,starred,pinned,created_at,updated_at "
-            "FROM messenger_user_message_states WHERE project_id=%s AND placement_uuid=%s AND user_uuid=%s",
-            (api.project_id, placement_uuid, api.user_uuid),
-        ).fetchone()
-        == before
-    )
-    with contexts.Context().session_manager() as session:
-        v2_projection._refresh_recipient_counters(
-            session,
             api.project_id,
+            api.project_id,
+            api.user_uuid,
+            count,
             stream["uuid"],
             stream["default_topic_uuid"],
-            [api.user_uuid],
-            "user-topic",
-        )
-    assert db.execute(
-        "SELECT last_message_uuid FROM messenger_user_topic_bindings "
-        "WHERE project_id=%s AND user_uuid=%s AND topic_uuid=%s",
-        (api.project_id, api.user_uuid, stream["default_topic_uuid"]),
-    ).fetchone() == (placement_uuid,)
-
-
-@pytest.mark.isolated_schema
-def test_personal_preview_scope_resumes_while_history_is_being_read(
-    api, db, _test_database_url
-):
-    _stream, message = _create_message(api, "preview-resume-with-readers")
+            api.user_uuid,
+        ),
+    )
+    # Own/read history has no unread facts; a single unread remains a point lookup.
     db.execute(
-        "UPDATE messenger_user_message_states SET preview_stream_uuid=NULL "
-        "WHERE project_id=%s AND placement_uuid=%s",
-        (api.project_id, message["uuid"]),
-    )
-    filename = (
-        conftest.MIGRATIONS_DIR
-        / "0280-Index-recipient-scoped-canonical-message-previews-6025ad.py"
-    )
-    spec = importlib.util.spec_from_file_location("personal_preview_resume", filename)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    with psycopg.connect(_test_database_url) as reader:
-        reader.execute("SELECT 1 FROM messenger_user_message_states LIMIT 1")
-        with contexts.Context().session_manager() as session:
-            module.migration_step.upgrade(session)
-    assert db.execute(
-        "SELECT preview_stream_uuid IS NOT NULL FROM messenger_user_message_states "
-        "WHERE project_id=%s AND placement_uuid=%s",
-        (api.project_id, message["uuid"]),
-    ).fetchone() == (True,)
-
-
-@pytest.mark.isolated_schema
-def test_personal_preview_scope_tracks_moves_and_canonical_date_changes(api, db):
-    original, first = _create_message(api, "preview-source")
-    destination, second = _create_message(api, "preview-destination")
-    first_uuid, second_uuid = (
-        sys_uuid.UUID(first["uuid"]),
-        sys_uuid.UUID(second["uuid"]),
-    )
-    db.execute(
-        "UPDATE messenger_message_placements SET created_at='2030-01-01' "
-        "WHERE project_id=%s AND uuid=%s",
-        (api.project_id, first_uuid),
-    )
-    db.execute(
-        "UPDATE messenger_messages SET created_at='2020-01-01' "
-        "WHERE project_id=%s AND uuid=(SELECT message_uuid FROM messenger_message_placements "
-        "WHERE project_id=%s AND uuid=%s)",
-        (api.project_id, api.project_id, first_uuid),
-    )
-    db.execute(
-        "UPDATE messenger_message_placements SET stream_uuid=%s,topic_uuid=%s "
-        "WHERE project_id=%s AND uuid=%s",
+        "INSERT INTO messenger_user_message_unreads VALUES(%s,%s,%s,%s,%s)",
         (
-            destination["uuid"],
-            destination["default_topic_uuid"],
             api.project_id,
-            first_uuid,
+            api.user_uuid,
+            original["uuid"],
+            stream["uuid"],
+            stream["default_topic_uuid"],
         ),
     )
-    assert db.execute(
-        "SELECT preview_stream_uuid,preview_topic_uuid,preview_created_at::date::text "
-        "FROM messenger_user_message_states WHERE project_id=%s AND placement_uuid=%s",
-        (api.project_id, first_uuid),
-    ).fetchone() == (
-        sys_uuid.UUID(destination["uuid"]),
-        sys_uuid.UUID(destination["default_topic_uuid"]),
-        "2020-01-01",
-    )
-    for scope, expected in ((original, None), (destination, second_uuid)):
-        with contexts.Context().session_manager() as session:
-            v2_projection._refresh_recipient_counters(
-                session,
-                api.project_id,
-                scope["uuid"],
-                scope["default_topic_uuid"],
-                [api.user_uuid],
-                "user-stream",
-            )
-        assert db.execute(
-            "SELECT last_message_uuid FROM messenger_stream_bindings "
-            "WHERE project_id=%s AND user_uuid=%s AND stream_uuid=%s",
-            (api.project_id, api.user_uuid, scope["uuid"]),
-        ).fetchone() == (expected,)
-    db.execute(
-        "UPDATE messenger_messages SET created_at='2040-01-01' "
-        "WHERE project_id=%s AND uuid=(SELECT message_uuid FROM messenger_message_placements "
-        "WHERE project_id=%s AND uuid=%s)",
-        (api.project_id, api.project_id, first_uuid),
-    )
-    with contexts.Context().session_manager() as session:
-        v2_projection._refresh_recipient_counters(
-            session,
-            api.project_id,
-            destination["uuid"],
-            destination["default_topic_uuid"],
-            [api.user_uuid],
-            "user-topic",
-        )
-    assert db.execute(
-        "SELECT last_message_uuid FROM messenger_user_topic_bindings "
-        "WHERE project_id=%s AND user_uuid=%s AND topic_uuid=%s",
-        (api.project_id, api.user_uuid, destination["default_topic_uuid"]),
-    ).fetchone() == (first_uuid,)
-
-
-@pytest.mark.isolated_schema
-@pytest.mark.parametrize("date_first", [True, False])
-def test_personal_preview_scope_preserves_concurrent_date_and_topic_changes(
-    api, db, date_first, _test_database_url
-):
-    source, message = _create_message(api, "preview-concurrent-source")
-    destination, _ = _create_message(api, "preview-concurrent-destination")
-    placement_uuid = sys_uuid.UUID(message["uuid"])
-    canonical_uuid = db.execute(
-        "SELECT message_uuid FROM messenger_message_placements WHERE project_id=%s AND uuid=%s",
-        (api.project_id, placement_uuid),
-    ).fetchone()[0]
-    operations = [
-        (
-            "UPDATE messenger_messages SET created_at='2021-01-01' WHERE project_id=%s AND uuid=%s",
-            (api.project_id, canonical_uuid),
-        ),
-        (
-            "UPDATE messenger_message_placements SET stream_uuid=%s,topic_uuid=%s WHERE project_id=%s AND uuid=%s",
-            (
-                destination["uuid"],
-                destination["default_topic_uuid"],
-                api.project_id,
-                placement_uuid,
-            ),
-        ),
-    ]
-    if not date_first:
-        operations.reverse()
-    with (
-        psycopg.connect(_test_database_url) as first,
-        psycopg.connect(_test_database_url) as second,
-        concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool,
+    for table in (
+        "messenger_user_message_unreads",
+        "messenger_user_message_bindings",
+        "messenger_messages",
+        "messenger_message_placements",
     ):
-        first.execute(*operations[0])
-        future = pool.submit(second.execute, *operations[1])
-        deadline = time.monotonic() + 5
-        blocked = False
-        try:
-            while time.monotonic() < deadline and not future.done():
-                blocked = bool(
-                    db.execute(
-                        "SELECT %s=ANY(pg_blocking_pids(%s))",
-                        (first.info.backend_pid, second.info.backend_pid),
-                    ).fetchone()[0]
-                )
-                if blocked:
-                    break
-                time.sleep(0.01)
-            assert blocked
-        finally:
-            first.commit()
-        future.result(timeout=5)
-        second.commit()
-    assert db.execute(
-        "SELECT preview_stream_uuid,preview_topic_uuid,preview_created_at::date::text "
-        "FROM messenger_user_message_states WHERE project_id=%s AND placement_uuid=%s",
-        (api.project_id, placement_uuid),
-    ).fetchone() == (
-        sys_uuid.UUID(destination["uuid"]),
-        sys_uuid.UUID(destination["default_topic_uuid"]),
-        "2021-01-01",
+        db.execute(f"ANALYZE {table}")
+    values = (api.project_id, api.user_uuid, stream["default_topic_uuid"])
+    assert db.execute(counters.COUNT_TOPIC_SQL, values).fetchone() == (1, 1)
+    plan = db.execute(
+        "EXPLAIN (ANALYZE,BUFFERS,TIMING OFF,FORMAT JSON) " + counters.COUNT_TOPIC_SQL,
+        values,
+    ).fetchone()[0][0]
+    scanned = sum(
+        node["Actual Rows"] * node["Actual Loops"]
+        for node in _plan_nodes(plan["Plan"])
+        if node.get("Relation Name")
+        in {
+            "messenger_messages",
+            "messenger_message_placements",
+            "messenger_user_message_bindings",
+        }
     )
+    assert scanned < 100, plan
 
 
-@pytest.mark.isolated_schema
-def test_personal_preview_scope_handles_deferred_parent_inserts(
-    api, db, _test_database_url
-):
-    stream, message = _create_message(api, "preview-deferred-parents")
-    placement_uuid, canonical_uuid = sys_uuid.uuid4(), sys_uuid.uuid4()
-    content_uuid = db.execute(
-        "SELECT content_uuid FROM messenger_messages WHERE project_id=%s LIMIT 1",
-        (api.project_id,),
-    ).fetchone()[0]
-    with psycopg.connect(_test_database_url) as connection:
-        connection.execute("SET CONSTRAINTS ALL DEFERRED")
-        connection.execute(
-            "INSERT INTO messenger_user_message_states "
-            "(uuid,project_id,placement_uuid,user_uuid,membership_generation) "
-            "VALUES (gen_random_uuid(),%s,%s,%s,1)",
-            (api.project_id, placement_uuid, api.user_uuid),
-        )
-        connection.execute(
-            "INSERT INTO messenger_message_placements "
-            "(uuid,project_id,message_uuid,stream_uuid,topic_uuid) VALUES (%s,%s,%s,%s,%s)",
-            (
-                placement_uuid,
-                api.project_id,
-                canonical_uuid,
-                stream["uuid"],
-                stream["default_topic_uuid"],
-            ),
-        )
-        connection.execute(
-            "INSERT INTO messenger_messages (uuid,project_id,author_uuid,content_uuid,created_at) "
-            "VALUES (%s,%s,%s,%s,'2001-01-01')",
-            (canonical_uuid, api.project_id, api.user_uuid, content_uuid),
-        )
-    assert db.execute(
-        "SELECT preview_stream_uuid,preview_topic_uuid,preview_created_at::date::text "
-        "FROM messenger_user_message_states WHERE project_id=%s AND placement_uuid=%s",
-        (api.project_id, placement_uuid),
-    ).fetchone() == (
-        sys_uuid.UUID(stream["uuid"]),
-        sys_uuid.UUID(stream["default_topic_uuid"]),
-        "2001-01-01",
+@pytest.mark.parametrize("scope", ["stream", "topic"])
+def test_shared_preview_preserves_canonical_dates_and_uuid_ties(api, db, scope):
+    stream, first = _create_message(api, "shared-preview-order")
+    second = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream["uuid"],
+            "topic_uuid": stream["default_topic_uuid"],
+            "payload": {"kind": "markdown", "content": "same timestamp"},
+        },
+    ).json()
+    placements = [sys_uuid.UUID(first["uuid"]), sys_uuid.UUID(second["uuid"])]
+    db.execute(
+        "UPDATE messenger_messages SET created_at='2020-01-01' WHERE project_id=%s AND uuid IN ("
+        "SELECT message_uuid FROM messenger_message_placements WHERE project_id=%s AND uuid=ANY(%s::uuid[]))",
+        (api.project_id, api.project_id, placements),
     )
+    table = f"messenger_{scope}_last_messages"
+    column = f"{scope}_uuid"
+    scope_uuid = stream["uuid"] if scope == "stream" else stream["default_topic_uuid"]
+    for expected in sorted(placements, reverse=True):
+        assert db.execute(
+            f"SELECT placement_uuid FROM {table} WHERE project_id=%s AND {column}=%s",
+            (api.project_id, scope_uuid),
+        ).fetchone() == (expected,)
+        db.execute(
+            "UPDATE messenger_messages SET deleted_at=NOW() WHERE project_id=%s AND uuid=("
+            "SELECT message_uuid FROM messenger_message_placements WHERE project_id=%s AND uuid=%s)",
+            (api.project_id, api.project_id, expected),
+        )
+    assert not db.execute(
+        f"SELECT placement_uuid FROM {table} WHERE project_id=%s AND {column}=%s",
+        (api.project_id, scope_uuid),
+    ).fetchall()
 
 
 @pytest.mark.parametrize("limit", [0, 2, 5])
@@ -2588,7 +2038,7 @@ def test_user_projection_requeues_without_attempt_on_event_lock_contention(
     assert metrics["outbox_to_finish_seconds_read_counters"] >= 0
 
 
-def test_history_import_snapshot_requeues_on_event_lock_contention(
+def test_legacy_counter_translation_does_not_wait_for_event_publication(
     api,
     db,
     monkeypatch,
@@ -2624,7 +2074,7 @@ def test_history_import_snapshot_requeues_on_event_lock_contention(
     started_at = time.monotonic()
     try:
         with contexts.Context().session_manager() as session:
-            assert not v2_projection.process_one_projection_task(
+            assert v2_projection.process_one_projection_task(
                 session,
                 "integration:history-event-contention",
             )
@@ -2646,7 +2096,11 @@ def test_history_import_snapshot_requeues_on_event_lock_contention(
             """,
             (api.project_id, event_uuid),
         )
-        assert cursor.fetchone() == ("pending", 0, "event_lock_contention")
+        assert cursor.fetchone() == ("completed", 1, "completed")
+    assert db.execute(
+        "SELECT count(*) FROM messenger_counter_updates WHERE project_id=%s AND user_uuid=%s",
+        (api.project_id, user_uuid),
+    ).fetchone() == (1,)
     assert elapsed < 1
 
 
@@ -3594,20 +3048,17 @@ def test_counter_coalescing_does_not_expand_beyond_fenced_users(api, db, monkeyp
         for user in users
     ]
     ids = _seed_partition_claim_tasks(api, specs)
-    refreshed = []
+    queued = []
     monkeypatch.setattr(
         v2_projection,
-        "_refresh_recipient_counters",
-        lambda *args: refreshed.extend(args[4]),
-    )
-    monkeypatch.setattr(
-        v2_projection, "_enqueue_counter_outbox_events", lambda *args, **kwargs: None
+        "_enqueue_counter_outbox_events",
+        lambda *args, **kwargs: queued.append(kwargs["user_uuid"]),
     )
     with contexts.Context().session_manager() as session:
         task = v2_projection._claim_task(session, "integration:batch-coalesce", 30)
         assert task is not None
         v2_projection._process_read_counters(session, task)
-    assert refreshed == [sys_uuid.UUID(users[0])]
+    assert queued == [sys_uuid.UUID(users[0])]
     assert db.execute(
         "SELECT status FROM messenger_projection_tasks WHERE outbox_event_uuid=%s",
         (ids[1],),
@@ -3702,38 +3153,28 @@ def test_independent_publisher_commits_while_batched_counter_is_blocked(
     api, db, monkeypatch
 ):
     stream, message = _create_message(api, "publication-during-counter")
-    _seed_partition_claim_tasks(
-        api,
-        [
-            {
-                "task_kind": "read_counters",
-                "scope_kind": "user-topic",
-                "scope_key": "slow-counter",
-                "payload": {
-                    "source_kind": "message.created",
-                    "user_uuids": [api.user_uuid],
-                    "stream_uuid": stream["uuid"],
-                    "topic_uuid": stream["default_topic_uuid"],
-                    "emit_public_event": False,
-                },
-            }
-        ],
+    db.execute(
+        "SELECT messenger_queue_counters(%s,%s,%s,%s)",
+        (api.project_id, api.user_uuid, stream["uuid"], stream["default_topic_uuid"]),
     )
     ready, release = threading.Event(), threading.Event()
-    original = v2_projection._refresh_recipient_counters
+    execute = sessions.PgSQLSession.execute
 
-    def blocked_refresh(*args):
-        ready.set()
-        assert release.wait(10)
-        return original(*args)
+    def blocked_count(session, query, values=None):
+        if query == counters.COUNT_TOPIC_SQL:
+            ready.set()
+            assert release.wait(10)
+        return execute(session, query, values)
 
-    monkeypatch.setattr(v2_projection, "_refresh_recipient_counters", blocked_refresh)
-    projection = agents.MessengerWorkerAgent(
-        v2_projection_enabled=True, projection_only=True
-    )
+    monkeypatch.setattr(sessions.PgSQLSession, "execute", blocked_count)
+
+    def count_pending():
+        with contexts.Context().session_manager() as session:
+            return counters.process_pending(session)
+
     publisher = agents.MessengerPublicationAgent(iter_min_period=0, iter_pause=0)
     with concurrent.futures.ThreadPoolExecutor(2) as pool:
-        counter = pool.submit(projection._run_v2_projection_tasks)
+        counter = pool.submit(count_pending)
         try:
             assert ready.wait(5)
             with contexts.Context().session_manager() as session:
@@ -3765,7 +3206,6 @@ def test_independent_publisher_commits_while_batched_counter_is_blocked(
         finally:
             release.set()
             counter.result(10)
-            projection.stop()
             publisher.stop()
 
 

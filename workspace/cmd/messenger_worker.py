@@ -58,7 +58,10 @@ def configure_worker_database() -> None:
 
 
 def build_worker_services() -> tuple[
-    agents.MessengerWorkerAgent | agents.MessengerPublicationAgent, ...
+    agents.MessengerWorkerAgent
+    | agents.MessengerPublicationAgent
+    | agents.MessengerCounterAgent,
+    ...,
 ]:
     worker_count = (
         CONF[DOMAIN].v2_projection_workers if CONF[DOMAIN].v2_projection_enabled else 1
@@ -115,6 +118,9 @@ def build_worker_services() -> tuple[
         publisher = agents.MessengerPublicationAgent(iter_min_period=0.1, iter_pause=0)
         publisher.add_setup(configure_worker_database)
         services.append(publisher)
+    counter = agents.MessengerCounterAgent(iter_min_period=0, iter_pause=0)
+    counter.add_setup(configure_worker_database)
+    services.append(counter)
     return tuple(services)
 
 

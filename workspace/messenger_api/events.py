@@ -422,7 +422,7 @@ def _create_workspace_event(
     payload: typing.Any,
     session: typing.Any = None,
 ) -> typing.Any:
-    if mutation_journal_opts.enabled():
+    if mutation_journal_opts.enabled() or publication.DEFERRED.get():
         pending = publication.enqueue(
             session or contexts.Context().get_session(),
             project_id,
@@ -702,7 +702,9 @@ def create_broadcast_event(
         return []
     session = session or contexts.Context().get_session()
     recipients = sorted({sys_uuid.UUID(str(value)) for value in recipients}, key=str)
-    if mutation_journal_opts.enabled() and not owned_publication:
+    if (
+        mutation_journal_opts.enabled() or publication.DEFERRED.get()
+    ) and not owned_publication:
         return publication.enqueue(
             session,
             project_id,

@@ -46,35 +46,29 @@ def test_unread_mentions_avoid_scanning_the_users_entire_history(api, db):
         )
         db.execute(
             """INSERT INTO messenger_user_message_bindings
-                   (uuid,project_id,placement_uuid,user_uuid,membership_generation,
-                    relation_role,visibility,permissions)
-               SELECT ids.placement,%s,ids.placement,%s,member.membership_generation,
-                      'member','visible','{}'::jsonb
-               FROM mention_plan_ids ids CROSS JOIN messenger_stream_bindings member
-               WHERE member.project_id=%s AND member.stream_uuid=%s AND member.user_uuid=%s""",
-            (api.project_id, api.user_uuid, api.project_id, stream, api.user_uuid),
+                   (uuid,project_id,placement_uuid,user_uuid)
+               SELECT placement,%s,placement,%s FROM mention_plan_ids""",
+            (api.project_id, api.user_uuid),
         )
         db.execute(
-            """INSERT INTO messenger_user_message_states
-                   (uuid,project_id,placement_uuid,user_uuid,membership_generation,mentioned)
-               SELECT ids.placement,%s,ids.placement,%s,member.membership_generation,ids.i=%s
-               FROM mention_plan_ids ids CROSS JOIN messenger_stream_bindings member
-               WHERE member.project_id=%s AND member.stream_uuid=%s AND member.user_uuid=%s""",
-            (
-                api.project_id,
-                api.user_uuid,
-                count,
-                api.project_id,
-                stream,
-                api.user_uuid,
-            ),
+            """INSERT INTO messenger_user_message_unreads
+                   (project_id,user_uuid,placement_uuid,stream_uuid,topic_uuid)
+               SELECT %s,%s,placement,%s,%s FROM mention_plan_ids""",
+            (api.project_id, api.user_uuid, stream, topic),
+        )
+        db.execute(
+            """INSERT INTO messenger_user_message_mentions
+                   (project_id,user_uuid,placement_uuid,stream_uuid,topic_uuid)
+               SELECT %s,%s,placement,%s,%s FROM mention_plan_ids WHERE i=%s""",
+            (api.project_id, api.user_uuid, stream, topic, count),
         )
         for table in (
             "messenger_messages",
             "messenger_message_contents",
             "messenger_message_placements",
             "messenger_user_message_bindings",
-            "messenger_user_message_states",
+            "messenger_user_message_unreads",
+            "messenger_user_message_mentions",
             "messenger_stream_bindings",
         ):
             db.execute(f"ANALYZE {table}")
@@ -85,13 +79,11 @@ def test_unread_mentions_avoid_scanning_the_users_entire_history(api, db):
         values = (api.project_id, api.user_uuid)
         explain = "EXPLAIN (ANALYZE,BUFFERS,TIMING OFF,FORMAT JSON) "
         plan = db.execute(explain + query, values).fetchone()[0][0]
-        assert "messenger_user_message_states_unread_mentions_idx" in {
-            node.get("Index Name") for node in _nodes(plan["Plan"])
-        }, json.dumps(plan)
         scans = [
             node
             for node in _nodes(plan["Plan"])
-            if node.get("Relation Name") == "messenger_user_message_states"
+            if node.get("Relation Name")
+            in {"messenger_user_message_unreads", "messenger_user_message_mentions"}
         ]
         assert (
             sum(
@@ -119,7 +111,7 @@ def test_unread_mentions_avoid_scanning_the_users_entire_history(api, db):
         assert [row["uuid"] for row in response.json()] == [str(expected)]
         print(
             json.dumps(
-                {"history_states": count, "mention_query_ms": plan["Execution Time"]}
+                {"history_messages": count, "mention_query_ms": plan["Execution Time"]}
             )
         )
     finally:

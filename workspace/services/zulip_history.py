@@ -80,8 +80,15 @@ ACTIVITY_SQL = """
                OR data->>'message_uuid'=ANY(%s::text[])
                OR ordering_key=ANY(%s::text[]))
     ) AS pending,
-    EXISTS (SELECT 1 FROM matching WHERE processed_at IS NOT NULL) AS changed
+    EXISTS (SELECT 1 FROM matching WHERE processed_at IS NOT NULL) OR EXISTS (
+        SELECT 1 FROM zulip_outgoing_intents
+        WHERE project_id=%s AND status='done' AND completed_at>=%s
+          AND (entity_uuid::text=ANY(%s::text[])
+               OR data->>'message_uuid'=ANY(%s::text[])
+               OR ordering_key=ANY(%s::text[]))
+    ) AS changed
 """
+
 SELECT_MISSING_SQL = """
     SELECT DISTINCT message.provider_identity::bigint AS remote_id
     FROM messenger_messages message
@@ -89,7 +96,7 @@ SELECT_MISSING_SQL = """
       ON placement.project_id=message.project_id AND placement.message_uuid=message.uuid
     JOIN messenger_user_message_bindings access
       ON access.project_id=placement.project_id AND access.placement_uuid=placement.uuid
-     AND access.user_uuid=%s AND access.visibility='visible'
+     AND access.user_uuid=%s
     WHERE message.project_id=%s AND message.provider_uuid=%s AND message.source_name='zulip'
       AND message.deleted_at IS NULL AND message.provider_identity ~ '^[0-9]+$'
       AND message.provider_identity::bigint>=%s AND message.provider_identity::bigint<=%s
@@ -105,7 +112,7 @@ SELECT_LATEST_KNOWN_SQL = """
             JOIN messenger_user_message_bindings access
               ON access.project_id=placement.project_id AND access.placement_uuid=placement.uuid
             WHERE placement.project_id=message.project_id AND placement.message_uuid=message.uuid
-              AND access.user_uuid=%s AND access.visibility='visible'
+              AND access.user_uuid=%s
         ) AND message.project_id=%s AND message.provider_uuid=%s
           AND message.source_name='zulip' AND message.provider_identity ~ '^[0-9]+$'
           AND message.deleted_at IS NULL
@@ -808,7 +815,7 @@ class ZulipHistoryService:
             identifiers = [snapshot["message"]["uuid"]]
             identifiers.extend(
                 snapshot[key]["uuid"]
-                for key in ("stream", "topic", "placement", "state")
+                for key in ("stream", "topic", "placement", "access")
                 if snapshot[key]
             )
         elif remote is None:
@@ -825,6 +832,11 @@ class ZulipHistoryService:
                 fetched_at,
                 keys,
                 account["project_id"],
+                identifiers,
+                identifiers,
+                keys,
+                account["project_id"],
+                fetched_at,
                 identifiers,
                 identifiers,
                 keys,

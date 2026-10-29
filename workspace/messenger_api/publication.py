@@ -5,6 +5,8 @@
 """Persist event payloads with mutations; allocate browser epochs separately."""
 
 import json
+import contextlib
+import contextvars
 import dataclasses
 import typing
 import uuid as sys_uuid
@@ -12,6 +14,21 @@ import uuid as sys_uuid
 from restalchemy.storage.sql import sessions
 
 from workspace.messenger_api.api import resource_projection
+
+
+DEFERRED: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "messenger_deferred_publication", default=False
+)
+
+
+@contextlib.contextmanager
+def defer() -> typing.Iterator[None]:
+    """Keep background aggregation outside the client event ordering lock."""
+    token = DEFERRED.set(True)
+    try:
+        yield
+    finally:
+        DEFERRED.reset(token)
 
 
 ENQUEUE_SQL = """

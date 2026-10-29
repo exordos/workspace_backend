@@ -59,6 +59,14 @@ def _production_v2_store(_database, request, monkeypatch):
     if request.node.get_closest_marker("pre_retirement_schema") is not None:
         api_store.configure_store_factory(historical_factory.build_store_factory())
         monkeypatch.setattr(test_messenger_v2, "v2_projection", historical_projection)
+
+        def drain_historical_projection():
+            with contexts.Context().session_manager() as session:
+                return historical_projection.drain_projection_queue(
+                    session, f"historical-content:{sys_uuid.uuid4()}"
+                )
+
+        monkeypatch.setattr(test_messenger_v2, "_drain", drain_historical_projection)
     else:
         api_store.configure_store_factory(store_factory.build_store_factory())
     try:

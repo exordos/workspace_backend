@@ -11,9 +11,8 @@ processes tasks under a fenced scope lease and retains bounded derivation for
 operator repair.  All projection writes and the corresponding public event
 snapshot commit in the same worker transaction.
 
-Imported Zulip counters reconcile bounded viewer-message changes into unread
-and mentioned totals per topic and membership epoch. Notification modes use
-these totals; native streams retain their authoritative history-based repair.
+Unread facts mark counter scopes dirty. A separate process counts those facts
+and publishes topic, stream and folder snapshots independently of fanout.
 """
 
 import datetime
@@ -31,6 +30,7 @@ from restalchemy.common import contexts
 from restalchemy.dm import filters as dm_filters
 
 from workspace.common import messenger_reaction_opts
+from workspace.messenger_api import publication
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api.api import resource_projection
 from workspace.messenger_api.dm import message_payloads
@@ -51,7 +51,6 @@ EVENT_LOCK_CONTENTION_BASE_DELAY_SECONDS = 0.1
 EVENT_LOCK_CONTENTION_MAX_DELAY_SECONDS = 3.0
 GLOBAL_ADMISSION_LOCK_TIMEOUT = "500ms"
 REACTION_COALESCE_LIMIT = 128
-COUNTER_DELTA_BATCH_SIZE = 1000
 PROJECTION_PROJECT_GATE_PREFIX = "messenger-v2-projection-project-v1"
 PROJECTION_PROJECT_ADMISSION_PREFIX = "messenger-v2-projection-admission-v1"
 PROJECTION_PROJECT_ADMISSION_SCOPE_KIND = "project-admission"
@@ -1098,7 +1097,7 @@ def _try_lock_projection_partition(
 
 def _try_lock_project_event_tail(session: typing.Any, project_id: object) -> None:
     """Acquire cursor ordering only after user projection writes are ready."""
-    if owned_projection.CURRENT.get() is not None:
+    if owned_projection.CURRENT.get() is not None or publication.DEFERRED.get():
         return
     locked = session.execute(
         """
@@ -1179,198 +1178,6 @@ def _message_namespace(
     return types.SimpleNamespace(**dict(row))
 
 
-def _refresh_recipient_counters(
-    session: typing.Any,
-    project_id: object,
-    stream_uuid: object,
-    topic_uuid: object,
-    user_uuids: typing.Iterable[object],
-    scope_kind: str,
-) -> bool:
-    recipients = [_uuid(value) for value in user_uuids]
-    if not recipients:
-        return False
-    if scope_kind == "user-stream":
-        table = "messenger_stream_bindings"
-        scope_column = "stream_uuid"
-        scope_uuid = stream_uuid
-        targets = """
-            SELECT target.uuid, target.project_id, target.user_uuid,
-                   target.stream_uuid AS scope_uuid, target.stream_uuid, target.membership_generation
-            FROM messenger_stream_bindings AS target
-            JOIN messenger_streams AS stream
-              ON stream.project_id = target.project_id AND stream.uuid = target.stream_uuid
-            WHERE target.project_id = %s AND target.stream_uuid = %s
-              AND target.user_uuid = ANY(%s::uuid[]) AND target.active
-        """
-    elif scope_kind == "user-topic":
-        table = "messenger_user_topic_bindings"
-        scope_column = "topic_uuid"
-        scope_uuid = topic_uuid
-        targets = """
-            SELECT target.uuid, target.project_id, target.user_uuid,
-                   target.topic_uuid AS scope_uuid, membership.stream_uuid, membership.membership_generation
-            FROM messenger_user_topic_bindings AS target
-            JOIN messenger_topics AS topic
-              ON topic.project_id = target.project_id AND topic.uuid = target.topic_uuid
-            JOIN messenger_streams AS stream
-              ON stream.project_id = topic.project_id AND stream.uuid = topic.stream_uuid
-            JOIN messenger_stream_bindings AS membership
-              ON membership.project_id = topic.project_id
-             AND membership.stream_uuid = topic.stream_uuid
-             AND membership.user_uuid = target.user_uuid AND membership.active
-            WHERE target.project_id = %s AND target.topic_uuid = %s
-              AND target.user_uuid = ANY(%s::uuid[])
-        """
-    else:
-        raise ValueError(f"Unsupported counter scope {scope_kind}")
-
-    stream = session.execute(
-        "SELECT source_name FROM messenger_streams WHERE project_id = %s AND uuid = %s",
-        (project_id, stream_uuid),
-    ).fetchone()
-    pending = False
-    if (
-        owned_projection.CURRENT.get() is None
-        and stream is not None
-        and stream["source_name"] == "zulip"
-    ):
-        for user_uuid in recipients:
-            more = v2_models.WorkspaceMessageCounterChange.reconcile_batch(
-                project_id, user_uuid, stream_uuid, COUNTER_DELTA_BATCH_SIZE
-            )
-            pending = pending or more
-        unread_query = f"""
-            SELECT user_uuid, sum(unread_count) AS unread_count,
-                   sum(active_unread_count) AS active_unread_count
-            FROM messenger_topic_counter_totals
-            WHERE project_id = %s AND {scope_column} = %s AND user_uuid = ANY(%s::uuid[])
-            GROUP BY user_uuid
-        """
-    else:
-        unread_query = f"""
-            SELECT state.user_uuid, count(*) AS unread_count,
-                   count(*) FILTER (WHERE CASE
-                       WHEN topic_binding.notification_mode = 'mute'
-                           THEN stream.source_name = 'zulip' AND state.mentioned
-                       WHEN topic_binding.notification_mode = 'follow' THEN true
-                       WHEN topic_binding.notification_mode = 'unmute'
-                           THEN stream.source_name = 'zulip' OR state.mentioned
-                       WHEN membership.notification_mode = 'all_messages' THEN true
-                       WHEN membership.notification_mode = 'mentions_only' THEN state.mentioned
-                       ELSE false
-                   END) AS active_unread_count
-            FROM messenger_user_message_states AS state
-            JOIN messenger_message_placements AS placement
-              ON placement.project_id = state.project_id AND placement.uuid = state.placement_uuid
-            JOIN messenger_messages AS message
-              ON message.project_id = placement.project_id AND message.uuid = placement.message_uuid
-             AND message.deleted_at IS NULL
-            JOIN messenger_topics AS topic
-              ON topic.project_id = placement.project_id AND topic.uuid = placement.topic_uuid
-             AND topic.deleted_at IS NULL
-            JOIN messenger_user_message_bindings AS access
-              ON access.project_id = state.project_id AND access.user_uuid = state.user_uuid
-             AND access.placement_uuid = state.placement_uuid
-             AND access.membership_generation = state.membership_generation
-             AND access.visibility = 'visible'
-            JOIN messenger_stream_bindings AS membership
-              ON membership.project_id = placement.project_id
-             AND membership.stream_uuid = placement.stream_uuid
-             AND membership.user_uuid = state.user_uuid
-             AND membership.membership_generation = state.membership_generation
-             AND membership.active
-            JOIN messenger_streams AS stream
-              ON stream.project_id = membership.project_id AND stream.uuid = membership.stream_uuid
-            LEFT JOIN messenger_user_topic_bindings AS topic_binding
-              ON topic_binding.project_id = placement.project_id
-             AND topic_binding.topic_uuid = placement.topic_uuid
-             AND topic_binding.user_uuid = state.user_uuid
-            WHERE state.project_id = %s AND placement.{scope_column} = %s
-              AND state.user_uuid = ANY(%s::uuid[]) AND state.read_at IS NULL
-            GROUP BY state.user_uuid
-        """
-
-    # A standalone SELECT permits parallel aggregation; UPDATE would disable it.
-    snapshots = session.execute(
-        f"""
-        WITH unread AS ({unread_query})
-        SELECT target.uuid, target.stream_uuid, target.membership_generation,
-               COALESCE(unread.unread_count, 0) AS unread_count,
-               COALESCE(unread.active_unread_count, 0) AS active_unread_count,
-               preview.uuid AS last_message_uuid
-        FROM ({targets}) AS target
-        LEFT JOIN unread ON unread.user_uuid = target.user_uuid
-        LEFT JOIN LATERAL (
-            -- Seek this recipient's scope in canonical message order. Each
-            -- visibility check is a point lookup, including an empty scope.
-            SELECT personal.placement_uuid AS uuid
-            FROM messenger_user_message_states AS personal
-            CROSS JOIN LATERAL (
-                SELECT 1
-                FROM messenger_message_placements AS placement
-                JOIN messenger_messages AS message
-                  ON message.project_id = placement.project_id
-                 AND message.uuid = placement.message_uuid AND message.deleted_at IS NULL
-                JOIN messenger_topics AS topic
-                  ON topic.project_id = placement.project_id AND topic.uuid = placement.topic_uuid
-                 AND topic.deleted_at IS NULL
-                JOIN messenger_user_message_bindings AS access
-                  ON access.project_id = personal.project_id AND access.user_uuid = personal.user_uuid
-                 AND access.placement_uuid = personal.placement_uuid
-                 AND access.membership_generation = personal.membership_generation
-                 AND access.visibility = 'visible'
-                WHERE placement.project_id = personal.project_id
-                  AND placement.uuid = personal.placement_uuid
-                  AND placement.{scope_column} = target.scope_uuid
-                LIMIT 1
-            ) AS visible
-            WHERE personal.project_id = target.project_id
-              AND personal.user_uuid = target.user_uuid
-              AND personal.membership_generation = target.membership_generation
-              AND personal.preview_{scope_column} = target.scope_uuid
-              AND personal.preview_created_at IS NOT NULL
-            ORDER BY personal.preview_created_at DESC, personal.placement_uuid DESC
-            LIMIT 1
-        ) AS preview ON true
-        """,
-        (project_id, scope_uuid, recipients, project_id, scope_uuid, recipients),
-    ).fetchall()
-    if not snapshots:
-        return pending
-    session.execute(
-        f"""
-        UPDATE {table} AS binding
-        SET unread_count = snapshot.unread_count,
-            active_unread_count = snapshot.active_unread_count,
-            passive_unread_count = snapshot.unread_count - snapshot.active_unread_count,
-            last_message_uuid = snapshot.last_message_uuid, updated_at = NOW()
-        FROM unnest(%s::uuid[], %s::bigint[], %s::bigint[], %s::uuid[],
-                    %s::integer[], %s::uuid[])
-             AS snapshot(uuid, unread_count, active_unread_count, last_message_uuid,
-                         membership_generation, stream_uuid)
-        WHERE binding.project_id = %s AND binding.uuid = snapshot.uuid
-          AND EXISTS (
-              SELECT 1 FROM messenger_stream_bindings AS membership
-              WHERE membership.project_id = binding.project_id
-                AND membership.stream_uuid = snapshot.stream_uuid
-                AND membership.user_uuid = binding.user_uuid AND membership.active
-                AND membership.membership_generation = snapshot.membership_generation
-          )
-        """,
-        (
-            [row["uuid"] for row in snapshots],
-            [row["unread_count"] for row in snapshots],
-            [row["active_unread_count"] for row in snapshots],
-            [row["last_message_uuid"] for row in snapshots],
-            [row["membership_generation"] for row in snapshots],
-            [row["stream_uuid"] for row in snapshots],
-            project_id,
-        ),
-    )
-    return pending
-
-
 def _emit_unread_snapshots(
     session: typing.Any,
     project_id: object,
@@ -1439,44 +1246,26 @@ def _enqueue_counter_outbox_events(
     include_topic: bool = True,
     emit_public_event: bool = True,
 ) -> None:
-    changes = owned_projection.CURRENT.get()
-    if changes is not None and emit_public_event:
-        if include_topic and topic_uuid is not None:
-            changes.topic(project_id, stream_uuid, topic_uuid, [user_uuid])
-        else:
-            changes.stream(project_id, stream_uuid, [user_uuid])
-        return
-    common_payload = {
-        "source_kind": source_kind,
-        "emit_public_event": emit_public_event,
-        "user_uuid": user_uuid,
-        "stream_uuid": stream_uuid,
-        "topic_uuid": topic_uuid,
-    }
-    if placement_uuid is not None:
-        common_payload["placement_uuid"] = placement_uuid
-    scopes = [("user-stream", stream_uuid)]
-    if include_topic:
-        scopes.append(("user-topic", topic_uuid))
-    for scope_kind, scope_uuid in scopes:
+    """Mark a scope dirty; only the independent counter process recounts it."""
+    if topic_uuid is not None:
+        session.execute(
+            "SELECT messenger_queue_counters(%s,%s,%s,%s,%s)",
+            (project_id, user_uuid, stream_uuid, topic_uuid, emit_public_event),
+        )
+    else:
         session.execute(
             """
-            INSERT INTO messenger_domain_outbox_events (
-                uuid, project_id, event_kind, scope_kind, scope_key, payload
-            ) VALUES (
-                messenger_uuid_v5(%s, %s), %s, 'read_counters', %s, %s,
-                %s::jsonb
+            INSERT INTO messenger_counter_updates(
+                project_id,user_uuid,stream_uuid,topic_uuid,publish_updates
             )
-            ON CONFLICT (project_id, uuid) DO NOTHING
+            SELECT personal.project_id,personal.user_uuid,topic.stream_uuid,personal.topic_uuid,%s
+            FROM messenger_user_topic_bindings personal
+            JOIN messenger_topics topic ON topic.project_id=personal.project_id AND topic.uuid=personal.topic_uuid
+            WHERE personal.project_id=%s AND personal.user_uuid=%s AND topic.stream_uuid=%s
+            ON CONFLICT(project_id,user_uuid,topic_uuid) DO UPDATE
+                SET revision=EXCLUDED.revision,stream_uuid=EXCLUDED.stream_uuid,publish_updates=messenger_counter_updates.publish_updates OR EXCLUDED.publish_updates,next_retry_at=NULL
             """,
-            (
-                source_event_uuid,
-                f"counter:{scope_kind}:{user_uuid}",
-                project_id,
-                scope_kind,
-                f"{project_id}:{user_uuid}:{scope_uuid}",
-                json.dumps(_plain(common_payload)),
-            ),
+            (emit_public_event, project_id, user_uuid, stream_uuid),
         )
 
 
@@ -1578,7 +1367,7 @@ def _process_fanout(
         (root_uuid, project_id, task["outbox_event_uuid"], placement_uuid),
     ).fetchone()
     cursor = root["next_user_uuid"]
-    membership_lock = "FOR UPDATE" if owned_projection.CURRENT.get() is None else ""
+    membership_lock = "FOR KEY SHARE" if owned_projection.CURRENT.get() is None else ""
     recipients = session.execute(
         f"""
         SELECT user_uuid, membership_generation
@@ -1611,95 +1400,34 @@ def _process_fanout(
             (project_id, root_uuid),
         )
         return True
-    content = message_payloads.markdown_content(message.payload).lower()
-    author_uuid = _uuid(message.user_uuid)
-    now = datetime.datetime.now(datetime.timezone.utc)
     accepted_recipients = []
     for recipient in recipients:
         user_uuid = _uuid(recipient["user_uuid"])
-        membership_generation = int(recipient["membership_generation"])
-        current_membership = session.execute(
-            """
-            SELECT 1 FROM messenger_stream_bindings
-            WHERE project_id = %s AND stream_uuid = %s AND user_uuid = %s
-              AND active AND membership_generation = %s
-              AND membership_started_at <= %s::timestamptz
-            """,
-            (
-                project_id,
-                message.stream_uuid,
-                user_uuid,
-                membership_generation,
-                audience_created_before,
-            ),
-        ).fetchone()
-        if current_membership is None:
-            continue
-        accepted_recipients.append(user_uuid)
         row_uuid = sys_uuid.uuid5(placement_uuid, str(user_uuid))
         session.execute(
             """
             INSERT INTO messenger_user_message_bindings (
-                uuid, project_id, placement_uuid, user_uuid,
-                membership_generation, relation_role, visibility,
-                permissions, created_at, updated_at
-            ) VALUES (
-                %s, %s, %s, %s, %s, %s, 'visible',
-                '{"read":true,"react":true,"star":true,"pin":true}'::jsonb,
-                %s, %s
+                uuid,project_id,placement_uuid,user_uuid
             )
-            ON CONFLICT (project_id, placement_uuid, user_uuid) DO UPDATE
-            SET membership_generation = EXCLUDED.membership_generation,
-                relation_role = EXCLUDED.relation_role,
-                visibility = EXCLUDED.visibility,
-                permissions = EXCLUDED.permissions,
-                updated_at = NOW()
-            WHERE messenger_user_message_bindings.membership_generation
-                  <> EXCLUDED.membership_generation
+            SELECT %s,%s,%s,user_uuid
+            FROM messenger_stream_bindings
+            WHERE project_id=%s AND stream_uuid=%s AND user_uuid=%s
+              AND active AND membership_generation=%s
+              AND membership_started_at<=%s::timestamptz
+            ON CONFLICT(project_id,placement_uuid,user_uuid) DO NOTHING
             """,
             (
                 row_uuid,
                 project_id,
                 placement_uuid,
-                user_uuid,
-                membership_generation,
-                "author" if user_uuid == author_uuid else "member",
-                now,
-                now,
-            ),
-        )
-        session.execute(
-            """
-            INSERT INTO messenger_user_message_states (
-                uuid, project_id, placement_uuid, user_uuid,
-                membership_generation, read_at, mentioned,
-                created_at, updated_at, source_name, provider_uuid, status
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (project_id, user_uuid, placement_uuid) DO UPDATE
-            SET membership_generation = EXCLUDED.membership_generation,
-                read_at = EXCLUDED.read_at,
-                mentioned = EXCLUDED.mentioned,
-                starred = false,
-                pinned = false,
-                updated_at = NOW()
-            WHERE messenger_user_message_states.membership_generation
-                  <> EXCLUDED.membership_generation
-            """,
-            (
-                row_uuid,
                 project_id,
-                placement_uuid,
+                message.stream_uuid,
                 user_uuid,
-                membership_generation,
-                now if user_uuid == author_uuid else None,
-                f"](urn:user:{str(user_uuid).lower()})" in content,
-                now,
-                now,
-                message.source_name,
-                message.provider_uuid,
-                "active" if message.source_name == "native" else "new",
+                recipient["membership_generation"],
+                audience_created_before,
             ),
         )
+        accepted_recipients.append(user_uuid)
     recipient_uuids = accepted_recipients
     if task["payload"].get(
         "emit_public_event", True
@@ -1721,17 +1449,6 @@ def _process_fanout(
                 for recipient in recipients
                 if _uuid(recipient["user_uuid"]) in set(recipient_uuids)
             },
-        )
-    for user_uuid in recipient_uuids:
-        _enqueue_counter_outbox_events(
-            session,
-            source_event_uuid=task["outbox_event_uuid"],
-            project_id=project_id,
-            source_kind="message.created",
-            placement_uuid=placement_uuid,
-            user_uuid=user_uuid,
-            stream_uuid=message.stream_uuid,
-            topic_uuid=message.topic_uuid,
         )
     batch_no = int(root["processed_count"]) // batch_size
     session.execute(
@@ -1789,7 +1506,7 @@ def _process_content_mentions(
     states = session.execute(
         """
         SELECT user_uuid
-        FROM messenger_user_message_states
+        FROM messenger_user_message_bindings
         WHERE project_id = %s AND placement_uuid = %s
           AND (%s::uuid IS NULL OR user_uuid > %s::uuid)
         ORDER BY user_uuid
@@ -1809,29 +1526,29 @@ def _process_content_mentions(
     for row in states:
         user_uuid = _uuid(row["user_uuid"])
         recipient_uuids.append(user_uuid)
-        session.execute(
-            """
-            UPDATE messenger_user_message_states
-            SET mentioned = %s, updated_at = NOW()
-            WHERE project_id = %s AND placement_uuid = %s AND user_uuid = %s
-            """,
-            (
-                f"](urn:user:{str(user_uuid).lower()})" in content,
-                task["project_id"],
-                placement_uuid,
-                user_uuid,
-            ),
-        )
-        _enqueue_counter_outbox_events(
-            session,
-            source_event_uuid=task["outbox_event_uuid"],
-            project_id=task["project_id"],
-            source_kind=task["payload"]["source_kind"],
-            user_uuid=user_uuid,
-            stream_uuid=message.stream_uuid,
-            topic_uuid=message.topic_uuid,
-            placement_uuid=placement_uuid,
-        )
+        if f"](urn:user:{str(user_uuid).lower()})" in content:
+            session.execute(
+                """
+                INSERT INTO messenger_user_message_mentions
+                    (project_id,user_uuid,placement_uuid,stream_uuid,topic_uuid)
+                VALUES(%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING
+                """,
+                (
+                    task["project_id"],
+                    user_uuid,
+                    placement_uuid,
+                    message.stream_uuid,
+                    message.topic_uuid,
+                ),
+            )
+        else:
+            session.execute(
+                """
+                DELETE FROM messenger_user_message_mentions
+                WHERE project_id=%s AND user_uuid=%s AND placement_uuid=%s
+                """,
+                (task["project_id"], user_uuid, placement_uuid),
+            )
     if (
         task["payload"]["source_kind"] == "message.updated"
         and task["payload"].get("emit_message_updated", True)
@@ -2136,146 +1853,38 @@ def _counter_users(payload: typing.Mapping[str, typing.Any]) -> list[sys_uuid.UU
 def _process_read_counters(
     session: typing.Any, task: typing.Mapping[str, typing.Any]
 ) -> None:
+    """Translate counter tasks queued before the sparse-state migration."""
     payload = task["payload"]
-    emit_public_event = payload.get("emit_public_event", True)
-    users = _counter_users(payload)
-    user_uuid = users[0]
-    topic_value = payload.get("topic_uuid")
-    topic_uuid = None if topic_value is None else _uuid(topic_value)
-    if task["scope_kind"] == "user-topic" and topic_uuid is None:
-        raise ValueError("Topic counter task is missing its topic UUID")
-    if payload.get("source_kind") == "history.imported":
-        # The import transaction already applied bounded counter deltas. Never
-        # scan message history again to publish its completion snapshot.
-        if task["scope_kind"] == "user-stream":
-            _enqueue_folder_outbox_events(
-                session,
-                source_event_uuid=task["outbox_event_uuid"],
-                project_id=task["project_id"],
-                source_kind="history.imported",
-                user_uuid=user_uuid,
-                stream_uuid=_uuid(payload["stream_uuid"]),
-                emit_public_event=emit_public_event,
-            )
-        if emit_public_event:
-            _try_lock_project_event_tail(session, task["project_id"])
-            _emit_unread_snapshots(
-                session,
-                task["project_id"],
-                _uuid(payload["stream_uuid"]),
-                topic_uuid,
-                users,
-                task["scope_kind"],
-            )
-        return
-    if owned_projection.CURRENT.get() is None and not payload.get(
-        "emit_message_read", False
-    ):
-        # Counter tasks are authoritative snapshots.  One claimed snapshot can
-        # absorb every idle snapshot-only sibling for the same user scope;
-        # tasks that must emit a per-message read event remain independent.
-        coalesced = session.execute(
-            """
-            WITH siblings AS MATERIALIZED (
-                SELECT uuid
-                FROM messenger_projection_tasks
-                WHERE project_id = %s AND task_kind = 'read_counters'
-                  AND scope_kind = %s AND scope_key = %s AND uuid <> %s
-                  AND status IN ('pending', 'failed')
-                  AND (lease_expires_at IS NULL OR lease_expires_at <= NOW())
-                  AND COALESCE(
-                      (payload->>'emit_message_read')::boolean,
-                      FALSE
-                  ) = FALSE
-                  AND %s::jsonb @> COALESCE(
-                      payload->'user_uuids',
-                      jsonb_build_array(payload->>'user_uuid')
-                  )
-                FOR UPDATE SKIP LOCKED
-            )
-            UPDATE messenger_projection_tasks AS task
-            SET status = 'completed', lease_owner = NULL,
-                lease_expires_at = NULL, next_retry_at = NULL,
-                last_error = NULL, updated_at = NOW()
-            FROM siblings
-            WHERE task.project_id = %s AND task.uuid = siblings.uuid
-            RETURNING task.payload
-            """,
-            (
-                task["project_id"],
-                task["scope_kind"],
-                task["scope_key"],
-                task["uuid"],
-                json.dumps([str(user) for user in users]),
-                task["project_id"],
-            ),
+    for user_uuid in _counter_users(payload):
+        _enqueue_counter_outbox_events(
+            session,
+            source_event_uuid=task["outbox_event_uuid"],
+            project_id=task["project_id"],
+            source_kind=payload["source_kind"],
+            user_uuid=user_uuid,
+            stream_uuid=_uuid(payload["stream_uuid"]),
+            topic_uuid=payload.get("topic_uuid"),
+            emit_public_event=payload.get("emit_public_event", True),
         )
-        siblings = coalesced.fetchall()
-        emit_public_event = emit_public_event or any(
-            sibling["payload"].get("emit_public_event", True) for sibling in siblings
-        )
-    pending = _refresh_recipient_counters(
-        session,
-        task["project_id"],
-        _uuid(payload["stream_uuid"]),
-        topic_uuid,
-        users,
-        task["scope_kind"],
-    )
-    if pending or task["scope_kind"] == "user-topic":
-        for user_uuid in users:
-            _enqueue_counter_outbox_events(
-                session,
-                source_event_uuid=task["outbox_event_uuid"],
-                project_id=task["project_id"],
-                source_kind="zulip.reconciled",
-                user_uuid=user_uuid,
-                stream_uuid=_uuid(payload["stream_uuid"]),
-                topic_uuid=topic_uuid,
-                include_topic=pending and topic_uuid is not None,
-                emit_public_event=emit_public_event,
+        if payload.get("placement_uuid") and payload.get("emit_message_read"):
+            messages = _v2_rows(
+                v2_models.WorkspaceUserMessage,
+                task["project_id"],
+                {
+                    "uuid": dm_filters.EQ(_uuid(payload["placement_uuid"])),
+                    "user_uuid": dm_filters.EQ(user_uuid),
+                },
             )
-    if task["scope_kind"] == "user-stream":
-        for user_uuid in users:
-            _enqueue_folder_outbox_events(
-                session,
-                source_event_uuid=task["outbox_event_uuid"],
-                project_id=task["project_id"],
-                source_kind=payload["source_kind"],
-                user_uuid=user_uuid,
-                stream_uuid=_uuid(payload["stream_uuid"]),
-                emit_public_event=emit_public_event,
-            )
-    if not emit_public_event:
-        return
-    _try_lock_project_event_tail(session, task["project_id"])
-    if payload.get("placement_uuid") and payload.get("emit_message_read"):
-        messages = _v2_rows(
-            v2_models.WorkspaceUserMessage,
-            task["project_id"],
-            {
-                "uuid": dm_filters.EQ(_uuid(payload["placement_uuid"])),
-                "user_uuid": dm_filters.EQ(user_uuid),
-            },
-        )
-        if messages and messenger_events.is_recent_message(messages[0].created_at):
-            emitted = messenger_events.create_message_read_event(
-                messages[0], session=session
-            )
-            _guard_emitted_events(
-                session,
-                emitted,
-                project_id=task["project_id"],
-                stream_uuid=payload["stream_uuid"],
-            )
-    _emit_unread_snapshots(
-        session,
-        task["project_id"],
-        _uuid(payload["stream_uuid"]),
-        topic_uuid,
-        users,
-        task["scope_kind"],
-    )
+            if messages and messenger_events.is_recent_message(messages[0].created_at):
+                emitted = messenger_events.create_message_read_event(
+                    messages[0], session=session
+                )
+                _guard_emitted_events(
+                    session,
+                    emitted,
+                    project_id=task["project_id"],
+                    stream_uuid=payload["stream_uuid"],
+                )
 
 
 def _process_folder_projection(
@@ -2680,72 +2289,27 @@ def _process_topic_membership_policy_rebuild(
     ).fetchall()
     has_more = len(rows) > batch_size
     rows = rows[:batch_size]
-    now = datetime.datetime.now(datetime.timezone.utc)
     for row in rows:
         placement_uuid = _uuid(row["uuid"])
         row_uuid = sys_uuid.uuid5(placement_uuid, str(user_uuid))
         session.execute(
             """
             INSERT INTO messenger_user_message_bindings (
-                uuid, project_id, placement_uuid, user_uuid,
-                membership_generation, relation_role, visibility,
-                permissions, created_at, updated_at
-            ) VALUES (
-                %s, %s, %s, %s, %s, %s, 'visible',
-                '{"read":true,"react":true,"star":true,"pin":true}'::jsonb,
-                %s, %s
+                uuid,project_id,placement_uuid,user_uuid
             )
-            ON CONFLICT (project_id, placement_uuid, user_uuid) DO UPDATE
-            SET membership_generation = EXCLUDED.membership_generation,
-                relation_role = EXCLUDED.relation_role,
-                visibility = EXCLUDED.visibility,
-                permissions = EXCLUDED.permissions,
-                updated_at = NOW()
-            WHERE messenger_user_message_bindings.membership_generation
-                  <> EXCLUDED.membership_generation
+            SELECT %s,%s,%s,user_uuid FROM messenger_stream_bindings
+            WHERE project_id=%s AND stream_uuid=%s AND user_uuid=%s
+              AND active AND membership_generation=%s
+            ON CONFLICT(project_id,placement_uuid,user_uuid) DO NOTHING
             """,
             (
                 row_uuid,
                 project_id,
                 placement_uuid,
-                user_uuid,
-                generation,
-                "author" if _uuid(row["author_uuid"]) == user_uuid else "member",
-                now,
-                now,
-            ),
-        )
-        content = message_payloads.markdown_content(row["payload"]).lower()
-        session.execute(
-            """
-            INSERT INTO messenger_user_message_states (
-                uuid, project_id, placement_uuid, user_uuid,
-                membership_generation, read_at, mentioned,
-                created_at, updated_at, source_name, provider_uuid, status
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (project_id, user_uuid, placement_uuid) DO UPDATE
-            SET membership_generation = EXCLUDED.membership_generation,
-                read_at = EXCLUDED.read_at,
-                mentioned = EXCLUDED.mentioned,
-                starred = false,
-                pinned = false,
-                updated_at = NOW()
-            WHERE messenger_user_message_states.membership_generation
-                  <> EXCLUDED.membership_generation
-            """,
-            (
-                row_uuid,
                 project_id,
-                placement_uuid,
+                stream_uuid,
                 user_uuid,
                 generation,
-                now,
-                f"](urn:user:{str(user_uuid).lower()})" in content,
-                now,
-                now,
-                row["source_name"],
-                row["provider_uuid"],
-                "active" if row["source_name"] == "native" else "new",
             ),
         )
     if rows:
@@ -3070,11 +2634,16 @@ def _process_delivery_snapshot(
         placement = original_payload["placement"]
         rows = session.execute(
             """
-            SELECT user_uuid, membership_generation
-            FROM messenger_user_message_bindings
-            WHERE project_id = %s AND placement_uuid = %s
-              AND (%s::uuid IS NULL OR user_uuid > %s::uuid)
-            ORDER BY user_uuid
+            SELECT access.user_uuid,membership.membership_generation
+            FROM messenger_user_message_bindings access
+            JOIN messenger_message_placements placement
+              ON placement.project_id=access.project_id AND placement.uuid=access.placement_uuid
+            JOIN messenger_stream_bindings membership
+              ON membership.project_id=access.project_id AND membership.user_uuid=access.user_uuid
+             AND membership.stream_uuid=placement.stream_uuid AND membership.active
+            WHERE access.project_id = %s AND access.placement_uuid = %s
+              AND (%s::uuid IS NULL OR access.user_uuid > %s::uuid)
+            ORDER BY access.user_uuid
             LIMIT %s
             """,
             (

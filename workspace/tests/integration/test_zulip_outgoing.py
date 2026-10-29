@@ -7,25 +7,21 @@ import contextlib
 import datetime
 import importlib.util
 import json
+import types
+import uuid
 from unittest import mock
 
 import aiohttp
+import psycopg
+import pytest
 from aiohttp import web
 from psycopg.types import json as pg_json
-
-from workspace.services import zulip_outgoing
-from workspace.bridges.zulip import outgoing_operations
-from workspace.bridges.zulip import message_conversion
-import uuid
-import types
-
-import pytest
-import psycopg
 from restalchemy.common import contexts
 from restalchemy.dm import filters
 
-from workspace.messenger_api.dm import external_models
-from workspace.messenger_api.dm import v2_models
+from workspace.bridges.zulip import message_conversion, outgoing_operations
+from workspace.messenger_api.dm import external_models, v2_models
+from workspace.services import zulip_outgoing
 from workspace.services.messenger_workers import v2_projection
 from workspace.tests.integration import conftest
 
@@ -947,17 +943,26 @@ def test_cutover_preserves_queued_and_unscheduled_changes(outgoing, db):
             "UPDATE bridge_zulip_v5_deliveries SET zulip_message_id=123 WHERE uuid=%s",
             (copies[1].uuid,),
         )
-    assert (
-        api.post(
-            f"/v1/messenger/messages/{second['uuid']}/actions/star/invoke"
-        ).status_code
-        == 200
+    # This fixture tests the published pre-sparse migration. Seed its old
+    # state directly instead of invoking the current sparse API against it.
+    db.execute(
+        "UPDATE messenger_user_message_states SET starred=true WHERE project_id=%s AND placement_uuid=%s AND user_uuid=%s",
+        (account.project_id, uuid.UUID(second["uuid"]), api.user_uuid),
     )
-    reaction = api.post(
-        "/v1/messenger/message_reactions/",
-        json={"message_uuid": second["uuid"], "emoji_name": "thumbs_up"},
+    canonical = db.execute(
+        "SELECT message_uuid FROM messenger_message_placements WHERE uuid=%s",
+        (uuid.UUID(second["uuid"]),),
+    ).fetchone()[0]
+    db.execute(
+        "INSERT INTO messenger_message_reaction_facts(uuid,project_id,canonical_message_uuid,placement_uuid,user_uuid,emoji_name) VALUES(%s,%s,%s,%s,%s,'thumbs_up')",
+        (
+            uuid.uuid4(),
+            api.project_id,
+            canonical,
+            uuid.UUID(second["uuid"]),
+            api.user_uuid,
+        ),
     )
-    assert reaction.status_code == 201, reaction.text
     old_uuid = uuid.uuid4()
     for task_uuid, content in (
         (
@@ -1101,7 +1106,7 @@ def test_zulip_children_inherit_provider_before_receipt(
         assert entity["status"] == "new"
     for table, predicate, identifier in (
         ("messenger_user_topic_bindings", "topic_uuid", topic["uuid"]),
-        ("messenger_user_message_states", "placement_uuid", message["uuid"]),
+        ("messenger_api_user_messages_v1", "uuid", message["uuid"]),
     ):
         assert db.execute(
             f"SELECT source_name,provider_uuid FROM {table} WHERE {predicate}=%s",
@@ -1211,18 +1216,33 @@ def test_native_file_reference_never_schedules_an_upload(
         )
 
 
-@pytest.mark.isolated_schema
+@pytest.mark.pre_sparse_schema
 def test_provenance_migration_converts_legacy_children_and_retires_root_links(
     outgoing, db
 ):
     # Reapplying this published migration reinstalls its published SQL trigger.
     # It must not replace the current trigger in the shared test database.
     api, account, channel, *_ = outgoing
-    public = create(outgoing)
-    identifier = db.execute(
-        "SELECT message_uuid FROM messenger_message_placements WHERE uuid=%s",
-        (uuid.UUID(public["uuid"]),),
+    identifier, placement = uuid.uuid4(), uuid.uuid4()
+    topic = db.execute(
+        "SELECT default_topic_uuid FROM messenger_streams WHERE uuid=%s",
+        (channel.stream_uuid,),
     ).fetchone()[0]
+    db.execute(
+        "INSERT INTO messenger_messages(uuid,project_id,author_uuid,content_uuid) VALUES(%s,%s,%s,messenger_resolve_message_content(%s::jsonb,NULL))",
+        (
+            identifier,
+            api.project_id,
+            api.user_uuid,
+            pg_json.Jsonb(
+                {"kind": "markdown", "content": "Before provenance migration"}
+            ),
+        ),
+    )
+    db.execute(
+        "INSERT INTO messenger_message_placements(uuid,project_id,message_uuid,stream_uuid,topic_uuid) VALUES(%s,%s,%s,%s,%s)",
+        (placement, api.project_id, identifier, channel.stream_uuid, topic),
+    )
     db.execute(
         "UPDATE messenger_messages SET source_name='native',provider_uuid=NULL,provider_identity=NULL,status='active' WHERE uuid=%s",
         (identifier,),
@@ -1230,6 +1250,16 @@ def test_provenance_migration_converts_legacy_children_and_retires_root_links(
     db.execute(
         "INSERT INTO zulip_entity_links(project_id,entity_type,entity_uuid,provider_uuid,external_account_uuid,provider_identity) VALUES(%s,'message',%s,%s,%s,'987')",
         (account.project_id, identifier, account.provider_uuid, account.uuid),
+    )
+    db.execute(
+        "INSERT INTO zulip_outgoing_intents(project_id,entity_type,entity_uuid,ordering_key,external_account_uuid,operation,data) VALUES(%s,'message',%s,%s,%s,'insert',%s)",
+        (
+            api.project_id,
+            identifier,
+            f"message:{identifier}",
+            account.uuid,
+            pg_json.Jsonb({"source_name": "native"}),
+        ),
     )
     db.execute(
         'UPDATE zulip_outgoing_intents SET data=data||\'{"source_name":"native"}\'::jsonb WHERE entity_uuid=%s',

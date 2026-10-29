@@ -52,7 +52,7 @@ SELECT_MESSAGES_SQL = """
                ),'placement',to_jsonb(placement),
                'stream',to_jsonb(stream),'topic',to_jsonb(topic),
                -- Counter publications must not invalidate unrelated messages.
-               -- Keep membership identity, generation and access controls.
+               -- Keep membership identity and the visibility binding.
                'membership',to_jsonb(member)-ARRAY[
                    'updated_at','unread_count','active_unread_count',
                    'passive_unread_count','last_message_uuid'
@@ -73,9 +73,18 @@ SELECT_MESSAGES_SQL = """
     LEFT JOIN messenger_user_message_bindings access
       ON access.project_id=placement.project_id AND access.placement_uuid=placement.uuid
      AND access.user_uuid=%s
-    LEFT JOIN messenger_user_message_states state
-      ON state.project_id=placement.project_id AND state.placement_uuid=placement.uuid
-     AND state.user_uuid=%s
+    LEFT JOIN LATERAL (
+        SELECT NOT EXISTS (
+            SELECT 1 FROM messenger_user_message_unreads flag
+            WHERE flag.project_id=placement.project_id AND flag.placement_uuid=placement.uuid
+              AND flag.user_uuid=viewer.user_uuid
+        ) AS read, EXISTS (
+            SELECT 1 FROM messenger_user_message_stars flag
+            WHERE flag.project_id=placement.project_id AND flag.placement_uuid=placement.uuid
+              AND flag.user_uuid=viewer.user_uuid
+        ) AS starred
+        FROM (VALUES(%s::uuid)) viewer(user_uuid)
+    ) state ON true
     LEFT JOIN LATERAL (
         SELECT jsonb_agg(jsonb_build_object(
             'provider_identity',provider_identity,'emoji_name',emoji_name,
@@ -151,13 +160,22 @@ SELECT_CATALOG_TOPICS_SQL = """
 """
 SELECT_FLAG_PAGE_SQL = """
     SELECT message.provider_identity::bigint AS remote_id,
-           state.read_at IS NOT NULL AS read,state.starred
-    FROM messenger_user_message_states state
+           unread.placement_uuid IS NULL AS read,star.placement_uuid IS NOT NULL AS starred
+    FROM messenger_user_message_bindings access
     JOIN messenger_message_placements placement
-      ON placement.project_id=state.project_id AND placement.uuid=state.placement_uuid
+      ON placement.project_id=access.project_id AND placement.uuid=access.placement_uuid
     JOIN messenger_messages message
       ON message.project_id=placement.project_id AND message.uuid=placement.message_uuid
-    WHERE state.project_id=%s AND state.user_uuid=%s AND message.provider_uuid=%s
+    JOIN messenger_stream_bindings membership
+      ON membership.project_id=access.project_id AND membership.user_uuid=access.user_uuid
+     AND membership.stream_uuid=placement.stream_uuid AND membership.active
+    LEFT JOIN messenger_user_message_unreads unread
+      ON (unread.project_id,unread.user_uuid,unread.placement_uuid)=
+         (access.project_id,access.user_uuid,access.placement_uuid)
+    LEFT JOIN messenger_user_message_stars star
+      ON (star.project_id,star.user_uuid,star.placement_uuid)=
+         (access.project_id,access.user_uuid,access.placement_uuid)
+    WHERE access.project_id=%s AND access.user_uuid=%s AND message.provider_uuid=%s
       AND message.source_name='zulip' AND message.provider_identity ~ '^[0-9]+$'
       AND message.provider_identity::bigint>%s AND message.deleted_at IS NULL
     ORDER BY message.provider_identity::bigint LIMIT %s
@@ -195,7 +213,6 @@ def recently_changed(snapshot: dict | None, since: datetime.datetime) -> bool:
             "stream",
             "topic",
             "access",
-            "state",
         )
         if snapshot[name] is not None
     ]
@@ -464,19 +481,11 @@ class Operations(incoming_operations.Operations):
         ):
             return False
         membership, access, state = old["membership"], old["access"], old["state"]
-        if not membership or not membership["active"] or not access or not state:
+        if not membership or not membership["active"] or not access:
             return False
-        if (
-            access["membership_generation"] != membership["membership_generation"]
-            or state["membership_generation"] != membership["membership_generation"]
-            or access["visibility"] != "visible"
-            or state["provider_identity"]
-            != f"{data['id']}:{account['external_account_id']}"
+        if state["read"] != ("read" in data["flags"]) or state["starred"] != (
+            "starred" in data["flags"]
         ):
-            return False
-        if (state["read_at"] is not None) != ("read" in data["flags"]) or state[
-            "starred"
-        ] != ("starred" in data["flags"]):
             return False
         identities = {
             f"{data['id']}:{item['user_id']}:{item['reaction_type']}:{item['emoji_code']}"
@@ -679,16 +688,10 @@ class Operations(incoming_operations.Operations):
         if not old or not old["access"] or not old["placement"]:
             return
         access = old["access"]
-        if access["visibility"] == "hidden":
-            return
-        await self.save(
+        await incoming_operations.rows(
             connection,
-            "messenger_user_message_bindings",
-            {
-                "project_id": account["project_id"],
-                "uuid": access["uuid"],
-                "visibility": "hidden",
-            },
+            "DELETE FROM messenger_user_message_bindings WHERE project_id=%s AND uuid=%s RETURNING uuid",
+            (account["project_id"], access["uuid"]),
         )
         await self.publish(
             connection,

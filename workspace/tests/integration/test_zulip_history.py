@@ -11,17 +11,14 @@ from unittest import mock
 import pytest
 from oslo_config import cfg
 
-from workspace.bridges.zulip import history
-from workspace.bridges.zulip import incoming_operations
-from workspace.bridges.zulip import outgoing_operations
+from workspace.bridges.zulip import history, incoming_operations, outgoing_operations
 from workspace.common import mutation_journal_opts
 from workspace.messenger_api import publication
 from workspace.services import zulip_history
 from workspace.services.messenger_workers import mutation_runtime
 from workspace.tests.integration import test_mutation_journal as journal_tests
-from workspace.tests.integration import test_zulip_incoming as incoming_tests
 from workspace.tests.integration import test_projection_performance as projection_tests
-
+from workspace.tests.integration import test_zulip_incoming as incoming_tests
 
 incoming = incoming_tests.incoming
 
@@ -285,8 +282,8 @@ def test_latest_known_message_keeps_numeric_order_and_visibility(incoming):
         (account["project_id"],),
     )
     db.execute(
-        "UPDATE messenger_user_message_bindings access SET visibility='hidden' "
-        "FROM messenger_message_placements placement JOIN messenger_messages message "
+        "DELETE FROM messenger_user_message_bindings access "
+        "USING messenger_message_placements placement JOIN messenger_messages message "
         "ON message.project_id=placement.project_id AND message.uuid=placement.message_uuid "
         "WHERE access.project_id=placement.project_id AND access.placement_uuid=placement.uuid "
         "AND message.project_id=%s AND message.provider_identity='12'",
@@ -334,9 +331,8 @@ def test_latest_known_message_does_not_scan_all_visible_history(incoming):
             RETURNING uuid,project_id
         )
         INSERT INTO messenger_user_message_bindings
-            (uuid,project_id,placement_uuid,user_uuid,membership_generation,
-             relation_role,visibility,permissions)
-        SELECT gen_random_uuid(),project_id,uuid,%s,1,'author','visible','{}'::jsonb
+            (uuid,project_id,placement_uuid,user_uuid)
+        SELECT gen_random_uuid(),project_id,uuid,%s
         FROM placements
         """,
         (
@@ -409,19 +405,34 @@ def test_history_counters_preserve_a_realtime_publication(
                 await drain(service, account)
 
         asyncio.run(run())
-        counters = db.execute(
-            "SELECT uuid FROM messenger_projection_tasks WHERE project_id=%s "
-            "AND task_kind='read_counters' ORDER BY created_at,uuid",
+        scope = db.execute(
+            "SELECT placement.stream_uuid,placement.topic_uuid FROM messenger_message_placements placement "
+            "JOIN messenger_messages message ON message.project_id=placement.project_id AND message.uuid=placement.message_uuid "
+            "WHERE message.project_id=%s AND message.provider_identity='101'",
             (account["project_id"],),
-        ).fetchall()
-        assert len(counters) >= 2
+        ).fetchone()
+        parameters = (account["project_id"], account["owner_user_uuid"], *scope)
+        pending = db.execute(
+            "SELECT publish_updates FROM messenger_counter_updates "
+            "WHERE project_id=%s AND user_uuid=%s AND topic_uuid=%s",
+            (account["project_id"], account["owner_user_uuid"], scope[1]),
+        ).fetchone()
+        assert pending == (False,)
         if public_position is not None:
-            # A normal realtime invalidation can share this authoritative scope.
-            db.execute(
-                "UPDATE messenger_projection_tasks SET payload="
-                "jsonb_set(payload,'{emit_public_event}','true') WHERE uuid=%s",
-                (counters[public_position][0],),
-            )
+            # A live invalidation is retained whether it arrives before or
+            # after the last silent history invalidation in this scope.
+            db.execute("SELECT messenger_queue_counters(%s,%s,%s,%s)", parameters)
+            if public_position == 0:
+                with db.transaction():
+                    db.execute("SELECT set_config('workspace.zulip_history','on',true)")
+                    db.execute(
+                        "SELECT messenger_queue_counters(%s,%s,%s,%s)", parameters
+                    )
+            assert db.execute(
+                "SELECT publish_updates FROM messenger_counter_updates "
+                "WHERE project_id=%s AND user_uuid=%s AND topic_uuid=%s",
+                (account["project_id"], account["owner_user_uuid"], scope[1]),
+            ).fetchone() == (True,)
         project()
         messages = api.get("/v1/messenger/messages/").json()
         assert len(messages) == 2
@@ -589,8 +600,8 @@ def test_history_repairs_content_reactions_flags_and_scoped_absence(incoming, jo
         assert len(visible) == 1
         assert visible[0]["starred"] is True
         assert db.execute(
-            "SELECT read_at IS NOT NULL FROM messenger_user_message_states WHERE project_id=%s AND provider_identity=%s",
-            (account["project_id"], "101:7"),
+            "SELECT read FROM messenger_api_user_messages_v1 WHERE project_id=%s AND provider_identity=%s AND user_uuid=%s",
+            (account["project_id"], "101", account["owner_user_uuid"]),
         ).fetchone()[0]
     finally:
         if runtime is not None:
@@ -745,11 +756,11 @@ def test_snapshot_flags_do_not_mark_truncated_old_unreads_as_read(incoming):
             await drain(service, account)
             row = (
                 await service.db.sql(
-                    "SELECT read_at,starred FROM messenger_user_message_states WHERE project_id=%s",
+                    "SELECT read,starred FROM messenger_api_user_messages_v1 WHERE project_id=%s",
                     (account["project_id"],),
                 )
             )[0]
-            assert row["read_at"] is None and row["starred"]
+            assert not row["read"] and row["starred"]
 
     asyncio.run(run())
 
@@ -1058,8 +1069,8 @@ def test_history_flags_do_not_refetch_siblings_after_counter_updates(incoming):
             assert not [path for _, path, _ in calls if path.startswith("/messages/")]
             assert (
                 await service.db.sql(
-                    "SELECT count(*) AS count FROM messenger_user_message_states "
-                    "WHERE user_uuid=%s AND read_at IS NULL",
+                    "SELECT count(*) AS count FROM messenger_user_message_unreads "
+                    "WHERE user_uuid=%s",
                     (account["owner_user_uuid"],),
                 )
             )[0]["count"] == 3
@@ -1114,8 +1125,9 @@ def test_history_process_is_silent_for_an_actual_websocket_client(
     import socket
     import sys
 
-    from aiohttp import web
     import websockets
+    from aiohttp import web
+
     from workspace.messenger_api import websocket_service
     from workspace.messenger_api.dm import external_models
 

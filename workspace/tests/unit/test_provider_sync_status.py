@@ -21,7 +21,6 @@ from workspace.messenger_api.dm import v2_models
         v2_models.WorkspaceStreamTopic,
         v2_models.WorkspaceUserTopicBinding,
         v2_models.WorkspaceMessage,
-        v2_models.WorkspaceUserMessageState,
         v2_models.WorkspaceMessageReactionFact,
         models.WorkspaceFile,
     ),
