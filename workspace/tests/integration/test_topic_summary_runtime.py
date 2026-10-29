@@ -23,6 +23,7 @@ import json
 import threading
 import uuid as sys_uuid
 
+import pytest
 from restalchemy.common import contexts as ra_contexts
 
 from workspace.messenger_api import file_storage
@@ -74,6 +75,74 @@ TOPIC_SUMMARY_SETTINGS_MANAGE = (topic_summarization.SETTINGS_MANAGE_PERMISSION,
 def _run_database_operation(callback):
     with ra_contexts.Context().session_manager() as session:
         return callback(session)
+
+
+@pytest.mark.isolated_schema
+@pytest.mark.parametrize(
+    ("global_enabled", "project_enabled", "endpoint_enabled"),
+    ((False, True, True), (True, False, True), (True, True, False)),
+)
+def test_disabled_summary_does_not_scan_topics_or_create_jobs(
+    api, db, global_enabled, project_enabled, endpoint_enabled
+):
+    endpoint = api.post(
+        TOPIC_SUMMARY_ENDPOINTS,
+        permissions=TOPIC_SUMMARY_ENDPOINT_MANAGE,
+        json={
+            "uuid": str(sys_uuid.uuid4()),
+            "name": "disabled-summary",
+            "base_url": "https://llm.example.invalid/v1",
+            "model": "summary-model",
+            "api_key": "test-secret",
+            "enabled": endpoint_enabled,
+        },
+    )
+    assert endpoint.status_code == 201, endpoint.text
+    settings = api.put(
+        f"{TOPIC_SUMMARY_SETTINGS}{api.project_id}",
+        permissions=TOPIC_SUMMARY_SETTINGS_MANAGE,
+        json={"global_enabled": global_enabled, "project_enabled": project_enabled},
+    )
+    assert settings.status_code == 200, settings.text
+    stream = conftest.seed_user_stream(db, api.project_id, api.user_uuid, "Disabled")
+    topic = conftest.seed_stream_topic(
+        db, api.project_id, stream, api.user_uuid, "Work"
+    )
+    message = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream,
+            "topic_uuid": topic,
+            "payload": {"kind": "markdown", "content": "Pending summary."},
+        },
+    )
+    assert message.status_code == 201, message.text
+    statements = []
+
+    class Probe:
+        def __init__(self, session):
+            self.session = session
+
+        def execute(self, statement, values=()):
+            statements.append(statement)
+            return self.session.execute(statement, values)
+
+    claimed = _run_database_operation(
+        lambda session: topic_summarization.claim_summary_work(
+            Probe(session),
+            now=datetime.datetime.now(datetime.timezone.utc),
+            key_material="integration-test-topic-summary-key",
+            topic_claim_seconds=60,
+            endpoint_claim_seconds=60,
+        )
+    )
+    assert claimed is None
+    assert len(statements) == 1
+    assert "messenger_topics" not in statements[0]
+    assert "messenger_topic_messages_v1" not in statements[0]
+    assert db.execute(
+        "SELECT count(*) FROM m_workspace_topic_summary_jobs"
+    ).fetchone() == (0,)
 
 
 def test_topic_summary_endpoint_registry_and_settings_are_permissioned_and_safe(
@@ -396,6 +465,8 @@ def test_topic_summary_worker_waits_for_busy_vision_and_completes_outside_api(
     monkeypatch,
 ):
     monkeypatch.setenv(file_storage.ENV_STORAGE_PATH, str(tmp_path))
+    poll_clock = [0.0]
+    monkeypatch.setattr(messenger_worker_agents.time, "monotonic", lambda: poll_clock[0])
     received_requests = []
 
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -565,6 +636,7 @@ def test_topic_summary_worker_waits_for_busy_vision_and_completes_outside_api(
                 now=datetime.datetime.now(datetime.timezone.utc),
             )
         )
+        poll_clock[0] += 5
         assert worker._summarize_one_topic() is False
         assert received_requests == []
         with db.cursor() as cursor:
@@ -595,6 +667,7 @@ def test_topic_summary_worker_waits_for_busy_vision_and_completes_outside_api(
                 (str(sys_uuid.uuid4()), str(endpoint_uuids[0])),
             )
 
+        poll_clock[0] += 5
         assert worker._summarize_one_topic() is False
         assert received_requests == []
         with db.cursor() as cursor:
@@ -625,6 +698,7 @@ def test_topic_summary_worker_waits_for_busy_vision_and_completes_outside_api(
                 (topic_uuid,),
             )
 
+        poll_clock[0] += 5
         assert worker._summarize_one_topic() is True
         assert len(received_requests) == 1
         provider_request = received_requests[0]
@@ -775,9 +849,9 @@ def test_topic_summary_worker_waits_for_busy_vision_and_completes_outside_api(
                 (retry_topic_uuid,),
             )
             assert cursor.fetchone() == (
-                "waiting_endpoint",
-                0,
-                sys_uuid.UUID(new_message.json()["uuid"]),
+                "failed",
+                3,
+                sys_uuid.UUID(old_message.json()["uuid"]),
             )
             cursor.execute(
                 "UPDATE m_workspace_llm_endpoints SET enabled = TRUE WHERE uuid = %s",
@@ -790,6 +864,7 @@ def test_topic_summary_worker_waits_for_busy_vision_and_completes_outside_api(
                 (retry_topic_uuid,),
             )
 
+        poll_clock[0] += 5
         assert worker._summarize_one_topic() is True
         with db.cursor() as cursor:
             cursor.execute(
