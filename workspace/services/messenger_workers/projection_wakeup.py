@@ -27,7 +27,8 @@ class ProjectionQueueWakeup:
         self._db_url = db_url
         self._mutations = mutations
         self._closed = threading.Event()
-        self._wait_lock = threading.Lock()
+        # SIGTERM can call close() on the thread currently holding this lock.
+        self._wait_lock = threading.RLock()
 
     def _connect(self) -> typing.Any:
         connection = psycopg.connect(self._db_url, autocommit=True, connect_timeout=5)
