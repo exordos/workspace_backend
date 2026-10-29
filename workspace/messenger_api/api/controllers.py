@@ -373,6 +373,11 @@ class PushDeviceController(ra_controllers.BaseResourceController):
             filters={"uuid": dm_filters.EQ(uuid)},
             session=session,
         )
+        if device is not None and (
+            device.project_id != project_id or device.user_uuid != user_uuid
+        ):
+            raise ra_exc.ResourceNotFoundError(resource="PushDevice", path=str(uuid))
+        candidate.validate_registration_key()
         if device is None:
             candidate.insert(session=session)
             device = self.model.objects.get_one(
@@ -380,11 +385,6 @@ class PushDeviceController(ra_controllers.BaseResourceController):
                 session=session,
             )
             return self._response(device), 201, {}
-        if device.project_id != project_id or device.user_uuid != user_uuid:
-            raise ra_exc.ResourceNotFoundError(
-                resource="PushDevice",
-                path=str(uuid),
-            )
         device.update_dm(
             values={
                 "transport": candidate.transport,

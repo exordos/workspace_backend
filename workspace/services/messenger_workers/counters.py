@@ -6,7 +6,7 @@
 import logging
 import typing
 
-from workspace.messenger_api import publication
+from workspace.messenger_api import publication, push_events
 from workspace.services.messenger_workers import v2_projection
 
 LOG = logging.getLogger(__name__)
@@ -106,16 +106,25 @@ def _recount_scope(
             (unread, active, unread - active, project, user, topic),
         )
         # Mobile push integration point: counters changed for this user/topic.
-        # Enqueue only a topic-update snapshot here, including the zero case;
+        # Enqueue only a topic-update signal here, including the zero case;
         # ordinary message.created events must not create mobile pushes.
     session.execute(
         "SELECT messenger_refresh_topic_summary_state(%s,%s,%s::uuid[])",
         (project, topic, [user]),
     )
     if update["publish_updates"]:
-        v2_projection._emit_unread_snapshots(
+        emitted = v2_projection._emit_unread_snapshots(
             session, project, stream, topic, [user], "user-topic"
         )
+        if changed and emitted:
+            push_events.enqueue_topic(
+                project,
+                user,
+                stream,
+                topic,
+                emitted[0].uuid,
+                previous["active_unread_count"],
+            )
     session.execute(
         """WITH totals AS (
              SELECT COALESCE(sum(personal.unread_count),0) AS unread,

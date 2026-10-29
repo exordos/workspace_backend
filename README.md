@@ -272,3 +272,129 @@ setting, and mutation receipt deduplication retains its separate
 `[messenger_mutations] receipt_retention_seconds` setting. Service history expiry
 does not shorten either contract. Deleted PostgreSQL rows become reusable space;
 this worker does not run table rewrites or index rebuilds.
+
+## Native encrypted Android push
+
+Migration `0287-Use-SDK-events-for-native-mobile-push` follows master migration
+`0286-Replace-per-message-history-intents-with-bulk-import-batches` and applies
+the SDK event-table migration. The new migration UUID makes already deployed development builds traverse
+the new master dependency before reusing the existing SDK table. Prepared encrypted
+SDK events and previous migration records are retained; pending internal snapshots
+become topic signals without changing their UUID, timestamp or status. Message, topic, stream and read-up-to
+operations use the same independent counter worker, including mutation-journal mode.
+
+The existing `PUT/DELETE /api/workspace/v1/push_devices/{device_uuid}` API
+registers a device's FCM token and raw X25519 public key under the authenticated
+user/project. Private keys stay on the phone. The registration UUID stays stable
+when a token changes; there are no registration revisions.
+
+When `[mobile_push]` is configured, a changed recipient topic counter snapshot
+produces `notification_topic_update`: one SDK Event per registered Android device.
+The existing counter worker compares all three counts before updating them; an
+unchanged snapshot produces no push. Journal and ordinary mutation paths use
+this hook, including message/topic/stream reads, read-up-to and deletion.
+
+The click target and preview use the first visible unread public message placement
+in canonical history order. Once everything is read they use the last visible
+message. If the topic has become empty after deleting its last message, a zero
+update has `message_uuid: null` and removes the card by topic identity. Muted chats
+produce no events. Mentions-only chats produce updates when the active counter
+changes, including the zero that closes the last mention. Topic overrides retain
+the existing Workspace meaning. History import and protocol-only key messages do
+not create alerts.
+
+`AsyncEventClient` saves one timestamped `WorkspaceTopicSignal` SDK Event in the
+counter transaction into `gcl_sdk_events`. It contains project/user/stream/topic
+identifiers, the source WebSocket event UUID and the previous active-count hint.
+The SDK Event's `created_at` records when the signal was created. Counting uses
+master's unchanged SQL; no device lookup, message lookup, encryption or network
+request runs on this path. History-only counter updates remain silent.
+
+The independently managed `workspace-push-handler` reads signals after their
+ordinary WebSocket publication commits. It re-reads current access, notification
+settings, topic counters, first unread preview and devices. A dirty counter scope
+waits for its recount before preparation; delayed signals therefore use current
+counts and preview together. Preparation uses the latest visible topic publication whose counters match the
+current state, with its existing `epoch_version` and the user's `epoch_generation`.
+Pending topic publication is allowed to commit first. The original signal event
+supplies only the membership guard, not the outgoing ordering epoch. Encryption happens
+outside the database transaction. Each device delivery has a UUID derived from
+that WebSocket event and recipient/device identity. Ready SDK Events are enqueued
+through `AsyncEventClient.send_event()` and commit with signal completion.
+Only encrypted previews are persisted for delivery; the HTTP adapter refuses
+signals. Nothing plaintext leaves Workspace. Existing end-to-end encrypted chat
+content stays opaque to the backend and uses a generic encrypted-message preview.
+
+The separately managed `workspace-push-sender` subclasses SDK `EventSenderService`.
+Its standard loop owns Notification delivery, retries and status polling; its
+queries select only prepared `WorkspacePush` payloads, never signals. The handler
+also resumes converted development signals that already had `IN_PROGRESS` status. Push hooks
+check current membership/device access, redact transport data and handle results.
+Network calls hold no database/schema/device locks. Retries reuse the UUID,
+ciphertext and original one-hour deadline. The captured membership fence stays
+private and is excluded from the Notification HTTP body. An inactive-token result
+removes only the exact delivered token/key snapshot, preserving replacements.
+The SDK dependency is pinned until its sender-hook release is approved; released
+3.7.5 is unchanged. There is no parallel outbox or copied SDK delivery loop.
+
+The optional mobile-push site provisions one handler and one SDK sender per
+database, each as its own Core service. Either service can be stopped/restarted
+without restarting Messenger or the other push stage. Their pending work stays
+in the SDK event table. This topology does not claim concurrent queue consumers
+are supported. The handler also prunes old terminal push events once per minute.
+No delayed notification policy is enabled: signals are prepared immediately.
+
+Android maintains one card per saved connection/account/project/stream/topic.
+An absolute snapshot replaces its count, first-unread preview and click target;
+zero active unread closes it. The existing WebSocket cursor orders duplicates
+and delayed snapshots, including all-read updates received by an open client.
+There is no new registration or notification revision. Counter increases that
+create a user-visible alert use high FCM priority; decreases/zero use normal.
+Notification's owner-scoped binding API remains the transport source of truth;
+Workspace's preference proxy and Android preference UI remain deferred.
+
+Configuration keys are `mobile_push.organization_uuid`,
+`mobile_push.notification_endpoint` and `mobile_push.notification_auth_file`.
+The local Notification transport exports the persistent installation UUID;
+the connector imports it into Workspace configuration.
+The feature is disabled until the endpoint and private token file are set.
+When upgrading an existing installation, update the backend image first, then
+update the optional mobile-push site to provision its handler and sender services.
+When disabling mobile push, disable both site services as well.
+The file contains `{"access_token": "<platform-managed token>"}` and has mode 0600.
+The [optional site manifest](exordos/manifests/mobile_push.yaml.j2) uses the same
+`$core.iam.tokens` auto-renewal as Core email events. The sender reads the token
+file before every request through its redacted, redirect-refusing SDK transport. Renewal does not restart the API or workers and
+does not perform a second password login. The manifest connects the sender to
+local Notification and provisions a protected Event
+proxy through the existing Workspace gateway. Services read drop-ins from
+`/etc/workspace/workspace.conf.d`. Firebase sender credentials belong only on
+the upstream Notification, never in Workspace or customer installations.
+
+The complete event, encryption, relay and deployment contract is documented in
+`exordos_notification/docs/mobile-push.md`. Android integration is documented in
+`workspace_android/docs/mobile-push.md`.
+
+Tests include public HPKE vectors and a shared Python/Android event fixture,
+plus real PostgreSQL/HTTP integration of first-unread topic snapshots, all read
+scopes, deletion, retry, membership fencing and stale-token cleanup. Run the latter against a dedicated
+empty test database only:
+
+```bash
+WORKSPACE_TEST_DB_URL='<DEDICATED_TEST_POSTGRES_URL>' \
+  .tox/develop/bin/python -m pytest workspace/tests/integration/test_mobile_push.py \
+    workspace/tests/integration/test_topic_push.py
+```
+
+Its fixture recreates the test database's public schema. Use immutable
+`exordos build`/`exordos deploy` artifacts for runtime updates and preserve a
+Workspace database backup before applying migrations. A queued event or an
+`ACTIVE` transport status does not prove display on a real phone.
+
+
+The native push producer refuses HTTP redirects and redacts request/response
+bodies at every log level. The platform renews IAM tokens; issued tokens and encrypted device snapshots
+are omitted from HTTP diagnostics, including provider failures caught by the
+shared SDK sender. API diagnostic request/response bodies are also redacted, including
+registration requests and private messages. Methods, URLs and response statuses
+remain available.

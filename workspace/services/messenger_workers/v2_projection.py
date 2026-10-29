@@ -1185,10 +1185,10 @@ def _emit_unread_snapshots(
     topic_uuid: object,
     user_uuids: typing.Iterable[object],
     scope_kind: str,
-) -> None:
+) -> list[typing.Any]:
     recipients = [_uuid(value) for value in user_uuids]
     if not recipients:
-        return
+        return []
     if scope_kind == "user-topic":
         topics = _v2_rows(
             v2_models.WorkspaceUserTopic,
@@ -1209,7 +1209,7 @@ def _emit_unread_snapshots(
                 project_id=project_id,
                 stream_uuid=stream_uuid,
             )
-        return
+        return emitted
     if scope_kind != "user-stream":
         raise ValueError(f"Unsupported counter scope {scope_kind}")
     streams = _v2_rows(
@@ -1231,6 +1231,8 @@ def _emit_unread_snapshots(
             project_id=project_id,
             stream_uuid=stream_uuid,
         )
+
+    return emitted
 
 
 def _enqueue_counter_outbox_events(

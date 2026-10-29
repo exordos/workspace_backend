@@ -1,0 +1,14 @@
+[Unit]
+Description=Workspace Push Handler
+After=network-online.target
+
+[Service]
+TimeoutStopSec=5
+Restart=always
+RestartSec=5s
+KillSignal=SIGINT
+ExecStartPre=/bin/sleep 2
+ExecStart=workspace-push-handler --config-file /etc/workspace/workspace.conf --config-dir /etc/workspace/workspace.conf.d
+
+[Install]
+WantedBy=multi-user.target
