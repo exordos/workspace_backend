@@ -178,7 +178,7 @@ def publish():
         while True:
             with contexts.Context().session_manager() as session:
                 count = publication.publish(session, row["project_id"])
-            if count < 256:
+            if not count:
                 break
 
 
