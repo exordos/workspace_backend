@@ -655,6 +655,20 @@ def claim_summary_work(
     topic_claim_seconds: int,
     endpoint_claim_seconds: int,
 ) -> SummaryWork | None:
+    enabled = session.execute(
+        """
+        SELECT
+            EXISTS (SELECT 1 FROM m_workspace_topic_summary_global_settings
+                    WHERE singleton = TRUE AND enabled = TRUE)
+            AND EXISTS (SELECT 1 FROM m_workspace_topic_summary_project_settings
+                        WHERE enabled = TRUE)
+            AND EXISTS (SELECT 1 FROM m_workspace_llm_endpoints
+                        WHERE enabled = TRUE) AS enabled
+        """
+    ).fetchone()["enabled"]
+    if not enabled:
+        return None
+
     candidate = session.execute(
         """
         SELECT

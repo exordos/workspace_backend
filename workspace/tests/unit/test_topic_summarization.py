@@ -319,8 +319,9 @@ def test_worker_calls_provider_outside_transactions_and_persists_afterward():
     ):
         worker = agents.MessengerWorkerAgent(summary_secret_key="secret")
         assert worker._summarize_one_topic() is True
+        assert worker._summarize_one_topic() is True
 
-    assert len(entered_sessions) == 2
+    assert len(entered_sessions) == 4
 
 
 def test_worker_defaults_allow_long_reasoning_and_keep_claims_alive():
@@ -397,3 +398,43 @@ def test_worker_retries_a_retryable_failure_on_claimed_fallback_endpoint():
     ]
     assert fail.call_args.args[1:3] == (first, provider_error)
     assert complete.call_args.args[1:3] == (fallback, "Fallback summary.")
+
+
+def test_idle_summary_claim_is_not_repeated_on_every_projection_cycle(monkeypatch):
+    @contextlib.contextmanager
+    def session_context():
+        yield object()
+
+    worker = agents.MessengerWorkerAgent(summary_secret_key="secret")
+    clock = [0.0]
+    claim = unittest.mock.Mock(return_value=None)
+    monkeypatch.setattr(agents, "database_session_context", session_context)
+    monkeypatch.setattr(topic_summarization, "claim_summary_work", claim)
+    monkeypatch.setattr(agents.time, "monotonic", lambda: clock[0])
+    for instant in (0.0, 0.1, 1.0, 4.9):
+        clock[0] = instant
+        assert worker._summarize_one_topic() is False
+    assert claim.call_count == 1
+    clock[0] = 5.0
+    assert worker._summarize_one_topic() is False
+    assert claim.call_count == 2
+
+
+def test_disabled_summary_returns_before_scanning_topics_or_messages():
+    session = unittest.mock.Mock()
+    session.execute.return_value.fetchone.return_value = {"enabled": False}
+
+    assert (
+        topic_summarization.claim_summary_work(
+            session,
+            now=unittest.mock.sentinel.now,
+            key_material="secret",
+            topic_claim_seconds=60,
+            endpoint_claim_seconds=60,
+        )
+        is None
+    )
+
+    assert session.execute.call_count == 1
+    assert "messenger_topics" not in session.execute.call_args.args[0]
+    assert "messenger_topic_messages_v1" not in session.execute.call_args.args[0]

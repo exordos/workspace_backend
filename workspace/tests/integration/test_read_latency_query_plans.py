@@ -3,8 +3,10 @@
 # you may not use this file except in compliance with the License.
 
 import datetime
+import uuid as sys_uuid
 
 import pytest
+from psycopg import rows
 from restalchemy.common import contexts
 
 from workspace.messenger_api import message_flags, topic_summarization
@@ -122,6 +124,18 @@ def test_summary_boundary_probes_do_not_scan_unrelated_topics(api, db):
     )
     assert response.status_code == 201, response.text
     stream = response.json()
+    endpoint = api.post(
+        "/v1/messenger/topic_summary_endpoints/",
+        permissions=(topic_summarization.ENDPOINT_MANAGE_PERMISSION,),
+        json={
+            "uuid": str(sys_uuid.uuid4()),
+            "name": "summary-plan",
+            "base_url": "https://llm.example.invalid/v1",
+            "model": "summary-model",
+            "api_key": "test-secret",
+        },
+    )
+    assert endpoint.status_code == 201, endpoint.text
     with db.transaction(force_rollback=True):
         topic_count = 60
         message_count = topic_count * 20
@@ -192,7 +206,9 @@ def test_summary_boundary_probes_do_not_scan_unrelated_topics(api, db):
             pass
 
         class Probe:
-            def execute(self, statement, values):
+            def execute(self, statement, values=()):
+                if "snapshot_boundary_message_uuid" not in statement:
+                    return db.cursor(row_factory=rows.dict_row).execute(statement, values)
                 self.plan = db.execute(
                     "EXPLAIN (ANALYZE, FORMAT JSON, TIMING OFF) " + statement,
                     values,

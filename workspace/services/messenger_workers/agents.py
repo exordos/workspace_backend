@@ -47,6 +47,7 @@ LOG = logging.getLogger(__name__)
 EVENT_PRUNE_INTERVAL_SECONDS = 5 * 60
 V2_METRICS_LOG_INTERVAL_SECONDS = 30
 V2_IDLE_SLEEP_SECONDS = 0.5
+SUMMARY_IDLE_POLL_SECONDS = 5
 
 
 @contextlib.contextmanager
@@ -135,6 +136,7 @@ class MessengerWorkerAgent(basic.BasicService):
         )
         self._projection_only = projection_only
         self._summary_secret_key = summary_secret_key
+        self._next_summary_poll_at = 0.0
         self._summary_connect_timeout_seconds = summary_connect_timeout_seconds
         self._summary_request_timeout_seconds = summary_request_timeout_seconds
         self._summary_topic_claim_seconds = max(
@@ -398,6 +400,12 @@ class MessengerWorkerAgent(basic.BasicService):
     def _summarize_one_topic(self) -> bool:
         if self._summary_secret_key is None:
             return False
+        monotonic_now = time.monotonic()
+        if monotonic_now < self._next_summary_poll_at:
+            return False
+        # An empty claim can scan every enabled topic. Keep it off the hot
+        # projection loop while still draining available summary work promptly.
+        self._next_summary_poll_at = monotonic_now + SUMMARY_IDLE_POLL_SECONDS
         now = datetime.datetime.now(datetime.timezone.utc)
         try:
             with database_session_context() as session:
@@ -413,6 +421,7 @@ class MessengerWorkerAgent(basic.BasicService):
             return False
         if work is None:
             return False
+        self._next_summary_poll_at = 0.0
 
         while True:
             try:
