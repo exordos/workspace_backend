@@ -9,15 +9,11 @@ import uuid
 from unittest import mock
 
 import pytest
-from oslo_config import cfg
 
 from workspace.bridges.zulip import history, incoming_operations, outgoing_operations
-from workspace.common import mutation_journal_opts
-from workspace.messenger_api import publication
+from workspace.messenger_api import file_storage
 from workspace.services import zulip_history
-from workspace.services.messenger_workers import mutation_runtime
-from workspace.tests.integration import test_mutation_journal as journal_tests
-from workspace.tests.integration import test_projection_performance as projection_tests
+from workspace.tests.integration import conftest
 from workspace.tests.integration import test_zulip_incoming as incoming_tests
 
 incoming = incoming_tests.incoming
@@ -32,20 +28,18 @@ def message(identifier=101, content="Hello", **changes):
     }
 
 
-def request(db, account, registration=None, queue="history-test"):
+def request(db, account, registration=None, cutoff_id=1000000, cutoff_at=None):
     db.execute(
         history.REQUEST_SQL,
         (
             account["uuid"],
             account["project_id"],
             account["provider_uuid"],
-            account["owner_user_uuid"],
-            account["external_account_id"],
-            account["settings"]["server_url"],
+            cutoff_at or datetime.datetime.now(datetime.timezone.utc),
+            cutoff_id,
+            cutoff_id + 1,
             incoming_operations.json_value(registration or {}),
-            queue,
-            datetime.datetime.now(datetime.timezone.utc),
-            [item["stream_id"] for item in registration["subscriptions"]]
+            [row["stream_id"] for row in registration["subscriptions"]]
             if registration and "subscriptions" in registration
             else None,
         ),
@@ -56,58 +50,39 @@ def request(db, account, registration=None, queue="history-test"):
 async def worker(incoming, messages, **options):
     _, _, account, _, url = incoming
     service = zulip_history.ZulipHistoryService(
-        url, batch_size=3, queue_limit=6, **options
+        url, batch_size=options.pop("batch_size", 3), **options
     )
     await service.db.open()
     calls = []
 
     async def http(_account, method, path, query=None, **kwargs):
         calls.append((method, path, query))
-        if path == "/streams/42":
-            return {"stream": {"stream_id": 42, "name": "Channel", "description": ""}}
+        if path.startswith("/streams/"):
+            remote = int(path.rsplit("/", 1)[1])
+            return {
+                "stream": {
+                    "stream_id": remote,
+                    "name": "Channel" if remote == 42 else "Other",
+                    "description": "",
+                }
+            }
         if path.startswith("/users/"):
             return {
                 "user": {
-                    "user_id": 7,
+                    "user_id": int(path.rsplit("/", 1)[1]),
                     "full_name": "Sender",
                     "email": "user@example.com",
                 }
             }
-        if path.startswith("/messages/"):
-            identifier = int(path.rsplit("/", 1)[1])
-            if identifier not in messages:
-                raise outgoing_operations.ApiError(404, {"msg": "Invalid message(s)"})
-            return {"message": copy.deepcopy(messages[identifier])}
-        assert path == "/messages"
+        assert path == "/messages", path
         ordered = sorted(messages)
-        anchor = (
-            ordered[-1] if query["anchor"] == "newest" and ordered else query["anchor"]
-        )
-        if anchor == "newest":
-            return {"messages": [], "found_oldest": True, "found_newest": True}
-        before = (
-            [value for value in ordered if value < anchor][-query["num_before"] :]
-            if query["num_before"]
-            else []
-        )
-        after = [value for value in ordered if value > anchor][: query["num_after"]]
-        selected = (
-            before
-            + (
-                [anchor]
-                if anchor in messages and query.get("include_anchor", True)
-                else []
-            )
-            + after
-        )
+        selected = [value for value in ordered if value < query["anchor"]][
+            -query["num_before"] :
+        ]
         return {
             "messages": [copy.deepcopy(messages[value]) for value in selected],
-            "found_oldest": not ordered
-            or (bool(selected) and selected[0] == ordered[0])
-            or anchor <= ordered[0],
-            "found_newest": not ordered
-            or (bool(selected) and selected[-1] == ordered[-1])
-            or anchor >= ordered[-1],
+            "found_oldest": not selected or not ordered or selected[0] == ordered[0],
+            "found_newest": not ordered or query["anchor"] > ordered[-1],
         }
 
     service.http = mock.Mock(request=mock.AsyncMock(side_effect=http))
@@ -119,10 +94,8 @@ async def worker(incoming, messages, **options):
 
 
 async def job(service, account):
-    jobs = await service.db.sql(zulip_history.SELECT_JOBS_SQL, ([], [], 100))
-    return next(
-        (row for row in jobs if row["external_account_uuid"] == account["uuid"]), None
-    )
+    jobs = await service.db.sql(zulip_history.SELECT_JOBS_SQL, ([], 100))
+    return next((row for row in jobs if row["uuid"] == account["uuid"]), None)
 
 
 async def drain(service, account):
@@ -131,990 +104,459 @@ async def drain(service, account):
         if current is None:
             return
         await service.step(current)
-        errors = await service.db.sql(
-            "SELECT error FROM zulip_history_intents WHERE failed"
-        )
-        assert not errors, errors
         state = await service.db.sql(
-            "SELECT error FROM zulip_history_jobs WHERE external_account_uuid=%s",
+            "SELECT error FROM zulip_history_accounts WHERE external_account_uuid=%s",
             (account["uuid"],),
         )
         assert not state[0]["error"], state
-    pytest.fail("History did not finish its bounded scan")
+    pytest.fail("History did not finish")
 
 
-@pytest.mark.parametrize("members", [[7, 8], [7, 8, 9]])
-def test_history_dm_links_resume_a_failed_job_without_resetting_history(
-    incoming, members
-):
-    api, db, account, _http, _url = incoming
-    peers = [
-        incoming_tests.peer_account(incoming, identifier)[0]
-        for identifier in members[1:]
-    ]
-    try:
-        private = incoming_tests.event("Known private conversation", 901)
-        private["message"].update(
-            type="private",
-            recipient_id=1,
-            display_recipient=[
-                {"id": member, "full_name": str(member)} for member in members
-            ],
-        )
-        private["message"].pop("stream_id")
-        private["message"].pop("subject")
-        incoming_tests.apply(incoming, private)
-        target = api.get("/v1/messenger/messages/").json()[0]["stream_uuid"]
-        incoming_tests.drain()
-        events_before = incoming_tests.client_events(incoming)
-        base = account["settings"]["server_url"]
-        remote = ",".join(str(member) for member in reversed(members[1:]))
-        unknown = base + f"/#narrow/dm/{remote},999-unknown"
-        text = f"[Known]({base}/#narrow/dm/{remote}-peers) [Unknown]({unknown})"
-        messages = {
-            901: {**private["message"], "reactions": []},
-            902: message(902, text),
-        }
-        request(db, account)
-        db.execute(
-            "UPDATE zulip_history_jobs SET error=%s,attempts=1,next_attempt_at=NOW() "
-            "WHERE external_account_uuid=%s",
-            ("'dm_stream_uuids'", account["uuid"]),
-        )
-
-        async def run():
-            async with worker(incoming, messages) as (service, _calls):
-                await drain(service, account)
-
-        asyncio.run(run())
-        incoming_tests.drain()
-        imported = next(
-            row
-            for row in api.get("/v1/messenger/messages/").json()
-            if row["provider_identity"] == "902"
-        )
-        assert imported["payload"]["content"] == (
-            f"[Known](urn:stream:{target}) [Unknown](urn:url:{unknown})"
-        )
-        assert db.execute(
-            "SELECT error,attempts,backfill_done FROM zulip_history_jobs "
-            "WHERE external_account_uuid=%s",
-            (account["uuid"],),
-        ).fetchone() == (None, 0, True)
-        assert incoming_tests.client_events(incoming) == events_before
-    finally:
-        for peer in peers:
-            peer.delete()
-
-
-def test_history_import_resumes_and_repeated_scan_is_silent(incoming):
-    _, db, account, _, _ = incoming
+def test_bulk_import_is_newest_first_idempotent_and_silent(incoming):
+    api, db, account, _, _ = incoming
     incoming_tests.drain()
     before = incoming_tests.client_events(incoming)
     messages = {
-        identifier: message(identifier, f"History {identifier}")
-        for identifier in range(101, 109)
+        i: message(i, f"History {i}", flags=["read"] if i % 2 else ["starred"])
+        for i in range(101, 111)
     }
     request(db, account)
 
     async def run():
         async with worker(incoming, messages) as (service, calls):
-            await service.step(await job(service, account))  # Empty registration.
-            await service.step(await job(service, account))  # Latest page.
-            assert len(await service.db.sql("SELECT 1 FROM zulip_history_intents")) == 3
-            checkpoint = (
-                await service.db.sql("SELECT before_id FROM zulip_history_jobs")
-            )[0]["before_id"]
-            assert checkpoint == 106
-        async with worker(incoming, messages) as (service, calls):
             await drain(service, account)
-            assert not [path for _, path, _ in calls if path.startswith("/messages/")]
-            assert (
-                len(
-                    await service.db.sql(
-                        "SELECT 1 FROM messenger_messages WHERE project_id=%s",
-                        (account["project_id"],),
-                    )
-                )
-                == 8
-            )
-            assert not await service.db.sql(
-                "SELECT 1 FROM zulip_outgoing_intents WHERE project_id=%s",
-                (account["project_id"],),
-            )
-        incoming_tests.publish()
-        request(db, account, queue="replacement")
-        async with worker(incoming, messages) as (service, calls):
-            await drain(service, account)
-            assert not await service.db.sql("SELECT 1 FROM zulip_history_intents")
-            assert not await service.db.sql(
-                "SELECT 1 FROM messenger_publication_outbox WHERE project_id=%s",
-                (account["project_id"],),
-            )
-            assert not [path for _, path, _ in calls if path.startswith("/messages/")]
+            assert [c[2]["anchor"] for c in calls if c[1] == "/messages"] == [
+                1000001,
+                108,
+                105,
+                102,
+            ]
+            assert not await service.db.sql("SELECT 1 FROM zulip_history_batches")
 
     asyncio.run(run())
     incoming_tests.drain()
-    assert len(incoming[0].get("/v1/messenger/messages/").json()) == 8
+    assert len(api.get("/v1/messenger/messages/").json()) == 10
+    assert incoming_tests.client_events(incoming) == before
+    roots = db.execute(
+        "SELECT uuid,content_uuid,content_revision FROM messenger_messages ORDER BY uuid"
+    ).fetchall()
+    request(db, account)
+    asyncio.run(run())
+    incoming_tests.drain()
+    assert (
+        roots
+        == db.execute(
+            "SELECT uuid,content_uuid,content_revision FROM messenger_messages ORDER BY uuid"
+        ).fetchall()
+    )
+    assert db.execute(
+        "SELECT count(*) FROM messenger_user_message_unreads WHERE project_id=%s",
+        (account["project_id"],),
+    ).fetchone() == (5,)
+    assert db.execute(
+        "SELECT count(*) FROM messenger_user_message_stars WHERE project_id=%s",
+        (account["project_id"],),
+    ).fetchone() == (5,)
     assert incoming_tests.client_events(incoming) == before
 
 
-def test_latest_known_message_keeps_numeric_order_and_visibility(incoming):
-    _, db, account, _, _ = incoming
-    parameters = (
-        account["owner_user_uuid"],
-        account["project_id"],
-        account["provider_uuid"],
-    )
-    assert db.execute(zulip_history.SELECT_LATEST_KNOWN_SQL, parameters).fetchone() == (
-        0,
-    )
-    incoming_tests.apply(
-        incoming,
-        *(
-            incoming_tests.event(identifier=identifier)
-            for identifier in (9, 10, 11, 12, 13)
-        ),
-    )
-    db.execute(
-        "UPDATE messenger_messages SET deleted_at=now() "
-        "WHERE project_id=%s AND provider_identity='11'",
-        (account["project_id"],),
-    )
-    db.execute(
-        "DELETE FROM messenger_user_message_bindings access "
-        "USING messenger_message_placements placement JOIN messenger_messages message "
-        "ON message.project_id=placement.project_id AND message.uuid=placement.message_uuid "
-        "WHERE access.project_id=placement.project_id AND access.placement_uuid=placement.uuid "
-        "AND message.project_id=%s AND message.provider_identity='12'",
-        (account["project_id"],),
-    )
-    db.execute(
-        "UPDATE messenger_messages SET provider_identity='not-numeric' "
-        "WHERE project_id=%s AND provider_identity='13'",
-        (account["project_id"],),
-    )
-    assert db.execute(zulip_history.SELECT_LATEST_KNOWN_SQL, parameters).fetchone() == (
-        10,
-    )
-    for index in range(len(parameters)):
-        unrelated = list(parameters)
-        unrelated[index] = uuid.uuid4()
-        assert db.execute(
-            zulip_history.SELECT_LATEST_KNOWN_SQL, unrelated
-        ).fetchone() == (0,)
-
-
-@pytest.mark.isolated_schema
-def test_latest_known_message_does_not_scan_all_visible_history(incoming):
-    _, db, account, _, _ = incoming
-    incoming_tests.apply(incoming, incoming_tests.event(identifier=9))
-    stream_uuid, topic_uuid, content_uuid = db.execute(
-        "SELECT placement.stream_uuid,placement.topic_uuid,message.content_uuid "
-        "FROM messenger_messages message JOIN messenger_message_placements placement "
-        "ON placement.project_id=message.project_id AND placement.message_uuid=message.uuid "
-        "WHERE message.project_id=%s AND message.provider_identity='9'",
-        (account["project_id"],),
-    ).fetchone()
-    db.execute(
-        """
-        WITH messages AS (
-            INSERT INTO messenger_messages
-                (uuid,project_id,author_uuid,content_uuid,source_name,provider_uuid,provider_identity)
-            SELECT gen_random_uuid(),%s,%s,%s,'zulip',%s,(1000000+number)::text
-            FROM generate_series(1,10000) AS input(number)
-            RETURNING uuid,project_id
-        ), placements AS (
-            INSERT INTO messenger_message_placements
-                (uuid,project_id,message_uuid,stream_uuid,topic_uuid)
-            SELECT gen_random_uuid(),project_id,uuid,%s,%s FROM messages
-            RETURNING uuid,project_id
-        )
-        INSERT INTO messenger_user_message_bindings
-            (uuid,project_id,placement_uuid,user_uuid)
-        SELECT gen_random_uuid(),project_id,uuid,%s
-        FROM placements
-        """,
-        (
-            account["project_id"],
-            account["owner_user_uuid"],
-            content_uuid,
-            account["provider_uuid"],
-            stream_uuid,
-            topic_uuid,
-            account["owner_user_uuid"],
-        ),
-    )
-    for table in (
-        "messenger_messages",
-        "messenger_message_placements",
-        "messenger_user_message_bindings",
-    ):
-        db.execute(f"ANALYZE {table}")
-    parameters = (
-        account["owner_user_uuid"],
-        account["project_id"],
-        account["provider_uuid"],
-    )
-    assert db.execute(zulip_history.SELECT_LATEST_KNOWN_SQL, parameters).fetchone() == (
-        1010000,
-    )
-    plan = db.execute(
-        "EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) "
-        + zulip_history.SELECT_LATEST_KNOWN_SQL,
-        parameters,
-    ).fetchone()[0][0]
-    scanned = sum(
-        node["Actual Rows"] * node["Actual Loops"]
-        for node in projection_tests._plan_nodes(plan["Plan"])
-        if node.get("Relation Name")
-        in {
-            "messenger_messages",
-            "messenger_message_placements",
-            "messenger_user_message_bindings",
-        }
-    )
-    assert scanned < 100, plan
-
-
-@pytest.mark.parametrize("journal", [False, True])
-@pytest.mark.parametrize("public_position", [None, 0, -1])
-def test_history_counters_preserve_a_realtime_publication(
-    incoming, journal, public_position
-):
-    api, db, account, _, _ = incoming
-    cfg.CONF.set_override("enabled", journal, group=mutation_journal_opts.DOMAIN)
-    runtime = mutation_runtime.MutationRuntime() if journal else None
-
-    def project():
-        if runtime is None:
-            incoming_tests.drain()
-        else:
-            journal_tests.drain(runtime, db)
-
-    try:
-        project()
-        before = incoming_tests.client_events(incoming)
-        request(db, account, {"subscriptions": [{"stream_id": 42, "name": "Channel"}]})
-
-        async def run():
-            async with worker(incoming, {101: message(), 102: message(102)}) as (
-                service,
-                _,
-            ):
-                await drain(service, account)
-
-        asyncio.run(run())
-        scope = db.execute(
-            "SELECT placement.stream_uuid,placement.topic_uuid FROM messenger_message_placements placement "
-            "JOIN messenger_messages message ON message.project_id=placement.project_id AND message.uuid=placement.message_uuid "
-            "WHERE message.project_id=%s AND message.provider_identity='101'",
-            (account["project_id"],),
-        ).fetchone()
-        parameters = (account["project_id"], account["owner_user_uuid"], *scope)
-        pending = db.execute(
-            "SELECT publish_updates FROM messenger_counter_updates "
-            "WHERE project_id=%s AND user_uuid=%s AND topic_uuid=%s",
-            (account["project_id"], account["owner_user_uuid"], scope[1]),
-        ).fetchone()
-        assert pending == (False,)
-        if public_position is not None:
-            # A live invalidation is retained whether it arrives before or
-            # after the last silent history invalidation in this scope.
-            db.execute("SELECT messenger_queue_counters(%s,%s,%s,%s)", parameters)
-            if public_position == 0:
-                with db.transaction():
-                    db.execute("SELECT set_config('workspace.zulip_history','on',true)")
-                    db.execute(
-                        "SELECT messenger_queue_counters(%s,%s,%s,%s)", parameters
-                    )
-            assert db.execute(
-                "SELECT publish_updates FROM messenger_counter_updates "
-                "WHERE project_id=%s AND user_uuid=%s AND topic_uuid=%s",
-                (account["project_id"], account["owner_user_uuid"], scope[1]),
-            ).fetchone() == (True,)
-        project()
-        messages = api.get("/v1/messenger/messages/").json()
-        assert len(messages) == 2
-        topic = api.get(
-            "/v1/messenger/stream_topics/" + messages[0]["topic_uuid"]
-        ).json()
-        assert topic["unread_count"] == 2
-        stream = api.get("/v1/messenger/streams/" + messages[0]["stream_uuid"]).json()
-        assert stream["unread_count"] == 2
-        assert bool(incoming_tests.client_events(incoming)[len(before) :]) == (
-            public_position is not None
-        )
-    finally:
-        if runtime is not None:
-            runtime.close()
-        cfg.CONF.clear_override("enabled", group=mutation_journal_opts.DOMAIN)
-
-
-def test_silent_folder_rebuild_preserves_a_pending_realtime_publication(incoming):
-    _, db, account, _, _ = incoming
-    incoming_tests.apply(incoming, incoming_tests.event())
-    incoming_tests.drain()
-    before = incoming_tests.client_events(incoming)
-    folder = db.execute(
-        "SELECT folder_uuid FROM messenger_user_folder_bindings WHERE project_id=%s AND user_uuid=%s ORDER BY folder_uuid LIMIT 1",
-        (account["project_id"], account["owner_user_uuid"]),
-    ).fetchone()[0]
-    identifiers = []
-    for emit in (False, True):
-        identifier = uuid.uuid4()
-        identifiers.append(identifier)
-        db.execute(
-            "INSERT INTO messenger_domain_outbox_events (uuid,project_id,event_kind,scope_kind,scope_key,payload) VALUES (%s,%s,'folder_projection','user-folder',%s,%s)",
-            (
-                identifier,
-                account["project_id"],
-                f"{account['project_id']}:{account['owner_user_uuid']}:{folder}",
-                incoming_operations.json_value(
-                    {
-                        "source_kind": "zulip.reconciled",
-                        "user_uuid": account["owner_user_uuid"],
-                        "folder_uuid": folder,
-                        "emit_public_event": emit,
-                    }
-                ),
-            ),
-        )
-    with incoming_tests.contexts.Context().session_manager() as session:
-        task = session.execute(
-            "SELECT * FROM messenger_projection_tasks WHERE outbox_event_uuid=%s",
-            (identifiers[0],),
-        ).fetchone()
-        assert incoming_tests.v2_projection._process_task(session, task, 1000)
-    incoming_tests.publish()
-    assert any(
-        event["kind"] == "folder.updated"
-        for event in incoming_tests.client_events(incoming)[len(before) :]
-    )
-
-
-@pytest.mark.parametrize("provider_content", [None, "Previous provider spelling"])
-def test_history_repairs_provider_content_without_changing_workspace_payload(
-    incoming, provider_content
-):
-    _, db, account, _, _ = incoming
-    original = message()
-    incoming_tests.apply(incoming, {"type": "message", "message": original})
-    with db.transaction():
-        db.execute("SELECT set_config('workspace.zulip_incoming','on',true)")
-        db.execute(
-            "UPDATE messenger_messages message SET content_uuid="
-            "messenger_resolve_message_content(contents.workspace_content,%s) "
-            "FROM messenger_message_contents contents "
-            "WHERE contents.uuid=message.content_uuid AND message.project_id=%s",
-            (provider_content, account["project_id"]),
-        )
-    incoming_tests.publish()
-    request(db, account)
+@pytest.mark.parametrize("field", ["cross_realm_bots", "realm_non_active_users"])
+def test_registration_keeps_historical_users_outside_the_active_realm(incoming, field):
+    api, db, account, _, url = incoming
+    person = {
+        "user_id": 6,
+        "full_name": "Historical sender",
+        "email": "sender@example.com",
+        "is_active": field != "realm_non_active_users",
+    }
 
     async def run():
-        async with worker(incoming, {101: original}) as (service, _):
-            await drain(service, account)
-            current = (
-                await service.db.sql(
-                    "SELECT message.content_revision,contents.workspace_content,"
-                    "contents.provider_content FROM messenger_messages message "
-                    "JOIN messenger_message_contents contents ON contents.uuid=message.content_uuid "
-                    "WHERE message.project_id=%s AND message.provider_identity='101'",
-                    (account["project_id"],),
-                )
-            )[0]
-            assert current == {
-                "content_revision": 3,
-                "workspace_content": {"kind": "markdown", "content": "Hello"},
-                "provider_content": "Hello",
-            }
-            assert not await service.db.sql(
-                "SELECT 1 FROM zulip_outgoing_intents WHERE project_id=%s",
-                (account["project_id"],),
+        receiver = incoming_tests.zulip_incoming.ZulipIncomingService(url)
+        await receiver.db.open()
+        receiver.http = mock.Mock(
+            request=mock.AsyncMock(
+                return_value={
+                    "queue_id": "historical-user-catalog",
+                    "last_event_id": 0,
+                    "max_message_id": 101,
+                    "subscriptions": [{"stream_id": 42, "name": "Channel"}],
+                    "realm_users": [],
+                    field: [person],
+                    "user_topics": [],
+                }
             )
+        )
+        receiver.poll_http = mock.Mock(
+            request=mock.AsyncMock(side_effect=asyncio.CancelledError)
+        )
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await receiver.receive(account)
+        finally:
+            await receiver.db.close()
+        async with worker(incoming, {101: message(sender_id=6)}) as (service, calls):
+            original = service.http.request.side_effect
+
+            async def http(account, method, path, query=None, **kwargs):
+                if path == "/users/6":
+                    raise RuntimeError("Zulip HTTP 400: No such user")
+                return await original(account, method, path, query, **kwargs)
+
+            service.http.request.side_effect = http
+            service.busy = mock.AsyncMock(return_value=False)
+            await drain(service, account)
+            assert not any(call[1] == "/users/6" for call in calls)
 
     asyncio.run(run())
-
-
-@pytest.mark.parametrize("journal", [False, True])
-def test_history_repairs_content_reactions_flags_and_scoped_absence(incoming, journal):
-    _, db, account, _, _ = incoming
-    first = message(
-        reactions=[
-            {
-                "user_id": 7,
-                "emoji_name": "smile",
-                "emoji_code": "1f604",
-                "reaction_type": "unicode_emoji",
-            }
-        ]
-    )
-    second = message(102, "Will disappear")
-    incoming_tests.apply(
-        incoming,
-        {"type": "message", "message": first},
-        {"type": "message", "message": second},
-    )
     incoming_tests.drain()
-    cfg.CONF.set_override("enabled", journal, group=mutation_journal_opts.DOMAIN)
-    runtime = mutation_runtime.MutationRuntime() if journal else None
-    try:
-        if runtime is not None:
-            journal_tests.drain(runtime, db)
-        before = incoming_tests.client_events(incoming)
-        changed = message(
-            content="Updated",
-            flags=["read", "starred"],
-            last_edit_timestamp=first["timestamp"] + 5,
-        )
-        request(db, account)
-
-        async def run():
-            async with worker(incoming, {101: changed}) as (service, _):
-                await drain(service, account)
-                root = (
-                    await service.db.sql(
-                        "SELECT payload,reactions FROM messenger_messages_with_content_v1 WHERE project_id=%s AND provider_identity=%s",
-                        (account["project_id"], "101"),
-                    )
-                )[0]
-                assert root["payload"]["content"] == "Updated"
-                assert root["reactions"] == {}
-                assert not await service.db.sql(
-                    "SELECT 1 FROM messenger_message_reaction_facts WHERE project_id=%s",
-                    (account["project_id"],),
-                )
-                assert not await service.db.sql(
-                    "SELECT 1 FROM messenger_messages WHERE project_id=%s AND deleted_at IS NOT NULL",
-                    (account["project_id"],),
-                )
-
-        asyncio.run(run())
-        if runtime is None:
-            incoming_tests.drain()
-        else:
-            journal_tests.drain(runtime, db)
-        assert incoming_tests.client_events(incoming) == before
-        visible = incoming[0].get("/v1/messenger/messages/").json()
-        assert len(visible) == 1
-        assert visible[0]["starred"] is True
-        assert db.execute(
-            "SELECT read FROM messenger_api_user_messages_v1 WHERE project_id=%s AND provider_identity=%s AND user_uuid=%s",
-            (account["project_id"], "101", account["owner_user_uuid"]),
-        ).fetchone()[0]
-    finally:
-        if runtime is not None:
-            runtime.close()
-        cfg.CONF.clear_override("enabled", group=mutation_journal_opts.DOMAIN)
+    assert len(api.get("/v1/messenger/messages/").json()) == 1
+    assert db.execute(
+        "SELECT users.first_name,users.email,users.disabled FROM m_workspace_users users "
+        "JOIN m_external_accounts_v2 account ON account.owner_user_uuid=users.uuid "
+        "WHERE account.project_id=%s AND account.provider_uuid=%s "
+        "AND account.external_account_id='6'",
+        (account["project_id"], account["provider_uuid"]),
+    ).fetchone() == ("Historical sender", "sender@example.com", not person["is_active"])
 
 
-@pytest.mark.parametrize("provider_identity", [None, "101:7:smile"])
-@pytest.mark.parametrize("retained", [False, True])
-def test_history_reconciles_reactions_using_persisted_fact_keys(
-    incoming, provider_identity, retained
-):
-    _, db, account, _, _ = incoming
+def test_bulk_snapshot_replaces_flags_and_reactions_in_its_page(incoming):
+    api, db, account, _, _ = incoming
     reaction = {
         "user_id": 7,
         "emoji_name": "smile",
         "emoji_code": "1f604",
         "reaction_type": "unicode_emoji",
     }
-    incoming_tests.apply(
-        incoming, {"type": "message", "message": message(reactions=[reaction])}
-    )
-    canonical_name = db.execute(
-        "SELECT emoji_name FROM messenger_message_reaction_facts WHERE project_id=%s",
-        (account["project_id"],),
-    ).fetchone()[0]
-    db.execute(
-        "UPDATE messenger_message_reaction_facts SET provider_identity=%s WHERE project_id=%s",
-        (provider_identity, account["project_id"]),
-    )
-    request(db, account)
-
-    async def run():
-        async with worker(
-            incoming, {101: message(reactions=[reaction] if retained else [])}
-        ) as (service, _):
-            await drain(service, account)
-            request(db, account, queue="repeat")
-            await drain(service, account)
-            facts = await service.db.sql(
-                "SELECT emoji_name FROM messenger_message_reaction_facts WHERE project_id=%s",
-                (account["project_id"],),
-            )
-            assert facts == ([{"emoji_name": canonical_name}] if retained else [])
-            root = (
-                await service.db.sql(
-                    "SELECT reactions FROM messenger_messages WHERE project_id=%s",
-                    (account["project_id"],),
-                )
-            )[0]
-            assert root["reactions"] == ({canonical_name: 1} if retained else {})
-            assert not await service.db.sql(
-                "SELECT 1 FROM zulip_outgoing_intents WHERE project_id=%s",
-                (account["project_id"],),
-            )
-
-    asyncio.run(run())
-
-
-def test_repeated_registration_keeps_cursors_and_does_not_duplicate_work(incoming):
-    _, db, account, _, _ = incoming
-    request(db, account)
-    db.execute(
-        "UPDATE zulip_history_jobs SET newest_id=1000,before_id=800,target_id=1200,repair_before_id=400 WHERE external_account_uuid=%s",
-        (account["uuid"],),
-    )
-    request(db, account, queue="next-queue")
-    row = db.execute(
-        "SELECT newest_id,before_id,target_id,repair_before_id FROM zulip_history_jobs WHERE external_account_uuid=%s",
-        (account["uuid"],),
-    ).fetchone()
-    assert tuple(row) == (1000, 800, 1200, 400)
-    assert (
-        db.execute(
-            "SELECT count(*) FROM zulip_history_jobs WHERE external_account_uuid=%s",
-            (account["uuid"],),
-        ).fetchone()[0]
-        == 1
-    )
-
-
-def test_stale_snapshot_does_not_overwrite_a_newer_realtime_change(incoming):
-    _, db, account, _, _ = incoming
-    original = message()
-    incoming_tests.apply(incoming, {"type": "message", "message": original})
-    request(db, account)
-    remote = message(
-        content="Current", last_edit_timestamp=original["timestamp"] + 3, flags=["read"]
-    )
-
-    async def run():
-        async with worker(incoming, {101: remote}) as (service, calls):
-            started = (await service.db.sql("SELECT clock_timestamp() AS value"))[0][
-                "value"
-            ]
-            expected = (await service.operations.snapshots(account, [101]))["101"]
-            async with service.db.transaction() as connection:
-                await service.enqueue(
-                    connection,
-                    account,
-                    {
-                        "type": "message",
-                        "message": message(
-                            content="Stale",
-                            last_edit_timestamp=original["timestamp"] + 1,
-                        ),
-                        "history": True,
-                    },
-                    expected,
-                    started,
-                )
-            # Simulate a committed realtime edit while the old page was in flight.
-            prepared = await incoming_tests.prepare_dependencies(
-                service.operations,
-                service.db,
-                account,
-                {"type": "message", "message": remote},
-            )
-            async with service.db.transaction() as connection:
-                await connection.execute(
-                    "SELECT set_config('workspace.zulip_incoming','on',true)"
-                )
-                await service.operations.apply(connection, account, prepared)
-            await drain(service, account)
-            assert [path for _, path, _ in calls if path == "/messages/101"]
-            current = (
-                await service.db.sql(
-                    "SELECT payload FROM messenger_messages_with_content_v1 WHERE project_id=%s AND provider_identity=%s",
-                    (account["project_id"], "101"),
-                )
-            )[0]
-            assert current["payload"]["content"] == "Current"
-
-    asyncio.run(run())
-
-
-def test_snapshot_flags_do_not_mark_truncated_old_unreads_as_read(incoming):
-    _, db, account, _, _ = incoming
-    current = message()
-    incoming_tests.apply(incoming, {"type": "message", "message": current})
-    request(
-        db,
-        account,
-        {
-            "unread_msgs": {"old_unreads_missing": True, "streams": []},
-            "starred_messages": [101],
-        },
-    )
-
-    async def run():
-        async with worker(incoming, {101: message(flags=["starred"])}) as (service, _):
-            await drain(service, account)
-            row = (
-                await service.db.sql(
-                    "SELECT read,starred FROM messenger_api_user_messages_v1 WHERE project_id=%s",
-                    (account["project_id"],),
-                )
-            )[0]
-            assert not row["read"] and row["starred"]
-
-    asyncio.run(run())
-
-
-def test_publication_prioritizes_realtime_and_preserves_each_entity_order(incoming):
-    _, db, account, _, _ = incoming
-    first, second, third = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
-    db.execute("SELECT set_config('workspace.zulip_history','on',false)")
-    for identifier in (first, third):
-        db.execute(
-            publication.ENQUEUE_SQL,
-            (
-                uuid.uuid4(),
-                account["project_id"],
-                identifier,
-                "message.updated",
-                [],
-                "{}",
-                "{}",
-                False,
-            ),
-        )
-    db.execute("SELECT set_config('workspace.zulip_history','off',false)")
-    for identifier in (second, third):
-        db.execute(
-            publication.ENQUEUE_SQL,
-            (
-                uuid.uuid4(),
-                account["project_id"],
-                identifier,
-                "message.updated",
-                [],
-                "{}",
-                "{}",
-                False,
-            ),
-        )
-    with db.cursor() as cursor:
-        cursor.execute(publication.SELECT_PENDING_SQL, (account["project_id"],))
-        # Realtime promotes the preceding historical snapshot of its own entity.
-        assert [row[3] for row in cursor.fetchall()] == [third, second, third, first]
-
-
-def test_queue_replacement_recovers_a_gap_even_when_realtime_has_a_newer_id(incoming):
-    _, db, account, _, _ = incoming
-    messages = {value: message(value, f"Old {value}") for value in range(101, 106)}
+    messages = {101: message(flags=["starred"], reactions=[reaction])}
     request(db, account)
 
     async def run():
         async with worker(incoming, messages) as (service, _):
             await drain(service, account)
-        incoming_tests.publish()
-        messages.update(
-            {value: message(value, f"New {value}") for value in range(106, 115)}
-        )
-        # Seeing the newest ID in realtime does not confirm the intervening IDs.
-        await asyncio.to_thread(
-            incoming_tests.apply,
-            incoming,
-            {"type": "message", "message": messages[114]},
-        )
-        request(db, account, queue="first-reset")
-        async with worker(incoming, messages) as (service, _):
-            await service.step(await job(service, account))
-            await service.step(await job(service, account))
-            current = (
-                await service.db.sql(
-                    "SELECT newest_id,target_id FROM zulip_history_jobs WHERE external_account_uuid=%s",
-                    (account["uuid"],),
-                )
-            )[0]
-            assert current == {"newest_id": 105, "target_id": 114}
-            messages[115] = message(115, "Another reset")
-            request(db, account, queue="second-reset")
-            await drain(service, account)
-            ids = await service.db.sql(
-                "SELECT provider_identity FROM messenger_messages WHERE project_id=%s ORDER BY provider_identity",
-                (account["project_id"],),
-            )
-            assert {int(row["provider_identity"]) for row in ids} == set(
-                range(101, 116)
-            )
 
     asyncio.run(run())
+    incoming_tests.drain()
+    row = api.get("/v1/messenger/messages/").json()[0]
+    assert not row["read"] and row["starred"] and row["reactions"]
+    messages[101] = message(content="Edited", flags=["read"])
+    request(db, account)
+    asyncio.run(run())
+    incoming_tests.drain()
+    row = api.get("/v1/messenger/messages/").json()[0]
+    assert row["read"] and not row["starred"] and row["reactions"] == {}
+    assert row["payload"]["content"] == "Edited"
+    assert db.execute("SELECT count(*) FROM messenger_counter_updates").fetchone() == (
+        0,
+    )
 
 
-def test_history_observes_access_per_account_and_does_not_repeat_shared_writes(
-    incoming,
-):
+def test_history_upper_boundary_excludes_new_realtime_messages(incoming):
     api, db, account, _, _ = incoming
-    linked, peer = incoming_tests.peer_account(incoming)
-    subscription = {
-        "type": "subscription",
-        "op": "add",
-        "subscriptions": [{"stream_id": 42, "name": "Channel"}],
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)
+    messages = {
+        101: message(),
+        102: message(102, timestamp=int(cutoff.timestamp()) + 1),
+        103: message(103),
     }
-    incoming_tests.apply(incoming, subscription)
-    incoming_tests.apply(peer, subscription)
-    request(db, account)
-    first = message(flags=["starred"])
-    try:
+    request(db, account, cutoff_id=102, cutoff_at=cutoff)
 
-        async def run():
-            async with worker(incoming, {101: first}) as (service, _):
-                await drain(service, account)
-            incoming_tests.publish()
-            assert not api.get(
-                "/v1/messenger/messages/", user=linked.owner_user_uuid
-            ).json()
-            before = db.execute(
-                "SELECT updated_at FROM messenger_messages WHERE project_id=%s",
-                (account["project_id"],),
-            ).fetchone()[0]
-            request(db, peer[2])
-            async with worker(peer, {101: message(flags=["read"])}) as (service, _):
-                await drain(service, peer[2])
-            assert (
-                db.execute(
-                    "SELECT updated_at FROM messenger_messages WHERE project_id=%s",
-                    (account["project_id"],),
-                ).fetchone()[0]
-                == before
-            )
-            incoming_tests.publish()
-            assert api.get("/v1/messenger/messages/").json()[0]["starred"]
-            other = api.get(
-                "/v1/messenger/messages/", user=linked.owner_user_uuid
-            ).json()[0]
-            assert other["read"] and not other["starred"]
-            request(db, account, queue="lost-access")
-            async with worker(incoming, {}) as (service, _):
-                await drain(service, account)
-            incoming_tests.publish()
+    async def run():
+        async with worker(incoming, messages) as (service, _):
+            await drain(service, account)
+
+    asyncio.run(run())
+    assert [
+        r["provider_identity"] for r in api.get("/v1/messenger/messages/").json()
+    ] == ["101"]
+
+
+def test_failed_merge_keeps_durable_batch_and_cursor_for_retry(incoming):
+    api, db, account, _, _ = incoming
+    request(db, account)
+
+    async def run():
+        async with worker(incoming, {101: message()}) as (service, calls):
+            await service.step(await job(service, account))  # catalog
+            merge_batch = service.operations.merge_batch
+
+            async def fail(connection, selected, batch):
+                await merge_batch(connection, selected, batch)
+                raise RuntimeError("interrupted before commit")
+
+            service.operations.merge_batch = fail
+            await service.step(await job(service, account))
             assert not api.get("/v1/messenger/messages/").json()
             assert (
+                await service.db.sql("SELECT before_id FROM zulip_history_accounts")
+            )[0]["before_id"] == 1000001
+            assert (
                 len(
-                    api.get(
-                        "/v1/messenger/messages/", user=linked.owner_user_uuid
-                    ).json()
+                    await service.db.sql(
+                        "SELECT 1 FROM zulip_history_batches WHERE messages IS NOT NULL"
+                    )
                 )
                 == 1
             )
-
-        asyncio.run(run())
-    finally:
-        db.execute("DELETE FROM m_external_accounts_v2 WHERE uuid=%s", (linked.uuid,))
-
-
-def test_history_pauses_for_publication_and_realtime_backlogs(incoming):
-    _, db, account, _, _ = incoming
-    request(db, account)
-    db.execute(
-        "INSERT INTO messenger_publication_outbox(uuid,project_id,entity_uuid,kind,recipients,payload) VALUES (%s,%s,%s,'message.updated','{}','{}')",
-        (uuid.uuid4(), account["project_id"], uuid.uuid4()),
-    )
-
-    async def run():
-        async with worker(incoming, {101: message()}, publication_limit=1) as (
-            service,
-            calls,
-        ):
-            await service.step(await job(service, account))
-            assert calls == []
-            assert not await service.db.sql("SELECT 1 FROM zulip_history_intents")
+            service.operations.merge_batch = merge_batch
             await service.db.sql(
-                "DELETE FROM messenger_publication_outbox WHERE project_id=%s",
-                (account["project_id"],),
-            )
-            await service.db.sql("UPDATE zulip_history_jobs SET next_attempt_at=now()")
-            await service.db.sql(
-                "INSERT INTO zulip_incoming_events(project_id,external_account_uuid,provider_uuid,owner_user_uuid,account_identity,queue_id,event_id,payload,received_at) VALUES (%s,%s,%s,%s,%s,'busy',1,'{}',now()-interval '1 minute')",
-                (
-                    account["project_id"],
-                    account["uuid"],
-                    account["provider_uuid"],
-                    account["owner_user_uuid"],
-                    account["external_account_id"],
-                ),
-            )
-            await service.step(await job(service, account))
-            assert calls == []
-            assert not await service.db.sql("SELECT 1 FROM zulip_history_intents")
-
-    asyncio.run(run())
-
-
-def test_pending_outbox_work_defers_history_without_http_requests(incoming):
-    _, db, account, _, _ = incoming
-    original = message()
-    incoming_tests.apply(incoming, {"type": "message", "message": original})
-    request(db, account)
-    root = db.execute(
-        "SELECT uuid FROM messenger_messages WHERE project_id=%s",
-        (account["project_id"],),
-    ).fetchone()[0]
-    db.execute(
-        "INSERT INTO zulip_outgoing_intents(project_id,entity_type,entity_uuid,ordering_key,external_account_uuid,operation,data) VALUES (%s,'message',%s,%s,%s,'update','{}')",
-        (account["project_id"], root, f"message:{root}", account["uuid"]),
-    )
-
-    async def run():
-        async with worker(
-            incoming,
-            {
-                101: message(
-                    content="Provider edit",
-                    last_edit_timestamp=original["timestamp"] + 1,
-                )
-            },
-        ) as (service, calls):
-            started = (await service.db.sql("SELECT clock_timestamp() AS value"))[0][
-                "value"
-            ]
-            expected = (await service.operations.snapshots(account, [101]))["101"]
-            async with service.db.transaction() as connection:
-                await service.enqueue(
-                    connection,
-                    account,
-                    {"type": "message", "message": original, "history": True},
-                    expected,
-                    started,
-                )
-            intent = (
-                await service.db.sql(
-                    zulip_history.SELECT_INTENT_SQL, (account["uuid"],)
-                )
-            )[0]
-            await service.process(account, intent)
-            assert calls == []
-            assert await service.db.sql("SELECT 1 FROM zulip_history_intents")
-            await service.db.sql(
-                "UPDATE zulip_outgoing_intents SET status='done' WHERE project_id=%s",
-                (account["project_id"],),
-            )
-            await service.db.sql(
-                "UPDATE zulip_history_intents SET next_attempt_at=now()"
+                "UPDATE zulip_history_accounts SET next_attempt_at=now()"
             )
             await drain(service, account)
+            assert len([c for c in calls if c[1] == "/messages"]) == 1
 
     asyncio.run(run())
+    assert len(api.get("/v1/messenger/messages/").json()) == 1
 
 
-def test_batch_comparison_uses_a_bounded_number_of_queries(incoming):
-    _, db, account, _, _ = incoming
-    messages = [
-        message(identifier, f"Plain {identifier}") for identifier in range(101, 111)
-    ]
-    incoming_tests.apply(
-        incoming, *({"type": "message", "message": item} for item in messages)
-    )
-
-    async def run():
-        async with worker(incoming, {item["id"]: item for item in messages}) as (
-            service,
-            calls,
-        ):
-            service.db.sql = mock.AsyncMock(wraps=service.db.sql)
-            assert await service.operations.differences(account, messages) == []
-            assert service.db.sql.await_count <= 6
-            assert calls == []
-
-    asyncio.run(run())
-
-
-def test_history_flags_do_not_refetch_siblings_after_counter_updates(incoming):
-    _, db, account, _, _ = incoming
-    now = int(datetime.datetime.now(datetime.timezone.utc).timestamp()) + 5
-    messages = {
-        i: message(i, flags=["read"], sender_id=8, timestamp=now)
-        for i in range(101, 104)
-    }
-    incoming_tests.apply(
-        incoming,
-        {
-            "type": "realm_user",
-            "op": "add",
-            "person": {
-                "user_id": 8,
-                "full_name": "Other sender",
-                "email": "other@example.com",
-            },
-        },
-    )
-    incoming_tests.apply(
-        incoming, *({"type": "message", "message": item} for item in messages.values())
-    )
-    for item in messages.values():
-        item["flags"] = []
+def test_disabling_account_during_preparation_prevents_merge_and_can_resume(incoming):
+    api, db, account, _, _ = incoming
     request(db, account)
-    db.execute("UPDATE zulip_history_jobs SET registration=NULL")
-
-    async def run():
-        async with worker(incoming, messages) as (service, calls):
-            for _ in range(100):
-                current = await job(service, account)
-                if current is None:
-                    break
-                await service.step(current)
-                incoming_tests.drain()
-                # Counter projection may touch the shared membership between
-                # history steps even when its resulting counters are unchanged.
-                db.execute(
-                    "UPDATE messenger_stream_bindings SET updated_at=clock_timestamp() "
-                    "WHERE project_id=%s AND user_uuid=%s",
-                    (account["project_id"], account["owner_user_uuid"]),
-                )
-            assert await job(service, account) is None
-            assert not [path for _, path, _ in calls if path.startswith("/messages/")]
-            assert (
-                await service.db.sql(
-                    "SELECT count(*) AS count FROM messenger_user_message_unreads "
-                    "WHERE user_uuid=%s",
-                    (account["owner_user_uuid"],),
-                )
-            )[0]["count"] == 3
-
-    asyncio.run(run())
-
-
-def test_failed_page_commit_keeps_both_work_and_cursor_unadvanced(
-    incoming, monkeypatch
-):
-    _, db, account, _, _ = incoming
-    request(db, account)
-    db.execute("UPDATE zulip_history_jobs SET registration=NULL")
 
     async def run():
         async with worker(incoming, {101: message()}) as (service, _):
-            original = service.db.transaction
+            await service.step(await job(service, account))
+            prepare = service.operations.prepare_batch
 
-            @contextlib.asynccontextmanager
-            async def fail_commit():
-                async with original() as connection:
-                    yield connection
-                    raise RuntimeError("simulated lost transaction")
-
-            with monkeypatch.context() as patch:
-                patch.setattr(service.db, "transaction", fail_commit)
-                await service.step(await job(service, account))
-            assert not await service.db.sql("SELECT 1 FROM zulip_history_intents")
-            state = (
-                await service.db.sql(
-                    "SELECT before_id,newest_id FROM zulip_history_jobs"
+            async def disable(selected, messages):
+                value = await prepare(selected, messages)
+                db.execute(
+                    "UPDATE m_external_accounts_v2 SET disabled=true WHERE uuid=%s",
+                    (account["uuid"],),
                 )
-            )[0]
-            assert state == {"before_id": None, "newest_id": 0}
-            await service.db.sql("UPDATE zulip_history_jobs SET next_attempt_at=now()")
-            await drain(service, account)
-            assert await service.db.sql(
-                "SELECT 1 FROM messenger_messages WHERE project_id=%s",
-                (account["project_id"],),
+                return value
+
+            service.operations.prepare_batch = disable
+            await service.step(await job(service, account))
+            assert not api.get("/v1/messenger/messages/").json()
+            assert await job(service, account) is None
+            assert (
+                await service.db.sql("SELECT before_id FROM zulip_history_accounts")
+            )[0]["before_id"] == 1000001
+            service.operations.prepare_batch = prepare
+            db.execute(
+                "UPDATE m_external_accounts_v2 SET disabled=false WHERE uuid=%s",
+                (account["uuid"],),
             )
+            await drain(service, account)
 
     asyncio.run(run())
+    assert len(api.get("/v1/messenger/messages/").json()) == 1
+
+
+@pytest.mark.parametrize("field", ["api_key", "email", "server_url"])
+def test_settings_changed_during_preparation_prevent_merge(incoming, field):
+    api, db, account, *_ = incoming
+    request(db, account)
+
+    async def run():
+        async with worker(incoming, {101: message()}) as (service, _):
+            await service.step(await job(service, account))
+            prepare = service.operations.prepare_batch
+
+            async def change_settings(selected, messages):
+                batch = await prepare(selected, messages)
+                settings = {
+                    **account["settings"],
+                    field: {
+                        "api_key": "replacement-test-key",
+                        "email": "replacement@example.com",
+                        "server_url": "https://another.example.com",
+                    }[field],
+                }
+                response = api.put(
+                    f"/v1/messenger/external_accounts/{account['uuid']}",
+                    json={"settings": settings},
+                    permissions=("workspace.external_account.update",),
+                )
+                assert response.status_code == 200, response.text
+                assert response.json()["status"] == "new"
+                return batch
+
+            service.operations.prepare_batch = change_settings
+            await service.step(await job(service, account))
+            assert not db.execute(
+                "SELECT 1 FROM messenger_messages WHERE project_id=%s",
+                (account["project_id"],),
+            ).fetchall()
+            assert db.execute(
+                "SELECT before_id,error FROM zulip_history_accounts WHERE external_account_uuid=%s",
+                (account["uuid"],),
+            ).fetchone() == (1000001, None)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("disconnect", ["disable", "unlink"])
+@pytest.mark.parametrize("kind,identity", [("user", "8"), ("stream", "999")])
+def test_disconnect_during_dependency_lookup_prevents_catalog_writes(
+    incoming, disconnect, kind, identity
+):
+    api, db, account, *_ = incoming
+    request(db, account)
+    changes = {"sender_id": 8} if kind == "user" else {"stream_id": 999}
+
+    async def run():
+        async with worker(incoming, {101: message(**changes)}) as (service, _):
+            await service.step(await job(service, account))
+            prepare = service.operations.prepare_dependency
+            changed = False
+
+            async def disconnect_account(selected, spec):
+                nonlocal changed
+                prepared = await prepare(selected, spec)
+                if (
+                    not changed
+                    and spec["kind"] == kind
+                    and spec["identity"] == identity
+                ):
+                    path = f"/v1/messenger/external_accounts/{account['uuid']}"
+                    if disconnect == "disable":
+                        response = api.put(
+                            path,
+                            json={"disabled": True},
+                            permissions=("workspace.external_account.update",),
+                        )
+                        assert response.status_code == 200, response.text
+                    else:
+                        response = api.delete(
+                            path, permissions=("workspace.external_account.delete",)
+                        )
+                        assert response.status_code == 204, response.text
+                    changed = True
+                return prepared
+
+            service.operations.prepare_dependency = disconnect_account
+            with contextlib.suppress(asyncio.CancelledError):
+                await service.step(await job(service, account))
+            assert changed
+            if kind == "user":
+                query = "SELECT 1 FROM m_external_accounts_v2 WHERE project_id=%s AND provider_uuid=%s AND external_account_id=%s"
+            else:
+                query = "SELECT 1 FROM messenger_streams WHERE project_id=%s AND provider_uuid=%s AND provider_identity=%s"
+            assert not db.execute(
+                query, (account["project_id"], account["provider_uuid"], identity)
+            ).fetchall()
+            assert not api.get("/v1/messenger/messages/").json()
+            assert db.execute(
+                "SELECT before_id,error FROM zulip_history_accounts WHERE external_account_uuid=%s",
+                (account["uuid"],),
+            ).fetchone() == (1000001, None)
+            if disconnect == "disable":
+                service.operations.prepare_dependency = prepare
+                response = api.put(
+                    f"/v1/messenger/external_accounts/{account['uuid']}",
+                    json={"disabled": False},
+                    permissions=("workspace.external_account.update",),
+                )
+                assert response.status_code == 200, response.text
+                await drain(service, account)
+                assert len(api.get("/v1/messenger/messages/").json()) == 1
+
+    asyncio.run(run())
+
+
+def test_scheduler_catches_up_new_account_before_advancing_older_accounts(incoming):
+    _, db, account, _, _ = incoming
+    peer, other_context = incoming_tests.peer_account(incoming, 8)
+    other = other_context[2]
+    try:
+        request(db, account, cutoff_id=900)
+        request(db, other, cutoff_id=1200)
+        db.execute("UPDATE zulip_history_accounts SET registration=NULL")
+
+        async def run():
+            async with worker(incoming, {}) as (service, _):
+                selected = await service.db.sql(zulip_history.SELECT_JOBS_SQL, ([], 10))
+                assert [r["uuid"] for r in selected] == [other["uuid"]]
+                await service.db.sql(
+                    "UPDATE zulip_history_accounts SET before_id=800 WHERE external_account_uuid=%s",
+                    (other["uuid"],),
+                )
+                selected = await service.db.sql(zulip_history.SELECT_JOBS_SQL, ([], 10))
+                assert [r["uuid"] for r in selected] == [account["uuid"]]
+                db.execute(
+                    "UPDATE m_external_accounts_v2 SET disabled=true WHERE uuid=%s",
+                    (account["uuid"],),
+                )
+                selected = await service.db.sql(zulip_history.SELECT_JOBS_SQL, ([], 10))
+                assert [r["uuid"] for r in selected] == [other["uuid"]]
+
+        asyncio.run(run())
+    finally:
+        peer.delete()
+
+
+def test_running_scope_does_not_block_another_project_with_the_same_provider(incoming):
+    _, db, account, _, _ = incoming
+    peer, other_context = incoming_tests.peer_account(incoming, 8)
+    other = {**other_context[2], "project_id": uuid.uuid4()}
+    try:
+        db.execute(
+            "UPDATE m_external_accounts_v2 SET project_id=%s WHERE uuid=%s",
+            (other["project_id"], other["uuid"]),
+        )
+        request(db, account)
+        request(db, other)
+
+        async def run():
+            async with worker(incoming, {}) as (service, _):
+                selected = await service.db.sql(zulip_history.SELECT_JOBS_SQL, ([], 10))
+                assert {row["uuid"] for row in selected} == {
+                    account["uuid"],
+                    other["uuid"],
+                }
+                running = [f"{account['project_id']}:{account['provider_uuid']}"]
+                selected = await service.db.sql(
+                    zulip_history.SELECT_JOBS_SQL, (running, 10)
+                )
+                assert [row["uuid"] for row in selected] == [other["uuid"]]
+
+        asyncio.run(run())
+    finally:
+        peer.delete()
+
+
+def test_history_yields_before_provider_io_when_realtime_is_delayed(incoming):
+    _, db, account, _, _ = incoming
+    request(db, account)
+
+    async def run():
+        async with worker(incoming, {101: message()}) as (service, calls):
+            service.busy = mock.AsyncMock(return_value=True)
+            await service.step(await job(service, account))
+            assert calls == []
+            assert not await service.db.sql("SELECT 1 FROM zulip_history_batches")
+
+    asyncio.run(run())
+
+
+def test_bulk_merge_uses_a_bounded_number_of_statements(incoming):
+    _, db, account, _, _ = incoming
+    request(db, account)
+
+    async def run():
+        async with worker(incoming, {}, batch_size=1000) as (service, _):
+            batch = await service.operations.prepare_batch(
+                await job(service, account),
+                [message(i) for i in range(1, 1001)],
+            )
+            async with service.db.transaction() as connection:
+                execute = connection.execute
+                queries = []
+
+                async def record(query, *args, **kwargs):
+                    queries.append(query)
+                    return await execute(query, *args, **kwargs)
+
+                with mock.patch.object(connection, "execute", side_effect=record):
+                    await service.operations.merge_batch(connection, account, batch)
+                assert len(queries) < 55
+
+    asyncio.run(run())
+    assert db.execute(
+        "SELECT count(*) FROM messenger_messages WHERE project_id=%s",
+        (account["project_id"],),
+    ).fetchone() == (1000,)
 
 
 @pytest.mark.isolated_schema
@@ -1236,7 +678,7 @@ def test_history_process_is_silent_for_an_actual_websocket_client(
                         await asyncio.wait_for(websocket.recv(), 0.2)
                     payload["content"] = "Edited through recovery"
                     payload["last_edit_timestamp"] = now + 5
-                    request(db, account, queue="recovered")
+                    request(db, account)
                     while (
                         db.execute(
                             "SELECT payload->>'content' FROM messenger_messages_with_content_v1 WHERE project_id=%s",
@@ -1278,40 +720,6 @@ def test_history_process_is_silent_for_an_actual_websocket_client(
     asyncio.run(run())
 
 
-def test_global_history_queue_limit_prevents_more_page_downloads(incoming):
-    _, db, account, _, _ = incoming
-    linked, peer = incoming_tests.peer_account(incoming)
-    request(db, account)
-    request(db, peer[2])
-    try:
-
-        async def run():
-            async with worker(incoming, {101: message()}) as (service, calls):
-                async with service.db.transaction() as connection:
-                    for identifier in range(201, 207):
-                        await service.enqueue(
-                            connection,
-                            peer[2],
-                            {
-                                "type": "message",
-                                "message": message(identifier),
-                                "history": True,
-                            },
-                            None,
-                            datetime.datetime.now(datetime.timezone.utc),
-                        )
-                await service.step(await job(service, account))
-                assert calls == []
-                assert (
-                    len(await service.db.sql("SELECT 1 FROM zulip_history_intents"))
-                    == 6
-                )
-
-        asyncio.run(run())
-    finally:
-        db.execute("DELETE FROM m_external_accounts_v2 WHERE uuid=%s", (linked.uuid,))
-
-
 @pytest.mark.parametrize("known", [False, True])
 def test_history_does_not_subscribe_an_account_to_old_channels(incoming, known):
     _, db, account, _, _ = incoming
@@ -1334,7 +742,7 @@ def test_history_does_not_subscribe_an_account_to_old_channels(incoming, known):
                 "SELECT 1 FROM messenger_stream_bindings WHERE project_id=%s AND active",
                 (account["project_id"],),
             )
-            assert not await service.db.sql("SELECT 1 FROM zulip_history_intents")
+            assert not await service.db.sql("SELECT 1 FROM zulip_history_batches")
 
     asyncio.run(run())
 
@@ -1368,7 +776,7 @@ def test_history_respects_inactive_direct_message_memberships(incoming, known):
         async def run():
             async with worker(incoming, {102: remote}) as (service, _):
                 await drain(service, account)
-                assert not await service.db.sql("SELECT 1 FROM zulip_history_intents")
+                assert not await service.db.sql("SELECT 1 FROM zulip_history_batches")
                 active = await service.db.sql(
                     "SELECT active FROM messenger_stream_bindings WHERE project_id=%s AND user_uuid=%s",
                     (account["project_id"], account["owner_user_uuid"]),
@@ -1383,6 +791,120 @@ def test_history_respects_inactive_direct_message_memberships(incoming, known):
                     assert len(api.get("/v1/messenger/messages/").json()) == 1
 
         asyncio.run(run())
+    finally:
+        linked.delete()
+
+
+@pytest.mark.parametrize("members", [(7, 8), (7, 8, 9)])
+def test_readding_account_restores_its_direct_history_without_reopening_peer(
+    incoming, members
+):
+    api, db, account, http, url = incoming
+    linked, _ = incoming_tests.peer_account(incoming)
+    group_peer = incoming_tests.peer_account(incoming, 9)[0] if 9 in members else None
+    remote = message(
+        101,
+        type="private",
+        recipient_id=1,
+        display_recipient=[
+            {"id": member, "full_name": str(member)} for member in members
+        ],
+    )
+    remote.pop("stream_id")
+    remote.pop("subject")
+    permissions = tuple(
+        f"workspace.external_account.{action}"
+        for action in ("read", "create", "delete")
+    )
+    try:
+        incoming_tests.apply(incoming, {"type": "message", "message": remote})
+        db.execute(
+            "UPDATE messenger_stream_bindings SET active=false WHERE project_id=%s AND user_uuid=%s",
+            (account["project_id"], linked.owner_user_uuid),
+        )
+        path = f"/v1/messenger/external_accounts/{account['uuid']}"
+        assert api.delete(path, permissions=permissions).status_code == 204
+        assert api.get(path, permissions=permissions).status_code == 404
+        created = api.post(
+            "/v1/messenger/external_accounts/",
+            json={"provider": "zulip", "settings": account["settings"]},
+            permissions=permissions,
+        )
+        assert created.status_code == 201, created.text
+
+        async def run():
+            receiver = incoming_tests.zulip_incoming.ZulipIncomingService(url)
+            await receiver.db.open()
+            try:
+                selected = (
+                    await receiver.db.sql(
+                        incoming_tests.zulip_incoming.SELECT_ACCOUNT_SQL,
+                        (created.json()["uuid"],),
+                    )
+                )[0]
+                operations = incoming_operations.Operations(receiver.db, http)
+                async with receiver.db.transaction() as connection:
+                    await connection.execute(
+                        incoming_tests.zulip_incoming.INCOMING_TRANSACTION_SQL
+                    )
+                    restored = await operations.initialize(
+                        connection, selected, {"user_id": 7}
+                    )
+                assert restored["uuid"] == account["uuid"]
+            finally:
+                await receiver.db.close()
+            request(db, account, {"subscriptions": []})
+            async with worker(incoming, {101: remote, 102: {**remote, "id": 102}}) as (
+                service,
+                _,
+            ):
+                await drain(service, account)
+
+        asyncio.run(run())
+        incoming_tests.drain()
+        assert len(api.get("/v1/messenger/messages/").json()) == 2
+        assert not db.execute(
+            "SELECT active FROM messenger_stream_bindings WHERE project_id=%s AND user_uuid=%s",
+            (account["project_id"], linked.owner_user_uuid),
+        ).fetchone()[0]
+    finally:
+        linked.delete()
+        if group_peer is not None:
+            group_peer.delete()
+
+
+def test_history_joins_an_existing_dm_when_this_account_has_no_membership(incoming):
+    api, db, account, _, _ = incoming
+    linked, _ = incoming_tests.peer_account(incoming)
+    remote = message(
+        101,
+        type="private",
+        recipient_id=1,
+        display_recipient=[
+            {"id": 7, "full_name": "Sender"},
+            {"id": 8, "full_name": "Peer"},
+        ],
+    )
+    remote.pop("stream_id")
+    remote.pop("subject")
+    try:
+        incoming_tests.apply(incoming, {"type": "message", "message": remote})
+        db.execute(
+            "DELETE FROM messenger_stream_bindings WHERE project_id=%s AND user_uuid=%s",
+            (account["project_id"], account["owner_user_uuid"]),
+        )
+        request(db, account, {"subscriptions": []})
+
+        async def run():
+            async with worker(incoming, {101: remote, 102: {**remote, "id": 102}}) as (
+                service,
+                _,
+            ):
+                await drain(service, account)
+
+        asyncio.run(run())
+        incoming_tests.drain()
+        assert len(api.get("/v1/messenger/messages/").json()) == 2
     finally:
         linked.delete()
 
@@ -1415,7 +937,7 @@ def test_history_imports_dm_without_reactivating_an_inactive_peer(incoming):
                 _,
             ):
                 await drain(service, account)
-                assert not await service.db.sql("SELECT 1 FROM zulip_history_intents")
+                assert not await service.db.sql("SELECT 1 FROM zulip_history_batches")
                 assert (
                     await service.db.sql(
                         "SELECT active FROM messenger_stream_bindings WHERE project_id=%s AND user_uuid=%s",
@@ -1432,126 +954,433 @@ def test_history_imports_dm_without_reactivating_an_inactive_peer(incoming):
         linked.delete()
 
 
-def test_registration_recovers_a_missed_attachment_removal(
-    incoming, tmp_path, monkeypatch
-):
-    _, db, account, http, _ = incoming
-    monkeypatch.setenv("WORKSPACE_FILE_STORAGE_PATH", str(tmp_path))
-    http.download = mock.AsyncMock(return_value=(b"file content", "text/plain"))
-    incoming_tests.apply(
-        incoming,
-        {
-            "type": "message",
-            "message": message(content="[file](/user_uploads/1/a/file.txt)"),
-        },
-        {
-            "type": "attachment",
-            "op": "add",
-            "attachment": {"id": 123, "path_id": "1/a/file.txt", "name": "file.txt"},
-        },
-    )
-    assert db.execute(
-        "SELECT 1 FROM m_workspace_files WHERE project_id=%s", (account["project_id"],)
-    ).fetchone()
-    request(db, account, {"attachments": []})
+def test_history_snapshot_preserves_native_reaction_facts_and_aggregates(incoming):
+    import uuid
 
-    async def run():
-        async with worker(incoming, {}) as (service, _):
-            # Exercise only catalog recovery; message history has its own scope checks.
-            await service.db.sql(
-                "UPDATE zulip_history_jobs SET newest_id=101,before_id=0,backfill_done=true,completed_at=requested_at,repair_after=now()+interval '1 day'"
-            )
-            await drain(service, account)
-            assert not await service.db.sql(
-                "SELECT 1 FROM m_workspace_files WHERE project_id=%s",
-                (account["project_id"],),
-            )
-            assert not await service.db.sql(
-                "SELECT 1 FROM zulip_incoming_attachments WHERE project_id=%s",
-                (account["project_id"],),
-            )
-            # Cleanup intentions contain provider_deleted and do not resend a deletion.
-            assert not await service.db.sql(
-                "SELECT 1 FROM zulip_outgoing_intents WHERE project_id=%s AND NOT(data @> '{\"provider_deleted\":true}')",
-                (account["project_id"],),
-            )
-
-    asyncio.run(run())
-
-
-def test_failed_catalog_removal_does_not_keep_registration_running(incoming):
-    _, db, account, _, _ = incoming
+    api, db, account, _, _ = incoming
     incoming_tests.apply(incoming, {"type": "message", "message": message()})
-    request(db, account, {"subscriptions": []})
-
-    async def run():
-        async with worker(incoming, {}) as (service, _):
-            await service.db.sql(
-                "UPDATE zulip_history_jobs SET newest_id=101,before_id=0,"
-                "backfill_done=true,completed_at=requested_at,"
-                "repair_after=now()+interval '1 day'"
-            )
-            await service.step(await job(service, account))
-            intent = (await service.db.sql("SELECT * FROM zulip_history_intents"))[0]
-            assert intent["entity_key"] == "subscription:42"
-            with mock.patch.object(
-                service, "prepare", side_effect=ValueError("permanent catalog failure")
-            ):
-                await service.step(await job(service, account))
-            for _ in range(5):
-                current = await job(service, account)
-                if current is None:
-                    break
-                await service.step(current)
-            assert await job(service, account) is None
-            failed = await service.db.sql("SELECT * FROM zulip_history_intents")
-            assert len(failed) == 1
-            assert failed[0]["failed"]
-            assert failed[0]["error"] == "permanent catalog failure"
-            assert not (
-                await service.db.sql("SELECT registration FROM zulip_history_jobs")
-            )[0]["registration"]
-
-    asyncio.run(run())
-
-
-def test_newer_catalog_event_is_not_repeatedly_reversed_by_registration(incoming):
-    _, db, account, _, _ = incoming
-    incoming_tests.apply(
-        incoming,
-        {
-            "type": "subscription",
-            "op": "add",
-            "subscriptions": [{"stream_id": 42, "name": "Channel"}],
-        },
-    )
-    request(db, account, {"subscriptions": []})
+    row = api.get("/v1/messenger/messages/").json()[0]
+    root = db.execute(
+        "SELECT message_uuid FROM messenger_message_placements WHERE uuid=%s",
+        (row["uuid"],),
+    ).fetchone()[0]
     db.execute(
-        "INSERT INTO zulip_incoming_events(project_id,external_account_uuid,provider_uuid,owner_user_uuid,account_identity,queue_id,event_id,payload,ordering_keys,processed_at) VALUES (%s,%s,%s,%s,%s,'after-registration',1,%s,%s,now())",
+        """
+        INSERT INTO messenger_message_reaction_facts(uuid,project_id,canonical_message_uuid,placement_uuid,user_uuid,emoji_name)
+        VALUES(%s,%s,%s,%s,%s,'heart')
+    """,
         (
+            uuid.uuid4(),
             account["project_id"],
-            account["uuid"],
-            account["provider_uuid"],
+            root,
+            row["uuid"],
             account["owner_user_uuid"],
-            account["external_account_id"],
-            incoming_operations.json_value(
-                {
-                    "type": "subscription",
-                    "op": "add",
-                    "subscriptions": [{"stream_id": 42, "name": "Channel"}],
-                }
-            ),
-            ["stream:42"],
         ),
     )
+    db.execute(
+        "UPDATE messenger_messages SET reactions=%s WHERE project_id=%s AND uuid=%s",
+        (incoming_operations.json_value({"heart": 1}), account["project_id"], root),
+    )
+    request(db, account)
 
     async def run():
-        async with worker(incoming, {}) as (service, _):
+        async with worker(incoming, {101: message()}) as (service, _):
             await drain(service, account)
-            assert await service.db.sql(
-                "SELECT 1 FROM messenger_stream_bindings WHERE project_id=%s AND active",
-                (account["project_id"],),
-            )
-            assert not await service.db.sql("SELECT 1 FROM zulip_history_intents")
 
     asyncio.run(run())
+    result = api.get("/v1/messenger/messages/").json()[0]
+    assert result["reactions"] == {"heart": 1}
+
+
+def test_bulk_page_resolves_quotes_before_either_message_is_persisted(incoming):
+    api, db, account, _, _ = incoming
+    messages = {
+        101: message(101, "Source text"),
+        102: message(
+            102,
+            "@_**Sender|7** [said](https://zulip.example.com/#narrow/near/101):\n"
+            "```quote\nSource text\n```",
+        ),
+    }
+    request(db, account)
+
+    async def run():
+        async with worker(incoming, messages) as (service, _):
+            await drain(service, account)
+
+    asyncio.run(run())
+    rows = api.get("/v1/messenger/messages/").json()
+    by_remote = {row["provider_identity"]: row for row in rows}
+    assert (
+        f"urn:quote:{by_remote['101']['uuid']}"
+        in by_remote["102"]["payload"]["content"]
+    )
+    assert "urn:forward:" not in by_remote["102"]["payload"]["content"]
+
+
+@pytest.mark.parametrize("separate_streams", [False, True])
+def test_history_reuses_file_bytes_by_hash_across_pages_and_keeps_acl(
+    incoming, tmp_path, monkeypatch, separate_streams
+):
+    api, db, account, _, _ = incoming
+    monkeypatch.setenv("WORKSPACE_FILE_STORAGE_PATH", str(tmp_path))
+
+    class Storage(file_storage.LocalWorkspaceFileStorage):
+        storage_type = "s3"
+        storage_id = "history-test-bucket"
+
+    storage = Storage()
+    monkeypatch.setattr(
+        file_storage, "get_workspace_file_storage", lambda **kw: storage
+    )
+    saves = mock.Mock(wraps=file_storage.save_workspace_file)
+    monkeypatch.setattr(file_storage, "save_workspace_file", saves)
+    messages = {
+        i: message(i, f"[file](/user_uploads/1/key/{i}.txt)") for i in (101, 102)
+    }
+    if separate_streams:
+        messages[102]["stream_id"] = 43
+    request(db, account)
+
+    async def run():
+        async with worker(incoming, messages) as (service, _):
+            service.http.download = mock.AsyncMock(
+                return_value=(b"same bytes", "text/plain")
+            )
+            await drain(service, account)
+
+    asyncio.run(run())
+    assert saves.call_count == 1
+    messages[103] = message(103, "[file](/user_uploads/1/key/103.txt)")
+    request(db, account)
+    asyncio.run(run())
+    assert saves.call_count == 1
+    files = api.get("/v1/messenger/files/").json()
+    assert len(files) == 3
+    assert db.execute(
+        "SELECT count(DISTINCT storage_object_id) FROM m_workspace_files WHERE project_id=%s",
+        (account["project_id"],),
+    ).fetchone() == (1,)
+    for item in files:
+        assert (
+            api.get(f"/v1/messenger/files/{item['uuid']}/actions/download").content
+            == b"same bytes"
+        )
+        assert (
+            api.get(
+                f"/v1/messenger/files/{item['uuid']}/actions/download",
+                user="00000000-0000-0000-0000-000000000999",
+            ).status_code
+            == 404
+        )
+
+    if separate_streams:
+        allowed_stream = db.execute(
+            "SELECT uuid FROM messenger_streams WHERE project_id=%s AND provider_identity='42'",
+            (account["project_id"],),
+        ).fetchone()[0]
+        peer = uuid.uuid4()
+        conftest.seed_user_stream_binding(
+            db, account["project_id"], allowed_stream, peer
+        )
+        assert not db.execute(
+            "SELECT 1 FROM m_external_accounts_v2 WHERE owner_user_uuid=%s", (peer,)
+        ).fetchall()
+        for item in files:
+            response = api.get(
+                f"/v1/messenger/files/{item['uuid']}/actions/download", user=peer
+            )
+            assert response.status_code == (
+                200 if item["stream_uuid"] == str(allowed_stream) else 404
+            )
+            if response.status_code == 200:
+                assert response.content == b"same bytes"
+
+    assert api.delete(f"/v1/messenger/files/{files[0]['uuid']}").status_code == 204
+
+    async def finish_delete():
+        async with worker(incoming, {}) as (service, _):
+            intents = await service.db.sql(
+                "SELECT * FROM zulip_outgoing_intents WHERE project_id=%s AND entity_type='file' AND operation='delete'",
+                (account["project_id"],),
+            )
+            assert len(intents) == 1
+
+            await outgoing_operations.Operations(service.db, service.http).finish(
+                intents[0], account, {"kind": "delete"}, {}
+            )
+
+    asyncio.run(finish_delete())
+    assert (
+        api.get(f"/v1/messenger/files/{files[1]['uuid']}/actions/download").content
+        == b"same bytes"
+    )
+
+
+def test_reconnection_replaces_an_inflight_page_without_advancing_the_new_cursor(
+    incoming,
+):
+    api, db, account, _, _ = incoming
+    request(db, account, cutoff_id=101)
+
+    async def run():
+        async with worker(incoming, {101: message()}) as (service, _):
+            await service.step(await job(service, account))
+            prepare = service.operations.prepare_batch
+
+            async def reconnect(selected, messages):
+                batch = await prepare(selected, messages)
+                db.execute(
+                    "DELETE FROM zulip_history_batches WHERE external_account_uuid=%s",
+                    (account["uuid"],),
+                )
+                request(db, account, cutoff_id=200)
+                return batch
+
+            service.operations.prepare_batch = reconnect
+            await service.step(await job(service, account))
+            current = await job(service, account)
+            assert current["before_id"] == 201
+            assert not current["finished"]
+            assert not api.get("/v1/messenger/messages/").json()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("provider_content", [None, "Previous provider spelling"])
+def test_history_repairs_provider_content_without_changing_workspace_payload(
+    incoming, provider_content
+):
+    _, db, account, _, _ = incoming
+    original = message()
+    incoming_tests.apply(incoming, {"type": "message", "message": original})
+    with db.transaction():
+        db.execute("SELECT set_config('workspace.zulip_incoming','on',true)")
+        db.execute(
+            "UPDATE messenger_messages message SET content_uuid="
+            "messenger_resolve_message_content(contents.workspace_content,%s) "
+            "FROM messenger_message_contents contents "
+            "WHERE contents.uuid=message.content_uuid AND message.project_id=%s",
+            (provider_content, account["project_id"]),
+        )
+    incoming_tests.publish()
+    request(db, account)
+
+    async def run():
+        async with worker(incoming, {101: original}) as (service, _):
+            await drain(service, account)
+            current = (
+                await service.db.sql(
+                    "SELECT message.content_revision,contents.workspace_content,"
+                    "contents.provider_content FROM messenger_messages message "
+                    "JOIN messenger_message_contents contents ON contents.uuid=message.content_uuid "
+                    "WHERE message.project_id=%s AND message.provider_identity='101'",
+                    (account["project_id"],),
+                )
+            )[0]
+            assert current == {
+                "content_revision": 3,
+                "workspace_content": {"kind": "markdown", "content": "Hello"},
+                "provider_content": "Hello",
+            }
+            assert not await service.db.sql(
+                "SELECT 1 FROM zulip_outgoing_intents WHERE project_id=%s",
+                (account["project_id"],),
+            )
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("provider_identity", [None, "101:7:smile"])
+@pytest.mark.parametrize("retained", [False, True])
+def test_history_reconciles_reactions_using_persisted_fact_keys(
+    incoming, provider_identity, retained
+):
+    _, db, account, _, _ = incoming
+    reaction = {
+        "user_id": 7,
+        "emoji_name": "smile",
+        "emoji_code": "1f604",
+        "reaction_type": "unicode_emoji",
+    }
+    incoming_tests.apply(
+        incoming, {"type": "message", "message": message(reactions=[reaction])}
+    )
+    canonical_name = db.execute(
+        "SELECT emoji_name FROM messenger_message_reaction_facts WHERE project_id=%s",
+        (account["project_id"],),
+    ).fetchone()[0]
+    db.execute(
+        "UPDATE messenger_message_reaction_facts SET provider_identity=%s WHERE project_id=%s",
+        (provider_identity, account["project_id"]),
+    )
+    request(db, account)
+
+    async def run():
+        async with worker(
+            incoming, {101: message(reactions=[reaction] if retained else [])}
+        ) as (service, _):
+            await drain(service, account)
+            request(db, account)
+            await drain(service, account)
+            facts = await service.db.sql(
+                "SELECT emoji_name FROM messenger_message_reaction_facts WHERE project_id=%s",
+                (account["project_id"],),
+            )
+            assert facts == ([{"emoji_name": canonical_name}] if retained else [])
+            root = (
+                await service.db.sql(
+                    "SELECT reactions FROM messenger_messages WHERE project_id=%s",
+                    (account["project_id"],),
+                )
+            )[0]
+            assert root["reactions"] == ({canonical_name: 1} if retained else {})
+            assert not await service.db.sql(
+                "SELECT 1 FROM zulip_outgoing_intents WHERE project_id=%s",
+                (account["project_id"],),
+            )
+
+    asyncio.run(run())
+
+
+def test_message_created_during_queue_registration_is_not_lost(incoming):
+    api, db, account, _, url = incoming
+    captured = {}
+
+    async def run():
+        receiver = incoming_tests.zulip_incoming.ZulipIncomingService(url)
+        await receiver.db.open()
+
+        async def register(*args, **kwargs):
+            # The queue snapshot includes a message created while /register was
+            # in flight. It will not arrive again through the new event queue.
+            await asyncio.sleep(1.05)
+            captured[101] = message(
+                timestamp=int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+            )
+            return {
+                "queue_id": "history-registration-window",
+                "last_event_id": 0,
+                "max_message_id": 101,
+                "subscriptions": [{"stream_id": 42, "name": "Channel"}],
+                "realm_users": [],
+                "user_topics": [],
+            }
+
+        receiver.http = mock.Mock(request=mock.AsyncMock(side_effect=register))
+        receiver.poll_http = mock.Mock(
+            request=mock.AsyncMock(side_effect=asyncio.CancelledError)
+        )
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await receiver.receive(account)
+        finally:
+            await receiver.db.close()
+        async with worker(incoming, captured) as (service, _):
+            # The fixture already initialized this account; only the synthetic
+            # account_ready notification remains in the receiver inbox.
+            service.busy = mock.AsyncMock(return_value=False)
+            await drain(service, account)
+
+    asyncio.run(run())
+    messages = api.get("/v1/messenger/messages/").json()
+    assert [row["provider_identity"] for row in messages] == ["101"]
+
+
+def test_history_reuses_a_locally_created_topic_before_its_provider_receipt(incoming):
+    api, db, account, _, _ = incoming
+    incoming_tests.apply(incoming, incoming_tests.event("Existing message"))
+    stream = api.get("/v1/messenger/streams/").json()[0]
+    response = api.post(
+        "/v1/messenger/stream_topics/",
+        json={"stream_uuid": stream["uuid"], "name": "Local pending topic"},
+    )
+    assert response.status_code == 201, response.text
+    topic = response.json()
+    assert topic["provider_identity"] is None
+    incoming_tests.drain()
+    request(db, account)
+
+    async def run():
+        async with worker(
+            incoming, {102: message(102, subject="Local pending topic")}
+        ) as (service, _):
+            await drain(service, account)
+
+    asyncio.run(run())
+    rows = api.get("/v1/messenger/messages/").json()
+    imported = next(row for row in rows if row["provider_identity"] == "102")
+    assert imported["topic_uuid"] == topic["uuid"]
+    topics = api.get("/v1/messenger/stream_topics/").json()
+    assert [row["uuid"] for row in topics if row["name"] == topic["name"]] == [
+        topic["uuid"]
+    ]
+
+
+def test_history_reuses_a_delivered_local_message_before_its_realtime_echo(incoming):
+    api, db, account, _, _ = incoming
+    incoming_tests.apply(incoming, incoming_tests.event("Seed"))
+    seed = api.get("/v1/messenger/messages/").json()[0]
+    payload = {"kind": "markdown", "content": "**Original**"}
+    response = api.post(
+        "/v1/messenger/messages/",
+        json={
+            "stream_uuid": seed["stream_uuid"],
+            "topic_uuid": seed["topic_uuid"],
+            "payload": payload,
+        },
+    )
+    assert response.status_code == 201, response.text
+    local = response.json()
+    assert local["provider_identity"] is None
+    canonical = db.execute(
+        "SELECT message_uuid FROM messenger_message_placements WHERE uuid=%s",
+        (local["uuid"],),
+    ).fetchone()[0]
+    with db.transaction():
+        db.execute(history.TRANSACTION_SQL)
+        delivery = db.execute(
+            outgoing_operations.UPSERT_DELIVERED_MESSAGE_SQL,
+            (
+                uuid.uuid4(),
+                account["project_id"],
+                canonical,
+                seed["stream_uuid"],
+                account["uuid"],
+                account["hostname"],
+                account["external_account_id"],
+                incoming_operations.json_value({"to": 42}),
+                "General",
+                102,
+            ),
+        ).fetchone()[0]
+        content = db.execute(
+            "SELECT messenger_resolve_message_content(%s::jsonb,%s)",
+            (incoming_operations.json_value(payload), "*Original*"),
+        ).fetchone()[0]
+        db.execute(
+            outgoing_operations.INSERT_CONTENT_SNAPSHOT_SQL,
+            (uuid.uuid4(), delivery, content, 1),
+        )
+        db.execute(
+            "UPDATE zulip_outgoing_intents SET status='done' WHERE project_id=%s",
+            (account["project_id"],),
+        )
+    incoming_tests.drain()
+    before = incoming_tests.client_events(incoming)
+    request(db, account)
+
+    async def run():
+        async with worker(
+            incoming, {102: message(102, "*Original*", flags=["read"])}
+        ) as (service, _):
+            await drain(service, account)
+
+    asyncio.run(run())
+    incoming_tests.drain()
+    rows = api.get("/v1/messenger/messages/").json()
+    assert len(rows) == 2
+    imported = next(row for row in rows if row["provider_identity"] == "102")
+    assert imported["uuid"] == local["uuid"]
+    assert imported["payload"] == payload
+    assert incoming_tests.client_events(incoming) == before

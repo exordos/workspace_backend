@@ -858,6 +858,7 @@ def test_long_polling_reaches_an_actual_websocket_client(incoming, monkeypatch):
             return web.json_response(
                 {
                     "queue_id": f"live-queue-{len(registrations)}",
+                    "max_message_id": 100,
                     "last_event_id": -1,
                     "event_queue_longpoll_timeout_seconds": 1,
                     "realm_users": [],

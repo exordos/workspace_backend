@@ -1016,6 +1016,32 @@ class Operations:
                         "created",
                         stream["uuid"],
                     )
+        if merged:
+            # Unlinking deactivates this account's chats. An explicit new link
+            # restores its own DMs, including groups, while ordinary history
+            # replay still respects inactive memberships.
+            for stream in await rows(
+                connection,
+                """
+                SELECT stream.* FROM messenger_streams stream
+                JOIN messenger_stream_bindings member ON member.project_id=stream.project_id
+                    AND member.stream_uuid=stream.uuid
+                WHERE stream.project_id=%s AND stream.provider_uuid=%s
+                    AND stream.source_name='zulip' AND stream.provider_identity LIKE 'dm:%%'
+                    AND member.user_uuid=%s AND NOT member.active
+                    AND member.source_name='zulip' AND member.provider_uuid=stream.provider_uuid
+                    AND member.provider_identity=stream.provider_identity||':'||%s
+                """,
+                (
+                    account["project_id"],
+                    account["provider_uuid"],
+                    account["owner_user_uuid"],
+                    identity,
+                ),
+            ):
+                await self.bind(
+                    connection, values, stream, account["owner_user_uuid"], identity
+                )
         if changed:
             await self.account_snapshot(
                 connection,

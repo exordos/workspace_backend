@@ -58,7 +58,7 @@ def test_expired_file_link_uses_current_account_access(
             ) as (service, _):
                 service.http.download = mock.AsyncMock(side_effect=download)
                 await history_tests.drain(service, account)
-                assert not await service.db.sql("SELECT 1 FROM zulip_history_intents")
+                assert not await service.db.sql("SELECT 1 FROM zulip_history_batches")
 
         asyncio.run(run())
     incoming_tests.drain()
@@ -202,7 +202,7 @@ def test_upload_path_byte_limit_keeps_message_synchronization(
             ) as (service, _):
                 service.http.download = download
                 await history_tests.drain(service, account)
-                assert not await service.db.sql("SELECT 1 FROM zulip_history_intents")
+                assert not await service.db.sql("SELECT 1 FROM zulip_history_batches")
 
         asyncio.run(run())
     incoming_tests.drain()

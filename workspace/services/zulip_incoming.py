@@ -303,9 +303,6 @@ class ZulipIncomingService:
         while True:
             try:
                 if subscription is None:
-                    registration_started = (
-                        await self.db.sql("SELECT clock_timestamp() AS value")
-                    )[0]["value"]
                     registration = await self.http.request(
                         account,
                         "POST",
@@ -330,6 +327,11 @@ class ZulipIncomingService:
                             },
                         },
                     )
+                    # The snapshot includes messages created while /register
+                    # was in flight, before this queue could deliver events.
+                    registered_at = (
+                        await self.db.sql("SELECT clock_timestamp() AS value")
+                    )[0]["value"]
                     subscription = {
                         "queue_id": registration["queue_id"],
                         "last_event_id": registration["last_event_id"],
@@ -355,36 +357,35 @@ class ZulipIncomingService:
                             ),
                         )
                         await connection.execute(
+                            "DELETE FROM zulip_history_batches WHERE external_account_uuid=%s",
+                            (account["uuid"],),
+                        )
+                        await connection.execute(
                             history.REQUEST_SQL,
                             (
                                 account["uuid"],
                                 account["project_id"],
                                 account["provider_uuid"],
-                                account["owner_user_uuid"],
-                                account["external_account_id"],
-                                account["settings"]["server_url"],
+                                registered_at,
+                                registration["max_message_id"],
+                                registration["max_message_id"] + 1,
                                 pg_json.Jsonb(
                                     {
                                         key: registration[key]
                                         for key in (
                                             "realm_users",
+                                            "realm_non_active_users",
+                                            "cross_realm_bots",
                                             "subscriptions",
-                                            "attachments",
-                                            "unread_msgs",
-                                            "starred_messages",
                                             "user_topics",
                                         )
                                         if key in registration
                                     }
                                 ),
-                                subscription["queue_id"],
-                                registration_started,
                                 [
                                     item["stream_id"]
                                     for item in registration["subscriptions"]
-                                ]
-                                if "subscriptions" in registration
-                                else None,
+                                ],
                             ),
                         )
                         initial = [{"type": "account_ready"}]
