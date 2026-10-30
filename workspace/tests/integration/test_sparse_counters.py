@@ -3,18 +3,28 @@
 
 """Counter projection must not hold up message and flag producers."""
 
+import asyncio
 import concurrent.futures
+import json
+import socket
 import threading
 import time
 import uuid
+from unittest import mock
 
 import psycopg
 import pytest
+import websockets
 from oslo_config import cfg
 from restalchemy.common import contexts
 
 from workspace.common import mutation_journal_opts
-from workspace.messenger_api import events, message_flags, publication
+from workspace.messenger_api import (
+    events,
+    message_flags,
+    publication,
+    websocket_service,
+)
 from workspace.messenger_api.api import v2_store
 from workspace.services.messenger_workers import counters, v2_projection
 from workspace.tests.integration import conftest
@@ -27,6 +37,336 @@ conversation = journal_tests.conversation
 def _count_one():
     with contexts.Context().session_manager() as session:
         return counters.process_pending(session)
+
+
+def test_delete_after_read_change_does_not_deadlock_counter_acknowledgement(
+    api, db, conversation, caplog
+):
+    stream, messages, peer = conversation
+    cfg.CONF.set_override("enabled", False, group=mutation_journal_opts.DOMAIN)
+    topic = stream["default_topic_uuid"]
+    # Deletion refreshes personal summary state, sharing the counter's cache
+    # row. A producer first changes an unread fact and its dirty revision.
+    db.execute(
+        "UPDATE messenger_topics SET summary='Existing summary' WHERE project_id=%s AND uuid=%s",
+        (api.project_id, topic),
+    )
+    db.execute(
+        "SELECT messenger_queue_counters(%s,%s,%s,%s)",
+        (api.project_id, peer, stream["uuid"], topic),
+    )
+    revision = db.execute(
+        "SELECT revision FROM messenger_counter_updates WHERE project_id=%s AND user_uuid=%s AND topic_uuid=%s",
+        (api.project_id, peer, topic),
+    ).fetchone()[0]
+    acknowledging, release, changed = (
+        threading.Event(),
+        threading.Event(),
+        threading.Event(),
+    )
+    producer_pid = []
+
+    class AcknowledgementGate:
+        def __init__(self, session):
+            self.session = session
+
+        def execute(self, statement, values=()):
+            if statement.startswith("DELETE FROM messenger_counter_updates"):
+                acknowledging.set()
+                assert release.wait(5), "Counter acknowledgement was not released"
+            return self.session.execute(statement, values)
+
+        def __getattr__(self, name):
+            return getattr(self.session, name)
+
+    def count():
+        with contexts.Context().session_manager() as session:
+            return counters.process_pending(AcknowledgementGate(session))
+
+    def produce():
+        with contexts.Context().session_manager() as session:
+            producer_pid.append(
+                session.execute("SELECT pg_backend_pid() AS pid").fetchone()["pid"]
+            )
+            session.execute(
+                "DELETE FROM messenger_user_message_unreads "
+                "WHERE project_id=%s AND user_uuid=%s AND placement_uuid=%s",
+                (api.project_id, peer, messages[0]["uuid"]),
+            )
+            changed.set()
+            store = v2_store.MessengerV2Store(api.project_id, api.user_uuid)
+            store.delete_message(uuid.UUID(messages[-1]["uuid"]))
+
+    with concurrent.futures.ThreadPoolExecutor(2) as pool:
+        counter = pool.submit(count)
+        try:
+            assert acknowledging.wait(3)
+            producer = pool.submit(produce)
+            assert changed.wait(3)
+            deadline = time.monotonic() + 3
+            while not producer.done():
+                if db.execute(
+                    "SELECT wait_event_type FROM pg_stat_activity WHERE pid=%s",
+                    (producer_pid[0],),
+                ).fetchone() == ("Lock",):
+                    break
+                assert time.monotonic() < deadline
+                time.sleep(0.002)
+        finally:
+            release.set()
+        producer.result(timeout=5)
+        assert counter.result(timeout=5) == 1
+    assert "Cannot recount" not in caplog.text
+    # CAS must preserve the producer's committed revision despite the older
+    # COUNT/cache snapshot, so a later turn can converge to zero.
+    assert db.execute(
+        "SELECT revision>%s FROM messenger_counter_updates "
+        "WHERE project_id=%s AND user_uuid=%s AND topic_uuid=%s",
+        (revision, api.project_id, peer, topic),
+    ).fetchone() == (True,)
+    native._drain()
+    assert _project_count(db, api, peer) == (0, 0, 0)
+    assert api.get(f"{native.MESSAGES}{messages[-1]['uuid']}").status_code == 404
+
+
+def test_public_provider_message_delete_during_count_preserves_revision_and_realtime(
+    api, db, conversation, _test_database_url
+):
+    stream, messages, peer = conversation
+    cfg.CONF.set_override("enabled", False, group=mutation_journal_opts.DOMAIN)
+    provider = uuid.uuid5(uuid.NAMESPACE_DNS, "counter.example.com")
+    db.execute(
+        "INSERT INTO messenger_providers VALUES(%s,'counter.example.com') ON CONFLICT DO NOTHING",
+        (provider,),
+    )
+    db.execute(
+        "UPDATE messenger_streams SET source_name='zulip',provider_uuid=%s,provider_identity='42' "
+        "WHERE project_id=%s AND uuid=%s",
+        (provider, api.project_id, stream["uuid"]),
+    )
+    db.execute(
+        "UPDATE messenger_messages SET source_name='zulip',provider_uuid=%s,provider_identity=uuid::text "
+        "WHERE project_id=%s",
+        (provider, api.project_id),
+    )
+    topic = stream["default_topic_uuid"]
+    db.execute(
+        "SELECT messenger_queue_counters(%s,%s,%s,%s)",
+        (api.project_id, peer, stream["uuid"], topic),
+    )
+    revision = db.execute(
+        "SELECT revision FROM messenger_counter_updates WHERE project_id=%s AND user_uuid=%s AND topic_uuid=%s",
+        (api.project_id, peer, topic),
+    ).fetchone()[0]
+    counting, release = threading.Event(), threading.Event()
+
+    class CountSnapshotGate:
+        def __init__(self, session):
+            self.session = session
+
+        def execute(self, statement, values=()):
+            result = self.session.execute(statement, values)
+            if statement == counters.COUNT_TOPIC_SQL:
+                snapshot = result.fetchone()
+                counting.set()
+                assert release.wait(5), "COUNT snapshot was not released"
+                return mock.Mock(fetchone=lambda: snapshot)
+            return result
+
+        def __getattr__(self, name):
+            return getattr(self.session, name)
+
+    def count():
+        with contexts.Context().session_manager() as session:
+            return counters.process_pending(CountSnapshotGate(session))
+
+    async def run():
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        server = websocket_service.MessengerEventsWebsocketServer(
+            db_url=_test_database_url,
+            iam_engine_driver=mock.Mock(),
+            heartbeat_interval=25,
+            client_timeout=5,
+            catchup_limit=500,
+            send_queue_limit=32,
+            poll_interval=0.02,
+        )
+        server._authenticator.authenticate = lambda token: (
+            str(peer),
+            api.project_id,
+        )
+        serving = asyncio.create_task(server.serve("127.0.0.1", port))
+        try:
+            deadline = time.monotonic() + 5
+            while True:
+                try:
+                    websocket = await websockets.connect(
+                        f"ws://127.0.0.1:{port}/v1/events/ws",
+                        subprotocols=["workspace.events.v1", "bearer.test"],
+                    )
+                    break
+                except OSError:
+                    assert not serving.done()
+                    assert time.monotonic() < deadline
+                    await asyncio.sleep(0.01)
+            try:
+
+                async def receive(action, placement):
+                    while True:
+                        frame = json.loads(await asyncio.wait_for(websocket.recv(), 5))
+                        if (
+                            frame.get("object_type") == "message"
+                            and frame.get("action") == action
+                            and frame["payload"]["uuid"] == placement
+                        ):
+                            return frame
+
+                while (
+                    json.loads(await asyncio.wait_for(websocket.recv(), 5)).get("type")
+                    != "ready"
+                ):
+                    pass
+                with concurrent.futures.ThreadPoolExecutor(1) as pool:
+                    counter = pool.submit(count)
+                    try:
+                        assert await asyncio.to_thread(counting.wait, 3)
+                        response = await asyncio.to_thread(
+                            api.delete, f"{native.MESSAGES}{messages[-1]['uuid']}"
+                        )
+                        assert response.status_code == 204, response.text
+                    finally:
+                        release.set()
+                    assert await asyncio.to_thread(counter.result, 5) == 1
+                assert db.execute(
+                    "SELECT revision>%s FROM messenger_counter_updates "
+                    "WHERE project_id=%s AND user_uuid=%s AND topic_uuid=%s",
+                    (revision, api.project_id, peer, topic),
+                ).fetchone() == (True,)
+                await asyncio.to_thread(native._drain)
+                assert _project_count(db, api, peer) == (1, 1, 0)
+                assert (
+                    api.get(f"{native.STREAMS}{stream['uuid']}", user=peer).json()[
+                        "unread_count"
+                    ]
+                    == 1
+                )
+                assert (
+                    api.get(f"{native.STREAM_TOPICS}{topic}", user=peer).json()[
+                        "unread_count"
+                    ]
+                    == 1
+                )
+                assert db.execute(
+                    "SELECT unread_count FROM messenger_user_folder_bindings "
+                    "WHERE project_id=%s AND user_uuid=%s AND rule='all_chats'",
+                    (api.project_id, peer),
+                ).fetchone() == (1,)
+                await receive("deleted", messages[-1]["uuid"])
+                response = await asyncio.to_thread(
+                    api.post,
+                    native.MESSAGES,
+                    json={
+                        "stream_uuid": stream["uuid"],
+                        "topic_uuid": topic,
+                        "payload": {
+                            "kind": "markdown",
+                            "content": "After concurrent deletion",
+                        },
+                    },
+                )
+                assert response.status_code == 201, response.text
+                await asyncio.to_thread(native._drain)
+                await receive("created", response.json()["uuid"])
+                assert _project_count(db, api, peer) == (2, 2, 0)
+            finally:
+                await websocket.close()
+        finally:
+            release.set()
+            server.stop()
+            await serving
+
+    asyncio.run(run())
+
+
+def test_counter_crash_before_acknowledgement_keeps_committed_cache_and_dirty_scope(
+    api, db, conversation
+):
+    stream, messages, peer = conversation
+    cfg.CONF.set_override("enabled", False, group=mutation_journal_opts.DOMAIN)
+    response = api.delete(f"{native.MESSAGES}{messages[-1]['uuid']}")
+    assert response.status_code == 204, response.text
+    db.execute(
+        "DELETE FROM messenger_counter_updates WHERE project_id=%s AND user_uuid<>%s",
+        (api.project_id, peer),
+    )
+
+    class CrashBeforeAcknowledgement:
+        def __init__(self, session):
+            self.session = session
+
+        def execute(self, statement, values=()):
+            if statement.startswith("DELETE FROM messenger_counter_updates"):
+                raise RuntimeError("Counter stopped before acknowledgement")
+            return self.session.execute(statement, values)
+
+        def __getattr__(self, name):
+            return getattr(self.session, name)
+
+    with pytest.raises(RuntimeError, match="Counter stopped"):
+        with contexts.Context().session_manager() as session:
+            counters.process_pending(CrashBeforeAcknowledgement(session))
+    assert _project_count(db, api, peer) == (1, 1, 0)
+    assert db.execute(
+        "SELECT count(*) FROM messenger_counter_updates WHERE project_id=%s AND user_uuid=%s",
+        (api.project_id, peer),
+    ).fetchone() == (1,)
+    native._drain()
+    assert _project_count(db, api, peer) == (1, 1, 0)
+    assert db.execute(
+        "SELECT count(*) FROM messenger_counter_updates WHERE project_id=%s AND user_uuid=%s",
+        (api.project_id, peer),
+    ).fetchone() == (0,)
+
+
+@pytest.mark.parametrize("new_revision", [False, True])
+def test_failed_counter_scope_rolls_back_cache_and_only_postpones_its_revision(
+    api, db, conversation, monkeypatch, new_revision
+):
+    stream, _messages, peer = conversation
+    topic = stream["default_topic_uuid"]
+    db.execute(
+        "SELECT messenger_queue_counters(%s,%s,%s,%s)",
+        (api.project_id, peer, stream["uuid"], topic),
+    )
+
+    def fail(session, update):
+        session.execute(
+            "UPDATE messenger_user_topic_bindings SET unread_count=99 "
+            "WHERE project_id=%s AND user_uuid=%s AND topic_uuid=%s",
+            (api.project_id, peer, topic),
+        )
+        if new_revision:
+            db.execute(
+                "SELECT messenger_queue_counters(%s,%s,%s,%s)",
+                (api.project_id, peer, stream["uuid"], topic),
+            )
+        raise RuntimeError("Interrupted recount")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(counters, "_recount_scope", fail)
+        assert _count_one() == 1
+    assert db.execute(
+        "SELECT unread_count FROM messenger_user_topic_bindings "
+        "WHERE project_id=%s AND user_uuid=%s AND topic_uuid=%s",
+        (api.project_id, peer, topic),
+    ).fetchone() == (2,)
+    assert db.execute(
+        "SELECT next_retry_at IS NULL FROM messenger_counter_updates "
+        "WHERE project_id=%s AND user_uuid=%s AND topic_uuid=%s",
+        (api.project_id, peer, topic),
+    ).fetchone() == (new_revision,)
 
 
 def test_counters_keep_publishing_when_facts_change_during_every_count(

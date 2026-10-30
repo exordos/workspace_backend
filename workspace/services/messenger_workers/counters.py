@@ -7,6 +7,7 @@ import logging
 import typing
 
 from workspace.messenger_api import publication
+from workspace.messenger_api.dm import schema
 from workspace.services.messenger_workers import v2_projection
 
 LOG = logging.getLogger(__name__)
@@ -39,6 +40,7 @@ COUNT_TOPIC_SQL = """
 
 
 def process_pending(session: typing.Any, limit: int = 1) -> int:
+    """Own cache and acknowledgement transactions in the counter process."""
     with publication.defer():
         return _process_pending(session, limit)
 
@@ -52,21 +54,14 @@ def _process_pending(session: typing.Any, limit: int) -> int:
         (limit,),
     ).fetchall()
     for update in pending:
+        schema.lock_shared(session)
         session.execute("SAVEPOINT messenger_counter_scope", ())
+        failed = False
         try:
             _recount_scope(session, update)
         except Exception:
             session.execute("ROLLBACK TO SAVEPOINT messenger_counter_scope", ())
-            session.execute(
-                "UPDATE messenger_counter_updates SET next_retry_at=clock_timestamp()+interval '5 seconds' "
-                "WHERE project_id=%s AND user_uuid=%s AND topic_uuid=%s AND revision=%s",
-                (
-                    update["project_id"],
-                    update["user_uuid"],
-                    update["topic_uuid"],
-                    update["revision"],
-                ),
-            )
+            failed = True
             LOG.exception(
                 "Cannot recount topic %s for user %s in project %s",
                 update["topic_uuid"],
@@ -75,6 +70,28 @@ def _process_pending(session: typing.Any, limit: int) -> int:
             )
         finally:
             session.execute("RELEASE SAVEPOINT messenger_counter_scope", ())
+        # Producers may own the dirty row while waiting on our cache rows.
+        # Release every cache lock before either acknowledging or postponing
+        # that revision. A crash between commits leaves the scope dirty.
+        session.commit()
+        schema.lock_shared(session)
+        statement = (
+            "UPDATE messenger_counter_updates SET next_retry_at=clock_timestamp()+interval '5 seconds' "
+            if failed
+            else "DELETE FROM messenger_counter_updates "
+        )
+        session.execute(
+            statement
+            + "WHERE project_id=%s AND user_uuid=%s AND topic_uuid=%s AND revision=%s",
+            (
+                update["project_id"],
+                update["user_uuid"],
+                update["topic_uuid"],
+                update["revision"],
+            ),
+        )
+        # A batch's next recount must not retain this dirty-row lock either.
+        session.commit()
     return len(pending)
 
 
@@ -160,10 +177,4 @@ def _recount_scope(
              active_unread_count=totals.active,passive_unread_count=totals.unread-totals.active
            FROM totals WHERE project_id=%s AND user_uuid=%s""",
         (project, user, project, user),
-    )
-    # A producer can advance the revision while COUNT is running. In that
-    # case the row remains pending and is counted again after this commit.
-    session.execute(
-        "DELETE FROM messenger_counter_updates WHERE project_id=%s AND user_uuid=%s AND topic_uuid=%s AND revision=%s",
-        (project, user, topic, update["revision"]),
     )
