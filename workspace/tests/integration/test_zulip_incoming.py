@@ -244,6 +244,10 @@ def test_message_create_edit_delete_produces_client_events(incoming):
         == "Edited"
     )
     apply(incoming, {"type": "delete_message", "message_ids": [101]})
+    assert not db.execute(
+        "SELECT 1 FROM messenger_messages WHERE project_id=%s AND provider_identity='101'",
+        (account["project_id"],),
+    ).fetchall()
     drain()
     kinds = [
         row[0]
@@ -3591,7 +3595,7 @@ def test_late_message_copies_after_delete_do_not_resurrect_it_after_cache_expiry
             await admit(account, 1, event(identifier=201))
             await admit(account, 2, {"type": "delete_message", "message_id": 201})
             assert not await service.db.sql(
-                "SELECT 1 FROM messenger_messages WHERE project_id=%s AND provider_identity='201' AND deleted_at IS NULL",
+                "SELECT 1 FROM messenger_messages WHERE project_id=%s AND provider_identity='201'",
                 (account["project_id"],),
             )
             http.request.reset_mock()

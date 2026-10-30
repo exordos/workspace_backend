@@ -1100,35 +1100,9 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         if message.author_uuid != self.user_uuid:
             raise ra_exceptions.ValidationErrorException()
         session = contexts.Context().get_session()
-        placements = session.execute(
-            """
-            SELECT placement.uuid, placement.stream_uuid, placement.topic_uuid
-            FROM messenger_message_placements AS placement
-            WHERE placement.project_id = %s AND placement.message_uuid = %s
-            ORDER BY placement.uuid
-            """,
-            (self.project_uuid, message.canonical_message_uuid),
-        ).fetchall()
-        for placement in placements:
-            self._enqueue(
-                "delivery_snapshot_event",
-                "message",
-                f"{self.project_uuid}:{message.canonical_message_uuid}",
-                {
-                    "source_kind": "message.deleted",
-                    "placement": dict(placement),
-                    "canonical_message_uuid": message.canonical_message_uuid,
-                    "message_created_at": message.created_at,
-                    "author_uuid": message.author_uuid,
-                    "source_name": message.source_name,
-                    "provider_uuid": message.provider_uuid,
-                    "provider_identity": message.provider_identity,
-                },
-            )
         session.execute(
             """
-            UPDATE messenger_messages
-            SET deleted_at = NOW()
+            DELETE FROM messenger_messages
             WHERE project_id = %s AND uuid = %s
             """,
             (self.project_uuid, message.canonical_message_uuid),

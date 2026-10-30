@@ -190,7 +190,11 @@ def _guard_emitted_events(
         FROM unnest(%s::uuid[], %s::uuid[], %s::integer[]) AS input(
             event_uuid, user_uuid, membership_generation
         )
-        ON CONFLICT (event_uuid, user_uuid) DO NOTHING
+        -- The captured generation overrides the automatic publication guard.
+        ON CONFLICT (event_uuid, user_uuid) DO UPDATE
+        SET stream_uuid=EXCLUDED.stream_uuid,
+            membership_generation=EXCLUDED.membership_generation,
+            control_effect=EXCLUDED.control_effect
         """,
         (
             project_id,

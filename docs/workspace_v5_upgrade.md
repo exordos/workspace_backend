@@ -57,9 +57,10 @@ longer retry interval. The realtime dispatcher checks new Workspace messages
 before processing one flag change and one reaction change per pass, so bulk
 state reconciliation does not hold a message behind a large batch.
 
-Deleting an acknowledged native outgoing message records the Zulip route in
-the existing domain outbox transaction, before local tombstone cleanup. The
-realtime task retains that snapshot across restarts, uses the original sender's
-account, and cancels if that account has been rebound. Repeating a DELETE after
-a lost response accepts an already absent provider message; permission failures
-remain errors. Existing deletion events without a captured route are ignored.
+Migration 0287 removes message roots in the command transaction and captures
+local deletion audiences and outgoing Zulip routing before the database cascades
+dependent rows. Stop writers and workers before applying it, then start the
+matching application version. Old queued soft-delete work can still drain;
+stream and topic deletion retain their existing lifecycle. See
+[transactional message deletion](message_deletion.md) for delivery, replay
+protection and retention boundaries.

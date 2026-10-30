@@ -15,6 +15,7 @@ from oslo_config import cfg
 from restalchemy.common import contexts
 
 from workspace.common import mutation_journal_opts
+from workspace.messenger_api.api import v2_store
 from workspace.services.messenger_workers import v2_projection
 from workspace.tests.integration import test_messenger_v2 as native
 from workspace.tests.integration import test_mutation_journal as journal
@@ -44,10 +45,34 @@ def test_public_delete_during_previous_message_purge_does_not_deadlock(
         "WHERE project_id=%s",
         (provider, api.project_id),
     )
-    assert (
-        api.delete(f"{native.MESSAGES}{messages[purged_index]['uuid']}").status_code
-        == 204
-    )
+    # A pre-upgrade soft-delete task must still finish safely while the new
+    # API physically deletes another root in the same topic.
+    with contexts.Context().session_manager() as session:
+        store = v2_store.MessengerV2Store(api.project_id, api.user_uuid)
+        message = store._message(messages[purged_index]["uuid"])
+        store._enqueue(
+            "delivery_snapshot_event",
+            "message",
+            f"{api.project_id}:{message.canonical_message_uuid}",
+            {
+                "source_kind": "message.deleted",
+                "placement": {
+                    "uuid": message.uuid,
+                    "stream_uuid": message.stream_uuid,
+                    "topic_uuid": message.topic_uuid,
+                },
+                "canonical_message_uuid": message.canonical_message_uuid,
+                "message_created_at": message.created_at,
+                "author_uuid": message.author_uuid,
+                "source_name": message.source_name,
+                "provider_uuid": message.provider_uuid,
+                "provider_identity": message.provider_identity,
+            },
+        )
+        session.execute(
+            "UPDATE messenger_messages SET deleted_at=now() WHERE project_id=%s AND uuid=%s",
+            (api.project_id, message.canonical_message_uuid),
+        )
     purging, release = threading.Event(), threading.Event()
     original = v2_projection._purge_completed_tombstone
     worker_pid = []

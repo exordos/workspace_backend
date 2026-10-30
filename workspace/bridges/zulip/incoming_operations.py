@@ -126,6 +126,27 @@ OBSERVE_DELIVERY_SQL = """
         content_observed_at = %s
     WHERE uuid = %s
 """
+SELECT_REMOVED_MESSAGES_SQL = """
+    WITH scope(project_id,provider_uuid,identities) AS (
+        VALUES (%s::uuid,%s::uuid,%s::text[])
+    ), receipts AS (
+        SELECT link.project_id,link.entity_uuid,link.provider_identity
+        FROM scope JOIN zulip_entity_links link ON link.project_id=scope.project_id
+            AND link.provider_uuid=scope.provider_uuid AND link.entity_type='message'
+            AND link.provider_identity=ANY(scope.identities)
+        UNION ALL
+        -- A pending send can acquire its remote ID after its root was deleted.
+        SELECT delivery.project_id,delivery.message_uuid,delivery.zulip_message_id::text
+        FROM scope JOIN messenger_providers provider ON provider.uuid=scope.provider_uuid
+        JOIN bridge_zulip_v5_deliveries delivery ON delivery.project_id=scope.project_id
+            AND delivery.hostname=provider.hostname
+            AND delivery.zulip_message_id=ANY(scope.identities::bigint[])
+    )
+    SELECT DISTINCT receipt.provider_identity FROM receipts receipt
+    WHERE NOT EXISTS(SELECT 1 FROM messenger_messages message
+        WHERE message.project_id=receipt.project_id AND message.uuid=receipt.entity_uuid)
+"""
+
 SELECT_MESSAGE_CLOCKS_SQL = """
     SELECT provider_identity,content_updated_at FROM messenger_messages
     WHERE project_id=%s AND provider_uuid=%s AND source_name='zulip'
@@ -1386,6 +1407,15 @@ class Operations:
             return await self.prepare_dependency(account, event["dependency"])
         message_ids = []
         if kind == "message":
+            if await self.db.sql(
+                SELECT_REMOVED_MESSAGES_SQL,
+                (
+                    account["project_id"],
+                    account["provider_uuid"],
+                    [str(event["message"]["id"])],
+                ),
+            ):
+                return prepared
             if "_shared_key" in event:
                 known = await self.db.sql(
                     "SELECT payload,deleted_at FROM messenger_messages_with_content_v1 WHERE project_id=%s AND provider_uuid=%s AND source_name='zulip' AND provider_identity=%s",
@@ -2151,14 +2181,9 @@ class Operations:
                 snapshots,
                 placement["stream_uuid"],
             )
-        await self.save(
-            connection,
-            TABLES["message"],
-            {
-                "uuid": identifier,
-                "project_id": account["project_id"],
-                "deleted_at": datetime.datetime.now(datetime.timezone.utc),
-            },
+        await connection.execute(
+            "DELETE FROM messenger_messages WHERE project_id=%s AND uuid=%s",
+            (account["project_id"], identifier),
         )
         for placement in placements:
             await self.counters(connection, account, placement)
@@ -2223,6 +2248,10 @@ class Operations:
                 account, "message", data["id"], connection=connection
             )
         )
+        await connection.execute(
+            "SELECT uuid FROM messenger_messages WHERE project_id=%s AND uuid=%s FOR UPDATE",
+            (account["project_id"], identifier),
+        )
         old = await rows(
             connection,
             SELECT_ROW_SQL.format(table="messenger_messages_with_content_v1"),
@@ -2240,6 +2269,12 @@ class Operations:
             )
             return
         if old and old[0]["deleted_at"] is not None:
+            return
+        if not old and await rows(
+            connection,
+            SELECT_REMOVED_MESSAGES_SQL,
+            (account["project_id"], account["provider_uuid"], [str(data["id"])]),
+        ):
             return
         if not old and not deliveries:
             pending = await rows(
@@ -2927,6 +2962,12 @@ class Operations:
             (account["project_id"], account["provider_uuid"], str(identifier)),
         )
         if not canonical:
+            if await rows(
+                connection,
+                SELECT_REMOVED_MESSAGES_SQL,
+                (account["project_id"], account["provider_uuid"], [str(identifier)]),
+            ):
+                return
             raise MissingSharedMessage()
         message = canonical[0]
         if message["deleted_at"] is not None:

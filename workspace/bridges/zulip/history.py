@@ -240,6 +240,14 @@ class Operations(incoming_operations.Operations):
                 if item["type"] != "stream" or item["stream_id"] in subscriptions
             ]
         scope = (account["project_id"], account["provider_uuid"])
+        removed = {
+            row["provider_identity"]
+            for row in await self.db.sql(
+                incoming_operations.SELECT_REMOVED_MESSAGES_SQL,
+                (*scope, [str(item["id"]) for item in messages]),
+            )
+        }
+        messages = [item for item in messages if str(item["id"]) not in removed]
         people = await self.db.sql(PEOPLE_SQL, scope)
         users = {row["external_account_id"]: row["owner_user_uuid"] for row in people}
         needed = {str(item["sender_id"]) for item in messages}
@@ -688,6 +696,70 @@ class Operations(incoming_operations.Operations):
         self, connection: typing.Any, account: dict, batch: dict
     ) -> None:
         await execute(connection, "setup", TRANSACTION_SQL)
+        # Serialize updates with root deletion, then recheck receipts: a page
+        # can have been prepared before its messages were removed.
+        await connection.execute(
+            "SELECT uuid FROM messenger_messages WHERE project_id=%s "
+            "AND uuid=ANY(%s::uuid[]) ORDER BY uuid FOR UPDATE",
+            (
+                account["project_id"],
+                [item["uuid"] for item in batch["messenger_messages"]],
+            ),
+        )
+        removed = {
+            row["provider_identity"]
+            for row in await incoming_operations.rows(
+                connection,
+                incoming_operations.SELECT_REMOVED_MESSAGES_SQL,
+                (
+                    account["project_id"],
+                    account["provider_uuid"],
+                    [item["provider_identity"] for item in batch["messenger_messages"]],
+                ),
+            )
+        }
+        if removed:
+            batch = dict(batch)
+            batch["messenger_messages"] = [
+                item
+                for item in batch["messenger_messages"]
+                if item["provider_identity"] not in removed
+            ]
+            roots = {item["uuid"] for item in batch["messenger_messages"]}
+            batch["messenger_message_placements"] = [
+                item
+                for item in batch["messenger_message_placements"]
+                if item["message_uuid"] in roots
+            ]
+            placements = {
+                item["uuid"] for item in batch["messenger_message_placements"]
+            }
+            for table in (
+                "messenger_user_message_bindings",
+                "messenger_user_message_unreads",
+                "messenger_user_message_stars",
+                "messenger_user_message_mentions",
+                "messenger_message_reaction_facts",
+            ):
+                batch[table] = [
+                    item
+                    for item in batch[table]
+                    if item["placement_uuid"] in placements
+                ]
+            contents = {item["content_uuid"] for item in batch["messenger_messages"]}
+            batch["messenger_message_contents"] = [
+                item
+                for item in batch["messenger_message_contents"]
+                if item["uuid"] in contents
+            ]
+            reactions = {
+                item["uuid"] for item in batch["messenger_message_reaction_facts"]
+            }
+            batch["zulip_entity_links"] = [
+                item
+                for item in batch["zulip_entity_links"]
+                if item["entity_type"] != "reaction" or item["entity_uuid"] in reactions
+            ]
         for table, values in batch.items():
             await stage(connection, table, values)
         for table in (

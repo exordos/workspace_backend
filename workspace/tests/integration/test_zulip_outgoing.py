@@ -513,10 +513,10 @@ def test_delete_404_uses_snapshot_after_local_root_is_removed(
                 == 204
             )
             with psycopg.connect(_test_database_url, autocommit=True) as connection:
-                connection.execute(
-                    "DELETE FROM messenger_messages WHERE project_id=%s",
+                assert not connection.execute(
+                    "SELECT 1 FROM messenger_messages WHERE project_id=%s",
                     (account.project_id,),
-                )
+                ).fetchall()
             server.messages.clear()
             await drain(service)
             assert server.calls[-1][:2] == ("DELETE", "/api/v1/messages/101")
@@ -768,9 +768,9 @@ def test_create_then_delete_executes_from_snapshots_after_root_cleanup(
     api, account, *_ = outgoing
     public = create(outgoing)
     assert api.delete(f"/v1/messenger/messages/{public['uuid']}").status_code == 204
-    db.execute(
-        "DELETE FROM messenger_messages WHERE project_id=%s", (account.project_id,)
-    )
+    assert not db.execute(
+        "SELECT 1 FROM messenger_messages WHERE project_id=%s", (account.project_id,)
+    ).fetchall()
 
     async def run():
         async with sender(account, _test_database_url) as (service, server):

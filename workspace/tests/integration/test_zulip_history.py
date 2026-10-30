@@ -596,6 +596,42 @@ def test_history_yields_before_provider_io_when_realtime_is_delayed(incoming):
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("prepare_before_delete", [False, True])
+def test_history_cannot_restore_a_physically_deleted_message(
+    incoming, prepare_before_delete
+):
+    api, db, account, _, _ = incoming
+    incoming_tests.apply(incoming, incoming_tests.event(identifier=101))
+    request(db, account)
+
+    async def run():
+        async with worker(incoming, {}) as (service, _):
+            selected = await job(service, account)
+            page = [message(101, flags=["starred"]), message(102, flags=[])]
+            if prepare_before_delete:
+                batch = await service.operations.prepare_batch(selected, page)
+            await asyncio.to_thread(
+                incoming_tests.apply,
+                incoming,
+                {"type": "delete_message", "message_id": 101},
+            )
+            if not prepare_before_delete:
+                batch = await service.operations.prepare_batch(selected, page)
+            async with service.db.transaction() as connection:
+                await service.operations.merge_batch(connection, selected, batch)
+
+    asyncio.run(run())
+    incoming_tests.drain()
+    assert db.execute(
+        "SELECT provider_identity FROM messenger_messages WHERE project_id=%s ORDER BY provider_identity",
+        (api.project_id,),
+    ).fetchall() == [("102",)]
+    assert db.execute(
+        "SELECT count(*) FROM messenger_user_message_stars WHERE project_id=%s",
+        (api.project_id,),
+    ).fetchone() == (0,)
+
+
 def test_bulk_merge_uses_a_bounded_number_of_statements(incoming):
     _, db, account, _, _ = incoming
     request(db, account)
