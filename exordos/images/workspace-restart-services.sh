@@ -25,6 +25,8 @@ SERVICE_NAMES=(
     workspace-zulip-outgoing
     workspace-messenger-worker
     workspace-messenger-events
+    workspace-push-handler
+    workspace-push-sender
 )
 
 for service_name in "${SERVICE_NAMES[@]}"; do

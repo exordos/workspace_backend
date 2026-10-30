@@ -29,6 +29,7 @@ from restalchemy.common import contexts
 from restalchemy.dm import filters as dm_filters
 from workspace.common import mutation_journal_opts
 from workspace.messenger_api import publication
+
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.dm import event_payloads
 from workspace.messenger_api.dm import message_payloads
@@ -442,7 +443,8 @@ def _create_workspace_event(
         action=action,
         payload=_payload_with_kind(kind, payload),
     )
-    return event.insert(session=session)
+    result = event.insert(session=session)
+    return result
 
 
 def create_message_events(

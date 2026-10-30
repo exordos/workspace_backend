@@ -26,6 +26,8 @@ import webob
 from gcl_iam import middlewares as iam_middlewares
 from restalchemy.api import middlewares
 
+from oslo_config import cfg
+from workspace.common import mobile_push_opts
 from workspace.messenger_api import exceptions as messenger_exceptions
 from workspace.messenger_api.api import versions
 
@@ -70,7 +72,8 @@ def build_server_settings(req: typing.Any) -> dict[str, typing.Any]:
             "saml": False,
             "openid connect": False,
         },
-        "push_notifications_enabled": True,
+        "push_notifications_enabled": mobile_push_opts.enabled(),
+        "organization_uuid": cfg.CONF.mobile_push.organization_uuid,
         "email_auth_enabled": True,
         "require_email_format_usernames": True,
         "realm_url": realm_url,

@@ -20,6 +20,8 @@ set -eu
 set -x
 set -o pipefail
 
+install -d -m 0755 /etc/workspace/workspace.conf.d /etc/nginx/workspace.d/locations
+
 GC_PATH="/opt/workspace"
 GC_CFG_DIR=/etc/workspace
 VENV_PATH="$GC_PATH/.venv"
@@ -31,6 +33,8 @@ WORKSPACE_BINARIES=(
     workspace-zulip-outgoing
     workspace-messenger-worker
     workspace-messenger-events
+    workspace-push-handler
+    workspace-push-sender
 )
 WORKSPACE_HELPERS=(
     backend-bootstrap.sh:workspace-bootstrap

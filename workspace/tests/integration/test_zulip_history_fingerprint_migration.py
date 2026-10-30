@@ -62,7 +62,11 @@ def test_hash_migration_round_trip_handles_recreated_flags_and_archived_tasks(
     with conftest.isolated_migration_database(
         "0250-Index-unread-Messenger-mentions-by-viewer-40a61a.py"
     ) as url:
-        path = next(conftest.MIGRATIONS_DIR.glob("0251-*.py"))
+        path = next(
+            conftest.MIGRATIONS_DIR.glob(
+                "0251-Add-Zulip-history-snapshot-fingerprints-*.py"
+            )
+        )
         spec = importlib.util.spec_from_file_location(
             "history_fingerprint_migration", path
         )

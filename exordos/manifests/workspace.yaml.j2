@@ -496,7 +496,6 @@ resources:
           max_pending_per_user = 4096
           receipt_retention_seconds = 86400
 
-
           [topic_summary]
           secret_encryption_key = {$core.secret.passwords.$workspace_topic_summary_secret_key:value}
           connect_timeout_seconds = 30
@@ -537,6 +536,7 @@ resources:
 
           server {
               listen 80;
+              include /etc/nginx/workspace.d/locations/*.conf;
               server_name _;
               client_max_body_size 50m;
 

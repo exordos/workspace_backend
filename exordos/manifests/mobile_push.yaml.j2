@@ -1,0 +1,142 @@
+# Install after workspace, the local Notification, and its push_source manifest.
+# The organization UUID is imported from the local Notification transport.
+name: workspace_mobile_push
+description: Native Workspace mobile push producer
+schema_version: 1
+version: "{{ version | default('1.0.0') }}"
+api_version: v1
+requirements:
+  workspace:
+    from_version: "1.3.2-dev"
+  exordos_notification:
+    from_version: "1.2.8-dev"
+  notification_push_source:
+    from_version: "1.0.0"
+  {{ notification_transport | default('notification_relay') }}:
+    from_version: "1.0.0"
+imports:
+  organization_uuid:
+    element: "${{ notification_transport | default('notification_relay') }}"
+    kind: resource
+    link: "$core.vs.variables.$organization_uuid"
+  backend_node:
+    element: "$workspace"
+    kind: resource
+    link: "$core.compute.nodes.$workspace_backend"
+  notification_node:
+    element: "$exordos_notification"
+    kind: resource
+    link: "$core.compute.nodes.$notification_cp"
+  source_user:
+    element: "$notification_push_source"
+    kind: resource
+    link: "$core.iam.users.$source"
+  iam_default_client_uuid:
+    element: "$core"
+    kind: resource
+    link: "$core.vs.variables.$iam_default_client_uuid"
+  core_local_domain:
+    element: "$core"
+    kind: resource
+    link: "$core.dns.domains.$local_domain"
+resources:
+  $core.iam.tokens:
+    push_sender:
+      name: workspace-mobile-push-sender
+      user: $workspace_mobile_push.imports.$source_user:uuid
+      iam_client: $workspace_mobile_push.imports.$iam_default_client_uuid:value
+      issuer: f"http://core.{$workspace_mobile_push.imports.$core_local_domain:name}/api/core/v1/iam/clients/{$workspace_mobile_push.imports.$iam_default_client_uuid:value}"
+      scope: ""
+      auto_renew: true
+      expiration_delta: 604800
+  $core.config.configs:
+    authentication:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      path: /etc/workspace/mobile-push-auth.json
+      mode: "0600"
+      on_change:
+        kind: no_action
+      target:
+        kind: node
+        node: $workspace_mobile_push.imports.$backend_node:uuid
+      body:
+        kind: text
+        content: |
+          f"{
+            "access_token": "{$core.iam.tokens.$push_sender:access_token}"
+          }"
+    notification_endpoint:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      path: /etc/workspace/workspace.conf.d/90-mobile-push.conf
+      mode: "0600"
+      target:
+        kind: node
+        node: $workspace_mobile_push.imports.$backend_node:uuid
+      on_change:
+        kind: shell
+        command: /usr/local/bin/workspace-restart-services
+      body:
+        kind: text
+        content: |
+          f"
+          [mobile_push]
+          organization_uuid = {$workspace_mobile_push.imports.$organization_uuid:value}
+          notification_endpoint = http://{$workspace_mobile_push.imports.$notification_node:default_network:ipv4}:8080
+          notification_auth_file = /etc/workspace/mobile-push-auth.json
+          "
+
+    public_notification_gateway:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      path: /etc/nginx/workspace.d/locations/90-notification.conf
+      mode: "0644"
+      target:
+        kind: node
+        node: $workspace_mobile_push.imports.$backend_node:uuid
+      on_change:
+        kind: shell
+        command: /usr/local/bin/workspace-nginx-reload
+      body:
+        kind: text
+        content: |
+          f"
+          location ^~ /api/workspace/notification/ {
+              proxy_pass http://{$workspace_mobile_push.imports.$notification_node:default_network:ipv4}:8080/;
+              proxy_set_header Host $host;
+              proxy_set_header X-Notification-Relay 1;
+              proxy_set_header Authorization $http_authorization;
+              proxy_connect_timeout 5s;
+              proxy_read_timeout 15s;
+          }
+          "
+
+  $core.em.services:
+    push_handler:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace-push-handler
+      path: /usr/bin/workspace-push-handler --config-file /etc/workspace/workspace.conf --config-dir /etc/workspace/workspace.conf.d
+      user: root
+      target:
+        kind: node
+        node: $workspace_mobile_push.imports.$backend_node:uuid
+      service_type:
+        kind: simple
+        count: 1
+      target_status: enabled
+      before:
+        - kind: shell
+          command: /usr/local/bin/workspace-bootstrap
+    push_sender:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace-push-sender
+      path: /usr/bin/workspace-push-sender --config-file /etc/workspace/workspace.conf --config-dir /etc/workspace/workspace.conf.d
+      user: root
+      target:
+        kind: node
+        node: $workspace_mobile_push.imports.$backend_node:uuid
+      service_type:
+        kind: simple
+        count: 1
+      target_status: enabled
+      before:
+        - kind: shell
+          command: /usr/local/bin/workspace-bootstrap
