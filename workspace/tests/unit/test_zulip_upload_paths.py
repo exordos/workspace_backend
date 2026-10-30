@@ -1,17 +1,12 @@
 # Copyright 2026 Genesis Corporation.
 # Licensed under the Apache License, Version 2.0 (the "License").
 
-import asyncio
 import base64
-import contextlib
 import urllib.parse
-from unittest import mock
 
-import psycopg
 import pytest
 
 from workspace.bridges.zulip import message_conversion
-from workspace.services import zulip_history
 from workspace.messenger_api.dm import models
 
 
@@ -52,46 +47,6 @@ def test_invalid_temporary_upload_is_not_used_as_an_authenticated_path(target):
 def test_regular_upload_path_keeps_its_identity():
     path = "/user_uploads/1/key/file%20name.pdf"
     assert message_conversion.zulip_upload_path(path) == path
-
-
-@pytest.mark.parametrize(
-    "error,permanent",
-    [
-        (psycopg.errors.StringDataRightTruncation("too long"), True),
-        (psycopg.errors.LockNotAvailable("lock timeout"), False),
-        (psycopg.errors.SerializationFailure("concurrent change"), False),
-    ],
-)
-def test_history_does_not_retry_a_permanent_length_failure(error, permanent):
-    account = dict.fromkeys(
-        ("project_id", "provider_uuid", "owner_user_uuid", "external_account_id"),
-        "identity",
-    )
-    account["settings"] = {"server_url": "https://zulip.example.com"}
-    intent = {
-        "id": 1,
-        "identity": zulip_history.identity(account),
-        "payload": {"type": "message"},
-        "expected": None,
-        "fetched_at": None,
-        "attempts": 20,
-    }
-
-    @contextlib.asynccontextmanager
-    async def transaction():
-        yield mock.AsyncMock()
-
-    async def run():
-        service = zulip_history.ZulipHistoryService("postgresql://unused")
-        service.db = mock.Mock(transaction=transaction, sql=mock.AsyncMock())
-        service.activity = mock.AsyncMock(return_value={"pending": False})
-        service.prepare = mock.AsyncMock(side_effect=error)
-        await service.process(account, intent)
-        service.db.sql.assert_awaited_once_with(
-            zulip_history.RETRY_INTENT_SQL, (str(error), permanent, 256, 1)
-        )
-
-    asyncio.run(run())
 
 
 @pytest.mark.parametrize(

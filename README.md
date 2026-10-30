@@ -56,32 +56,36 @@ Workspace event projection publishes snapshots over WebSocket, including edits,
 reactions and personal flags on old messages. Provider changes never create
 outgoing intentions. Native copies retain empty `provider_identity`.
 
-Initial registration persists its catalog snapshot and requests background recovery.
-The separate `workspace-zulip-history` process compares catalogs and message pages
-against current Workspace state. Only differences enter `zulip_history_intents`;
-the same incoming operations apply them without publishing client events.
-History updates messages, catalogs, flags, reactions and counter projections in
-the database silently, including deferred projection tasks. Clients read imported
-data through the unchanged REST API. Normal realtime changes still publish
-WebSocket events. Incoming and history changes never produce provider outbox work.
+Initial registration saves its catalog and fixed realtime boundary for the account.
+The separate `workspace-zulip-history` process imports history silently in durable
+pages of up to 1000 messages, newest first. Accounts of the same project/provider
+advance at approximately the same message-ID frontier: a newly connected account
+catches up before existing accounts continue into older history. Different providers
+can run independently. A process restart resumes the saved page; a new realtime
+queue registration establishes a fresh boundary and repeats the history scan
+idempotently, including any gap while disconnected.
 
-History cursors in `zulip_history_jobs` survive queue replacement and process
-restarts. The scanner loads recent messages first, fills gaps from its confirmed
-forward cursor, and walks older history backwards. Repeated queue resets coalesce
-into one job without resetting backfill or repair progress. A rolling repair also
-finds missed edits, reactions and flags on old messages. Unavailable messages are
-rechecked individually; access is removed only for the affected account.
+Each page prepares Workspace-shaped temporary tables for contents, messages,
+placements, visibility, sparse flags, reactions and files. Attachment hashes identify
+reusable blobs; missing bytes reach the configured S3 storage before the merge.
+`INSERT ... SELECT`, `UPDATE ... FROM` and scoped `DELETE` statements merge the page
+in one transaction, together with its cursor. Existing identical rows stay unchanged.
+History emits no message WebSocket events or provider outgoing intentions. The
+independent counter process recomputes affected topic, stream and folder counts.
+Concurrent changes to old messages and personal flags may be overwritten by the
+import snapshot; this deliberately avoids a second conflict/replay mechanism.
 
-`[zulip_history]` defaults to pages of 500 messages, at most 1000 pending intentions,
-four concurrent account tasks and four HTTP connections, with one active task per
-provider. Page admission is serial; admitted intentions can prepare and apply
-concurrently. Accounts take turns after each page or intention. History pauses
-when realtime work is delayed by 0.5 seconds or a project's publication backlog
-reaches 256 entries. A completed repair restarts after 86400 seconds. Requests and file
-preparation run outside transactions. Short snapshot-isolation transactions
-check account identity, pending local work and concurrent changes before applying;
-stale message snapshots are fetched again. Permanent failures retain their error
-for inspection without holding up other intentions.
+`[zulip_history]` defaults to pages of 1000 messages, four HTTP connections and four
+concurrent providers, with one active page per provider. History yields when realtime
+work is delayed by 0.5 seconds or the project's publication backlog reaches 256.
+The per-message history-intent queue, rolling repair scanner and stale-snapshot
+comparison path are retired. Upgrading requires stopping incoming/history writers
+and a verified database backup; the forward-only cutover preserves Workspace data,
+removes old importer work and requests fresh realtime registration.
+After a successful merge, its downloaded JSON batch is deleted in the same
+transaction and its temporary tables disappear at commit. Failed batches remain
+available for retry. Workspace records and attachment bytes stay in their normal
+storage.
 
 `[zulip_incoming] connections` limits ordinary provider requests (default 128).
 Long polling has a separate connector so waiting accounts cannot block lookups.
@@ -137,15 +141,17 @@ Permanent failures remain visible with an error and do not block subsequent even
 
 Before upgrading, back up the database and stop the old realtime, history,
 incoming, outgoing and Messenger projection workers. Apply all migrations through
-0275 before starting the new workers and WebSocket services. Migration 0266
+0286 before starting the new workers and WebSocket services. Migration 0266
 preserves live queue cursors and received events while retiring history tasks;
 0267 enforces local native entities, 0269 retires queued delivery snapshots,
 0270 orders independent incoming messages separately, and 0271 deduplicates active
 dependency intentions. Migration 0272 avoids duplicate incoming counter scope
 invalidations; 0273 introduces immutable message contents and per-message revision
 history; 0274 adds resumable history reconciliation; and 0275 makes content hashes
-safe to restore with an empty search path. Start `workspace-zulip-history` alongside
-the incoming and outgoing services to import and repair history silently. These
+safe to restore with an empty search path. Migration 0285 separates message
+visibility from sparse flags and counters; 0286 replaces history intentions with
+bounded bulk batches. Start `workspace-zulip-history` alongside
+the incoming and outgoing services to import history silently. These
 cutovers are forward-only; rollback requires the backup. Deploy the matching Web
 UI after the backend because provider metadata now uses the flattened v6 fields.
 
@@ -260,12 +266,6 @@ have completed before the cutoff. Pending work, unresolved failures and dead
 letters remain available for recovery. Message content pages remain pinned by
 current messages, every edit revision and delivery snapshots. Outgoing conversion
 cache/pages are preserved while any unfinished message intent may still use them.
-
-The worker also deletes expired `history-imports/v1/<bridge>/<job>/batch.json`
-staging objects from the retired ingress protocol, using bounded paginated storage
-requests. Other object namespaces, file bytes, file metadata, migration archives,
-message history and recovery cursors are preserved. This staging collection needs
-`ListBucket` and `DeleteObject` access to the configured file bucket.
 
 Browser event replay retains its separate existing `event_retention_seconds`
 setting, and mutation receipt deduplication retains its separate

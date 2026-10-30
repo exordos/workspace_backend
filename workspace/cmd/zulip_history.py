@@ -38,11 +38,9 @@ def main() -> None:
         reaction_user_limit=config.getint(
             "messenger_reactions", "user_list_limit", fallback=5
         ),
-        batch_size=int(options.get("batch_size", 500)),
-        queue_limit=int(options.get("queue_limit", 1000)),
+        batch_size=int(options.get("batch_size", 1000)),
         publication_limit=int(options.get("publication_limit", 256)),
         realtime_delay=float(options.get("realtime_delay", 0.5)),
-        repair_interval=float(options.get("repair_interval", 86400)),
         poll_interval=float(options.get("poll_interval", 1)),
     )
     asyncio.run(service.run())

@@ -203,7 +203,14 @@ SELECT_TOPIC_SQL = """
 SELECT_STREAM_TOPICS_SQL = """
     SELECT * FROM messenger_topics WHERE project_id = %s AND stream_uuid = %s
 """
+# Freshly imported tables can still have tiny cardinality estimates. Resolve
+# provider IDs once so a nested loop cannot rescan history for each binding.
 SELECT_STATES_SQL = """
+    WITH messages AS MATERIALIZED (
+        SELECT project_id,uuid,provider_uuid FROM messenger_messages
+        WHERE project_id=%s AND source_name='zulip' AND provider_uuid=%s
+          AND (%s::text[] IS NULL OR provider_identity=ANY(%s::text[]))
+    )
     SELECT binding.uuid,binding.project_id,binding.user_uuid,binding.placement_uuid,
            placement.message_uuid,placement.stream_uuid,placement.topic_uuid,
            NOT EXISTS(SELECT 1 FROM messenger_user_message_unreads flag
@@ -212,20 +219,18 @@ SELECT_STATES_SQL = """
            EXISTS(SELECT 1 FROM messenger_user_message_stars flag
                WHERE (flag.project_id,flag.user_uuid,flag.placement_uuid)=
                    (binding.project_id,binding.user_uuid,binding.placement_uuid)) AS starred
-    FROM messenger_user_message_bindings binding
+    FROM messages message
     JOIN messenger_message_placements placement
-      ON placement.project_id=binding.project_id AND placement.uuid=binding.placement_uuid
+      ON placement.project_id=message.project_id AND placement.message_uuid=message.uuid
+    JOIN messenger_user_message_bindings binding
+      ON binding.project_id=placement.project_id AND binding.placement_uuid=placement.uuid
     JOIN messenger_stream_bindings member
       ON member.project_id=binding.project_id AND member.user_uuid=binding.user_uuid
      AND member.stream_uuid=placement.stream_uuid AND member.active
     JOIN messenger_streams stream
       ON stream.project_id=placement.project_id AND stream.uuid=placement.stream_uuid
-    JOIN messenger_messages message
-      ON message.project_id=placement.project_id AND message.uuid=placement.message_uuid
-    WHERE binding.project_id=%s AND binding.user_uuid=%s
-      AND (%s::text[] IS NULL OR message.provider_identity=ANY(%s::text[]))
-      AND stream.source_name='zulip' AND stream.provider_uuid=%s
-      AND message.source_name='zulip' AND message.provider_uuid=stream.provider_uuid
+    WHERE binding.user_uuid=%s
+      AND stream.source_name='zulip' AND stream.provider_uuid=message.provider_uuid
       AND NOT EXISTS (
           SELECT 1 FROM zulip_outgoing_intents intent
           WHERE intent.project_id=binding.project_id AND intent.entity_type='message_state'
@@ -1016,6 +1021,32 @@ class Operations:
                         "created",
                         stream["uuid"],
                     )
+        if merged:
+            # Unlinking deactivates this account's chats. An explicit new link
+            # restores its own DMs, including groups, while ordinary history
+            # replay still respects inactive memberships.
+            for stream in await rows(
+                connection,
+                """
+                SELECT stream.* FROM messenger_streams stream
+                JOIN messenger_stream_bindings member ON member.project_id=stream.project_id
+                    AND member.stream_uuid=stream.uuid
+                WHERE stream.project_id=%s AND stream.provider_uuid=%s
+                    AND stream.source_name='zulip' AND stream.provider_identity LIKE 'dm:%%'
+                    AND member.user_uuid=%s AND NOT member.active
+                    AND member.source_name='zulip' AND member.provider_uuid=stream.provider_uuid
+                    AND member.provider_identity=stream.provider_identity||':'||%s
+                """,
+                (
+                    account["project_id"],
+                    account["provider_uuid"],
+                    account["owner_user_uuid"],
+                    identity,
+                ),
+            ):
+                await self.bind(
+                    connection, values, stream, account["owner_user_uuid"], identity
+                )
         if changed:
             await self.account_snapshot(
                 connection,
@@ -2593,10 +2624,10 @@ class Operations:
             SELECT_STATES_SQL,
             (
                 account["project_id"],
-                account["owner_user_uuid"],
-                messages,
-                messages,
                 account["provider_uuid"],
+                messages,
+                messages,
+                account["owner_user_uuid"],
             ),
         )
         if not states:
