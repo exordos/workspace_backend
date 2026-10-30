@@ -2632,6 +2632,17 @@ def _process_delivery_snapshot(
     limit = min(max(batch_size, 1), MAX_FANOUT_BATCH_SIZE)
     if source_kind == "message.deleted":
         placement = original_payload["placement"]
+        # Match soft deletion: shared last-message rows precede dirty counters.
+        # The later physical purge repairs these pointers in this transaction.
+        session.execute(
+            "SELECT messenger_repair_last_message(%s,%s,%s,%s)",
+            (
+                task["project_id"],
+                _uuid(placement["stream_uuid"]),
+                _uuid(placement["topic_uuid"]),
+                _uuid(placement["uuid"]),
+            ),
+        )
         rows = session.execute(
             """
             SELECT access.user_uuid,membership.membership_generation
