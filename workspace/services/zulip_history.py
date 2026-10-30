@@ -14,7 +14,6 @@ from psycopg.types import json as pg_json
 from workspace.bridges.zulip import history, incoming_operations
 from workspace.services import zulip_outgoing
 
-
 LOG = logging.getLogger(__name__)
 SELECT_JOBS_SQL = """
     WITH candidates AS (
@@ -206,15 +205,17 @@ class ZulipHistoryService:
                 await connection.execute(
                     "DELETE FROM zulip_history_batches WHERE id=%s", (batch["id"],)
                 )
+                merged = time.monotonic()
             finished = time.monotonic()
             LOG.info(
-                "History batch account=%s messages=%s before=%s fetch_ms=%.1f prepare_ms=%.1f merge_ms=%.1f total_ms=%.1f",
+                "History batch account=%s messages=%s before=%s fetch_ms=%.1f prepare_ms=%.1f merge_ms=%.1f commit_ms=%.1f total_ms=%.1f",
                 account["uuid"],
                 len(batch["messages"]),
                 batch["next_before_id"],
                 1000 * (fetched - started),
                 1000 * (prepared - fetched),
-                1000 * (finished - prepared),
+                1000 * (merged - prepared),
+                1000 * (finished - merged),
                 1000 * (finished - started),
             )
         except asyncio.CancelledError:

@@ -6,6 +6,8 @@
 import asyncio
 import datetime
 import hashlib
+import logging
+import time
 import typing
 import urllib.parse
 import uuid
@@ -13,11 +15,29 @@ import uuid
 from psycopg import sql
 from psycopg.types import json as pg_json
 
-from workspace.bridges.zulip import incoming_operations, message_conversion
-from workspace.bridges.zulip import outgoing_operations
+from workspace.bridges.zulip import (
+    incoming_operations,
+    message_conversion,
+    outgoing_operations,
+)
 from workspace.common import emoji
 from workspace.messenger_api import file_storage
 from workspace.messenger_api.dm import base
+
+LOG = logging.getLogger(__name__)
+
+
+async def execute(
+    connection: typing.Any, operation: str, query: str, parameters: tuple = ()
+) -> None:
+    started = time.monotonic()
+    cursor = await connection.execute(query, parameters)
+    LOG.info(
+        "History SQL operation=%s duration_ms=%.1f rows=%s",
+        operation,
+        1000 * (time.monotonic() - started),
+        cursor.rowcount,
+    )
 
 
 REQUEST_SQL = """
@@ -100,12 +120,19 @@ def catalog_events(registration: dict) -> list[dict]:
 
 async def stage(connection: typing.Any, table: str, values: list[dict]) -> None:
     """A private relation with the same columns/defaults as the working table."""
+    started = time.monotonic()
     await connection.execute(
         sql.SQL(
             "CREATE TEMP TABLE {} (LIKE {} INCLUDING DEFAULTS INCLUDING GENERATED) ON COMMIT DROP"
         ).format(sql.Identifier("history_" + table), sql.Identifier(table))
     )
+    created = time.monotonic()
     if not values:
+        LOG.info(
+            "History stage table=%s rows=0 create_ms=%.1f copy_ms=0",
+            table,
+            1000 * (created - started),
+        )
         return
     columns = list(values[0])
     query = sql.SQL("COPY {} ({}) FROM STDIN").format(
@@ -123,6 +150,14 @@ async def stage(connection: typing.Any, table: str, values: list[dict]) -> None:
                 )
             )
 
+    LOG.info(
+        "History stage table=%s rows=%s create_ms=%.1f copy_ms=%.1f",
+        table,
+        len(values),
+        1000 * (created - started),
+        1000 * (time.monotonic() - created),
+    )
+
 
 async def merge(
     connection: typing.Any,
@@ -134,18 +169,26 @@ async def merge(
     # Names are internal constants, never provider input.
     names = ",".join(columns)
     match = " AND ".join(f"dst.{name}=src.{name}" for name in key)
-    await connection.execute(f"""
+    await execute(
+        connection,
+        "insert." + table,
+        f"""
         INSERT INTO {table} ({names}) SELECT {",".join("src." + c for c in columns)}
         FROM history_{table} src LEFT JOIN {table} dst ON {match}
         WHERE dst.{key[0]} IS NULL ON CONFLICT DO NOTHING
-    """)
+    """,
+    )
     if update:
-        await connection.execute(f"""
+        await execute(
+            connection,
+            "update." + table,
+            f"""
             UPDATE {table} dst SET {",".join(c + "=src." + c for c in update)},updated_at=now()
             FROM history_{table} src WHERE {match}
               AND ({",".join("dst." + c for c in update)}) IS DISTINCT FROM
                   ({",".join("src." + c for c in update)})
-        """)
+        """,
+        )
 
 
 class Operations(incoming_operations.Operations):
@@ -644,7 +687,7 @@ class Operations(incoming_operations.Operations):
     async def merge_batch(
         self, connection: typing.Any, account: dict, batch: dict
     ) -> None:
-        await connection.execute(TRANSACTION_SQL)
+        await execute(connection, "setup", TRANSACTION_SQL)
         for table, values in batch.items():
             await stage(connection, table, values)
         for table in (
@@ -661,7 +704,10 @@ class Operations(incoming_operations.Operations):
                     if table == "m_workspace_files"
                     else ("project_id", "uuid"),
                 )
-        await connection.execute("""
+        await execute(
+            connection,
+            "insert.contents",
+            """
             INSERT INTO messenger_message_contents(uuid,workspace_content,provider_content)
             SELECT DISTINCT ON (src.workspace_content_hash,src.provider_content_hash)
                    src.uuid,src.workspace_content,src.provider_content
@@ -670,15 +716,20 @@ class Operations(incoming_operations.Operations):
               ON dst.workspace_content_hash=src.workspace_content_hash
              AND dst.provider_content_hash IS NOT DISTINCT FROM src.provider_content_hash
             WHERE dst.uuid IS NULL ON CONFLICT DO NOTHING
-        """)
-        await connection.execute("""
+        """,
+        )
+        await execute(
+            connection,
+            "remap.contents",
+            """
             UPDATE history_messenger_messages message SET content_uuid=dst.uuid
             FROM history_messenger_message_contents src
             JOIN messenger_message_contents dst
               ON dst.workspace_content_hash=src.workspace_content_hash
              AND dst.provider_content_hash IS NOT DISTINCT FROM src.provider_content_hash
             WHERE message.content_uuid=src.uuid
-        """)
+        """,
+        )
         if batch["messenger_messages"]:
             await merge(
                 connection,
@@ -693,7 +744,9 @@ class Operations(incoming_operations.Operations):
             )
         # A canonical provider message has one destination; removing its old
         # placement lets the database cascade dependent rows.
-        await connection.execute(
+        await execute(
+            connection,
+            "delete.placements",
             """
             DELETE FROM messenger_message_placements dst
             USING history_messenger_message_placements src,messenger_streams stream
@@ -711,14 +764,18 @@ class Operations(incoming_operations.Operations):
                 await merge(connection, table, list(batch[table][0]), updates)
         for suffix in ("unreads", "stars", "mentions"):
             table = "messenger_user_message_" + suffix
-            await connection.execute(f"""
+            await execute(
+                connection,
+                "delete." + table,
+                f"""
                 DELETE FROM {table} dst USING history_messenger_user_message_bindings access
                 WHERE dst.project_id=access.project_id AND dst.user_uuid=access.user_uuid
                   AND dst.placement_uuid=access.placement_uuid AND NOT EXISTS (
                     SELECT 1 FROM history_{table} src
                     WHERE (src.project_id,src.user_uuid,src.placement_uuid)=
                           (dst.project_id,dst.user_uuid,dst.placement_uuid))
-            """)
+            """,
+            )
             await merge(
                 connection,
                 table,
@@ -731,7 +788,9 @@ class Operations(incoming_operations.Operations):
                 ],
                 key=("project_id", "user_uuid", "placement_uuid"),
             )
-        await connection.execute(
+        await execute(
+            connection,
+            "delete.reactions",
             """
             DELETE FROM messenger_message_reaction_facts dst USING history_messenger_messages message
             WHERE dst.project_id=message.project_id AND dst.canonical_message_uuid=message.uuid
@@ -749,7 +808,9 @@ class Operations(incoming_operations.Operations):
                 list(batch["messenger_message_reaction_facts"][0]),
                 key=("project_id", "canonical_message_uuid", "user_uuid", "emoji_name"),
             )
-        await connection.execute(
+        await execute(
+            connection,
+            "update.reaction_snapshot",
             """
             WITH counts AS (
                 SELECT message.project_id,message.uuid,fact.emoji_name,count(*) AS total,
@@ -776,14 +837,18 @@ class Operations(incoming_operations.Operations):
             (self.reaction_user_limit,),
         )
         # Existing native/provider facts can already own this user/emoji key.
-        await connection.execute("""
+        await execute(
+            connection,
+            "remap.reactions",
+            """
             UPDATE history_zulip_entity_links link SET entity_uuid=dst.uuid
             FROM history_messenger_message_reaction_facts src
             JOIN messenger_message_reaction_facts dst ON dst.project_id=src.project_id
                 AND dst.canonical_message_uuid=src.canonical_message_uuid
                 AND dst.user_uuid=src.user_uuid AND dst.emoji_name=src.emoji_name
             WHERE link.entity_type='reaction' AND link.entity_uuid=src.uuid
-        """)
+        """,
+        )
         if batch["zulip_entity_links"]:
             await merge(
                 connection,
@@ -798,7 +863,10 @@ class Operations(incoming_operations.Operations):
             )
         # One dirty scope per affected topic; the existing independent counter
         # process derives topic/stream/folder totals, without history WS events.
-        await connection.execute("""
+        await execute(
+            connection,
+            "queue.counters",
+            """
             INSERT INTO messenger_counter_updates(project_id,user_uuid,stream_uuid,topic_uuid,publish_updates)
             SELECT DISTINCT access.project_id,access.user_uuid,placement.stream_uuid,placement.topic_uuid,false
             FROM history_messenger_user_message_bindings access
@@ -807,5 +875,8 @@ class Operations(incoming_operations.Operations):
             ORDER BY 1,2,4
             ON CONFLICT(project_id,user_uuid,topic_uuid) DO UPDATE
                 SET revision=EXCLUDED.revision,next_retry_at=NULL
-        """)
-        await connection.execute("SELECT pg_notify('workspace_counters','')")
+        """,
+        )
+        await execute(
+            connection, "notify.counters", "SELECT pg_notify('workspace_counters','')"
+        )

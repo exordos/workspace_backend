@@ -160,6 +160,72 @@ def test_bulk_import_is_newest_first_idempotent_and_silent(incoming):
     assert incoming_tests.client_events(incoming) == before
 
 
+def test_realtime_flag_lookup_stays_bounded_before_history_is_analyzed(incoming):
+    api, db, account, *_ = incoming
+    incoming_tests.apply(incoming, incoming_tests.event())
+    tables = (
+        "messenger_messages",
+        "messenger_message_placements",
+        "messenger_user_message_bindings",
+        "messenger_stream_bindings",
+        "messenger_user_message_unreads",
+        "messenger_user_message_stars",
+    )
+    plans = []
+    original_rows = incoming_operations.rows
+
+    async def explain(connection, query, parameters=()):
+        if query == incoming_operations.SELECT_STATES_SQL:
+            result = await original_rows(
+                connection,
+                "EXPLAIN (ANALYZE,BUFFERS,TIMING OFF,FORMAT JSON) " + query,
+                parameters,
+            )
+            plans.append(result[0]["QUERY PLAN"][0]["Plan"])
+        return await original_rows(connection, query, parameters)
+
+    try:
+        # A just-imported database still has statistics from its initial rows.
+        for table in tables:
+            db.execute(f"ALTER TABLE {table} SET (autovacuum_enabled=false)")
+            db.execute(f"ANALYZE {table}")
+        messages = {i: message(i, flags=["starred"]) for i in range(200, 4296)}
+        request(db, account)
+
+        async def run():
+            async with worker(incoming, messages, batch_size=1000) as (service, _):
+                await drain(service, account)
+
+        asyncio.run(run())
+        with mock.patch.object(incoming_operations, "rows", side_effect=explain):
+            incoming_tests.apply(
+                incoming,
+                {
+                    "type": "update_message_flags",
+                    "op": "add",
+                    "flag": "read",
+                    "messages": [4295],
+                },
+            )
+        assert len(plans) == 1
+        # Count buffer work, not wall time: one ID must not rescan all history
+        # once for every personal binding when cardinality estimates are stale.
+        assert plans[0]["Shared Hit Blocks"] < 10000, plans[0]
+        placement = db.execute(
+            "SELECT placement.uuid FROM messenger_messages message "
+            "JOIN messenger_message_placements placement ON placement.message_uuid=message.uuid "
+            "AND placement.project_id=message.project_id "
+            "WHERE message.project_id=%s AND message.provider_uuid=%s AND message.provider_identity='4295'",
+            (account["project_id"], account["provider_uuid"]),
+        ).fetchone()[0]
+        visible = api.get(f"/v1/messenger/messages/{placement}").json()
+        assert visible["read"] and visible["starred"]
+    finally:
+        for table in tables:
+            db.execute(f"ALTER TABLE {table} RESET (autovacuum_enabled)")
+            db.execute(f"ANALYZE {table}")
+
+
 @pytest.mark.parametrize("field", ["cross_realm_bots", "realm_non_active_users"])
 def test_registration_keeps_historical_users_outside_the_active_realm(incoming, field):
     api, db, account, _, url = incoming
