@@ -1450,3 +1450,749 @@ def test_history_reuses_a_delivered_local_message_before_its_realtime_echo(incom
     assert imported["uuid"] == local["uuid"]
     assert imported["payload"] == payload
     assert incoming_tests.client_events(incoming) == before
+
+
+def test_unchanged_blocks_skip_preparation_after_worker_restart(incoming):
+    _, db, account, *_ = incoming
+    messages = {i: message(i) for i in range(101, 111)}
+    request(db, account)
+
+    async def first():
+        async with worker(incoming, messages) as (service, _):
+            await drain(service, account)
+
+    asyncio.run(first())
+    incoming_tests.drain()
+    request(db, account)
+
+    async def repeated():
+        async with worker(incoming, messages) as (service, _):
+            with mock.patch.object(
+                service.operations,
+                "prepare_batch",
+                wraps=service.operations.prepare_batch,
+            ) as prepare:
+                await drain(service, account)
+                assert prepare.call_count == 0
+
+    asyncio.run(repeated())
+    assert db.execute(
+        "SELECT count(*) FROM messenger_messages WHERE project_id=%s",
+        (account["project_id"],),
+    ).fetchone() == (10,)
+    assert db.execute(
+        "SELECT count(*) FROM messenger_counter_updates WHERE project_id=%s",
+        (account["project_id"],),
+    ).fetchone() == (0,)
+
+
+def test_partial_import_restart_skips_committed_blocks_and_finishes_older_history(
+    incoming,
+):
+    _, db, account, *_ = incoming
+    messages = {i: message(i) for i in range(101, 111)}
+    request(db, account, cutoff_id=110)
+
+    async def partial():
+        async with worker(incoming, messages) as (service, _):
+            await service.step(await job(service, account))  # Catalog.
+            for _ in range(2):
+                await service.step(await job(service, account))
+
+    asyncio.run(partial())
+    assert db.execute(
+        "SELECT count(*) FROM messenger_messages WHERE project_id=%s",
+        (account["project_id"],),
+    ).fetchone() == (6,)
+    # A fresh registration starts at the newest boundary, including one new ID.
+    messages[111] = message(111)
+    request(db, account, cutoff_id=111)
+
+    async def resume():
+        async with worker(incoming, messages) as (service, calls):
+            with mock.patch.object(
+                service.operations,
+                "prepare_batch",
+                wraps=service.operations.prepare_batch,
+            ) as prepare:
+                await drain(service, account)
+                imported = [
+                    [item["id"] for item in call.args[1]]
+                    for call in prepare.call_args_list
+                ]
+                assert imported == [[111], [102, 103, 104], [101]]
+            assert [call[2]["anchor"] for call in calls if call[1] == "/messages"] == [
+                112,
+                111,
+                108,
+                105,
+                102,
+            ]
+
+    asyncio.run(resume())
+    assert db.execute(
+        "SELECT count(*),count(DISTINCT provider_identity) FROM messenger_messages WHERE project_id=%s",
+        (account["project_id"],),
+    ).fetchone() == (11, 11)
+
+
+def test_deleted_range_edge_does_not_shift_other_block_hashes(incoming):
+    _, db, account, *_ = incoming
+    messages = {i: message(i) for i in range(101, 110)}
+    request(db, account, cutoff_id=109)
+
+    async def run():
+        async with worker(incoming, messages) as (service, _):
+            await drain(service, account)
+
+    asyncio.run(run())
+    del messages[107]
+    request(db, account, cutoff_id=109)
+
+    async def repeated():
+        async with worker(incoming, messages) as (service, _):
+            with mock.patch.object(
+                service.operations,
+                "prepare_batch",
+                wraps=service.operations.prepare_batch,
+            ) as prepare:
+                await drain(service, account)
+                assert [
+                    [m["id"] for m in call.args[1]] for call in prepare.call_args_list
+                ] == [[108, 109]]
+
+    asyncio.run(repeated())
+
+
+def test_changed_flags_use_personal_path_without_rewriting_messages(incoming):
+    _, db, account, *_ = incoming
+    messages = {i: message(i, flags=["read"]) for i in range(101, 107)}
+    request(db, account, cutoff_id=106)
+
+    async def run():
+        async with worker(incoming, messages) as (service, _):
+            await drain(service, account)
+
+    asyncio.run(run())
+    contents = db.execute(
+        "SELECT uuid,content_uuid,content_revision FROM messenger_messages WHERE project_id=%s ORDER BY uuid",
+        (account["project_id"],),
+    ).fetchall()
+    messages[105]["flags"] = ["starred"]
+    request(db, account, cutoff_id=106)
+
+    async def repeated():
+        async with worker(incoming, messages) as (service, _):
+            with (
+                mock.patch.object(
+                    service.operations,
+                    "prepare_batch",
+                    side_effect=AssertionError("Full preparation on flag-only change"),
+                ),
+                mock.patch.object(
+                    service.operations,
+                    "merge_personal_flags",
+                    wraps=service.operations.merge_personal_flags,
+                ) as flags,
+            ):
+                await drain(service, account)
+                assert flags.call_count == 1
+
+    asyncio.run(repeated())
+    assert (
+        contents
+        == db.execute(
+            "SELECT uuid,content_uuid,content_revision FROM messenger_messages WHERE project_id=%s ORDER BY uuid",
+            (account["project_id"],),
+        ).fetchall()
+    )
+    for table in ("messenger_user_message_unreads", "messenger_user_message_stars"):
+        assert db.execute(
+            f"SELECT count(*) FROM {table} WHERE project_id=%s",
+            (account["project_id"],),
+        ).fetchone() == (1,)
+
+
+def test_receipt_rolls_back_with_merge_and_durable_batch_survives_restart(incoming):
+    _, db, account, *_ = incoming
+    messages = {i: message(i) for i in range(101, 107)}
+    request(db, account, cutoff_id=106)
+
+    async def failed():
+        async with worker(incoming, messages) as (service, _):
+            await service.step(await job(service, account))
+            original = service.operations.merge_batch
+
+            async def fail_after_merge(*args):
+                await original(*args)
+                raise RuntimeError("Injected transaction failure")
+
+            with mock.patch.object(
+                service.operations, "merge_batch", side_effect=fail_after_merge
+            ):
+                await service.step(await job(service, account))
+
+    asyncio.run(failed())
+    assert db.execute(
+        "SELECT count(*) FROM zulip_history_block_receipts WHERE external_account_uuid=%s",
+        (account["uuid"],),
+    ).fetchone() == (0,)
+    assert db.execute(
+        "SELECT count(*) FROM messenger_messages WHERE project_id=%s",
+        (account["project_id"],),
+    ).fetchone() == (0,)
+    row = db.execute(
+        "SELECT before_id,messages IS NOT NULL FROM zulip_history_batches WHERE external_account_uuid=%s",
+        (account["uuid"],),
+    ).fetchone()
+    assert row == (107, True)
+    db.execute(
+        "UPDATE zulip_history_accounts SET next_attempt_at=now() WHERE external_account_uuid=%s",
+        (account["uuid"],),
+    )
+
+    async def resume():
+        async with worker(incoming, messages) as (service, calls):
+            await drain(service, account)
+            assert [call[2]["anchor"] for call in calls if call[1] == "/messages"] == [
+                104
+            ]
+
+    asyncio.run(resume())
+    assert db.execute(
+        "SELECT count(*) FROM messenger_messages WHERE project_id=%s",
+        (account["project_id"],),
+    ).fetchone() == (6,)
+
+
+@pytest.mark.parametrize(
+    "change", ["content", "reaction", "binding", "generation", "identity"]
+)
+def test_receipt_rechecks_changed_data_and_local_context(incoming, change):
+    _, db, account, *_ = incoming
+    messages = {i: message(i) for i in range(101, 107)}
+    request(db, account, cutoff_id=106)
+
+    async def first():
+        async with worker(incoming, messages) as (service, _):
+            await drain(service, account)
+
+    asyncio.run(first())
+    if change == "content":
+        messages[105]["content"] = "Changed history"
+    elif change == "reaction":
+        messages[105]["reactions"] = [
+            {
+                "user_id": 8,
+                "emoji_name": "smile",
+                "emoji_code": "1f604",
+                "reaction_type": "unicode_emoji",
+            }
+        ]
+    elif change == "binding":
+        db.execute(
+            "DELETE FROM messenger_user_message_bindings WHERE project_id=%s AND placement_uuid=(SELECT placement.uuid FROM messenger_message_placements placement JOIN messenger_messages message ON message.project_id=placement.project_id AND message.uuid=placement.message_uuid WHERE message.project_id=%s AND message.provider_identity='105')",
+            (account["project_id"], account["project_id"]),
+        )
+    elif change == "generation":
+        db.execute(
+            "UPDATE messenger_stream_bindings SET membership_generation=membership_generation+1 WHERE project_id=%s AND user_uuid=%s",
+            (account["project_id"], account["owner_user_uuid"]),
+        )
+    else:
+        db.execute(
+            "UPDATE m_external_accounts_v2 SET external_account_id='99' WHERE uuid=%s",
+            (account["uuid"],),
+        )
+        account["external_account_id"] = "99"
+    request(db, account, cutoff_id=106)
+
+    async def repeated():
+        async with worker(incoming, messages) as (service, _):
+            with mock.patch.object(
+                service.operations,
+                "prepare_batch",
+                wraps=service.operations.prepare_batch,
+            ) as prepare:
+                await drain(service, account)
+                assert prepare.call_count == (
+                    2 if change in ("generation", "identity") else 1
+                )
+
+    asyncio.run(repeated())
+
+
+def test_empty_block_is_rechecked_without_finishing_older_history(incoming):
+    _, db, account, *_ = incoming
+    messages = {i: message(i) for i in range(101, 110)}
+    request(db, account, cutoff_id=109)
+
+    async def run():
+        async with worker(incoming, messages) as (service, _):
+            await drain(service, account)
+
+    asyncio.run(run())
+    for identifier in (104, 105, 106):
+        del messages[identifier]
+    messages[101]["content"] = "Oldest block still needs import"
+    request(db, account, cutoff_id=109)
+
+    async def repeated():
+        async with worker(incoming, messages) as (service, _):
+            with mock.patch.object(
+                service.operations,
+                "prepare_batch",
+                wraps=service.operations.prepare_batch,
+            ) as prepare:
+                await drain(service, account)
+                assert [
+                    [item["id"] for item in call.args[1]]
+                    for call in prepare.call_args_list
+                ] == [[], [101, 102, 103]]
+
+    asyncio.run(repeated())
+
+
+def test_expanded_saved_range_fetches_all_pages_before_comparison(incoming):
+    _, db, account, *_ = incoming
+    messages = {i: message(i) for i in (100, 200, 300, 400, 500, 600)}
+    request(db, account, cutoff_id=600)
+
+    async def run():
+        async with worker(incoming, messages) as (service, _):
+            await drain(service, account)
+
+    asyncio.run(run())
+    messages.update({i: message(i) for i in (401, 402, 403, 404, 405)})
+    request(db, account, cutoff_id=600)
+
+    async def repeated():
+        async with worker(incoming, messages) as (service, _):
+            with mock.patch.object(
+                service.operations,
+                "prepare_batch",
+                wraps=service.operations.prepare_batch,
+            ) as prepare:
+                await drain(service, account)
+                assert [
+                    [item["id"] for item in call.args[1]]
+                    for call in prepare.call_args_list
+                ] == [[400, 401, 402, 403, 404, 405, 500, 600]]
+
+    asyncio.run(repeated())
+    assert db.execute(
+        "SELECT count(*) FROM messenger_messages WHERE project_id=%s",
+        (account["project_id"],),
+    ).fetchone() == (11,)
+
+
+def test_missing_attachment_is_retried_instead_of_sealing_receipt(
+    incoming, tmp_path, monkeypatch
+):
+    _, db, account, *_ = incoming
+    monkeypatch.setenv("WORKSPACE_FILE_STORAGE_PATH", str(tmp_path))
+    messages = {101: message(101, "[file](/user_uploads/1/key/file.txt)")}
+    request(db, account, cutoff_id=101)
+
+    async def unavailable():
+        async with worker(incoming, messages) as (service, _):
+            service.http.download = mock.AsyncMock(
+                side_effect=outgoing_operations.ApiError(403, {"msg": "Unavailable"})
+            )
+            await drain(service, account)
+
+    asyncio.run(unavailable())
+    assert db.execute(
+        "SELECT count(*) FROM zulip_history_block_receipts WHERE external_account_uuid=%s",
+        (account["uuid"],),
+    ).fetchone() == (0,)
+    request(db, account, cutoff_id=101)
+
+    async def available():
+        async with worker(incoming, messages) as (service, _):
+            service.http.download = mock.AsyncMock(
+                return_value=(b"Now available", "text/plain")
+            )
+            await drain(service, account)
+            assert service.http.download.await_count == 1
+
+    asyncio.run(available())
+    assert db.execute(
+        "SELECT count(*) FROM zulip_history_block_receipts WHERE external_account_uuid=%s",
+        (account["uuid"],),
+    ).fetchone() == (1,)
+
+
+def test_cache_hit_still_checks_disconnection_before_advancing_cursor(incoming):
+    from workspace.bridges.zulip import history_blocks
+
+    _, db, account, *_ = incoming
+    messages = {i: message(i) for i in range(101, 107)}
+    request(db, account, cutoff_id=106)
+
+    async def first():
+        async with worker(incoming, messages) as (service, _):
+            await drain(service, account)
+
+    asyncio.run(first())
+    request(db, account, cutoff_id=106)
+
+    async def disconnected():
+        async with worker(incoming, messages) as (service, _):
+            await service.step(await job(service, account))
+            current = await job(service, account)
+            original = history_blocks.context
+
+            async def disconnect(*args):
+                value = await original(*args)
+                db.execute(
+                    "UPDATE m_external_accounts_v2 SET disabled=true WHERE uuid=%s",
+                    (account["uuid"],),
+                )
+                return value
+
+            with mock.patch.object(history_blocks, "context", side_effect=disconnect):
+                await service.step(current)
+
+    asyncio.run(disconnected())
+    assert db.execute(
+        "SELECT before_id FROM zulip_history_accounts WHERE external_account_uuid=%s",
+        (account["uuid"],),
+    ).fetchone() == (107,)
+
+
+@pytest.mark.parametrize("migration_first", [False, True])
+@pytest.mark.parametrize("finished", [False, True])
+def test_upgrade_retains_an_already_fetched_batch(incoming, migration_first, finished):
+    _, db, account, *_ = incoming
+    filename = next(conftest.MIGRATIONS_DIR.glob("0287-*")).name
+    migration = conftest.DataMigration(filename)
+    migration.rollback_migration(filename)
+    messages = {i: message(i) for i in range(104 if finished else 101, 107)}
+    try:
+        request(db, account, cutoff_id=106)
+        db.execute(
+            "UPDATE zulip_history_accounts SET registration=NULL WHERE external_account_uuid=%s",
+            (account["uuid"],),
+        )
+        if migration_first:
+            migration.apply_migration(filename)
+        db.execute(
+            "INSERT INTO zulip_history_batches(external_account_uuid,before_id,next_before_id,messages,finished) VALUES(%s,107,104,%s,%s)",
+            (
+                account["uuid"],
+                incoming_operations.json_value([messages[i] for i in (104, 105, 106)]),
+                finished,
+            ),
+        )
+        migration.apply_migration(filename)
+    finally:
+        migration.apply_migration(filename)
+
+    async def resume():
+        async with worker(incoming, messages) as (service, calls):
+            await drain(service, account)
+            assert [call[2]["anchor"] for call in calls if call[1] == "/messages"] == (
+                [] if finished else [104]
+            )
+
+    asyncio.run(resume())
+    assert db.execute(
+        "SELECT count(*) FROM messenger_messages WHERE project_id=%s",
+        (account["project_id"],),
+    ).fetchone() == (len(messages),)
+    assert db.execute(
+        "SELECT lower_id FROM zulip_history_block_receipts WHERE external_account_uuid=%s AND upper_id=107",
+        (account["uuid"],),
+    ).fetchone() == (0 if finished else 104,)
+
+
+def test_sender_mapping_changes_invalidate_plain_stream_message_receipts(incoming):
+    _, db, account, *_ = incoming
+    messages = {101: message(101, sender_id=6)}
+    request(db, account, cutoff_id=101)
+
+    async def run():
+        async with worker(incoming, messages) as (service, _):
+            await drain(service, account)
+
+    asyncio.run(run())
+    new_author = uuid.uuid4()
+    conftest.seed_workspace_user(db, new_author, f"user-{new_author}")
+    db.execute(
+        incoming_operations.REGISTER_USER_SQL, (account["project_id"], new_author)
+    )
+    db.execute(
+        "UPDATE m_external_accounts_v2 SET owner_user_uuid=%s WHERE project_id=%s AND provider_uuid=%s AND external_account_id='6'",
+        (new_author, account["project_id"], account["provider_uuid"]),
+    )
+    request(db, account, cutoff_id=101)
+
+    async def repeated():
+        async with worker(incoming, messages) as (service, _):
+            with mock.patch.object(
+                service.operations,
+                "prepare_batch",
+                wraps=service.operations.prepare_batch,
+            ) as prepare:
+                await drain(service, account)
+                assert prepare.call_count == 1
+
+    asyncio.run(repeated())
+    assert db.execute(
+        "SELECT author_uuid FROM messenger_messages WHERE project_id=%s AND provider_uuid=%s AND provider_identity='101'",
+        (account["project_id"], account["provider_uuid"]),
+    ).fetchone() == (new_author,)
+
+
+@pytest.mark.parametrize("fixed", [False, True])
+@pytest.mark.parametrize("overlap", [False, True])
+def test_nonadvancing_history_page_is_retryable_without_committing(
+    incoming, fixed, overlap
+):
+    _, db, account, *_ = incoming
+    messages = {i: message(i) for i in range(101, 107)}
+    request(db, account, cutoff_id=106)
+
+    async def run():
+        async with worker(incoming, messages) as (service, _):
+            if fixed:
+                await drain(service, account)
+                request(db, account, cutoff_id=106)
+            await service.step(await job(service, account))  # Catalog.
+            current = await job(service, account)
+            original = service.http.request.side_effect
+            receipts = await service.db.sql(
+                "SELECT * FROM zulip_history_block_receipts ORDER BY upper_id"
+            )
+            calls = 0
+
+            async def bad_page(*args, **kwargs):
+                nonlocal calls
+                if args[2] != "/messages":
+                    return await original(*args, **kwargs)
+                calls += 1
+                assert calls <= (2 if fixed else 1), "Fetched a nonadvancing page again"
+                if fixed:
+                    ids = [104, 105] if overlap and calls == 2 else [105, 106]
+                else:
+                    ids = [106, 107] if overlap else [107]
+                return {
+                    "messages": [message(i) for i in ids],
+                    "found_oldest": False,
+                }
+
+            service.http.request.side_effect = bad_page
+            await service.step(current)
+            state = (
+                await service.db.sql(
+                    "SELECT before_id,error FROM zulip_history_accounts WHERE external_account_uuid=%s",
+                    (account["uuid"],),
+                )
+            )[0]
+            assert state["before_id"] == 107
+            assert (
+                state["error"] == "Zulip history page did not advance below its anchor"
+            )
+            assert calls == (2 if fixed else 1)
+            assert receipts == await service.db.sql(
+                "SELECT * FROM zulip_history_block_receipts ORDER BY upper_id"
+            )
+            assert (await service.db.sql("SELECT messages FROM zulip_history_batches"))[
+                0
+            ]["messages"] is None
+            await service.db.sql(
+                "UPDATE zulip_history_accounts SET next_attempt_at=now() WHERE external_account_uuid=%s",
+                (account["uuid"],),
+            )
+            service.http.request.side_effect = original
+            await drain(service, account)
+
+    asyncio.run(run())
+    assert db.execute(
+        "SELECT count(*) FROM messenger_messages WHERE project_id=%s",
+        (account["project_id"],),
+    ).fetchone() == (6,)
+
+
+def test_receipt_records_the_conversion_context_actually_prepared(incoming):
+    _, db, account, *_ = incoming
+    db.execute(
+        "UPDATE m_workspace_users SET first_name='Before' WHERE uuid=%s",
+        (account["owner_user_uuid"],),
+    )
+    messages = {101: message(101, "@**Before** hello")}
+    request(db, account, cutoff_id=101)
+
+    async def changed_during_preparation():
+        async with worker(incoming, messages) as (service, _):
+            original = service.operations.prepare_batch
+
+            async def change_context(*args):
+                batch = await original(*args)
+                db.execute(
+                    "UPDATE m_workspace_users SET first_name='After' WHERE uuid=%s",
+                    (account["owner_user_uuid"],),
+                )
+                return batch
+
+            with mock.patch.object(
+                service.operations, "prepare_batch", side_effect=change_context
+            ):
+                await drain(service, account)
+
+    asyncio.run(changed_during_preparation())
+    request(db, account, cutoff_id=101)
+
+    async def repeated():
+        async with worker(incoming, messages) as (service, _):
+            with mock.patch.object(
+                service.operations,
+                "prepare_batch",
+                wraps=service.operations.prepare_batch,
+            ) as prepare:
+                await drain(service, account)
+                assert prepare.call_count == 1
+
+    asyncio.run(repeated())
+
+
+def test_repeated_catalog_does_not_invalidate_committed_blocks(incoming):
+    _, db, account, *_ = incoming
+    messages = {i: message(i) for i in range(101, 107)}
+    registration = {
+        "subscriptions": [{"stream_id": 42, "name": "Channel", "description": ""}]
+    }
+    request(db, account, registration, cutoff_id=106)
+
+    async def first():
+        async with worker(incoming, messages) as (service, _):
+            await drain(service, account)
+
+    asyncio.run(first())
+    request(db, account, registration, cutoff_id=106)
+
+    async def repeated():
+        async with worker(incoming, messages) as (service, _):
+            with mock.patch.object(
+                service.operations,
+                "prepare_batch",
+                wraps=service.operations.prepare_batch,
+            ) as prepare:
+                await drain(service, account)
+                assert prepare.call_count == 0
+
+    asyncio.run(repeated())
+
+
+def test_temporary_upload_mapping_is_rechecked_before_skipping(
+    incoming, tmp_path, monkeypatch
+):
+    import base64
+
+    _, db, account, *_ = incoming
+    monkeypatch.setenv("WORKSPACE_FILE_STORAGE_PATH", str(tmp_path))
+    token = base64.b16encode(b"1/key/file.txt:1:signature").decode()
+    messages = {101: message(101, f"[file](/user_uploads/temporary/{token}/file.txt)")}
+    request(db, account, cutoff_id=101)
+
+    async def first():
+        async with worker(incoming, messages) as (service, _):
+            service.http.download = mock.AsyncMock(
+                return_value=(b"File bytes", "text/plain")
+            )
+            await drain(service, account)
+
+    asyncio.run(first())
+    db.execute(
+        "DELETE FROM m_workspace_files WHERE project_id=%s", (account["project_id"],)
+    )
+    request(db, account, cutoff_id=101)
+
+    async def repeated():
+        async with worker(incoming, messages) as (service, _):
+            service.http.download = mock.AsyncMock(
+                return_value=(b"File bytes", "text/plain")
+            )
+            with mock.patch.object(
+                service.operations,
+                "prepare_batch",
+                wraps=service.operations.prepare_batch,
+            ) as prepare:
+                await drain(service, account)
+                assert prepare.call_count == 1
+            assert service.http.download.await_count == 1
+
+    asyncio.run(repeated())
+
+
+def test_unrelated_topic_name_in_text_does_not_invalidate_receipt(incoming):
+    _, db, account, *_ = incoming
+    messages = {
+        101: message(101, "Sharedword"),
+        102: message(102, stream_id=43, subject="Sharedword"),
+    }
+    request(db, account, cutoff_id=102)
+
+    async def first():
+        async with worker(incoming, messages, batch_size=1) as (service, _):
+            await drain(service, account)
+
+    asyncio.run(first())
+    request(db, account, cutoff_id=102)
+
+    async def repeated():
+        async with worker(incoming, messages, batch_size=1) as (service, _):
+            with mock.patch.object(
+                service.operations,
+                "prepare_batch",
+                wraps=service.operations.prepare_batch,
+            ) as prepare:
+                await drain(service, account)
+                assert prepare.call_count == 0
+
+    asyncio.run(repeated())
+
+
+def test_new_topic_reference_in_same_block_is_reconverted_before_skipping(incoming):
+    _, db, account, *_ = incoming
+    messages = {
+        101: message(101, "#**Channel>Fresh**"),
+        102: message(102, subject="Fresh"),
+    }
+    request(db, account, cutoff_id=102)
+
+    async def imported():
+        async with worker(incoming, messages) as (service, _):
+            await drain(service, account)
+
+    asyncio.run(imported())
+    request(db, account, cutoff_id=102)
+
+    async def repeated(expected):
+        async with worker(incoming, messages) as (service, _):
+            with mock.patch.object(
+                service.operations,
+                "prepare_batch",
+                wraps=service.operations.prepare_batch,
+            ) as prepare:
+                await drain(service, account)
+                assert prepare.call_count == expected
+
+    asyncio.run(repeated(1))
+    payload = db.execute(
+        "SELECT content.workspace_content FROM messenger_messages message JOIN messenger_message_contents content ON content.uuid=message.content_uuid WHERE message.project_id=%s AND message.provider_identity='101'",
+        (account["project_id"],),
+    ).fetchone()[0]
+    assert "urn:topic:" in str(payload)
+    request(db, account, cutoff_id=102)
+    asyncio.run(repeated(1))
+    edited = db.execute(
+        "SELECT content_updated_at FROM messenger_messages WHERE project_id=%s AND provider_identity='101'",
+        (account["project_id"],),
+    ).fetchone()[0]
+    assert edited == datetime.datetime.fromtimestamp(
+        1700000000, datetime.timezone.utc
+    ).replace(tzinfo=None)
+    request(db, account, cutoff_id=102)
+    asyncio.run(repeated(0))

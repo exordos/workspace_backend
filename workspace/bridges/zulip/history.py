@@ -332,7 +332,7 @@ class Operations(incoming_operations.Operations):
         )
         prepared["quoted_messages"] = {str(item["id"]): item for item in messages}
         files = await self.prepare_files(account, messages, stream_map, users)
-        batch: dict[str, list] = {
+        batch: dict = {
             table: []
             for table in (
                 "messenger_topics",
@@ -548,6 +548,21 @@ class Operations(incoming_operations.Operations):
                     "data": {"account_identity": account["external_account_id"]},
                 }
             )
+        # Keep the exact resolver snapshot used above. Reading a newer catalog
+        # after merge could otherwise certify a payload prepared with old mappings.
+        batch["_context"] = {
+            "catalog": people,
+            "streams": streams,
+            # New topics are used for their own placements, but cross-message
+            # references were converted with the pre-merge resolver snapshot.
+            "topics": topics,
+            "references": prepared["references"],
+            "files": [record for record in files.values() if "missing" not in record],
+            "edited": {
+                str(row["uuid"]): row["content_updated_at"]
+                for row in batch["messenger_messages"]
+            },
+        }
         return batch
 
     async def prepare_files(
@@ -689,7 +704,8 @@ class Operations(incoming_operations.Operations):
     ) -> None:
         await execute(connection, "setup", TRANSACTION_SQL)
         for table, values in batch.items():
-            await stage(connection, table, values)
+            if table != "_context":
+                await stage(connection, table, values)
         for table in (
             "messenger_topics",
             "messenger_user_topic_bindings",
@@ -762,32 +778,7 @@ class Operations(incoming_operations.Operations):
         ):
             if batch[table]:
                 await merge(connection, table, list(batch[table][0]), updates)
-        for suffix in ("unreads", "stars", "mentions"):
-            table = "messenger_user_message_" + suffix
-            await execute(
-                connection,
-                "delete." + table,
-                f"""
-                DELETE FROM {table} dst USING history_messenger_user_message_bindings access
-                WHERE dst.project_id=access.project_id AND dst.user_uuid=access.user_uuid
-                  AND dst.placement_uuid=access.placement_uuid AND NOT EXISTS (
-                    SELECT 1 FROM history_{table} src
-                    WHERE (src.project_id,src.user_uuid,src.placement_uuid)=
-                          (dst.project_id,dst.user_uuid,dst.placement_uuid))
-            """,
-            )
-            await merge(
-                connection,
-                table,
-                [
-                    "project_id",
-                    "user_uuid",
-                    "placement_uuid",
-                    "stream_uuid",
-                    "topic_uuid",
-                ],
-                key=("project_id", "user_uuid", "placement_uuid"),
-            )
+        await self.merge_flags(connection)
         await execute(
             connection,
             "delete.reactions",
@@ -861,6 +852,41 @@ class Operations(incoming_operations.Operations):
                     "external_account_uuid",
                 ),
             )
+        await self.queue_counters(connection)
+
+    async def merge_flags(
+        self,
+        connection: typing.Any,
+        suffixes: tuple[str, ...] = ("unreads", "stars", "mentions"),
+    ) -> None:
+        for suffix in suffixes:
+            table = "messenger_user_message_" + suffix
+            await execute(
+                connection,
+                "delete." + table,
+                f"""
+                DELETE FROM {table} dst USING history_messenger_user_message_bindings access
+                WHERE dst.project_id=access.project_id AND dst.user_uuid=access.user_uuid
+                  AND dst.placement_uuid=access.placement_uuid AND NOT EXISTS (
+                    SELECT 1 FROM history_{table} src
+                    WHERE (src.project_id,src.user_uuid,src.placement_uuid)=
+                          (dst.project_id,dst.user_uuid,dst.placement_uuid))
+            """,
+            )
+            await merge(
+                connection,
+                table,
+                [
+                    "project_id",
+                    "user_uuid",
+                    "placement_uuid",
+                    "stream_uuid",
+                    "topic_uuid",
+                ],
+                key=("project_id", "user_uuid", "placement_uuid"),
+            )
+
+    async def queue_counters(self, connection: typing.Any) -> None:
         # One dirty scope per affected topic; the existing independent counter
         # process derives topic/stream/folder totals, without history WS events.
         await execute(
@@ -880,3 +906,86 @@ class Operations(incoming_operations.Operations):
         await execute(
             connection, "notify.counters", "SELECT pg_notify('workspace_counters','')"
         )
+
+    async def prepare_flags(self, account: dict, messages: list[dict]) -> dict | None:
+        records = await self.db.sql(
+            """
+            SELECT message.provider_identity,access.*,placement.message_uuid,placement.stream_uuid,placement.topic_uuid
+            FROM messenger_messages message
+            JOIN LATERAL (
+                SELECT * FROM messenger_message_placements
+                WHERE project_id=message.project_id AND message_uuid=message.uuid OFFSET 0
+            ) placement ON true
+            JOIN LATERAL (
+                SELECT * FROM messenger_user_message_bindings
+                WHERE project_id=placement.project_id AND placement_uuid=placement.uuid AND user_uuid=%s LIMIT 1
+            ) access ON true
+            JOIN LATERAL (
+                SELECT 1 FROM messenger_stream_bindings
+                WHERE project_id=placement.project_id AND stream_uuid=placement.stream_uuid
+                  AND user_uuid=access.user_uuid AND active LIMIT 1
+            ) member ON true
+            WHERE message.project_id=%s AND message.provider_uuid=%s
+                AND message.provider_identity=ANY(%s::text[])
+        """,
+            (
+                account["owner_user_uuid"],
+                account["project_id"],
+                account["provider_uuid"],
+                [str(item["id"]) for item in messages],
+            ),
+        )
+        if len(records) != len(messages):
+            return None
+        by_id = {row["provider_identity"]: row for row in records}
+        batch: dict[str, list] = {
+            table: []
+            for table in (
+                "messenger_message_placements",
+                "messenger_user_message_bindings",
+                "messenger_user_message_unreads",
+                "messenger_user_message_stars",
+            )
+        }
+        for item in messages:
+            record = by_id[str(item["id"])]
+            batch["messenger_message_placements"].append(
+                {
+                    key: record[key]
+                    for key in (
+                        "project_id",
+                        "message_uuid",
+                        "stream_uuid",
+                        "topic_uuid",
+                    )
+                }
+                | {"uuid": record["placement_uuid"]}
+            )
+            batch["messenger_user_message_bindings"].append(
+                {
+                    key: record[key]
+                    for key in ("uuid", "project_id", "placement_uuid", "user_uuid")
+                }
+            )
+            flag = {
+                key: record[key]
+                for key in (
+                    "project_id",
+                    "placement_uuid",
+                    "user_uuid",
+                    "stream_uuid",
+                    "topic_uuid",
+                )
+            }
+            if "read" not in item["flags"]:
+                batch["messenger_user_message_unreads"].append(flag)
+            if "starred" in item["flags"]:
+                batch["messenger_user_message_stars"].append(flag)
+        return batch
+
+    async def merge_personal_flags(self, connection: typing.Any, batch: dict) -> None:
+        await execute(connection, "setup", TRANSACTION_SQL)
+        for table, values in batch.items():
+            await stage(connection, table, values)
+        await self.merge_flags(connection, ("unreads", "stars"))
+        await self.queue_counters(connection)

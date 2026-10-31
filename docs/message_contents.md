@@ -45,3 +45,7 @@ automatic downgrade is unsupported.
 Client requests, payloads, UUIDs, event formats and pagination remain unchanged.
 Read views join content pages and preserve their prior public column sets; content
 UUIDs and revision numbers are internal and are not accepted as client fields.
+
+Zulip history can also reuse complete, successfully imported source blocks before
+content conversion. See [history block receipts](zulip_history_blocks.md) for
+stable boundaries, personal-state updates and restart semantics.
