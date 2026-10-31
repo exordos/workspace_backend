@@ -11,7 +11,7 @@ import time
 
 from psycopg.types import json as pg_json
 
-from workspace.bridges.zulip import history, incoming_operations
+from workspace.bridges.zulip import history, history_blocks, incoming_operations
 from workspace.services import zulip_outgoing
 
 LOG = logging.getLogger(__name__)
@@ -144,43 +144,55 @@ class ZulipHistoryService:
                 (account["uuid"], account["before_id"]),
             )
             batch = tasks[0]
+            receipts = await self.db.sql(
+                """SELECT * FROM zulip_history_block_receipts
+                   WHERE external_account_uuid=%s AND upper_id<=%s
+                   ORDER BY upper_id DESC LIMIT 1""",
+                (account["uuid"], batch["before_id"]),
+            )
+            receipt = receipts[0] if receipts else None
             if batch["messages"] is None:
-                page = await self.http.request(
-                    account,
-                    "GET",
-                    "/messages",
-                    {
-                        "anchor": batch["before_id"],
-                        "include_anchor": False,
-                        "num_before": self.batch_size,
-                        "num_after": 0,
-                        "apply_markdown": False,
-                    },
-                )
-                messages = [
-                    item
-                    for item in page["messages"]
-                    if item["id"] <= account["cutoff_id"]
-                    and item["timestamp"] < account["cutoff_at"].timestamp()
-                ]
-                batch["messages"] = messages
-                batch["next_before_id"] = min(
-                    (m["id"] for m in page["messages"]), default=0
-                )
-                batch["finished"] = page["found_oldest"] or not page["messages"]
+                await self.fetch_block(account, batch, receipt)
+            elif batch["lower_id"] is None:
+                # A preceding worker can persist its fetched page after migration.
+                batch["lower_id"] = 0 if batch["finished"] else batch["next_before_id"]
+            data_hash, state_hash = history_blocks.fingerprints(batch["messages"])
+            mode, context_hash = "full", None
+            if (
+                receipt
+                and receipt["upper_id"] == batch["before_id"]
+                and receipt["data_hash"] == data_hash
+            ):
+                async with self.db.transaction() as connection:
+                    context_hash = await history_blocks.context(
+                        connection, account, batch["messages"], self.reaction_user_limit
+                    )
+                if context_hash == receipt["context_hash"]:
+                    mode = "skip" if state_hash == receipt["state_hash"] else "flags"
+            fetched = time.monotonic()
+            normalized: dict = {}
+            if mode == "flags":
+                flags = await self.operations.prepare_flags(account, batch["messages"])
+                if flags is None:
+                    mode = "full"
+                else:
+                    normalized = flags
+            if mode != "skip":
+                # Only pages which still need work enter the durable JSON queue.
                 await self.db.sql(
-                    """
-                    UPDATE zulip_history_batches SET messages=%s,next_before_id=%s,finished=%s WHERE id=%s
-                """,
+                    """UPDATE zulip_history_batches SET messages=%s,next_before_id=%s,lower_id=%s,finished=%s WHERE id=%s""",
                     (
-                        pg_json.Jsonb(messages),
+                        pg_json.Jsonb(batch["messages"]),
                         batch["next_before_id"],
+                        batch["lower_id"],
                         batch["finished"],
                         batch["id"],
                     ),
                 )
-            fetched = time.monotonic()
-            normalized = await self.operations.prepare_batch(account, batch["messages"])
+            if mode == "full":
+                normalized = await self.operations.prepare_batch(
+                    account, batch["messages"]
+                )
             prepared = time.monotonic()
             # Recheck admission after HTTP/S3, before taking any working-row locks.
             if await self.busy(account["project_id"]):
@@ -189,7 +201,47 @@ class ZulipHistoryService:
             async with self.db.transaction() as connection:
                 if not await self.operations.current(connection, account):
                     return
-                await self.operations.merge_batch(connection, account, normalized)
+                if mode != "full" and context_hash != await history_blocks.context(
+                    connection, account, batch["messages"], self.reaction_user_limit
+                ):
+                    return
+                if mode == "full":
+                    await self.operations.merge_batch(connection, account, normalized)
+                elif mode == "flags":
+                    await self.operations.merge_personal_flags(connection, normalized)
+                # A temporary missing attachment must be retried on the next scan.
+                cacheable = mode != "full" or history_blocks.cacheable(
+                    batch["messages"], normalized
+                )
+                if mode != "skip":
+                    if cacheable:
+                        context_hash = await history_blocks.context(
+                            connection,
+                            account,
+                            batch["messages"],
+                            self.reaction_user_limit,
+                            normalized["_context"] if mode == "full" else None,
+                        )
+                        await connection.execute(
+                            """INSERT INTO zulip_history_block_receipts(external_account_uuid,upper_id,lower_id,data_hash,state_hash,context_hash)
+                               VALUES (%s,%s,%s,%s,%s,%s)
+                               ON CONFLICT(external_account_uuid,upper_id) DO UPDATE SET
+                                 lower_id=EXCLUDED.lower_id,data_hash=EXCLUDED.data_hash,
+                                 state_hash=EXCLUDED.state_hash,context_hash=EXCLUDED.context_hash""",
+                            (
+                                account["uuid"],
+                                batch["before_id"],
+                                batch["lower_id"],
+                                data_hash,
+                                state_hash,
+                                context_hash,
+                            ),
+                        )
+                    else:
+                        await connection.execute(
+                            "DELETE FROM zulip_history_block_receipts WHERE external_account_uuid=%s AND upper_id=%s",
+                            (account["uuid"], batch["before_id"]),
+                        )
                 await connection.execute(
                     """
                     UPDATE zulip_history_accounts SET before_id=%s,finished=%s,error=NULL,next_attempt_at=now()
@@ -208,10 +260,11 @@ class ZulipHistoryService:
                 merged = time.monotonic()
             finished = time.monotonic()
             LOG.info(
-                "History batch account=%s messages=%s before=%s fetch_ms=%.1f prepare_ms=%.1f merge_ms=%.1f commit_ms=%.1f total_ms=%.1f",
+                "History batch account=%s messages=%s before=%s mode=%s fetch_ms=%.1f prepare_ms=%.1f merge_ms=%.1f commit_ms=%.1f total_ms=%.1f",
                 account["uuid"],
                 len(batch["messages"]),
                 batch["next_before_id"],
+                mode,
                 1000 * (fetched - started),
                 1000 * (prepared - fetched),
                 1000 * (merged - prepared),
@@ -229,6 +282,63 @@ class ZulipHistoryService:
             """,
                 (str(error), account["uuid"], account["cutoff_at"]),
             )
+
+    async def fetch_block(
+        self, account: dict, batch: dict, receipt: dict | None
+    ) -> None:
+        fixed = receipt is not None and receipt["upper_id"] == batch["before_id"]
+        lower = (
+            0
+            if receipt is None
+            else receipt["lower_id"]
+            if fixed
+            else receipt["upper_id"]
+        )
+        anchor = batch["before_id"]
+        messages: list[dict] = []
+        while True:
+            page = await self.http.request(
+                account,
+                "GET",
+                "/messages",
+                {
+                    "anchor": anchor,
+                    "include_anchor": False,
+                    "num_before": self.batch_size,
+                    "num_after": 0,
+                    "apply_markdown": False,
+                },
+            )
+            raw = page["messages"]
+            if any(item["id"] >= anchor for item in raw):
+                raise ValueError("Zulip history page did not advance below its anchor")
+            oldest = min((item["id"] for item in raw), default=0)
+            messages.extend(
+                item
+                for item in raw
+                if item["id"] >= lower
+                and item["id"] <= account["cutoff_id"]
+                and item["timestamp"] < account["cutoff_at"].timestamp()
+                and (
+                    account["subscribed_streams"] is None
+                    or item["type"] != "stream"
+                    or item["stream_id"] in account["subscribed_streams"]
+                )
+            )
+            if not fixed:
+                lower = max(lower, 0 if page["found_oldest"] else oldest)
+                break
+            if page["found_oldest"] or not raw or oldest <= lower:
+                break
+            # Access expansion can add more than one page inside a saved range.
+            # A receipt is never compared against a truncated range.
+            anchor = oldest
+        batch.update(
+            messages=sorted(messages, key=lambda item: item["id"]),
+            lower_id=lower,
+            next_before_id=lower,
+            finished=lower == 0 and (page["found_oldest"] or not raw),
+        )
 
     async def defer(self, account_uuid: object, delay: float) -> None:
         await self.db.sql(
