@@ -240,6 +240,11 @@ class Operations(incoming_operations.Operations):
                 if item["type"] != "stream" or item["stream_id"] in subscriptions
             ]
         scope = (account["project_id"], account["provider_uuid"])
+        uuid_strings: dict = {}
+        owner = incoming_operations._uuid_text(uuid_strings, account["owner_user_uuid"])
+        provider = incoming_operations._uuid_text(
+            uuid_strings, account["provider_uuid"]
+        )
         people = await self.db.sql(PEOPLE_SQL, scope)
         users = {row["external_account_id"]: row["owner_user_uuid"] for row in people}
         needed = {str(item["sender_id"]) for item in messages}
@@ -305,7 +310,7 @@ class Operations(incoming_operations.Operations):
                 remote,
                 uuid.uuid5(
                     account["project_id"],
-                    f"{account['provider_uuid']}:message:{remote}",
+                    f"{provider}:message:{remote}",
                 ),
             )
             stream_uuid = stream_map[
@@ -313,7 +318,9 @@ class Operations(incoming_operations.Operations):
             ]["uuid"]
             public_ids[remote] = placements.get(
                 (identifier, stream_uuid)
-            ) or uuid.uuid5(identifier, str(stream_uuid))
+            ) or uuid.uuid5(
+                identifier, incoming_operations._uuid_text(uuid_strings, stream_uuid)
+            )
         prepared = {"catalog": people, "streams": streams, "topics": topics}
         prepared["references"] = await self.db.sql(
             incoming_operations.SELECT_MESSAGE_REFERENCES_SQL,
@@ -332,6 +339,9 @@ class Operations(incoming_operations.Operations):
         )
         prepared["quoted_messages"] = {str(item["id"]): item for item in messages}
         files = await self.prepare_files(account, messages, stream_map, users)
+        context_base = incoming_operations.conversion_context_base(
+            account, prepared, uuid_strings=uuid_strings
+        )
         batch: dict = {
             table: []
             for table in (
@@ -350,6 +360,11 @@ class Operations(incoming_operations.Operations):
             )
         }
         topic_map = {row["provider_identity"]: row for row in topics}
+        named_topics: dict[tuple, dict] = {}
+        for row in topics:
+            named_topics.setdefault(
+                (row["stream_uuid"], row["name"], row["is_done"]), row
+            )
         new_topics: dict[str, dict] = {}
         personal_topics: dict[object, dict] = {}
         content_pages: dict[tuple, dict] = {}
@@ -376,15 +391,12 @@ class Operations(incoming_operations.Operations):
             topic_identity = f"{remote}:{subject}"
             topic = topic_map.get(topic_identity)
             if topic is None:
-                topic = next(
+                topic = named_topics.get(
                     (
-                        t
-                        for t in topics
-                        if t["stream_uuid"] == stream["uuid"]
-                        and t["name"] == (subject.removeprefix("✔ ") or "General")
-                        and t["is_done"] == subject.startswith("✔ ")
-                    ),
-                    None,
+                        stream["uuid"],
+                        subject.removeprefix("✔ ") or "General",
+                        subject.startswith("✔ "),
+                    )
                 )
             if topic is None:
                 topic = new_topics.setdefault(
@@ -399,7 +411,7 @@ class Operations(incoming_operations.Operations):
                     },
                 )
             personal_topics[topic["uuid"]] = {
-                "uuid": uuid.uuid5(topic["uuid"], str(account["owner_user_uuid"])),
+                "uuid": uuid.uuid5(topic["uuid"], owner),
                 "project_id": account["project_id"],
                 "user_uuid": account["owner_user_uuid"],
                 "topic_uuid": topic["uuid"],
@@ -410,7 +422,7 @@ class Operations(incoming_operations.Operations):
             identifier = identities[str(item["id"])]
             placement = public_ids[str(item["id"])]
             context = incoming_operations.conversion_context(
-                account, item, stream, topic, placement, prepared
+                account, item, stream, topic, placement, prepared, base=context_base
             )
             for target, path in item.get("_files", []):
                 record = files[(stream["uuid"], path)]
@@ -422,7 +434,8 @@ class Operations(incoming_operations.Operations):
                     context.setdefault(reason, set()).add(target)
                 else:
                     context["files"][target] = message_conversion.file_urn(
-                        record["uuid"], record["content_type"]
+                        incoming_operations._uuid_text(uuid_strings, record["uuid"]),
+                        record["content_type"],
                     )
             payload = original.get((identifier, item["content"]))
             if payload is None:
@@ -464,7 +477,9 @@ class Operations(incoming_operations.Operations):
                 }
                 batch["messenger_message_reaction_facts"].append(fact)
                 reactions[name] = reactions.get(name, 0) + 1
-                reaction_users.setdefault(name, []).append(str(actor))
+                reaction_users.setdefault(name, []).append(
+                    incoming_operations._uuid_text(uuid_strings, actor)
+                )
                 batch["zulip_entity_links"].append(
                     {
                         "project_id": account["project_id"],
@@ -508,7 +523,7 @@ class Operations(incoming_operations.Operations):
             )
             batch["messenger_user_message_bindings"].append(
                 {
-                    "uuid": uuid.uuid5(placement, str(account["owner_user_uuid"])),
+                    "uuid": uuid.uuid5(placement, owner),
                     "project_id": account["project_id"],
                     "placement_uuid": placement,
                     "user_uuid": account["owner_user_uuid"],
@@ -525,10 +540,7 @@ class Operations(incoming_operations.Operations):
                 batch["messenger_user_message_unreads"].append(flag)
             if "starred" in item["flags"]:
                 batch["messenger_user_message_stars"].append(flag)
-            if (
-                f"](urn:user:{account['owner_user_uuid']})"
-                in payload["content"].lower()
-            ):
+            if f"](urn:user:{owner})" in payload["content"].lower():
                 batch["messenger_user_message_mentions"].append(flag)
         batch["messenger_topics"] = list(new_topics.values())
         batch["messenger_user_topic_bindings"] = list(personal_topics.values())
