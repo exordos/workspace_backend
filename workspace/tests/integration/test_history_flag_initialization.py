@@ -152,19 +152,32 @@ def test_history_initializer_migration_round_trip(db):
 
 
 @pytest.mark.parametrize("query_override", [False, True])
+@pytest.mark.parametrize("configured_override", [False, True])
 def test_benchmark_preserves_the_maintenance_database(
-    _database, tmp_path, query_override
+    _database, tmp_path, query_override, configured_override
 ):
     name = "cassi_benchmark_maintenance_" + uuid.uuid4().hex
-    with psycopg.connect(conftest.TEST_DB_URL, autocommit=True) as admin:
+    configured = urllib.parse.urlsplit(conftest.TEST_DB_URL)
+    query = dict(urllib.parse.parse_qsl(configured.query, keep_blank_values=True))
+    if configured_override:
+        query.setdefault("dbname", configured.path.lstrip("/"))
+    configured = configured._replace(
+        query=urllib.parse.urlencode(query, quote_via=urllib.parse.quote)
+    )
+    with psycopg.connect(configured.geturl(), autocommit=True) as admin:
         admin.execute(
             psycopg.sql.SQL("CREATE DATABASE {} TEMPLATE template0").format(
                 psycopg.sql.Identifier(name)
             )
         )
         try:
-            parts = urllib.parse.urlsplit(conftest.TEST_DB_URL)._replace(
-                path="/" + name
+            query = dict(
+                urllib.parse.parse_qsl(configured.query, keep_blank_values=True)
+            )
+            query.pop("dbname", None)
+            parts = configured._replace(
+                path="/" + name,
+                query=urllib.parse.urlencode(query, quote_via=urllib.parse.quote),
             )
             if query_override:
                 query = dict(urllib.parse.parse_qsl(parts.query))
@@ -174,6 +187,8 @@ def test_benchmark_preserves_the_maintenance_database(
                 )
             url = parts.geturl()
             with psycopg.connect(url, autocommit=True) as connection:
+                # Check the real endpoint before writing even a sentinel row.
+                assert connection.info.dbname == name
                 connection.execute("CREATE TABLE benchmark_sentinel(value int)")
                 connection.execute("INSERT INTO benchmark_sentinel VALUES(42)")
                 output = tmp_path / "benchmark.json"
