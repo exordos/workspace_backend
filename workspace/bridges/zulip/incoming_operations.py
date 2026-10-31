@@ -4,11 +4,13 @@
 """Resolve HTTP dependencies before short, atomic SQL domain changes."""
 
 import asyncio
+import collections
 import datetime
 import hashlib
 import json
 import re
 import typing
+import types
 import urllib.parse
 import uuid
 
@@ -606,6 +608,50 @@ def references(messages: list) -> dict:
     }
 
 
+def _uuid_text(cache: dict, identifier: object) -> str:
+    if identifier not in cache:
+        cache[identifier] = str(identifier)
+    return cache[identifier]
+
+
+def conversion_context_base(
+    account: dict, prepared: dict, *, uuid_strings: dict | None = None
+) -> dict:
+    """Resolve the immutable catalog once for a history page."""
+    strings: dict = {} if uuid_strings is None else uuid_strings
+    mentions, streams, stream_ids, direct, messages, topics = {}, {}, {}, {}, {}, {}
+    for person in prepared.get("catalog", []):
+        user = _uuid_text(strings, person["owner_user_uuid"])
+        mentions[f"id:{person['external_account_id']}"] = user
+        if person["first_name"]:
+            mentions[f"name:{person['first_name']}"] = user
+    for item in prepared.get("streams", []):
+        identifier = _uuid_text(strings, item["uuid"])
+        streams[item["name"]] = identifier
+        stream_ids[item["name"]] = item["provider_identity"]
+        if item["provider_identity"].startswith("dm:"):
+            direct[item["provider_identity"]] = identifier
+    for item in prepared.get("references", []):
+        messages[item["remote_id"]] = _uuid_text(strings, item["uuid"])
+    for item in prepared.get("topics", []):
+        topics[f"{item['stream_name']}>{item['name']}"] = _uuid_text(
+            strings, item["uuid"]
+        )
+    return {
+        "server_url": account["settings"]["server_url"],
+        "zulip_namespace": _uuid_text(strings, account["provider_uuid"]),
+        "own_user_id": account["external_account_id"],
+        "messages": prepared.get("quoted_messages", {}),
+        "mention_uuids": types.MappingProxyType(mentions),
+        "stream_uuids": types.MappingProxyType(streams),
+        "stream_ids": types.MappingProxyType(stream_ids),
+        "dm_stream_uuids": types.MappingProxyType(direct),
+        "message_uuids": types.MappingProxyType(messages),
+        "topic_uuids": types.MappingProxyType(topics),
+        "uuid_strings": strings,
+    }
+
+
 def conversion_context(
     account: dict,
     data: dict,
@@ -613,46 +659,64 @@ def conversion_context(
     topic: dict,
     public_uuid: object,
     prepared: dict,
+    *,
+    base: dict | None = None,
 ) -> dict:
+    # History only reads these mapping views. Single-event callers keep plain
+    # dictionaries, including the exact JSON shape used by the content cache.
+    shared = base is not None
+    if base is None:
+        base = conversion_context_base(account, prepared)
+    strings = base["uuid_strings"]
+    public = _uuid_text(strings, public_uuid)
+    stream_uuid = _uuid_text(strings, stream["uuid"])
+    topic_uuids = {}
+    stream_id = stream["provider_identity"]
+    if data["type"] == "stream":
+        stream_id = str(data["stream_id"])
+        topic_uuids[f"{stream['name']}>{data['subject']}"] = _uuid_text(
+            strings, topic["uuid"]
+        )
     context = {
-        "server_url": account["settings"]["server_url"],
-        "original_url": account["settings"]["server_url"].rstrip("/")
-        + f"/#narrow/near/{data['id']}",
-        "zulip_namespace": str(account["provider_uuid"]),
-        "own_user_id": account["external_account_id"],
+        "server_url": base["server_url"],
+        "original_url": base["server_url"].rstrip("/") + f"/#narrow/near/{data['id']}",
+        "zulip_namespace": base["zulip_namespace"],
+        "own_user_id": base["own_user_id"],
         "normalize_emoji": True,
         "strict_identities": True,
-        "current_message_uuid": str(public_uuid),
-        "message_uuids": {str(data["id"]): str(public_uuid)},
-        "topic_uuids": {},
-        "messages": prepared.get("quoted_messages", {}),
-        "mention_uuids": {},
-        "stream_uuids": {},
-        "stream_ids": {},
-        "dm_stream_uuids": {},
+        "current_message_uuid": public,
+        # Catalog entries used to be assigned after these per-message defaults.
+        # ChainMap preserves both their precedence and insertion order.
+        "message_uuids": collections.ChainMap(
+            base["message_uuids"], {str(data["id"]): public}
+        ),
+        "topic_uuids": collections.ChainMap(base["topic_uuids"], topic_uuids),
+        "messages": base["messages"],
+        "mention_uuids": base["mention_uuids"],
+        "stream_uuids": collections.ChainMap(
+            {stream["name"]: stream_uuid}, base["stream_uuids"]
+        ),
+        "stream_ids": collections.ChainMap(
+            {stream["name"]: stream_id}, base["stream_ids"]
+        ),
+        "dm_stream_uuids": collections.ChainMap(
+            {stream["provider_identity"]: stream_uuid}
+            if stream["provider_identity"].startswith("dm:")
+            else {},
+            base["dm_stream_uuids"],
+        ),
         "files": {},
     }
-    for person in prepared.get("catalog", []):
-        user = str(person["owner_user_uuid"])
-        context["mention_uuids"][f"id:{person['external_account_id']}"] = user
-        if person["first_name"]:
-            context["mention_uuids"][f"name:{person['first_name']}"] = user
-    for item in (*prepared.get("streams", []), stream):
-        context["stream_uuids"][item["name"]] = str(item["uuid"])
-        context["stream_ids"][item["name"]] = item["provider_identity"]
-        if item["provider_identity"].startswith("dm:"):
-            context["dm_stream_uuids"][item["provider_identity"]] = str(item["uuid"])
-    if data["type"] == "stream":
-        context["stream_ids"][stream["name"]] = str(data["stream_id"])
-        context["topic_uuids"][f"{stream['name']}>{data['subject']}"] = str(
-            topic["uuid"]
-        )
-    for item in prepared.get("references", []):
-        context["message_uuids"][item["remote_id"]] = str(item["uuid"])
-    for item in prepared.get("topics", []):
-        context["topic_uuids"][f"{item['stream_name']}>{item['name']}"] = str(
-            item["uuid"]
-        )
+    if not shared:
+        for name in (
+            "message_uuids",
+            "topic_uuids",
+            "mention_uuids",
+            "stream_uuids",
+            "stream_ids",
+            "dm_stream_uuids",
+        ):
+            context[name] = dict(context[name])
     return context
 
 
