@@ -7,8 +7,12 @@ import os
 import pathlib
 import subprocess
 import sys
+import urllib.parse
+import uuid
 
 import psycopg.rows
+import psycopg.sql
+import pytest
 
 from tools import benchmark_history_merge
 from workspace.tests.integration import conftest, test_zulip_history
@@ -147,36 +151,58 @@ def test_history_initializer_migration_round_trip(db):
             connection.execute(candidate)
 
 
-def test_benchmark_preserves_the_maintenance_database(_database, tmp_path):
-    with conftest.isolated_migration_database(
-        "0287-Cache-successful-Zulip-history-blocks-c0769e.py"
-    ) as url:
-        with psycopg.connect(url, autocommit=True) as connection:
-            connection.execute("CREATE TABLE benchmark_sentinel(value int)")
-            connection.execute("INSERT INTO benchmark_sentinel VALUES(42)")
-            output = tmp_path / "benchmark.json"
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "tools.benchmark_history_merge",
-                    "--rows",
-                    "0",
-                    "--messages",
-                    "8",
-                    "--repeats",
-                    "1",
-                    "--output",
-                    str(output),
-                ],
-                cwd=conftest.REPO_ROOT,
-                env={**os.environ, "WORKSPACE_TEST_DB_URL": url},
-                capture_output=True,
-                text=True,
-                timeout=45,
+@pytest.mark.parametrize("query_override", [False, True])
+def test_benchmark_preserves_the_maintenance_database(
+    _database, tmp_path, query_override
+):
+    name = "cassi_benchmark_maintenance_" + uuid.uuid4().hex
+    with psycopg.connect(conftest.TEST_DB_URL, autocommit=True) as admin:
+        admin.execute(
+            psycopg.sql.SQL("CREATE DATABASE {} TEMPLATE template0").format(
+                psycopg.sql.Identifier(name)
             )
-            assert result.returncode == 0, result.stdout + result.stderr
-            assert connection.execute(
-                "SELECT value FROM benchmark_sentinel"
-            ).fetchone() == (42,)
-            assert json.loads(output.read_text())["messages"] == 8
+        )
+        try:
+            parts = urllib.parse.urlsplit(conftest.TEST_DB_URL)._replace(
+                path="/" + name
+            )
+            if query_override:
+                query = dict(urllib.parse.parse_qsl(parts.query))
+                query["dbname"] = name
+                parts = parts._replace(
+                    query=urllib.parse.urlencode(query, quote_via=urllib.parse.quote)
+                )
+            url = parts.geturl()
+            with psycopg.connect(url, autocommit=True) as connection:
+                connection.execute("CREATE TABLE benchmark_sentinel(value int)")
+                connection.execute("INSERT INTO benchmark_sentinel VALUES(42)")
+                output = tmp_path / "benchmark.json"
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "tools.benchmark_history_merge",
+                        "--rows",
+                        "0",
+                        "--messages",
+                        "8",
+                        "--repeats",
+                        "1",
+                        "--output",
+                        str(output),
+                    ],
+                    cwd=conftest.REPO_ROOT,
+                    env={**os.environ, "WORKSPACE_TEST_DB_URL": url},
+                    capture_output=True,
+                    text=True,
+                    timeout=45,
+                )
+                assert result.returncode == 0, result.stdout + result.stderr
+                assert connection.execute(
+                    "SELECT value FROM benchmark_sentinel"
+                ).fetchone() == (42,)
+                assert json.loads(output.read_text())["messages"] == 8
+        finally:
+            admin.execute(
+                psycopg.sql.SQL("DROP DATABASE {}").format(psycopg.sql.Identifier(name))
+            )

@@ -262,6 +262,14 @@ def main():
             "Use ascending distinct nonnegative row counts and positive messages/repeats"
         )
     url = os.environ["WORKSPACE_TEST_DB_URL"]
+    parts = urllib.parse.urlsplit(url)
+    # libpq query parameters override the URI path. Keep the generated database
+    # authoritative even when the maintenance URL supplies ?dbname=....
+    query = [
+        (key, value)
+        for key, value in urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+        if key != "dbname"
+    ]
     name = "cassi_history_merge_bench_" + uuid.uuid4().hex
     with psycopg.connect(url, autocommit=True) as admin:
         admin.execute(
@@ -270,9 +278,10 @@ def main():
             )
         )
         try:
-            os.environ["WORKSPACE_TEST_DB_URL"] = (
-                urllib.parse.urlsplit(url)._replace(path="/" + name).geturl()
-            )
+            os.environ["WORKSPACE_TEST_DB_URL"] = parts._replace(
+                path="/" + name,
+                query=urllib.parse.urlencode(query, quote_via=urllib.parse.quote),
+            ).geturl()
             os.environ["WORKSPACE_REQUIRE_INTEGRATION_TESTS"] = "1"
             os.environ["WORKSPACE_HISTORY_MERGE_BENCHMARK"] = json.dumps(vars(args))
             root = pathlib.Path(__file__).resolve().parents[1]
