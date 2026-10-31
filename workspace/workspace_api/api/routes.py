@@ -5,6 +5,7 @@
 
 from restalchemy.api import routes
 
+from workspace.mail_api.api import routes as mail_routes
 from workspace.messenger_api.api import routes as messenger_routes
 from workspace.user_api.api import routes as user_routes
 from workspace.workspace_api.api import controllers
@@ -42,6 +43,14 @@ class ServiceRoute(user_routes.ServiceRoute):
     __allow_methods__ = [routes.FILTER, routes.GET]
 
 
+class MailRoute(routes.Route):
+    __controller__ = controllers.MailApiEndpointController
+    __allow_methods__ = [routes.FILTER]
+
+    folders = routes.route(mail_routes.MailFolderRoute)
+    messages = routes.route(mail_routes.MailMessageRoute)
+
+
 class WorkspaceApiEndpointRoute(routes.Route):
     __controller__ = controllers.WorkspaceApiEndpointController
     __allow_methods__ = [routes.FILTER]
@@ -53,3 +62,4 @@ class WorkspaceApiEndpointRoute(routes.Route):
     epoch = routes.route(messenger_routes.WorkspaceEpochRoute)
     push_devices = routes.route(messenger_routes.PushDeviceRoute)
     messenger = routes.route(MessengerRoute)
+    mail = routes.route(MailRoute)

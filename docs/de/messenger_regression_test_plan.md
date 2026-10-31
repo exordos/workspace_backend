@@ -44,7 +44,7 @@ Definition von Wiederaufbau, Wiederherstellung, Skalierung und Lastakzeptanz.
 | --- | --- | --- |
 | MSG-API-001 | Nach `/api/workspace/v1/messenger` jede Sammlung und Aktion Messenger anfordern. | Methoden, Statuscodes, Schemata, Paginierungen und Aktionspfade entsprechen der Basislinie. |
 | MSG-API-002 | Anfordern Sie `/api/workspace/v1/messenger/server_settings` mit und ohne Schrägstrich, wenden Sie dann das `realm_icon`-Ziel ohne Anmeldeinformationen aus und holen Sie es ab. | Die öffentliche Antwort enthält `urn:url:<realm>/logo-512x512.png`, und das verpackte Organisationsemblem wird anonym als `image/png` zurückgegeben. |
-| MSG-API-003 | Verlangen Sie alte `/api/messenger/**` Pfade und browserunzugängliche Anbieter-, E-Mail- oder Kalenderpfade. | Nginx oder die Anwendung gibt `404` zurück und leitet nicht weiter. |
+| MSG-API-003 | Alte `/api/messenger/**`-Pfade und browserunzugängliche Provider- oder Kalenderpfade anfragen. `/api/workspace/v1/mail/**` getrennt gegen den Mail-Vertrag prüfen. | Nicht unterstützte Pfade geben `404` zurück; Mail-Routen behalten dokumentierte Schemas und Owner-Scope. |
 | MSG-API-004 | Vergleichen Sie die erzeugten OpenAPI mit den eingefrorenen Messenger Ausgangswerten. | Die vorhandenen Ressourcen, erforderlichen Werte, Mehrteilsanforderungen, Aktionen und Antwortüberschriften bleiben unverändert. |
 | MSG-API-005 | Überprüfen Sie den durch den Browser sichtbaren Datenverkehr während der Verwendung von Messenger. | Es werden keine Datenbank-, Provider-Service-, SMTP, IMAP-, Maildir-, Mail- oder Kalenderimplementierungsdetails aufgedeckt. |
 

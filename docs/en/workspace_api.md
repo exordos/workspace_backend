@@ -3,8 +3,8 @@
 This document describes the browser-facing API contract served by the unified
 `workspace-api` REST service and the companion `workspace-messenger-events`
 websocket service. Messenger resources, users, client service settings,
-push-device registrations, and REST events all use `workspace-api`.
-Standalone Mail, Calendar, and External Users endpoints are not part of this
+push-device registrations, Mail resources, and REST events all use
+`workspace-api`. Calendar and External Users endpoints are not part of this
 release. Provider-neutral external account, chat, operation, policy, health,
 and bridge-instance resources are part of the Messenger API.
 
@@ -18,6 +18,7 @@ Direct local services:
 
 ```text
 Messenger REST API:  http://127.0.0.1:21084/v1/messenger
+Mail REST API:       http://127.0.0.1:21084/v1/mail
 Events WebSocket:    ws://127.0.0.1:21082/v1/events/ws
 Workspace REST API:  http://127.0.0.1:21084/v1
 Worker:              workspace-messenger-worker
@@ -33,13 +34,14 @@ the path:
 ```text
 Workspace REST root: /api/workspace/v1/...
 Messenger REST:      /api/workspace/v1/messenger/...
+Mail REST:           /api/workspace/v1/mail/...
 Events REST:         /api/workspace/v1/events/...
 Events WebSocket:    /api/workspace/v1/events/ws?last_epoch_version=<number>&epoch_generation=<generation>
 OpenAPI spec:        /api/workspace/specifications/3.0.3
 ```
 
 All REST requests under `/api/workspace/`, including
-`/api/workspace/v1/messenger/`, are proxied to `workspace-api` on
+`/api/workspace/v1/messenger/` and `/api/workspace/v1/mail/`, are proxied to `workspace-api` on
 `127.0.0.1:21084` without changing the public URL structure. The exact nginx
 location `/api/workspace/v1/events/ws` is proxied to the websocket service
 endpoint `/v1/events/ws` on `127.0.0.1:21082`.
@@ -266,6 +268,13 @@ authoritative snapshots before starting a new cursor.
 | Method | Path | Description |
 | --- | --- | --- |
 | `GET` | `/api/workspace/v1/` | List routes below `/api/workspace/v1/`. |
+| `GET` | `/api/workspace/v1/mail/` | List Mail routes. |
+| `GET`, `POST` | `/api/workspace/v1/mail/folders/` | List owned folders or create one. |
+| `GET`, `PUT`, `DELETE` | `/api/workspace/v1/mail/folders/{folder_uuid}` | Read, update, or soft-delete an empty owned folder. |
+| `GET`, `POST` | `/api/workspace/v1/mail/messages/` | List owned messages or create a draft. |
+| `GET`, `PUT`, `DELETE` | `/api/workspace/v1/mail/messages/{message_uuid}` | Read, update, or soft-delete an owned message. |
+| `POST` | `/api/workspace/v1/mail/messages/{message_uuid}/actions/move/invoke` | Move a message between owned folders of the same account. |
+| `POST` | `/api/workspace/v1/mail/messages/{message_uuid}/actions/send/invoke` | Durably queue a draft for an external mail runtime. |
 | `GET` | `/api/workspace/v1/messenger/` | List Messenger routes below `/api/workspace/v1/messenger/`. |
 | `GET` | `/api/workspace/v1/messenger/server_settings` | Return Zulip-like server settings. |
 | `GET` | `/api/workspace/v1/messenger/server_settings/` | Same as above; trailing slash is supported. |
@@ -1779,7 +1788,7 @@ metadata. Nginx rejects multipart requests larger than `50m` before they reach
 | `uuid` | UUID | no | yes | File identifier. |
 | `project_id` | UUID | no | yes | IAM project scope; hidden in API responses. |
 | `user_uuid` | UUID | no | yes | Owner/uploader. |
-| `stream_uuid` | UUID or `null` | yes | no | Stream that owns a chat file. Required for JSON create and `stream_members` multipart uploads; omitted for multipart uploads with `acl.mode=public`. |
+| `stream_uuid` | UUID or `null` | yes | no | Stream that owns a chat file. Required for JSON create and `stream_members` multipart uploads; omitted for multipart uploads with `acl.mode=owner` or `acl.mode=public`. |
 | `name` | string, max 255 | yes | no | File display name. |
 | `description` | string, max 255 | no | no | File description; defaults to an empty string. |
 | `content_type` | string | yes | no | MIME content type. |
@@ -1830,9 +1839,10 @@ description=Authenticated Workspace-wide file
 ```
 
 For multipart uploads, `file` is required and exactly one scope must be
-provided: either `stream_uuid`, or the JSON form field
-`acl={"mode":"public"}`. Public uploads reject `stream_uuid`; stream uploads
-retain the `stream_members` ACL. `name` defaults to the uploaded filename and
+provided: `stream_uuid`, `acl={"mode":"owner"}`, or
+`acl={"mode":"public"}`. Owner and public uploads reject `stream_uuid`;
+stream uploads retain the `stream_members` ACL. Owner mode is intended for
+private mail attachments. `name` defaults to the uploaded filename and
 `description` defaults to an empty string. The backend stores the bytes, sets
 `content_type` from the uploaded part, calculates `size_bytes`, and writes a
 SHA-256 `hash`. Both modes preserve the same binary plus JSON sidecar layout and

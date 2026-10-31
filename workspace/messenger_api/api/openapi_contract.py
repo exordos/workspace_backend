@@ -997,6 +997,119 @@ def add_current_user_contract(
     return specification
 
 
+def add_mail_contract(
+    specification: dict[str, typing.Any],
+    components: dict[str, typing.Any],
+) -> dict[str, typing.Any]:
+    schemas = components["components"]["schemas"]
+    folder_get = _component_schema(schemas, "MailFolder_Get")
+    folder_create_fields = (
+        "uuid",
+        "external_account_uuid",
+        "path",
+        "name",
+        "delimiter",
+        "special_use",
+    )
+    schemas["MailFolder_Create"] = _object_schema(
+        {
+            name: copy.deepcopy(folder_get["properties"][name])
+            for name in folder_create_fields
+        },
+        ["path", "name"],
+    )
+    schemas["MailFolder_Update"] = _object_schema(
+        {
+            name: copy.deepcopy(folder_get["properties"][name])
+            for name in folder_create_fields
+            if name != "uuid"
+        },
+        [],
+    )
+    folder_update = schemas["MailFolder_Update"]
+    folder_update["minProperties"] = 1
+
+    message_get = _component_schema(schemas, "MailMessage_Get")
+    message_content_fields = (
+        "from_address",
+        "to_addresses",
+        "cc_addresses",
+        "bcc_addresses",
+        "reply_to",
+        "subject",
+        "snippet",
+        "body_html",
+        "body_text",
+        "attachment_urns",
+        "in_reply_to",
+        "references",
+    )
+    message_create_fields = (
+        "uuid",
+        "folder_uuid",
+        *message_content_fields,
+        "seen",
+        "flagged",
+    )
+    schemas["MailMessage_Create"] = _object_schema(
+        {
+            name: copy.deepcopy(message_get["properties"][name])
+            for name in message_create_fields
+        },
+        ["folder_uuid"],
+    )
+    schemas["MailMessage_Update"] = _object_schema(
+        {
+            name: copy.deepcopy(message_get["properties"][name])
+            for name in (*message_content_fields, "seen", "flagged")
+        },
+        [],
+    )
+    message_update = schemas["MailMessage_Update"]
+    message_update["minProperties"] = 1
+
+    for name in (
+        "MailFolder_Create",
+        "MailFolder_Update",
+        "MailMessage_Create",
+        "MailMessage_Update",
+    ):
+        for property_schema in schemas[name]["properties"].values():
+            property_schema.pop("readOnly", None)
+
+    for name in ("MailMessage_Create", "MailMessage_Update"):
+        schema = _component_schema(schemas, name)
+        schema["properties"]["attachment_urns"]["items"].update(
+            {
+                "pattern": (
+                    "^urn:file:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-"
+                    "[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-"
+                    "[0-9a-fA-F]{12}(?:\\?.*)?$"
+                ),
+                "description": "Visible Workspace file URN stored in S3.",
+            }
+        )
+
+    paths = specification["paths"]
+    paths["/v1/mail/folders/"]["post"]["description"] = (
+        "Create an owner-scoped mail folder. An external_account_uuid must "
+        "refer to the current user's mail account in this project."
+    )
+    paths["/v1/mail/messages/"]["post"]["description"] = (
+        "Create a local draft. Attachments are existing visible Workspace "
+        "files referenced by urn:file identifiers; bytes remain in S3."
+    )
+    message_path = "/v1/mail/messages/{MailMessageUuid}"
+    paths[f"{message_path}/actions/send/invoke"]["post"]["description"] = (
+        "Atomically mark a draft queued, append a Workspace event, and create "
+        "one durable mail_outgoing_intent for an external mail runtime."
+    )
+    paths[f"{message_path}/actions/move/invoke"]["post"]["description"] = (
+        "Move a message to another owned folder belonging to the same mail account."
+    )
+    return specification
+
+
 def add_events_cursor_contract(
     specification: dict[str, typing.Any],
     events_path: str,

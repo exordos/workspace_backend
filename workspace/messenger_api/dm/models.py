@@ -545,6 +545,8 @@ WORKSPACE_EVENT_OBJECT_TYPES = (
     "folder_item",
     "file",
     "external_account",
+    "mail_folder",
+    "mail_message",
 )
 WORKSPACE_EVENT_ACTIONS = (
     "created",

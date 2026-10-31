@@ -3,8 +3,8 @@
 This document describes the browser-facing API contract served by the unified
 `workspace-api` REST service and the companion `workspace-messenger-events`
 websocket service. Messenger resources, users, client service settings,
-push-device registrations, and REST events all use `workspace-api`.
-独立邮件,日历和外部用户终端点不是此项的组成部分
+push-device registrations、Mail resources 和 REST events 都使用
+`workspace-api`。Calendar 与 External Users endpoints 不在本 release 中。
 提供者中立的外部帐户,聊天,运营,政策,健康,
 桥接实例资源是 Messenger API 的一部分.
 
@@ -18,6 +18,7 @@ push-device registrations, and REST events all use `workspace-api`.
 
 ```text
 Messenger REST API:  http://127.0.0.1:21084/v1/messenger
+Mail REST API:       http://127.0.0.1:21084/v1/mail
 Events WebSocket:    ws://127.0.0.1:21082/v1/events/ws
 Workspace REST API:  http://127.0.0.1:21084/v1
 Worker:              workspace-messenger-worker
@@ -33,13 +34,14 @@ Workspace OpenAPI:   http://127.0.0.1:21084/specifications/3.0.3
 ```text
 Workspace REST root: /api/workspace/v1/...
 Messenger REST:      /api/workspace/v1/messenger/...
+Mail REST:           /api/workspace/v1/mail/...
 Events REST:         /api/workspace/v1/events/...
 Events WebSocket:    /api/workspace/v1/events/ws?last_epoch_version=<number>&epoch_generation=<generation>
 OpenAPI spec:        /api/workspace/specifications/3.0.3
 ```
 
 All REST requests under `/api/workspace/`, including
-`/api/workspace/v1/messenger/`, are proxied to `workspace-api` on
+`/api/workspace/v1/messenger/` and `/api/workspace/v1/mail/`, are proxied to `workspace-api` on
 `127.0.0.1:21084` without changing the public URL structure. The exact nginx
 location `/api/workspace/v1/events/ws` is proxied to the websocket service
 endpoint `/v1/events/ws` on `127.0.0.1:21082`.
@@ -266,6 +268,13 @@ GET /api/workspace/v1/events/?epoch_version%3E=123&epoch_generation=781203&page_
 | 方法 | 路径 | 描述 |
 | --- | --- | --- |
 | `GET` | `/api/workspace/v1/` | 下面列出 `/api/workspace/v1/` 的航线. |
+| `GET` | `/api/workspace/v1/mail/` | 列出 Mail 路由。 |
+| `GET`, `POST` | `/api/workspace/v1/mail/folders/` | 列出自有文件夹或创建文件夹。 |
+| `GET`, `PUT`, `DELETE` | `/api/workspace/v1/mail/folders/{folder_uuid}` | 读取、更新或软删除自有空文件夹。 |
+| `GET`, `POST` | `/api/workspace/v1/mail/messages/` | 列出自有邮件或创建草稿。 |
+| `GET`, `PUT`, `DELETE` | `/api/workspace/v1/mail/messages/{message_uuid}` | 读取、更新或软删除自有邮件。 |
+| `POST` | `/api/workspace/v1/mail/messages/{message_uuid}/actions/move/invoke` | 在同一账户的自有文件夹之间移动邮件。 |
+| `POST` | `/api/workspace/v1/mail/messages/{message_uuid}/actions/send/invoke` | 持久地为外部 Mail runtime 排队草稿。 |
 | `GET` | `/api/workspace/v1/messenger/` | 在 `/api/workspace/v1/messenger/` 下列列出 Messenger 航线. |
 | `GET` | `/api/workspace/v1/messenger/server_settings` | 返回类似 Zulip 的服务器设置. |
 | `GET` | `/api/workspace/v1/messenger/server_settings/` | 同上述相同;支持后面斜. |
@@ -1754,7 +1763,7 @@ Workspace IAM中间件,以及没有有效的 Workspace 持有人的任何请求
 | `uuid` | UUID | 不需要 | 是的 | 文件标识符 |
 | `project_id` | UUID | 不需要 | 是的 | IAM项目范围;隐藏在 API 响应中. |
 | `user_uuid` | UUID | 不需要 | 是的 | 业主/uploader. |
-| `stream_uuid` | UUID没有`null` | 是的 | 不需要 | 拥有聊天文件的流. 需要创建JSON和 `stream_members`多部分上传; 省略了使用`acl.mode=public`多部分上传. |
+| `stream_uuid` | UUID没有`null` | 是的 | 不需要 | 聊天文件所属 stream。JSON 创建和 `stream_members` multipart 必填；使用 `acl.mode=owner` 或 `acl.mode=public` 时省略。 |
 | `name` | 连接器,最大 255 | 是的 | 不需要 | 文件显示名称. |
 | `description` | 连接器,最大 255 | 不需要 | 不需要 | 文件描述;默认为空字符串. |
 | `content_type` | 字符串 | 是的 | 不需要 | MIME 内容类型 |
@@ -1804,10 +1813,11 @@ name=public-example.txt
 description=Authenticated Workspace-wide file
 ```
 
-对于多部分上传,需要 `file`,并且必须有一个范围
-提供:要么是 `stream_uuid`,要么是 JSON 表格字段
-`acl={"mode":"public"}`.公共上传拒绝`stream_uuid`;流上传
-保留`stream_members` ACL. `name`默认的上传文件名和
+Multipart 上传需要 `file` 和且仅一个 scope：
+`stream_uuid`、`acl={"mode":"owner"}` 或
+`acl={"mode":"public"}`。Owner 和 public 上传拒绝 `stream_uuid`；
+stream 上传保留 `stream_members` ACL。Owner mode 用于私有邮件附件。
+`name` 默认使用上传文件名，
 `description`默认为空字符串.后端存储字节,设置
 `content_type`计算出了下载部分的`size_bytes`写了一个
 SHA-256 `hash`. 两种模式保持相同的二进制加 JSON 侧车布局和

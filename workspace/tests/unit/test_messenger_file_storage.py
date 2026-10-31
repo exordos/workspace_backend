@@ -14,8 +14,9 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import datetime
 import concurrent.futures
+import dataclasses
+import datetime
 import io
 import json
 import threading
@@ -188,6 +189,20 @@ def test_public_file_metadata_has_no_stream_uuid(tmp_path, monkeypatch):
     assert b'"mode":"public"' in payload
     assert b'"owner_uuid"' in payload
     assert b'"stream_uuid"' not in payload
+
+
+def test_owner_file_metadata_roundtrips_without_stream_uuid(tmp_path, monkeypatch):
+    _patch_conf(monkeypatch, tmp_path)
+    file_uuid = sys_uuid.uuid4()
+    metadata = dataclasses.replace(_public_metadata(file_uuid), acl_mode="owner")
+
+    file_storage.save_workspace_file_metadata(metadata)
+
+    restored = file_storage.get_workspace_file_storage().read_metadata(file_uuid)
+    assert restored == metadata
+    payload = json.loads(metadata.to_json())
+    assert payload["acl"] == {"mode": "owner"}
+    assert "stream_uuid" not in payload
 
 
 def test_default_storage_type_selects_s3(tmp_path, monkeypatch):

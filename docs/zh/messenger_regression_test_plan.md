@@ -44,7 +44,7 @@
 | --- | --- | --- |
 | MSG-API-001 | 要求每一个 Messenger 收集和行动下面 `/api/workspace/v1/messenger`. | 方法,状态代码,图表,页面化和行动路径与基线一致. |
 | MSG-API-002 | 要求 `/api/workspace/v1/messenger/server_settings` 带有或没有尾行斜,然后解包并获取 `realm_icon` 目标,而无凭证. | 公众响应包含`urn:url:<realm>/logo-512x512.png`,包装的组织标志被匿名返回为`image/png`. |
-| MSG-API-003 | 要求旧的 `/api/messenger/**` 路径和浏览器无法访问的提供商,邮件或日历路径. | inx或应用程序返回`404`而不会重定向. |
+| MSG-API-003 | 请求旧 `/api/messenger/**` 路径和浏览器不可访问的 provider 或 calendar 路径；按 Mail 契约单独验证 `/api/workspace/v1/mail/**`。 | 不支持的路径返回 `404`；Mail 路由保持文档化 schema 和 owner scope。 |
 | MSG-API-004 | 进行生成的 OpenAPI 与结的 Messenger 基线的比较. | 现有资源,要求值,多部分要求,操作和响应头目保持不变. |
 | MSG-API-005 | 在 Messenger 使用时检查浏览器可见的流量. | 没有数据库,提供商服务,SMTP,IMAP,邮件,邮件或日历实施细节暴露. |
 

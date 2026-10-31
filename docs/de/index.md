@@ -31,6 +31,7 @@ in exaktem Vertragssinn aufbewahrt werden.
 | Dokument | Status | Amt |
 | --- | --- | --- |
 |  [`workspace_api.md`](workspace_api.md)  | **- ein gültiger Vertrag** | Kanonischer Kundenvertrag Workspace/Messenger REST, Events und WebSocket: Routen, JSON, Status, Filter, Pagination und Grenze runtime/OpenAPI. |
+| [`mail_api.md`](mail_api.md) | **aktiver Vertrag; Transport ausstehend** | Öffentliche Mail-Ressourcen, owner-private S3-Anhänge, dauerhafte Send-Intents, Ereignisse und die Abnahmegrenze externer Zustellung. |
 |  [`workspace_ui_realtime_integration.md`](workspace_ui_realtime_integration.md)  | **- ein gültiger Vertrag** | REST-Überladen, Epoch-Cursor und Lieferung/Wiederholung WebSocket für Workspace UI. |
 |  [`architecture.md`](architecture.md)  | **historical reference** | Retired private bridge and provider API architecture. |
 |  [`workspace_server_v2_decisions.md`](workspace_server_v2_decisions.md)  | **historical reference** | Retired Provider API v2 and mTLS transport decisions. |

@@ -367,9 +367,10 @@ def test_file_upload_openapi_keeps_required_multipart_contract():
         "stream_uuid": {"format": "uuid", "type": "string"},
         "acl": {
             "description": (
-                'JSON ACL object. The only public form is {"mode":"public"}.'
+                "JSON ACL object. Use owner for a private mail attachment or "
+                "public for a realm-wide file."
             ),
-            "pattern": '^\\s*\\{\\s*"mode"\\s*:\\s*"public"\\s*\\}\\s*$',
+            "pattern": ('^\\s*\\{\\s*"mode"\\s*:\\s*"(?:owner|public)"\\s*\\}\\s*$'),
             "type": "string",
         },
         "name": {"type": "string"},

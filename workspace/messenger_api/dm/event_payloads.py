@@ -514,6 +514,30 @@ class ExternalAccountDeletedEventPayload(ExternalEventPayloadBase):
     KIND = "external_account.deleted"
 
 
+class MailFolderCreatedEventPayload(ExternalEventPayloadBase):
+    KIND = "mail.folder.created"
+
+
+class MailFolderUpdatedEventPayload(ExternalEventPayloadBase):
+    KIND = "mail.folder.updated"
+
+
+class MailFolderDeletedEventPayload(ExternalEventPayloadBase):
+    KIND = "mail.folder.deleted"
+
+
+class MailMessageCreatedEventPayload(ExternalEventPayloadBase):
+    KIND = "mail.message.created"
+
+
+class MailMessageUpdatedEventPayload(ExternalEventPayloadBase):
+    KIND = "mail.message.updated"
+
+
+class MailMessageDeletedEventPayload(ExternalEventPayloadBase):
+    KIND = "mail.message.deleted"
+
+
 WORKSPACE_EVENT_PAYLOAD_TYPE = types_dynamic.KindModelSelectorType(
     types_dynamic.KindModelType(MessageCreatedEventPayload),
     types_dynamic.KindModelType(MessageUpdatedEventPayload),
@@ -545,4 +569,10 @@ WORKSPACE_EVENT_PAYLOAD_TYPE = types_dynamic.KindModelSelectorType(
     types_dynamic.KindModelType(ExternalAccountCreatedEventPayload),
     types_dynamic.KindModelType(ExternalAccountUpdatedEventPayload),
     types_dynamic.KindModelType(ExternalAccountDeletedEventPayload),
+    types_dynamic.KindModelType(MailFolderCreatedEventPayload),
+    types_dynamic.KindModelType(MailFolderUpdatedEventPayload),
+    types_dynamic.KindModelType(MailFolderDeletedEventPayload),
+    types_dynamic.KindModelType(MailMessageCreatedEventPayload),
+    types_dynamic.KindModelType(MailMessageUpdatedEventPayload),
+    types_dynamic.KindModelType(MailMessageDeletedEventPayload),
 )

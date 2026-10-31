@@ -611,7 +611,59 @@ def test_workspace_openapi_exposes_messenger_and_rest_events():
         paths,
         "/v1/messenger/messages/{WorkspaceUserMessageUuid}",
     )
-    assert not any(path.startswith("/v1/mail/") for path in paths)
+    assert "/v1/mail/folders/" in paths
+    assert "/v1/mail/messages/" in paths
+    mail_message = "/v1/mail/messages/{MailMessageUuid}"
+    assert set(paths[f"{mail_message}/actions/send/invoke"]) == {"post"}
+    move = paths[f"{mail_message}/actions/move/invoke"]["post"]
+    move_schema = move["requestBody"]["content"]["application/json"]["schema"]
+    assert move_schema["required"] == ["folder_uuid"]
+    assert move_schema["additionalProperties"] is False
+    folder_create = _component_schema(specification, "MailFolder_Create")
+    assert folder_create["required"] == ["path", "name"]
+    assert folder_create["additionalProperties"] is False
+    assert set(folder_create["properties"]) == {
+        "uuid",
+        "external_account_uuid",
+        "path",
+        "name",
+        "delimiter",
+        "special_use",
+    }
+    folder_update = _component_schema(specification, "MailFolder_Update")
+    assert "required" not in folder_update
+    assert folder_update["minProperties"] == 1
+    assert folder_update["additionalProperties"] is False
+    assert "uuid" not in folder_update["properties"]
+    create = _component_schema(specification, "MailMessage_Create")
+    assert create["required"] == ["folder_uuid"]
+    assert create["additionalProperties"] is False
+    assert set(create["properties"]) == {
+        "uuid",
+        "folder_uuid",
+        "from_address",
+        "to_addresses",
+        "cc_addresses",
+        "bcc_addresses",
+        "reply_to",
+        "subject",
+        "snippet",
+        "body_html",
+        "body_text",
+        "attachment_urns",
+        "in_reply_to",
+        "references",
+        "seen",
+        "flagged",
+    }
+    assert create["properties"]["attachment_urns"]["items"]["pattern"].startswith(
+        "^urn:file:"
+    )
+    update = _component_schema(specification, "MailMessage_Update")
+    assert "required" not in update
+    assert update["minProperties"] == 1
+    assert update["additionalProperties"] is False
+    assert "folder_uuid" not in update["properties"]
     assert not any(path.startswith("/v1/calendar/") for path in paths)
     assert "/v1/providers/" not in paths
     push_device_path = "/v1/push_devices/{PushDeviceUuid}"
@@ -733,6 +785,8 @@ def test_workspace_openapi_exposes_messenger_and_rest_events():
         "file",
         "folder",
         "folder_item",
+        "mail_folder",
+        "mail_message",
         "message",
         "message_reaction",
         "stream",

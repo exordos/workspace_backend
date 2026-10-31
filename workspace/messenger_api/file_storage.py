@@ -64,9 +64,9 @@ class WorkspaceFileMetadata:
                 "mode": self.acl_mode,
                 "stream_uuid": str(self.stream_uuid),
             }
-        elif self.acl_mode == "public":
+        elif self.acl_mode in ("owner", "public"):
             if self.stream_uuid is not None:
-                raise ValueError("Public file metadata must not have a stream UUID")
+                raise ValueError("Unscoped file metadata must not have a stream UUID")
             acl = {"mode": self.acl_mode}
         else:
             raise ValueError("Unsupported file metadata ACL mode")
@@ -100,17 +100,17 @@ class WorkspaceFileMetadata:
         if data["schema_version"] not in (1, 2):
             raise ValueError("Unsupported file metadata schema version")
         acl_mode = data["acl"]["mode"]
-        if acl_mode not in ("stream_members", "public"):
+        if acl_mode not in ("stream_members", "owner", "public"):
             raise ValueError("Unsupported file metadata ACL mode")
         stream_uuid = data.get("stream_uuid")
         if acl_mode == "stream_members" and (
             stream_uuid is None or data["acl"].get("stream_uuid") != stream_uuid
         ):
             raise ValueError("File metadata ACL stream does not match file stream")
-        if acl_mode == "public" and (
+        if acl_mode in ("owner", "public") and (
             stream_uuid is not None or "stream_uuid" in data["acl"]
         ):
-            raise ValueError("Public file metadata must not have a stream UUID")
+            raise ValueError("Unscoped file metadata must not have a stream UUID")
         return cls(
             uuid=sys_uuid.UUID(data["uuid"]),
             project_id=sys_uuid.UUID(data["project_id"]),

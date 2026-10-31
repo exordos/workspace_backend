@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: Workspace v1 API
-  version: 1.3.2.dev28+g33649baf5.d20261019
+  version: 3.0.12.dev0+g7612bcc18.d20261031
   description: IAM-authenticated Workspace API
 components:
   responses:
@@ -101,6 +101,8 @@ components:
           - file
           - folder
           - folder_item
+          - mail_folder
+          - mail_message
           - message
           - message_reaction
           - stream
@@ -134,6 +136,528 @@ components:
       - object_type
       - action
       - payload
+    MailFolder_Get:
+      type: object
+      properties:
+        uuid:
+          type: string
+          example: 00000000-0000-0000-0000-000000000000
+          format: uuid
+          readOnly: true
+        created_at:
+          type: string
+          x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
+          example: '2006-01-02T15:04:05.000576Z'
+          format: date-time
+          readOnly: true
+          default: '2006-01-02T15:04:05.000576Z'
+        updated_at:
+          type: string
+          x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
+          example: '2006-01-02T15:04:05.000576Z'
+          format: date-time
+          readOnly: true
+          default: '2006-01-02T15:04:05.000576Z'
+        external_account_uuid:
+          type: string
+          example: 00000000-0000-0000-0000-000000000000
+          format: uuid
+          nullable: true
+        path:
+          type: string
+          example: any_string
+          minLength: 1
+          maxLength: 1024
+        name:
+          type: string
+          example: any_string
+          minLength: 1
+          maxLength: 256
+        delimiter:
+          type: string
+          example: ssssssss
+          minLength: 1
+          maxLength: 8
+          default: /
+        special_use:
+          type: string
+          example: any_string
+          maxLength: 64
+          nullable: true
+        unread_count:
+          type: integer
+          example: 0
+          minimum: 0
+          readOnly: true
+          default: 0
+        total_count:
+          type: integer
+          example: 0
+          minimum: 0
+          readOnly: true
+          default: 0
+        source_name:
+          type: string
+          enum:
+          - native
+          - provider
+          example: native
+          readOnly: true
+          default: native
+      required:
+      - path
+      - name
+    MailFolder_Create:
+      type: object
+      additionalProperties: false
+      properties:
+        uuid:
+          type: string
+          example: 00000000-0000-0000-0000-000000000000
+          format: uuid
+        external_account_uuid:
+          type: string
+          example: 00000000-0000-0000-0000-000000000000
+          format: uuid
+          nullable: true
+        path:
+          type: string
+          example: any_string
+          minLength: 1
+          maxLength: 1024
+        name:
+          type: string
+          example: any_string
+          minLength: 1
+          maxLength: 256
+        delimiter:
+          type: string
+          example: ssssssss
+          minLength: 1
+          maxLength: 8
+          default: /
+        special_use:
+          type: string
+          example: any_string
+          maxLength: 64
+          nullable: true
+      required:
+      - path
+      - name
+    MailFolder_Update:
+      type: object
+      additionalProperties: false
+      properties:
+        external_account_uuid:
+          type: string
+          example: 00000000-0000-0000-0000-000000000000
+          format: uuid
+          nullable: true
+        path:
+          type: string
+          example: any_string
+          minLength: 1
+          maxLength: 1024
+        name:
+          type: string
+          example: any_string
+          minLength: 1
+          maxLength: 256
+        delimiter:
+          type: string
+          example: ssssssss
+          minLength: 1
+          maxLength: 8
+          default: /
+        special_use:
+          type: string
+          example: any_string
+          maxLength: 64
+          nullable: true
+      minProperties: 1
+    MailFolder_Filter:
+      $ref: '#/components/schemas/MailFolder_Get'
+    MailMessage_Get:
+      type: object
+      properties:
+        uuid:
+          type: string
+          example: 00000000-0000-0000-0000-000000000000
+          format: uuid
+          readOnly: true
+        created_at:
+          type: string
+          x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
+          example: '2006-01-02T15:04:05.000576Z'
+          format: date-time
+          readOnly: true
+          default: '2006-01-02T15:04:05.000576Z'
+        updated_at:
+          type: string
+          x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
+          example: '2006-01-02T15:04:05.000576Z'
+          format: date-time
+          readOnly: true
+          default: '2006-01-02T15:04:05.000576Z'
+        folder_uuid:
+          type: string
+          example: 00000000-0000-0000-0000-000000000000
+          format: uuid
+        external_account_uuid:
+          type: string
+          example: 00000000-0000-0000-0000-000000000000
+          format: uuid
+          readOnly: true
+          nullable: true
+        from_address:
+          type: string
+          example: any_string
+          maxLength: 2048
+          default: ''
+        to_addresses:
+          type: array
+          items:
+            type: string
+            example: any_string
+            minLength: 1
+            maxLength: 2048
+          example:
+          - any_string
+          default: []
+        cc_addresses:
+          type: array
+          items:
+            type: string
+            example: any_string
+            minLength: 1
+            maxLength: 2048
+          example:
+          - any_string
+          default: []
+        bcc_addresses:
+          type: array
+          items:
+            type: string
+            example: any_string
+            minLength: 1
+            maxLength: 2048
+          example:
+          - any_string
+          default: []
+        reply_to:
+          type: string
+          example: any_string
+          maxLength: 2048
+          nullable: true
+        subject:
+          type: string
+          example: any_string
+          maxLength: 2048
+          default: ''
+        snippet:
+          type: string
+          example: any_string
+          maxLength: 4096
+          default: ''
+        body_html:
+          type: string
+          example: any_string
+          nullable: true
+        body_text:
+          type: string
+          example: any_string
+          nullable: true
+        attachment_urns:
+          type: array
+          items:
+            type: string
+            example: any_string
+            minLength: 1
+            maxLength: 4096
+          example:
+          - any_string
+          default: []
+        message_id:
+          type: string
+          example: any_string
+          maxLength: 2048
+          readOnly: true
+          nullable: true
+        in_reply_to:
+          type: string
+          example: any_string
+          maxLength: 2048
+          nullable: true
+        references:
+          type: array
+          items:
+            type: string
+            example: any_string
+            minLength: 1
+            maxLength: 2048
+          example:
+          - any_string
+          default: []
+        sent_at:
+          type: string
+          x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
+          example: '2006-01-02T15:04:05.000576Z'
+          format: date-time
+          readOnly: true
+          nullable: true
+        received_at:
+          type: string
+          x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
+          example: '2006-01-02T15:04:05.000576Z'
+          format: date-time
+          readOnly: true
+          nullable: true
+        seen:
+          type: boolean
+          example: true
+          default: false
+        flagged:
+          type: boolean
+          example: true
+          default: false
+        draft:
+          type: boolean
+          example: true
+          readOnly: true
+          default: true
+        delivery_status:
+          type: string
+          enum:
+          - draft
+          - failed
+          - queued
+          - received
+          - sent
+          example: draft
+          readOnly: true
+          default: draft
+        delivery_error:
+          type: string
+          example: any_string
+          readOnly: true
+          nullable: true
+        source_name:
+          type: string
+          enum:
+          - native
+          - provider
+          example: native
+          readOnly: true
+          default: native
+      required:
+      - folder_uuid
+    MailMessage_Create:
+      type: object
+      additionalProperties: false
+      properties:
+        uuid:
+          type: string
+          example: 00000000-0000-0000-0000-000000000000
+          format: uuid
+        folder_uuid:
+          type: string
+          example: 00000000-0000-0000-0000-000000000000
+          format: uuid
+        from_address:
+          type: string
+          example: any_string
+          maxLength: 2048
+          default: ''
+        to_addresses:
+          type: array
+          items:
+            type: string
+            example: any_string
+            minLength: 1
+            maxLength: 2048
+          example:
+          - any_string
+          default: []
+        cc_addresses:
+          type: array
+          items:
+            type: string
+            example: any_string
+            minLength: 1
+            maxLength: 2048
+          example:
+          - any_string
+          default: []
+        bcc_addresses:
+          type: array
+          items:
+            type: string
+            example: any_string
+            minLength: 1
+            maxLength: 2048
+          example:
+          - any_string
+          default: []
+        reply_to:
+          type: string
+          example: any_string
+          maxLength: 2048
+          nullable: true
+        subject:
+          type: string
+          example: any_string
+          maxLength: 2048
+          default: ''
+        snippet:
+          type: string
+          example: any_string
+          maxLength: 4096
+          default: ''
+        body_html:
+          type: string
+          example: any_string
+          nullable: true
+        body_text:
+          type: string
+          example: any_string
+          nullable: true
+        attachment_urns:
+          type: array
+          items:
+            type: string
+            example: any_string
+            minLength: 1
+            maxLength: 4096
+            pattern: ^urn:file:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}(?:\?.*)?$
+            description: Visible Workspace file URN stored in S3.
+          example:
+          - any_string
+          default: []
+        in_reply_to:
+          type: string
+          example: any_string
+          maxLength: 2048
+          nullable: true
+        references:
+          type: array
+          items:
+            type: string
+            example: any_string
+            minLength: 1
+            maxLength: 2048
+          example:
+          - any_string
+          default: []
+        seen:
+          type: boolean
+          example: true
+          default: false
+        flagged:
+          type: boolean
+          example: true
+          default: false
+      required:
+      - folder_uuid
+    MailMessage_Update:
+      type: object
+      additionalProperties: false
+      properties:
+        from_address:
+          type: string
+          example: any_string
+          maxLength: 2048
+          default: ''
+        to_addresses:
+          type: array
+          items:
+            type: string
+            example: any_string
+            minLength: 1
+            maxLength: 2048
+          example:
+          - any_string
+          default: []
+        cc_addresses:
+          type: array
+          items:
+            type: string
+            example: any_string
+            minLength: 1
+            maxLength: 2048
+          example:
+          - any_string
+          default: []
+        bcc_addresses:
+          type: array
+          items:
+            type: string
+            example: any_string
+            minLength: 1
+            maxLength: 2048
+          example:
+          - any_string
+          default: []
+        reply_to:
+          type: string
+          example: any_string
+          maxLength: 2048
+          nullable: true
+        subject:
+          type: string
+          example: any_string
+          maxLength: 2048
+          default: ''
+        snippet:
+          type: string
+          example: any_string
+          maxLength: 4096
+          default: ''
+        body_html:
+          type: string
+          example: any_string
+          nullable: true
+        body_text:
+          type: string
+          example: any_string
+          nullable: true
+        attachment_urns:
+          type: array
+          items:
+            type: string
+            example: any_string
+            minLength: 1
+            maxLength: 4096
+            pattern: ^urn:file:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}(?:\?.*)?$
+            description: Visible Workspace file URN stored in S3.
+          example:
+          - any_string
+          default: []
+        in_reply_to:
+          type: string
+          example: any_string
+          maxLength: 2048
+          nullable: true
+        references:
+          type: array
+          items:
+            type: string
+            example: any_string
+            minLength: 1
+            maxLength: 2048
+          example:
+          - any_string
+          default: []
+        seen:
+          type: boolean
+          example: true
+          default: false
+        flagged:
+          type: boolean
+          example: true
+          default: false
+      minProperties: 1
+    MailMessage_Filter:
+      $ref: '#/components/schemas/MailMessage_Get'
     WorkspaceUser_Filter:
       $ref: '#/components/schemas/WorkspaceUser_Get'
     WorkspaceDraft_Get:
@@ -274,8 +798,8 @@ components:
           enum:
           - active
           - error
-          - syncing
           - new
+          - syncing
           example: new
           default: new
         error_description:
@@ -667,8 +1191,6 @@ components:
       - user_uuid
       - emoji_name
     WorkspaceMessageReactions_Create:
-      $ref: '#/components/schemas/WorkspaceMessageReactions_Get'
-    WorkspaceMessageReactions_Update:
       $ref: '#/components/schemas/WorkspaceMessageReactions_Get'
     WorkspaceMessageReactions_Filter:
       $ref: '#/components/schemas/WorkspaceMessageReactions_Get'
@@ -2117,6 +2639,8 @@ components:
         - file
         - folder
         - folder_item
+        - mail_folder
+        - mail_message
         - message
         - message_reaction
         - stream
@@ -2150,6 +2674,437 @@ components:
             items: {}
         example:
           key: value
+    MailFolder_uuid:
+      name: uuid
+      in: query
+      schema:
+        type: string
+        example: 00000000-0000-0000-0000-000000000000
+        format: uuid
+        readOnly: true
+    MailFolderUuid:
+      name: MailFolderUuid
+      in: path
+      schema:
+        type: string
+        example: 00000000-0000-0000-0000-000000000000
+        format: uuid
+        readOnly: true
+      required: true
+    MailFolder_project_id:
+      name: project_id
+      in: query
+      schema:
+        type: string
+        example: 00000000-0000-0000-0000-000000000000
+        format: uuid
+        readOnly: true
+    MailFolder_created_at:
+      name: created_at
+      in: query
+      schema:
+        type: string
+        x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
+        example: '2006-01-02T15:04:05.000576Z'
+        format: date-time
+        readOnly: true
+        default: '2006-01-02T15:04:05.000576Z'
+    MailFolder_updated_at:
+      name: updated_at
+      in: query
+      schema:
+        type: string
+        x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
+        example: '2006-01-02T15:04:05.000576Z'
+        format: date-time
+        readOnly: true
+        default: '2006-01-02T15:04:05.000576Z'
+    MailFolder_owner_user_uuid:
+      name: owner_user_uuid
+      in: query
+      schema:
+        type: string
+        example: 00000000-0000-0000-0000-000000000000
+        format: uuid
+        readOnly: true
+    MailFolder_external_account_uuid:
+      name: external_account_uuid
+      in: query
+      schema:
+        type: string
+        example: 00000000-0000-0000-0000-000000000000
+        format: uuid
+        nullable: true
+    MailFolder_path:
+      name: path
+      in: query
+      schema:
+        type: string
+        example: any_string
+        minLength: 1
+        maxLength: 1024
+    MailFolder_name:
+      name: name
+      in: query
+      schema:
+        type: string
+        example: any_string
+        minLength: 1
+        maxLength: 256
+    MailFolder_delimiter:
+      name: delimiter
+      in: query
+      schema:
+        type: string
+        example: ssssssss
+        minLength: 1
+        maxLength: 8
+        default: /
+    MailFolder_special_use:
+      name: special_use
+      in: query
+      schema:
+        type: string
+        example: any_string
+        maxLength: 64
+        nullable: true
+    MailFolder_unread_count:
+      name: unread_count
+      in: query
+      schema:
+        type: integer
+        example: 0
+        minimum: 0
+        readOnly: true
+        default: 0
+    MailFolder_total_count:
+      name: total_count
+      in: query
+      schema:
+        type: integer
+        example: 0
+        minimum: 0
+        readOnly: true
+        default: 0
+    MailFolder_source_name:
+      name: source_name
+      in: query
+      schema:
+        type: string
+        enum:
+        - native
+        - provider
+        example: native
+        readOnly: true
+        default: native
+    MailFolder_provider_identity:
+      name: provider_identity
+      in: query
+      schema:
+        type: string
+        example: any_string
+        minLength: 1
+        maxLength: 2048
+        readOnly: true
+        nullable: true
+    MailFolder_deleted:
+      name: deleted
+      in: query
+      schema:
+        type: boolean
+        example: true
+        readOnly: true
+        default: false
+    MailMessage_uuid:
+      name: uuid
+      in: query
+      schema:
+        type: string
+        example: 00000000-0000-0000-0000-000000000000
+        format: uuid
+        readOnly: true
+    MailMessageUuid:
+      name: MailMessageUuid
+      in: path
+      schema:
+        type: string
+        example: 00000000-0000-0000-0000-000000000000
+        format: uuid
+        readOnly: true
+      required: true
+    MailMessage_project_id:
+      name: project_id
+      in: query
+      schema:
+        type: string
+        example: 00000000-0000-0000-0000-000000000000
+        format: uuid
+        readOnly: true
+    MailMessage_created_at:
+      name: created_at
+      in: query
+      schema:
+        type: string
+        x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
+        example: '2006-01-02T15:04:05.000576Z'
+        format: date-time
+        readOnly: true
+        default: '2006-01-02T15:04:05.000576Z'
+    MailMessage_updated_at:
+      name: updated_at
+      in: query
+      schema:
+        type: string
+        x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
+        example: '2006-01-02T15:04:05.000576Z'
+        format: date-time
+        readOnly: true
+        default: '2006-01-02T15:04:05.000576Z'
+    MailMessage_owner_user_uuid:
+      name: owner_user_uuid
+      in: query
+      schema:
+        type: string
+        example: 00000000-0000-0000-0000-000000000000
+        format: uuid
+        readOnly: true
+    MailMessage_folder_uuid:
+      name: folder_uuid
+      in: query
+      schema:
+        type: string
+        example: 00000000-0000-0000-0000-000000000000
+        format: uuid
+    MailMessage_external_account_uuid:
+      name: external_account_uuid
+      in: query
+      schema:
+        type: string
+        example: 00000000-0000-0000-0000-000000000000
+        format: uuid
+        readOnly: true
+        nullable: true
+    MailMessage_from_address:
+      name: from_address
+      in: query
+      schema:
+        type: string
+        example: any_string
+        maxLength: 2048
+        default: ''
+    MailMessage_to_addresses:
+      name: to_addresses
+      in: query
+      schema:
+        type: array
+        items:
+          type: string
+          example: any_string
+          minLength: 1
+          maxLength: 2048
+        example:
+        - any_string
+        default: []
+    MailMessage_cc_addresses:
+      name: cc_addresses
+      in: query
+      schema:
+        type: array
+        items:
+          type: string
+          example: any_string
+          minLength: 1
+          maxLength: 2048
+        example:
+        - any_string
+        default: []
+    MailMessage_bcc_addresses:
+      name: bcc_addresses
+      in: query
+      schema:
+        type: array
+        items:
+          type: string
+          example: any_string
+          minLength: 1
+          maxLength: 2048
+        example:
+        - any_string
+        default: []
+    MailMessage_reply_to:
+      name: reply_to
+      in: query
+      schema:
+        type: string
+        example: any_string
+        maxLength: 2048
+        nullable: true
+    MailMessage_subject:
+      name: subject
+      in: query
+      schema:
+        type: string
+        example: any_string
+        maxLength: 2048
+        default: ''
+    MailMessage_snippet:
+      name: snippet
+      in: query
+      schema:
+        type: string
+        example: any_string
+        maxLength: 4096
+        default: ''
+    MailMessage_body_html:
+      name: body_html
+      in: query
+      schema:
+        type: string
+        example: any_string
+        nullable: true
+    MailMessage_body_text:
+      name: body_text
+      in: query
+      schema:
+        type: string
+        example: any_string
+        nullable: true
+    MailMessage_attachment_urns:
+      name: attachment_urns
+      in: query
+      schema:
+        type: array
+        items:
+          type: string
+          example: any_string
+          minLength: 1
+          maxLength: 4096
+        example:
+        - any_string
+        default: []
+    MailMessage_message_id:
+      name: message_id
+      in: query
+      schema:
+        type: string
+        example: any_string
+        maxLength: 2048
+        readOnly: true
+        nullable: true
+    MailMessage_in_reply_to:
+      name: in_reply_to
+      in: query
+      schema:
+        type: string
+        example: any_string
+        maxLength: 2048
+        nullable: true
+    MailMessage_references:
+      name: references
+      in: query
+      schema:
+        type: array
+        items:
+          type: string
+          example: any_string
+          minLength: 1
+          maxLength: 2048
+        example:
+        - any_string
+        default: []
+    MailMessage_sent_at:
+      name: sent_at
+      in: query
+      schema:
+        type: string
+        x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
+        example: '2006-01-02T15:04:05.000576Z'
+        format: date-time
+        readOnly: true
+        nullable: true
+    MailMessage_received_at:
+      name: received_at
+      in: query
+      schema:
+        type: string
+        x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
+        example: '2006-01-02T15:04:05.000576Z'
+        format: date-time
+        readOnly: true
+        nullable: true
+    MailMessage_seen:
+      name: seen
+      in: query
+      schema:
+        type: boolean
+        example: true
+        default: false
+    MailMessage_flagged:
+      name: flagged
+      in: query
+      schema:
+        type: boolean
+        example: true
+        default: false
+    MailMessage_draft:
+      name: draft
+      in: query
+      schema:
+        type: boolean
+        example: true
+        readOnly: true
+        default: true
+    MailMessage_delivery_status:
+      name: delivery_status
+      in: query
+      schema:
+        type: string
+        enum:
+        - draft
+        - failed
+        - queued
+        - received
+        - sent
+        example: draft
+        readOnly: true
+        default: draft
+    MailMessage_delivery_error:
+      name: delivery_error
+      in: query
+      schema:
+        type: string
+        example: any_string
+        readOnly: true
+        nullable: true
+    MailMessage_source_name:
+      name: source_name
+      in: query
+      schema:
+        type: string
+        enum:
+        - native
+        - provider
+        example: native
+        readOnly: true
+        default: native
+    MailMessage_provider_identity:
+      name: provider_identity
+      in: query
+      schema:
+        type: string
+        example: any_string
+        minLength: 1
+        maxLength: 2048
+        readOnly: true
+        nullable: true
+    MailMessage_deleted:
+      name: deleted
+      in: query
+      schema:
+        type: boolean
+        example: true
+        readOnly: true
+        default: false
     WorkspaceUser_uuid:
       name: uuid
       in: query
@@ -2486,8 +3441,8 @@ components:
         enum:
         - active
         - error
-        - syncing
         - new
+        - syncing
         example: new
         default: new
     ExternalAccount_error_description:
@@ -4937,6 +5892,494 @@ paths:
       operationId: Filter_v1_events
       security:
       - bearerAuth: []
+  /v1/mail/:
+    get:
+      summary: Returns a list of all routes in the main route that are collection
+      tags: []
+      parameters:
+      - name: filters
+        description: 'the filters to apply when filtering the routes (Is not
+
+          implemented now)
+
+          '
+        schema:
+          type: string
+        in: query
+      - name: order_by
+        description: 'fields to order the routes by (Is not implemented
+
+          now)
+
+          '
+        schema:
+          type: string
+        in: query
+      responses:
+        '200':
+          description: Get nested urls
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - epoch_version
+                - epoch_generation
+                - current_epoch_version
+                - minimum_epoch_version
+                properties:
+                  epoch_version:
+                    type: integer
+                    minimum: 0
+                  epoch_generation:
+                    type: string
+                  current_epoch_version:
+                    type: integer
+                    minimum: 0
+                  minimum_epoch_version:
+                    type: integer
+                    minimum: 1
+          headers:
+            X-Pagination-Limit:
+              description: Requested page limit.
+              schema:
+                type: integer
+            X-Pagination-Marker:
+              description: Continuation marker. Present only when another resource
+                exists.
+              schema:
+                type: string
+                format: uuid
+        default:
+          $ref: '#/components/responses/Error'
+      operationId: Filter_v1_mail
+      security:
+      - bearerAuth: []
+  /v1/mail/folders/:
+    get:
+      summary: Get MailFolders
+      tags:
+      - MailFolder
+      parameters:
+      - name: q
+        in: query
+        required: false
+        description: "Filter expression (a subset of AIP-160). Combines with the field\n\
+          parameters, which stay the typed way to ask for equality.\n\n    name =\
+          \ \"vm1\" AND size > 10\n    tags:\"env:prod\" OR tags:\"env:staging\"\n\
+          \    NOT (state = error) AND created_at >= \"2026-07-01T00:00:00Z\"\n\n\
+          Operators: `=` `!=` `<` `<=` `>` `>=`, `:` (an array holds the element,\n\
+          or with `*` that the field is set), `AND` `OR` `NOT`, parentheses.\nThe\
+          \ keywords are uppercase, and `OR` binds tighter than `AND`. Values\ncarrying\
+          \ `:`, `.` or spaces must be quoted."
+        schema:
+          type: string
+        example: name = "vm1"
+        x-ra-filter-fields:
+        - created_at
+        - deleted
+        - delimiter
+        - external_account_uuid
+        - name
+        - owner_user_uuid
+        - path
+        - project_id
+        - provider_identity
+        - source_name
+        - special_use
+        - total_count
+        - unread_count
+        - updated_at
+        - uuid
+      - $ref: '#/components/parameters/MailFolder_uuid'
+      - $ref: '#/components/parameters/MailFolder_project_id'
+      - $ref: '#/components/parameters/MailFolder_created_at'
+      - $ref: '#/components/parameters/MailFolder_updated_at'
+      - $ref: '#/components/parameters/MailFolder_owner_user_uuid'
+      - $ref: '#/components/parameters/MailFolder_external_account_uuid'
+      - $ref: '#/components/parameters/MailFolder_path'
+      - $ref: '#/components/parameters/MailFolder_name'
+      - $ref: '#/components/parameters/MailFolder_delimiter'
+      - $ref: '#/components/parameters/MailFolder_special_use'
+      - $ref: '#/components/parameters/MailFolder_unread_count'
+      - $ref: '#/components/parameters/MailFolder_total_count'
+      - $ref: '#/components/parameters/MailFolder_source_name'
+      - $ref: '#/components/parameters/MailFolder_provider_identity'
+      - $ref: '#/components/parameters/MailFolder_deleted'
+      - name: page_limit
+        in: query
+        description: Maximum resources returned in this page.
+        schema:
+          type: integer
+          minimum: 0
+      - name: page_marker
+        in: query
+        description: Last resource identifier from the previous page.
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: MailFolder_Filter
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/MailFolder_Filter'
+          headers:
+            X-Pagination-Limit:
+              description: Requested page limit.
+              schema:
+                type: integer
+            X-Pagination-Marker:
+              description: Continuation marker. Present only when another resource
+                exists.
+              schema:
+                type: string
+                format: uuid
+        default:
+          $ref: '#/components/responses/Error'
+      operationId: Filter_v1_mail_folders
+      security:
+      - bearerAuth: []
+    post:
+      summary: Create MailFolder
+      tags:
+      - MailFolder
+      parameters: []
+      responses:
+        '201':
+          description: MailFolder_Create
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MailFolder_Create'
+        default:
+          $ref: '#/components/responses/Error'
+      operationId: Create_v1_mail_folders
+      requestBody:
+        description: MailFolder_Create
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MailFolder_Create'
+      security:
+      - bearerAuth: []
+      description: Create an owner-scoped mail folder. An external_account_uuid must
+        refer to the current user's mail account in this project.
+  /v1/mail/folders/{MailFolderUuid}:
+    get:
+      summary: Get MailFolder
+      tags:
+      - MailFolder
+      parameters:
+      - $ref: '#/components/parameters/MailFolderUuid'
+      responses:
+        '200':
+          description: MailFolder_Get
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MailFolder_Get'
+        default:
+          $ref: '#/components/responses/Error'
+      operationId: Get_v1_mail_folders_MailFolderUuid
+      security:
+      - bearerAuth: []
+    put:
+      summary: Update MailFolder
+      tags:
+      - MailFolder
+      parameters:
+      - $ref: '#/components/parameters/MailFolderUuid'
+      responses:
+        '200':
+          description: MailFolder_Update
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MailFolder_Update'
+        default:
+          $ref: '#/components/responses/Error'
+      operationId: Update_v1_mail_folders_MailFolderUuid
+      requestBody:
+        description: MailFolder_Update
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MailFolder_Update'
+      security:
+      - bearerAuth: []
+    delete:
+      summary: Delete MailFolder
+      tags:
+      - MailFolder
+      parameters:
+      - $ref: '#/components/parameters/MailFolderUuid'
+      responses:
+        '204':
+          description: MailFolder_Delete
+        default:
+          $ref: '#/components/responses/Error'
+      operationId: Delete_v1_mail_folders_MailFolderUuid
+      security:
+      - bearerAuth: []
+  /v1/mail/messages/:
+    get:
+      summary: Get MailMessages
+      tags:
+      - MailMessage
+      parameters:
+      - name: q
+        in: query
+        required: false
+        description: "Filter expression (a subset of AIP-160). Combines with the field\n\
+          parameters, which stay the typed way to ask for equality.\n\n    name =\
+          \ \"vm1\" AND size > 10\n    tags:\"env:prod\" OR tags:\"env:staging\"\n\
+          \    NOT (state = error) AND created_at >= \"2026-07-01T00:00:00Z\"\n\n\
+          Operators: `=` `!=` `<` `<=` `>` `>=`, `:` (an array holds the element,\n\
+          or with `*` that the field is set), `AND` `OR` `NOT`, parentheses.\nThe\
+          \ keywords are uppercase, and `OR` binds tighter than `AND`. Values\ncarrying\
+          \ `:`, `.` or spaces must be quoted."
+        schema:
+          type: string
+        example: name = "vm1"
+        x-ra-filter-fields:
+        - attachment_urns
+        - bcc_addresses
+        - body_html
+        - body_text
+        - cc_addresses
+        - created_at
+        - deleted
+        - delivery_error
+        - delivery_status
+        - draft
+        - external_account_uuid
+        - flagged
+        - folder_uuid
+        - from_address
+        - in_reply_to
+        - message_id
+        - owner_user_uuid
+        - project_id
+        - provider_identity
+        - received_at
+        - references
+        - reply_to
+        - seen
+        - sent_at
+        - snippet
+        - source_name
+        - subject
+        - to_addresses
+        - updated_at
+        - uuid
+      - $ref: '#/components/parameters/MailMessage_uuid'
+      - $ref: '#/components/parameters/MailMessage_project_id'
+      - $ref: '#/components/parameters/MailMessage_created_at'
+      - $ref: '#/components/parameters/MailMessage_updated_at'
+      - $ref: '#/components/parameters/MailMessage_owner_user_uuid'
+      - $ref: '#/components/parameters/MailMessage_folder_uuid'
+      - $ref: '#/components/parameters/MailMessage_external_account_uuid'
+      - $ref: '#/components/parameters/MailMessage_from_address'
+      - $ref: '#/components/parameters/MailMessage_reply_to'
+      - $ref: '#/components/parameters/MailMessage_subject'
+      - $ref: '#/components/parameters/MailMessage_snippet'
+      - $ref: '#/components/parameters/MailMessage_body_html'
+      - $ref: '#/components/parameters/MailMessage_body_text'
+      - $ref: '#/components/parameters/MailMessage_message_id'
+      - $ref: '#/components/parameters/MailMessage_in_reply_to'
+      - $ref: '#/components/parameters/MailMessage_sent_at'
+      - $ref: '#/components/parameters/MailMessage_received_at'
+      - $ref: '#/components/parameters/MailMessage_seen'
+      - $ref: '#/components/parameters/MailMessage_flagged'
+      - $ref: '#/components/parameters/MailMessage_draft'
+      - $ref: '#/components/parameters/MailMessage_delivery_status'
+      - $ref: '#/components/parameters/MailMessage_delivery_error'
+      - $ref: '#/components/parameters/MailMessage_source_name'
+      - $ref: '#/components/parameters/MailMessage_provider_identity'
+      - $ref: '#/components/parameters/MailMessage_deleted'
+      - name: page_limit
+        in: query
+        description: Maximum resources returned in this page.
+        schema:
+          type: integer
+          minimum: 0
+      - name: page_marker
+        in: query
+        description: Last resource identifier from the previous page.
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: MailMessage_Filter
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/MailMessage_Filter'
+          headers:
+            X-Pagination-Limit:
+              description: Requested page limit.
+              schema:
+                type: integer
+            X-Pagination-Marker:
+              description: Continuation marker. Present only when another resource
+                exists.
+              schema:
+                type: string
+                format: uuid
+        default:
+          $ref: '#/components/responses/Error'
+      operationId: Filter_v1_mail_messages
+      security:
+      - bearerAuth: []
+    post:
+      summary: Create MailMessage
+      tags:
+      - MailMessage
+      parameters: []
+      responses:
+        '201':
+          description: MailMessage_Create
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MailMessage_Create'
+        default:
+          $ref: '#/components/responses/Error'
+      operationId: Create_v1_mail_messages
+      requestBody:
+        description: MailMessage_Create
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MailMessage_Create'
+      security:
+      - bearerAuth: []
+      description: Create a local draft. Attachments are existing visible Workspace
+        files referenced by urn:file identifiers; bytes remain in S3.
+  /v1/mail/messages/{MailMessageUuid}:
+    get:
+      summary: Get MailMessage
+      tags:
+      - MailMessage
+      parameters:
+      - $ref: '#/components/parameters/MailMessageUuid'
+      responses:
+        '200':
+          description: MailMessage_Get
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MailMessage_Get'
+        default:
+          $ref: '#/components/responses/Error'
+      operationId: Get_v1_mail_messages_MailMessageUuid
+      security:
+      - bearerAuth: []
+    put:
+      summary: Update MailMessage
+      tags:
+      - MailMessage
+      parameters:
+      - $ref: '#/components/parameters/MailMessageUuid'
+      responses:
+        '200':
+          description: MailMessage_Update
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MailMessage_Update'
+        default:
+          $ref: '#/components/responses/Error'
+      operationId: Update_v1_mail_messages_MailMessageUuid
+      requestBody:
+        description: MailMessage_Update
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MailMessage_Update'
+      security:
+      - bearerAuth: []
+    delete:
+      summary: Delete MailMessage
+      tags:
+      - MailMessage
+      parameters:
+      - $ref: '#/components/parameters/MailMessageUuid'
+      responses:
+        '204':
+          description: MailMessage_Delete
+        default:
+          $ref: '#/components/responses/Error'
+      operationId: Delete_v1_mail_messages_MailMessageUuid
+      security:
+      - bearerAuth: []
+  /v1/mail/messages/{MailMessageUuid}/actions/move/invoke:
+    post:
+      summary: Move mail message
+      tags:
+      - MailMessage
+      parameters:
+      - $ref: '#/components/parameters/MailMessageUuid'
+      responses:
+        '200':
+          description: MailMessage_Get
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MailMessage_Get'
+        default:
+          $ref: '#/components/responses/Error'
+      operationId: Move_v1_mail_messages_MailMessageUuid_actions_move_invoke
+      requestBody:
+        description: Owned destination folder
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - folder_uuid
+              additionalProperties: false
+              properties:
+                folder_uuid:
+                  type: string
+                  format: uuid
+      security:
+      - bearerAuth: []
+      description: Move a message to another owned folder belonging to the same mail
+        account.
+  /v1/mail/messages/{MailMessageUuid}/actions/send/invoke:
+    post:
+      summary: Queue mail message for delivery
+      tags:
+      - MailMessage
+      parameters:
+      - $ref: '#/components/parameters/MailMessageUuid'
+      responses:
+        '200':
+          description: MailMessage_Get
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MailMessage_Get'
+        default:
+          $ref: '#/components/responses/Error'
+      operationId: Send_v1_mail_messages_MailMessageUuid_actions_send_invoke
+      security:
+      - bearerAuth: []
+      description: Atomically mark a draft queued, append a Workspace event, and create
+        one durable mail_outgoing_intent for an external mail runtime.
   /v1/me/:
     get:
       summary: Get current Workspace user
@@ -5665,8 +7108,9 @@ paths:
                   format: uuid
                   type: string
                 acl:
-                  description: JSON ACL object. The only public form is {"mode":"public"}.
-                  pattern: ^\s*\{\s*"mode"\s*:\s*"public"\s*\}\s*$
+                  description: JSON ACL object. Use owner for a private mail attachment
+                    or public for a realm-wide file.
+                  pattern: ^\s*\{\s*"mode"\s*:\s*"(?:owner|public)"\s*\}\s*$
                   type: string
                 name:
                   type: string
@@ -6283,31 +7727,6 @@ paths:
         default:
           $ref: '#/components/responses/Error'
       operationId: Get_v1_messenger_message_reactions_WorkspaceMessageReactionsUuid
-      security:
-      - bearerAuth: []
-    put:
-      summary: Update WorkspaceMessageReactions
-      tags:
-      - WorkspaceMessageReactions
-      parameters:
-      - $ref: '#/components/parameters/WorkspaceMessageReactionsUuid'
-      responses:
-        '200':
-          description: WorkspaceMessageReactions_Update
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/WorkspaceMessageReactions_Update'
-        default:
-          $ref: '#/components/responses/Error'
-      operationId: Update_v1_messenger_message_reactions_WorkspaceMessageReactionsUuid
-      requestBody:
-        description: WorkspaceMessageReactions_Update
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/WorkspaceMessageReactions_Update'
       security:
       - bearerAuth: []
     delete:
@@ -9306,6 +10725,10 @@ servers:
       default: v1
 tags:
 - name: WorkspaceEvent
+  description: ''
+- name: MailFolder
+  description: ''
+- name: MailMessage
   description: ''
 - name: WorkspaceDraft
   description: ''

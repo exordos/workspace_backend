@@ -74,6 +74,10 @@ class WorkspaceOpenApiPaths(openapi_structures.OpenApiPaths):
             "/v1/messenger/drafts/",
             components,
         )
+        specification = openapi_contract.add_mail_contract(
+            specification,
+            components,
+        )
         specification = openapi_contract.add_topic_summary_contract(
             specification,
             "/v1/messenger/",

@@ -540,7 +540,8 @@ def test_multipart_upload_builds_metadata_before_store_write(store_factory):
     save_metadata.assert_called_once_with(metadata, storage_type="s3")
 
 
-def test_multipart_public_upload_uses_public_acl_without_stream(store_factory):
+@pytest.mark.parametrize("acl_mode", ("owner", "public"))
+def test_multipart_acl_upload_uses_explicit_acl_without_stream(store_factory, acl_mode):
     store, _opened_scopes = store_factory
     controller = _controller(controllers.WorkspaceFileController)
     data = b"public example data"
@@ -550,7 +551,7 @@ def test_multipart_public_upload_uses_public_acl_without_stream(store_factory):
             filename="public-example.txt",
             type="text/plain",
         ),
-        "acl": types.SimpleNamespace(value='{"mode":"public"}'),
+        "acl": types.SimpleNamespace(value=f'{{"mode":"{acl_mode}"}}'),
     }
     storage_info = controllers.file_storage.WorkspaceFileStorageInfo(
         storage_type="s3",
@@ -575,7 +576,7 @@ def test_multipart_public_upload_uses_public_acl_without_stream(store_factory):
     assert values["stream_uuid"] is None
     metadata = save_metadata.call_args.args[0]
     assert metadata.stream_uuid is None
-    assert metadata.acl_mode == "public"
+    assert metadata.acl_mode == acl_mode
     save_metadata.assert_called_once_with(metadata, storage_type="s3")
 
 

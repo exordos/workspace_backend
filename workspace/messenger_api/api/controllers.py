@@ -543,9 +543,9 @@ class WorkspaceFileController(StoreResourceController):
             acl = acl_value if isinstance(acl_value, dict) else json.loads(acl_value)
         except (TypeError, ValueError) as exc:
             raise ra_exc.ValidationErrorException() from exc
-        if acl != {"mode": "public"}:
+        if acl not in ({"mode": "owner"}, {"mode": "public"}):
             raise ra_exc.ValidationErrorException()
-        return None, "public"
+        return None, acl["mode"]
 
     def process_result(
         self, result: typing.Any, *args: typing.Any, **kwargs: typing.Any
@@ -597,7 +597,7 @@ class WorkspaceFileController(StoreResourceController):
             {
                 "uuid": file_uuid,
                 "stream_uuid": stream_uuid,
-                "acl_mode": "public" if acl_mode == "public" else "stream",
+                "acl_mode": (acl_mode if acl_mode in {"owner", "public"} else "stream"),
                 "name": name,
                 "description": description,
                 "content_type": file_part.type,
@@ -738,11 +738,12 @@ setattr(
                             "stream_uuid": {"format": "uuid", "type": "string"},
                             "acl": {
                                 "description": (
-                                    "JSON ACL object. The only public form is "
-                                    '{"mode":"public"}.'
+                                    "JSON ACL object. Use owner for a private "
+                                    "mail attachment or public for a realm-wide file."
                                 ),
                                 "pattern": (
-                                    '^\\s*\\{\\s*"mode"\\s*:\\s*"public"\\s*\\}\\s*$'
+                                    '^\\s*\\{\\s*"mode"\\s*:\\s*'
+                                    '"(?:owner|public)"\\s*\\}\\s*$'
                                 ),
                                 "type": "string",
                             },
