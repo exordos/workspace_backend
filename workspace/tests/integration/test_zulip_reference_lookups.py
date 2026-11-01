@@ -5,7 +5,7 @@ import uuid
 
 import pytest
 
-from workspace.bridges.zulip import incoming_operations
+from workspace.bridges.zulip import incoming_operations, outgoing_operations
 from workspace.tests.integration import test_projection_performance as projection_tests
 from workspace.tests.integration import test_zulip_bounded_lookups as bounded_tests
 from workspace.tests.integration import test_zulip_incoming as incoming_tests
@@ -21,6 +21,44 @@ def parameters(account):
         ["101", "101", "missing"],
         account["provider_uuid"],
     )
+
+
+@pytest.mark.isolated_schema
+@pytest.mark.parametrize("reference_kind", ["placement", "canonical", "missing"])
+def test_outgoing_message_reference_does_not_scan_unrelated_history(
+    large_history, reference_kind
+):
+    db, account, target = large_history
+    canonical = db.execute(
+        "SELECT message_uuid FROM messenger_message_placements WHERE uuid=%s",
+        (target[3],),
+    ).fetchone()[0]
+    reference = {
+        "placement": target[3],
+        "canonical": canonical,
+        "missing": uuid.uuid4(),
+    }[reference_kind]
+    args = (account["project_id"], account["owner_user_uuid"], reference) * 2
+    assert db.execute(
+        outgoing_operations.SELECT_MESSAGE_REFERENCE_SQL, args
+    ).fetchall() == ([] if reference_kind == "missing" else [(canonical,)])
+    plan = db.execute(
+        "EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) "
+        + outgoing_operations.SELECT_MESSAGE_REFERENCE_SQL,
+        args,
+    ).fetchone()[0][0]
+    scanned = sum(
+        (node["Actual Rows"] + node.get("Rows Removed by Filter", 0))
+        * node["Actual Loops"]
+        for node in projection_tests._plan_nodes(plan["Plan"])
+        if node.get("Relation Name")
+        in {
+            "messenger_messages",
+            "messenger_message_placements",
+            "messenger_user_message_bindings",
+        }
+    )
+    assert scanned < 100, plan
 
 
 @pytest.mark.isolated_schema
@@ -118,3 +156,10 @@ def test_message_references_keep_the_complete_visibility_rules(incoming, case):
     assert db.execute(
         incoming_operations.SELECT_MESSAGE_REFERENCES_SQL, args
     ).fetchall() == ([(placement, "101")] if case in ("visible", "empty_flags") else [])
+    for identifier in (placement, message):
+        reference_args = (args[0], args[1], identifier) * 2
+        assert db.execute(
+            outgoing_operations.SELECT_MESSAGE_REFERENCE_SQL, reference_args
+        ).fetchall() == (
+            [(message,)] if case in ("visible", "empty_flags", "other_provider") else []
+        )

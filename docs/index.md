@@ -27,6 +27,10 @@ Messages, streams and topics retain `source_name` and `source` as
 `native` and `{"kind":"native"}`. Architecture proposals below predate this
 cleanup; the generated public API describes the current supported contract.
 
+## Query plan validation
+
+- [Message pages, sparse flags and reference lookups](message_page_queries.md)
+
 ## Translation contract
 
 All four language trees contain the same Markdown and PlantUML paths. Code
