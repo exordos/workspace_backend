@@ -196,15 +196,23 @@ def test_page_keys_downgrade_resumes_after_view_drop(api, db, monkeypatch):
 
 
 @pytest.mark.isolated_schema
-def test_bulk_page_keys_remain_keyed_with_stale_project_statistics(api, db):
-    history._seed(db, uuid.uuid4(), uuid.uuid4(), 4096)
+@pytest.mark.parametrize("previous_history", [False, True])
+def test_bulk_page_keys_remain_keyed_with_stale_project_statistics(
+    api, db, previous_history
+):
+    if previous_history:
+        history._seed(db, uuid.uuid4(), uuid.uuid4(), 1)
+        history._seed(db, uuid.uuid4(), uuid.uuid4(), 4096)
     for table in history.TABLES:
         db.execute(f"ALTER TABLE {table} SET (autovacuum_enabled=false)")
         db.execute(f"ANALYZE {table}")
     stream, _original = projection._create_message(api, "bulk-page-keys")
-    db.execute("ANALYZE messenger_messages,messenger_message_placements")
+    db.execute(
+        "ANALYZE messenger_messages,messenger_message_placements,messenger_user_message_bindings"
+    )
     with db.transaction():
         db.execute("SET LOCAL statement_timeout='30s'")
+        planner_setting = db.execute("SHOW enable_nestloop").fetchone()
         plan = db.execute(
             """EXPLAIN (ANALYZE,BUFFERS,TIMING OFF,FORMAT JSON)
             WITH content AS MATERIALIZED (
@@ -231,6 +239,7 @@ def test_bulk_page_keys_remain_keyed_with_stale_project_statistics(api, db):
                 api.user_uuid,
             ),
         ).fetchone()[0][0]
+        assert db.execute("SHOW enable_nestloop").fetchone() == planner_setting
     # Source INSERT synchronization is bounded per statement. Per-row repair
     # multiplies lookups across the newly inserted history and caused a timeout.
     names = {

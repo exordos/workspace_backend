@@ -72,6 +72,13 @@ Install the candidate view after this preparation finishes. Old application
 versions can keep using the unchanged message view with the added schema.
 Switch back to old application code before explicitly downgrading this migration.
 
+Migration 0292 bounds source INSERT synchronization when the source tables were
+last analyzed with only one row. It replans each transition-table repair and
+avoids nested-loop history scans for batches larger than 1,000 source rows.
+Small INSERTs retain normal indexed plans. Planner settings apply only within
+the two repair functions and are restored before the caller continues; other
+request work and connections keep their settings.
+
 Outgoing Zulip reference resolution accepts both placement and canonical
 message UUIDs. Use two indexed branches with `UNION ALL` and a final `LIMIT 1`,
 keeping the same visibility conditions in each branch. Resolve canonical message
