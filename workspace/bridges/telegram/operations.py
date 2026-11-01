@@ -8,6 +8,7 @@ import hashlib
 import typing
 import uuid
 
+from workspace.bridges import history
 from workspace.bridges import messenger
 from workspace.bridges.telegram import conversion
 from workspace.common import emoji
@@ -480,6 +481,256 @@ class Operations(messenger.Operations):
             connection, account, identifier, public_uuid, stream["uuid"], data
         )
         return not old, identifier
+
+    async def history_batch(
+        self,
+        connection: typing.Any,
+        account: dict,
+        peer: dict,
+        stream: dict,
+        messages: list[dict],
+    ) -> int:
+        """Normalize MTProto rows, then use the same COPY/merge engine as Zulip."""
+        if not messages:
+            return 0
+        identities = {item["identity"] for item in messages}
+        identities.update(
+            conversion.message_identity(
+                account["external_account_id"], peer["peer_key"], item["reply_to"]
+            )
+            for item in messages
+            if item.get("reply_to")
+        )
+        known = await messenger.rows(
+            connection,
+            """
+            SELECT message.*,placement.uuid AS placement_uuid
+            FROM messenger_messages message
+            LEFT JOIN messenger_message_placements placement ON placement.project_id=message.project_id
+                AND placement.message_uuid=message.uuid AND placement.stream_uuid=%s
+            WHERE message.project_id=%s AND message.provider_uuid=%s AND message.source_name='telegram'
+                AND message.provider_identity=ANY(%s::text[])
+        """,
+            (
+                stream["uuid"],
+                account["project_id"],
+                account["provider_uuid"],
+                sorted(identities),
+            ),
+        )
+        old = {row["provider_identity"]: row for row in known}
+        members = await messenger.rows(
+            connection,
+            messenger.SELECT_MEMBERS_SQL,
+            (account["project_id"], stream["uuid"]),
+        )
+        people = {}
+        for item in messages:
+            people[item["sender_id"]] = item.get("sender_name", "")
+            people.update({actor["user_id"]: "" for actor in item["reaction_actors"]})
+        users = {
+            remote: await self.user(connection, account, remote, name)
+            for remote, name in sorted(people.items())
+        }
+        topics = {}
+        for item in messages:
+            if item["topic_id"] not in topics:
+                topics[item["topic_id"]] = await self.topic(
+                    connection,
+                    account,
+                    stream,
+                    item["topic_id"],
+                    item.get("topic_title", ""),
+                )
+        batch: dict[str, list[dict]] = {
+            table: []
+            for table in (
+                "messenger_message_contents",
+                "messenger_messages",
+                "messenger_message_placements",
+                "messenger_user_message_bindings",
+                "messenger_user_message_unreads",
+                "messenger_message_reaction_facts",
+                "m_workspace_files",
+            )
+        }
+        contents: dict[tuple, dict] = {}
+        files: dict[uuid.UUID, dict] = {}
+        facts: dict[tuple, dict] = {}
+        created = 0
+        for item in messages:
+            previous = old.get(item["identity"])
+            if previous and previous["deleted_at"] is not None:
+                continue
+            identifier = (
+                previous["uuid"]
+                if previous
+                else messenger.canonical_uuid(account, "message", item["identity"])
+            )
+            placement = (
+                previous["placement_uuid"]
+                if previous and previous["placement_uuid"]
+                else uuid.uuid5(identifier, str(stream["uuid"]))
+            )
+            topic = topics[item["topic_id"]]
+            text = item["text"]
+            if item.get("reply_to"):
+                remote = conversion.message_identity(
+                    account["external_account_id"], peer["peer_key"], item["reply_to"]
+                )
+                reply = (
+                    old[remote]["uuid"]
+                    if remote in old
+                    else messenger.canonical_uuid(account, "message", remote)
+                )
+                text = f"[Reply](urn:message:{uuid.uuid5(reply, str(stream['uuid']))})\n\n{text}"
+            for file in item["files"]:
+                files[file["uuid"]] = {
+                    **file,
+                    "project_id": account["project_id"],
+                    "user_uuid": users[item["sender_id"]],
+                    "stream_uuid": stream["uuid"],
+                    **origin(account, f"{item['identity']}:file"),
+                }
+                kind = file["content_type"].lower().split("/", 1)[0]
+                kind = kind if kind in ("image", "video") else "file"
+                text += f"\n\n![{file['name']}](urn:{kind}:{file['uuid']})"
+            payload = {"kind": "markdown", "content": text}
+            content = contents.setdefault(
+                (str(payload), item["text"]),
+                {
+                    "uuid": uuid.uuid4(),
+                    "workspace_content": payload,
+                    "provider_content": item["text"],
+                },
+            )
+            edited = datetime.datetime.fromisoformat(item["edited_at"]).replace(
+                tzinfo=None
+            )
+            counts = {
+                emoji.normalize_name(name): count
+                for name, count in item["reactions"].items()
+            }
+            actors: dict[str, set[str]] = {}
+            for actor in item["reaction_actors"]:
+                name = emoji.normalize_name(actor["emoji"])
+                user = users[actor["user_id"]]
+                actors.setdefault(name, set()).add(str(user))
+                facts[(identifier, user, name)] = {
+                    "uuid": uuid.uuid5(identifier, f"{user}:{name}"),
+                    "project_id": account["project_id"],
+                    "canonical_message_uuid": identifier,
+                    "placement_uuid": placement,
+                    "user_uuid": user,
+                    "emoji_name": name,
+                    **origin(
+                        account,
+                        f"{item['identity']}:reaction:{actor['user_id']}:{name}",
+                    ),
+                }
+            root = {
+                "uuid": identifier,
+                "project_id": account["project_id"],
+                "author_uuid": users[item["sender_id"]],
+                "content_uuid": content["uuid"],
+                "created_at": datetime.datetime.fromisoformat(item["date"]).replace(
+                    tzinfo=None
+                ),
+                "content_updated_at": edited,
+                "reactions": counts,
+                "reaction_users": {
+                    name: sorted(values)
+                    for name, values in actors.items()
+                    if len(values) == counts.get(name) and len(values) <= 5
+                },
+                **origin(account, item["identity"]),
+            }
+            if previous and edited < previous["content_updated_at"].replace(
+                tzinfo=None
+            ):
+                for key in ("author_uuid", "content_uuid", "content_updated_at"):
+                    root[key] = previous[key]
+            batch["messenger_messages"].append(root)
+            batch["messenger_message_placements"].append(
+                {
+                    "uuid": placement,
+                    "project_id": account["project_id"],
+                    "message_uuid": identifier,
+                    "stream_uuid": stream["uuid"],
+                    "topic_uuid": topic["uuid"],
+                    "created_at": root["created_at"],
+                }
+            )
+            batch["messenger_user_message_bindings"].extend(
+                {
+                    "uuid": uuid.uuid5(placement, str(member["user_uuid"])),
+                    "project_id": account["project_id"],
+                    "placement_uuid": placement,
+                    "user_uuid": member["user_uuid"],
+                }
+                for member in members
+            )
+            if not item["out"] and item["id"] > peer["read_max_id"]:
+                batch["messenger_user_message_unreads"].append(
+                    {
+                        "project_id": account["project_id"],
+                        "user_uuid": account["owner_user_uuid"],
+                        "placement_uuid": placement,
+                        "stream_uuid": stream["uuid"],
+                        "topic_uuid": topic["uuid"],
+                    }
+                )
+            created += int(previous is None)
+        batch["messenger_message_contents"] = list(contents.values())
+        batch["m_workspace_files"] = list(files.values())
+        batch["messenger_message_reaction_facts"] = list(facts.values())
+        for table, values in batch.items():
+            await history.stage(connection, table, values)
+        if files:
+            await history.merge(
+                connection,
+                "m_workspace_files",
+                list(next(iter(files.values()))),
+                key=("uuid",),
+            )
+        await history.merge_messages(
+            connection,
+            batch,
+            account["provider_uuid"],
+            "telegram",
+            message_updates=(
+                "author_uuid",
+                "content_uuid",
+                "content_updated_at",
+                "provider_identity",
+                "reactions",
+                "reaction_users",
+            ),
+            condition="dst.deleted_at IS NULL AND src.content_updated_at>=dst.content_updated_at",
+        )
+        await history.merge_flags(connection, ("unreads",), account["owner_user_uuid"])
+        await history.execute(
+            connection,
+            "delete.reactions",
+            """
+            DELETE FROM messenger_message_reaction_facts dst USING history_messenger_messages message
+            WHERE dst.project_id=message.project_id AND dst.canonical_message_uuid=message.uuid
+              AND dst.source_name='telegram' AND dst.provider_uuid=%s AND NOT EXISTS (
+                SELECT 1 FROM history_messenger_message_reaction_facts src
+                WHERE src.project_id=dst.project_id AND src.canonical_message_uuid=dst.canonical_message_uuid
+                  AND src.user_uuid=dst.user_uuid AND src.emoji_name=dst.emoji_name)
+        """,
+            (account["provider_uuid"],),
+        )
+        if facts:
+            await history.merge(
+                connection,
+                "messenger_message_reaction_facts",
+                list(next(iter(facts.values()))),
+                key=("project_id", "canonical_message_uuid", "user_uuid", "emoji_name"),
+            )
+        await history.queue_counters(connection)
+        return created
 
     async def reactions(
         self,

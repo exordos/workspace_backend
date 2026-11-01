@@ -19,7 +19,7 @@ def test_telegram_authentication_is_owner_and_project_scoped(telegram_account):
     started = api.post(path, json={"operation": "start"}, permissions=PERMISSIONS)
     assert started.status_code == 200, started.text
     assert started.json()["state"] == "starting"
-    assert started.json()["history_enabled"] is False
+    assert started.json()["history_enabled"] is True
     assert started.json()["generation"]
     assert (
         api.post(

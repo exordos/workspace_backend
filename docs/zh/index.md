@@ -19,7 +19,7 @@
 
 ## Telegram 提供商
 
-[Telegram 账户与实时同步](telegram_provider.md)。
+[Telegram 账户、自动完整历史记录和同步](telegram_provider.md)。
 
 ## 公共 API 和设计历史
 

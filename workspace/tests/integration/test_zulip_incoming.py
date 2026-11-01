@@ -31,7 +31,8 @@ from workspace.cmd import messenger_worker
 from workspace.common import mutation_journal_opts
 from workspace.messenger_api import file_storage, publication, websocket_service
 from workspace.messenger_api.dm import external_models
-from workspace.services import zulip_history, zulip_incoming, zulip_outgoing
+from workspace.bridges import history as common_history
+from workspace.services import zulip_incoming, zulip_outgoing
 from workspace.services.messenger_workers import (
     counters,
     mutation_runtime,
@@ -2912,16 +2913,9 @@ def test_full_retry_window_cannot_starve_newer_topic_dependencies(incoming, free
                 "UPDATE zulip_incoming_events SET next_retry_at=now(), "
                 "received_at=now()-interval '1 second' WHERE processed_at IS NULL"
             )
-            busy_parameters = (
-                account["project_id"],
-                0.5,
-                account["project_id"],
-                256,
-                256,
+            assert await common_history.busy(
+                service.db, account["project_id"], 256, 0.5
             )
-            assert (await service.db.sql(zulip_history.BUSY_SQL, busy_parameters))[0][
-                "busy"
-            ]
             occupied = []
             for index in range(128 - free_slots):
                 task = asyncio.create_task(asyncio.Event().wait())
@@ -2957,9 +2951,9 @@ def test_full_retry_window_cannot_starve_newer_topic_dependencies(incoming, free
                 "OR payload->>'type'='ensure_dependency'"
             )
             publish()
-            assert not (await service.db.sql(zulip_history.BUSY_SQL, busy_parameters))[
-                0
-            ]["busy"]
+            assert not await common_history.busy(
+                service.db, account["project_id"], 256, 0.5
+            )
         finally:
             tasks = list(service.tasks.values())
             for task in tasks:

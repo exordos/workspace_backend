@@ -19,7 +19,7 @@ Entitätsnamen, Felder, Routen, JSON-Werte und Aufgabentypen in den Dokumenten b
 
 ## Telegram-Anbieter
 
-[Telegram-Konten und Echtzeitsynchronisierung](telegram_provider.md).
+[Telegram-Konten, automatische vollständige Historie und Synchronisation](telegram_provider.md).
 
 ## Öffentliche API und Designhistorie
 

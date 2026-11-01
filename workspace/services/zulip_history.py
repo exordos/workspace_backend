@@ -11,6 +11,7 @@ import time
 
 from psycopg.types import json as pg_json
 
+from workspace.bridges import history as common_history
 from workspace.bridges.zulip import history, history_blocks, incoming_operations
 from workspace.services import zulip_outgoing
 
@@ -34,15 +35,7 @@ SELECT_JOBS_SQL = """
       AND NOT((project_id::text||':'||provider_uuid::text)=ANY(%s::text[]))
     ORDER BY last_run_at LIMIT %s
 """
-BUSY_SQL = """
-    SELECT EXISTS (
-        SELECT 1 FROM zulip_incoming_events WHERE project_id=%s
-          AND processed_at IS NULL AND next_retry_at<=now()
-          AND received_at<now()-%s*interval '1 second'
-    ) OR (SELECT count(*) FROM (
-        SELECT 1 FROM messenger_publication_outbox WHERE project_id=%s LIMIT %s
-    ) pending)>=%s AS busy
-"""
+BUSY_SQL = common_history.BUSY_SQL
 
 
 class ZulipHistoryService:
@@ -109,18 +102,9 @@ class ZulipHistoryService:
         self.ready.set()
 
     async def busy(self, project: object) -> bool:
-        return (
-            await self.db.sql(
-                BUSY_SQL,
-                (
-                    project,
-                    self.realtime_delay,
-                    project,
-                    self.publication_limit,
-                    self.publication_limit,
-                ),
-            )
-        )[0]["busy"]
+        return await common_history.busy(
+            self.db, project, self.publication_limit, self.realtime_delay
+        )
 
     async def step(self, account: dict) -> None:
         started = time.monotonic()
@@ -310,9 +294,9 @@ class ZulipHistoryService:
                 },
             )
             raw = page["messages"]
-            if any(item["id"] >= anchor for item in raw):
-                raise ValueError("Zulip history page did not advance below its anchor")
-            oldest = min((item["id"] for item in raw), default=0)
+            oldest = common_history.page_before(
+                [item["id"] for item in raw], anchor, "Zulip"
+            )
             messages.extend(
                 item
                 for item in raw

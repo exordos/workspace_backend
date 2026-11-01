@@ -64,6 +64,7 @@ def test_startup_catalog_does_not_hold_realtime_receive_and_send(monkeypatch):
         service.catalog = blocked_catalog
         service.receive_loop = receive
         service.outgoing_loop = send
+        service.history_loop = idle
         task = asyncio.create_task(
             service.account({"uuid": uuid.uuid4(), "project_id": uuid.uuid4()})
         )
@@ -71,6 +72,190 @@ def test_startup_catalog_does_not_hold_realtime_receive_and_send(monkeypatch):
             await asyncio.wait_for(catalog_started.wait(), 0.5)
             await asyncio.wait_for(receiving.wait(), 0.1)
             await asyncio.wait_for(sending.wait(), 0.1)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+def test_channel_history_file_does_not_hold_private_or_group_history(monkeypatch):
+    async def run():
+        service = account_service(monkeypatch)
+        peers = [
+            {
+                "peer_key": f"{kind}:8",
+                "peer_kind": kind,
+                "history_done": False,
+                "history_retry_at": None,
+            }
+            for kind in ("channel", "chat", "user")
+        ]
+        service.selected = mock.AsyncMock(return_value=peers)
+        service.wait_retry = mock.AsyncMock()
+        service.status = mock.AsyncMock()
+        monkeypatch.setattr(
+            telegram.common_history, "busy", mock.AsyncMock(return_value=False)
+        )
+        blocked = asyncio.Event()
+        completed = {kind: asyncio.Event() for kind in ("chat", "user", "realtime")}
+
+        async def page(account, peer, client):
+            if peer["peer_kind"] == "channel":
+                blocked.set()
+                await asyncio.Future()
+            await blocked.wait()
+            return [], {}
+
+        async def merge(account, peer, prepared, **kwargs):
+            peer["history_done"] = True
+            completed[peer["peer_kind"]].set()
+
+        async def receive(*args):
+            await blocked.wait()
+            completed["realtime"].set()
+            await asyncio.Future()
+
+        async def idle(*args):
+            await asyncio.Future()
+
+        service.history_page = page
+        service.merge_batch = merge
+        service.receive_loop = receive
+        service.channel_loop = service.replay_loop = service.outgoing_loop = idle
+        service.catalog_loop = service.notification_loop = idle
+        task = asyncio.create_task(
+            service.account({"uuid": uuid.uuid4(), "project_id": uuid.uuid4()})
+        )
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*(event.wait() for event in completed.values())), 0.3
+            )
+            assert all(
+                call.args[1] == "syncing" for call in service.status.await_args_list
+            )
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+def test_history_checks_shared_retry_deadline_before_the_next_peer(monkeypatch):
+    async def run():
+        service = account_service(monkeypatch)
+        service.selected = mock.AsyncMock(
+            return_value=[
+                {
+                    "peer_key": f"user:{i}",
+                    "peer_kind": "user",
+                    "history_done": False,
+                    "history_retry_at": None,
+                }
+                for i in (8, 9)
+            ]
+        )
+        service.status = mock.AsyncMock()
+        monkeypatch.setattr(
+            telegram.common_history, "busy", mock.AsyncMock(return_value=False)
+        )
+        deferred = False
+        fetched = []
+
+        async def wait_retry(*args):
+            if deferred:
+                raise asyncio.CancelledError()
+
+        async def page(account, peer, client):
+            fetched.append(peer["peer_key"])
+            return [], {}
+
+        async def merge(*args, **kwargs):
+            nonlocal deferred
+            deferred = True
+
+        service.wait_retry = wait_retry
+        service.history_page = page
+        service.merge_batch = merge
+        with pytest.raises(asyncio.CancelledError):
+            await service.history_loop({"project_id": uuid.uuid4()}, None)
+        assert fetched == ["user:8"]
+
+    asyncio.run(run())
+
+
+def test_retry_wait_observes_a_deadline_extended_by_another_history_job(monkeypatch):
+    async def run():
+        service = telegram.TelegramService("unused", 12345, "synthetic", "synthetic")
+        service.db.sql = mock.AsyncMock(
+            side_effect=[
+                [{"seconds": 2}],
+                [{"seconds": 5}],
+                [{"seconds": 0}],
+            ]
+        )
+        sleep = mock.AsyncMock()
+        monkeypatch.setattr(telegram.asyncio, "sleep", sleep)
+        await service.wait_retry({"uuid": uuid.uuid4()}, "history")
+        assert [call.args[0] for call in sleep.await_args_list] == [2, 5]
+        assert service.db.sql.await_count == 3
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        telegram.errors.FloodWaitError(None, capture=30),
+        TimeoutError(),
+        ValueError("synthetic import failure"),
+    ],
+)
+def test_history_failure_keeps_realtime_account_jobs_running(monkeypatch, failure):
+    async def run():
+        service = account_service(monkeypatch)
+        history_failed = asyncio.Event()
+        realtime_after_failure = asyncio.Event()
+        service.selected = mock.AsyncMock(
+            return_value=[
+                {
+                    "peer_key": "user:8",
+                    "peer_kind": "user",
+                    "history_done": False,
+                    "history_retry_at": None,
+                }
+            ]
+        )
+        service.status = mock.AsyncMock()
+        monkeypatch.setattr(
+            telegram.common_history, "busy", mock.AsyncMock(return_value=False)
+        )
+
+        async def limited(*args):
+            history_failed.set()
+            raise failure
+
+        async def receive(*args):
+            await history_failed.wait()
+            await asyncio.sleep(0.01)
+            realtime_after_failure.set()
+            await asyncio.Future()
+
+        async def idle(*args):
+            await asyncio.Future()
+
+        service.history_page = limited
+        service.receive_loop = receive
+        service.outgoing_loop = idle
+        service.catalog_loop = idle
+        task = asyncio.create_task(
+            service.account({"uuid": uuid.uuid4(), "project_id": uuid.uuid4()})
+        )
+        try:
+            await asyncio.wait_for(realtime_after_failure.wait(), 0.2)
+            queries = [call.args[0] for call in service.db.sql.await_args_list]
+            assert any("history_retry_at" in query for query in queries)
+            assert not any("SET next_attempt_at=" in query for query in queries)
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
@@ -105,6 +290,7 @@ def test_catalog_flood_wait_keeps_realtime_account_jobs_running(monkeypatch):
         service.notification_defaults = mock.AsyncMock()
         service.wait_retry = wait_retry
         service.receive_loop = receive
+        service.history_loop = idle
         service.outgoing_loop = idle
         task = asyncio.create_task(service.account({"uuid": uuid.uuid4()}))
         try:
@@ -250,6 +436,7 @@ def test_account_refreshes_catalog_when_a_new_dialog_message_arrives(monkeypatch
             await asyncio.Future()
 
         service.catalog = catalog
+        service.history_loop = idle
         service.outgoing_loop = idle
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(service.account({"uuid": uuid.uuid4()}), 0.5)
@@ -307,6 +494,7 @@ def test_slow_channel_rpc_does_not_hold_direct_realtime(monkeypatch):
         service.receive_common = common
         service.receive_channel = channel
         service.replay_pending = mock.AsyncMock()
+        service.history_loop = idle
         service.outgoing_loop = idle
         service.catalog_loop = idle
         task = asyncio.create_task(service.account({"uuid": uuid.uuid4()}))

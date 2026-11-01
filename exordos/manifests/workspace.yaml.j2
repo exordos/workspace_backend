@@ -459,6 +459,7 @@ resources:
           api_id = 0
           api_hash =
           secret_encryption_key = {$core.secret.passwords.$workspace_telegram_secret_key:value}
+          history_batch_size = 100
           poll_interval = 1
 
           [zulip_outgoing]
