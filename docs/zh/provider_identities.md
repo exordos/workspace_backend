@@ -1,120 +1,47 @@
-# Provider identities
+# 提供商身份
 
-Messenger provider instances are stored in `messenger_providers` with `uuid`
-and unique `hostname`. Hostnames are normalized by URL parsing; scheme, port,
-and path are not part of the instance identity. Existing deterministic
-Workspace user, channel, topic, and message UUIDs are preserved.
+Messenger 提供商实例存储在 `messenger_providers` 中，具有 `uuid` 和唯一的 `hostname`。主机名通过 URL 解析进行规范化；方案、端口和路径不属于实例身份的一部分。现有的确定性 Workspace 用户、频道、主题和消息 UUID 均被保留。
 
-Provider-aware domain models carry `source_name`, `provider_uuid` (a foreign
-key to the provider), and nullable `provider_identity` (a string of at most
-255 characters). `source_name = "native"` means strictly local: both provider
-fields are null and the object never produces a Zulip outgoing intention.
-A child created in a Zulip stream or message inherits `source_name = "zulip"`
-and its parent's non-null `provider_uuid`, even when the user creates it through
-Workspace. Its `provider_identity` stays null until the provider confirms it.
-Clients cannot choose or change this inherited provenance. The former JSON
-`source` object is removed from models, REST responses, and realtime payloads.
-`WorkspaceUser.source` remains unchanged.
+支持提供商的领域模型包含 `source_name`、`provider_uuid`（指向提供商的外键）以及可为空的 `provider_identity`（最多 255 个字符的字符串）。`source_name = "native"` 表示严格本地：两个提供商字段均为 null，且该对象永远不会产生 Zulip 出站意图。在 Zulip 流或消息中创建的子项会继承 `source_name = "zulip"` 及其父项的非空 `provider_uuid`，即使用户是通过 Workspace 创建它的。其 `provider_identity` 保持为 null，直到提供商确认它。客户端无法选择或更改此继承的来源信息。旧的 JSON `source` 对象已从模型、REST 响应和实时负载中移除。`WorkspaceUser.source` 保持不变。
 
-| Model | Zulip provider identity |
+| 模型 | Zulip 提供商身份 |
 | --- | --- |
-| `WorkspaceStream` | Channel ID; direct/group conversations use `dm:` followed by the existing deterministic conversation UUID. |
-| `WorkspaceStreamBinding` | Stream identity followed by the remote user ID, separated by `:`. |
-| `WorkspaceStreamTopic` | Stream identity followed by the topic name, separated by `:`. |
-| `WorkspaceUserTopicBinding` | Topic identity followed by the remote user ID, separated by `:`. |
-| `WorkspaceMessage` | Remote message ID. |
-| `WorkspaceUserMessageState` | Remote message ID followed by the observing remote user ID, separated by `:`. |
-| `WorkspaceMessageReactionFact` | Remote message ID, reacting remote user ID, reaction type, and emoji code, separated by `:`. |
-| `WorkspaceFile` | Remote upload path returned by Zulip. |
+| `WorkspaceStream` | 频道 ID；直接/群组对话使用 `dm:` 后跟现有的确定性对话 UUID。 |
+| `WorkspaceStreamBinding` | 流身份后跟远程用户 ID，以 `:` 分隔。 |
+| `WorkspaceStreamTopic` | 流身份后跟主题名称，以 `:` 分隔。 |
+| `WorkspaceUserTopicBinding` | 主题身份后跟远程用户 ID，以 `:` 分隔。 |
+| `WorkspaceMessage` | 远程消息 ID。 |
+| `WorkspaceUserMessageState` | 远程消息 ID 后跟观察者的远程用户 ID，以 `:` 分隔。 |
+| `WorkspaceMessageReactionFact` | 远程消息 ID、反应远程用户 ID、反应类型和表情代码，以 `:` 分隔。 |
+| `WorkspaceFile` | Zulip 返回的远程上传路径。 |
 
-The canonical object owns its provider identity. Sending and receiving resolve
-that identity directly; a native object does not acquire a separate remote copy.
-File links retain account-scoped access observations, and reaction links retain
-custom emoji metadata. Technical placements, message-access bindings, and
-file-access rows inherit context through their existing foreign keys.
+规范对象拥有其提供商身份。发送和接收直接解析该身份；原生对象不会获取单独的远程副本。文件链接保留账户范围的同步观察结果，反应链接保留自定义表情元数据。文件授权使用 Workspace ACL 和活跃流成员资格，独立于关联的提供商账户或回执。技术放置、消息访问绑定和文件访问行通过其现有的外键继承上下文。
 
-`ExternalAccount.provider_uuid` references the same provider table.
-`external_account_id` stores the remote user ID without a hostname prefix.
-The account's `provider` string retains the provider type. Unconfigured accounts
-without a server hostname can retain a null provider link; supplying a provider
-UUID or configuring a server URL establishes the link. Account uniqueness
-includes `provider_uuid`, so the same owner can connect accounts on different
-servers and identical remote user IDs remain isolated. `settings.server_url`
-is retained as the transport endpoint, including scheme, port, and path;
-provider-scoped identity and hostname lookup use the provider foreign key.
+`ExternalAccount.provider_uuid` 引用相同的提供商表。`external_account_id` 存储远程用户 ID，不带主机名前缀。账户的 `provider` 字符串保留提供商类型。没有服务器主机名的未配置账户可以保留 null 提供商链接；提供提供商 UUID 或配置服务器 URL 会建立链接。账户唯一性包括 `provider_uuid`，因此同一所有者可以连接不同服务器上的账户，且相同的远程用户 ID 保持隔离。`settings.server_url` 作为传输端点被保留，包括方案、端口和路径；提供商范围的身份和主机名查找使用提供商外键。
 
-Migration 0263 replaces canonical JSON source columns with provider fields.
-Migrations 0265 and 0266 retire the old outgoing and incoming task machinery.
-Migration 0267 inherits existing children's provider context from their parents,
-removes obsolete root identity links and native outgoing intentions, and allows
-a pending Zulip identity without an external ID. This cutover is irreversible;
-restore a verified database backup together with its matching application
-version when recovery is required. Provider deletion uses cascading foreign
-keys for provider-owned rows.
+迁移 0263 用提供商字段替换规范 JSON 源列。迁移 0265 和 0266 退役旧的出站和入站任务机制。迁移 0267 从父项继承现有子项的提供商上下文，移除过时的根身份链接和原生出站意图，并允许没有外部 ID 的待定 Zulip 身份。此切换是不可逆的；当需要恢复时，请连同匹配的应用程序版本一起恢复经过验证的数据库备份。提供商删除对提供商拥有的行使用级联外键。
 
 
-## Synchronization status
+## 同步状态
 
-All eight provider-aware domain models expose a read-only `status` with values
-`new`, `syncing`, `active`, and `error`. Native entities start and remain
-`active`. A newly constructed provider entity starts as `new`; an import that
-creates an already complete entity persists it directly as `active`.
-Existing records are backfilled as `active` by migration 0264.
+所有八个支持提供商的领域模型都暴露一个只读的 `status`，其值为 `new`、`syncing`、`active` 和 `error`。原生实体以 `active` 开始并保持该状态。新构建的提供商实体以 `new` 开始；创建已完整实体的导入会直接将其持久化为 `active`。现有记录由迁移 0264 回填为 `active`。
 
-Provider reconciliation transitions an existing entity to `syncing`, then to
-`active` after successful processing. A failed worker records `error` for its
-specific persisted entity after rolling back the failed data writes. A retry
-can return it to `active`. Existing data remains readable in every status.
-Account connectivity errors do not mark all imported objects as failed.
+提供商协调将现有实体转换为 `syncing`，然后在成功处理后转换为 `active`。失败的 worker 在回滚失败的数据写入后，为其特定的持久化实体记录 `error`。重试可以将其返回到 `active`。在所有状态下，现有数据均保持可读。账户连接错误不会将所有导入对象标记为失败。
 
-The outgoing worker persists preparation before making HTTP requests. A
-confirmed response or retained matching event completes the intention and fills
-the canonical provider identity. Incoming domain writes, client publication, and
-inbox acknowledgement commit together. Status-only updates do not change domain
-timestamps, counters, or enqueue new synchronization work. Archive, completion,
-read, starred and pinned fields remain independent.
+出站 worker 在发出 HTTP 请求之前持久化准备状态。确认的响应或保留的匹配事件完成意图并填充规范提供商身份。入站领域写入、客户端发布和收件箱确认一起提交。仅状态更新不会更改领域时间戳、计数器或入队新的同步工作。归档、完成、已读、加星和置顶字段保持独立。
 
-## Optional send receipts
+## 可选发送回执
 
-Message sends pass the canonical Workspace message UUID as `local_id`, together
-with the sender's `queue_id`. Zulip returns it as `local_message_id` in that
-queue's message event. The outgoing worker can use a durably saved matching
-event after a lost HTTP response. The authoritative remote ID remains
-`provider_identity`; `local_id` is not a persistent lookup key or a provider
-idempotency guarantee. If neither a response nor a definitive receipt survives,
-the worker keeps the send uncertain instead of blindly creating a duplicate.
+消息发送将规范 Workspace 消息 UUID 作为 `local_id` 传递，连同发送者的 `queue_id`。Zulip 在该队列的消息事件中将其作为 `local_message_id` 返回。出站 worker 可以在 HTTP 响应丢失后使用持久保存的匹配事件。权威的远程 ID 仍然是 `provider_identity`；`local_id` 不是持久查找键或提供商幂等性保证。如果响应和确定性回执均未存活，worker 保持发送不确定状态，而不是盲目创建重复项。
 
-## Linked users in imported direct conversations
+## 导入直接对话中的关联用户
 
-A provider import can create a user before that person links an IAM account.
-Linking adopts the imported external account while retaining the IAM user UUID.
-For imported direct conversations, initialization replaces the old participant
-reference in `owner_uuid` and `direct_user_uuid` and restores missing membership
-and topic access for the linked user. Existing membership preferences take
-precedence, including inactive membership. The superseded imported membership
-becomes inactive; its historical references remain available. Conversation UUIDs, message history, and native conversations keep their identities.
+提供商导入可以在那个人链接 IAM 账户之前创建用户。链接会采用导入的外部账户，同时保留 IAM 用户 UUID。对于导入的直接对话，初始化会替换 `owner_uuid` 和 `direct_user_uuid` 中的旧参与者引用，并为关联用户恢复缺失的成员资格和主题访问权限。现有成员资格偏好优先，包括非活跃成员资格。被取代的导入成员资格变为非活跃；其历史引用仍然可用。对话 UUID、消息历史和原生对话保持其身份。
 
-Direct sends resolve the other endpoint relative to the current sender, scoped
-to the project and provider. They also recognize deterministic imported user
-aliases when an account was linked before participant repair was available.
-A stale queued recipient snapshot is not authoritative. Group conversations
-continue to resolve active membership, and channels use their provider stream ID.
-An unresolved participant remains pending; it is never guessed from a name.
+直接发送解析相对于当前发送者的另一端点，范围限定于项目和提供商。当账户在参与者修复可用之前链接时，它们还会识别确定性导入的用户别名。过时的排队接收者快照不是权威的。群组对话继续解析活跃成员资格，频道使用其提供商流 ID。未解析的参与者保持待定状态；绝不从名称猜测。
 
-Migration 0283 repairs existing deterministic aliases and refreshes unprepared
-queued direct sends. Prepared requests, uncertain sends, and delivery receipts
-are preserved to avoid changing a request that might already have reached Zulip.
-Downgrading restores the prior recipient resolver but retains repaired identity
-references; it does not reconstruct obsolete aliases.
+迁移 0283 修复现有的确定性别名并刷新未准备的排队直接发送。准备好的请求、不确定的发送和交付回执被保留，以避免更改可能已到达 Zulip 的请求。降级恢复之前的接收者解析器，但保留修复后的身份引用；它不会重建过时的别名。
 
-## IAM user identity
+## IAM 用户身份
 
-IAM user UUIDs identify local Workspace users. A historical user or a provider
-user may have the same username or email as a current IAM user; both fields are
-mutable profile metadata, not globally unique identity keys. Request bootstrap
-first materializes the authenticated UUID and then registers that UUID in the
-project. It never adopts another UUID, private membership, or history based on a
-matching name or email. Migrations 0289 and 0290 remove the obsolete username and
-IAM email uniqueness constraints while preserving all existing user UUIDs and
-references. Their downgrades can only restore uniqueness when no conflicting
-values exist; they never rename, merge, or erase users.
+IAM 用户 UUID 标识本地 Workspace 用户。历史用户或提供商用户可能与当前 IAM 用户具有相同的用户名或电子邮件；这两个字段都是可变的配置文件元数据，而不是全局唯一的身份键。请求引导程序首先实例化经过认证的 UUID，然后在项目中注册该 UUID。它绝不会基于匹配的名称或电子邮件采用另一个 UUID、私有成员资格或历史记录。迁移 0289 和 0290 移除过时的用户名和 IAM 电子邮件唯一性约束，同时保留所有现有的用户 UUID 和引用。它们的降级只有在不存在冲突值时才能恢复唯一性；它们绝不会重命名、合并或擦除用户。

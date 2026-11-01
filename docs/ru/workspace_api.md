@@ -1679,14 +1679,7 @@ If-Match: "1"
 
 ## Файлы {#files}
 
-Imported file `provider_identity` values may contain complete provider upload
-paths and can exceed 255 characters, up to 2048 bytes in UTF-8. The byte limit
-also applies to stored file links and keeps the full path below the database index
-entry limit. Oversized paths render a `file path too long` notice without preventing
-message synchronization. File UUIDs remain stable. Other entity identity limits
-are unchanged. Temporary Zulip download links are resolved to authenticated
-upload paths; a currently inaccessible or deleted attachment renders an explicit
-notice without preventing message synchronization.
+Значения `provider_identity` импортированных файлов могут содержать полные пути загрузки провайдера и превышать 255 символов, достигая 2048 байт в кодировке UTF-8. Ограничение в байтах также применяется к сохранённым ссылкам на файлы, чтобы полный путь помещался в запись индекса базы данных. Слишком длинные пути отображают уведомление `file path too long`, не препятствуя синхронизации сообщений. UUID файлов остаются стабильными. Другие ограничения на идентификацию сущностей не изменяются. Временные ссылки на загрузку Zulip разрешаются в аутентифицированные пути загрузки; недоступное или удаленное в данный момент вложение отображает явное уведомление, не препятствуя синхронизации сообщений.
 
 Байты файлов и отдельный JSON боковой вагон хранятся через конфигурированный
 S3 - развернутый бэкэнд; локальный бэкэнд

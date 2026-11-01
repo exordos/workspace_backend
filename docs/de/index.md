@@ -1,86 +1,73 @@
-# Dokumentation Workspace Backend
+# Workspace-Backend-Dokumentation
 
-Current contract: [Workspace public OpenAPI](../public_workspace_api.yaml).
-External accounts are owner/project scoped. Zulip and Telegram synchronize
-through the canonical Messenger model, alongside native messaging.
-Provider guides describe the active implementation. Older design proposals
-remain historical references and do not authorize changes.
+Aktueller Vertrag: [Workspace public OpenAPI](../public_workspace_api.yaml).
+Externe Konten sind auf Eigentümer-/Projekt-Ebene beschränkt. Zulip und Telegram synchronisieren über das kanonische Messenger-Modell, neben nativem Messaging.
+Anbieter-Guides beschreiben die aktive Implementierung. Ältere Designvorschläge bleiben historische Referenzen und autorisieren keine Änderungen.
 
-Workspace Backend. Status jeder
-Dokument ist klar angegeben: **wirksamer Vertrag/wirksame Architektur**
-beschreibt das aktuelle Verhalten, und **proposal (Entwurfsvorschlag) ** bezieht sich
-nur für die künftige Refaktoring-Projektion und erlaubt keine Änderung des Codes.
+Der Haupt-Navigationsindex für die Workspace-Backend-Dokumentation. Der Status jedes Dokuments ist explizit angegeben: **aktiver Vertrag/aktive Architektur** beschreibt das aktuelle Verhalten, während ein **Vorschlag (Designvorschlag)** nur für zukünftige Refactoring-Designs gilt und keine Code-Änderungen autorisiert.
 
 ## Glossar der Projektdokumentation {#глоссарий-проектной-документации}
 
-- Platzierung (**placement**)  eine kanonische Nachricht in einem bestimmten
-  stream/topic;
-- Bindung (**binding**)  Zugriff und persönlicher Status des Benutzers oder
-  - Ein Behälter .;
-- transactional outbox — Journal der unveränderlichen Ereignisse in der Transaktion der Eintragung;
-- Projektion (**projection**)  Vorbereitungszustand für einfache
-  Lesen API;
-- fan-out — Hintergrundverteilung der Bindungen an die Empfänger;
-- worker (Hintergrund-Aussteller)  Typisierte Aufgaben und Projektionen.
+- placement — eine kanonische Nachricht in einem bestimmten Stream/Topic;
+- binding — Zugriff und persönlicher Zustand eines Benutzers oder Containers;
+- transactional outbox — ein Journal unveränderlicher Ereignisse innerhalb einer Schreibtransaktion;
+- projection — vorberechneter Zustand für einfache API-Lesevorgänge;
+- fan-out — Hintergrundverteilung von Bindings an Empfänger;
+- worker (Hintergrund-Executor) — Handler für typisierte Aufgaben und Projektionen.
 
-Namen von Wesen, Feldern, Routen, JSON-Werten und Aufgabenarten in Dokumenten
-in exaktem Vertragssinn aufbewahrt werden.
+Entitätsnamen, Felder, Routen, JSON-Werte und Aufgabentypen in den Dokumenten bleiben in ihrer exakten Vertragsform erhalten.
 
-## Telegram provider
+## Telegram-Anbieter
 
-[Telegram accounts, automatic full history and synchronization](telegram_provider.md).
+[Telegram-Konten, automatische vollständige Historie und Synchronisation](telegram_provider.md).
 
-## Public API and design history
+## Öffentliche API und Designhistorie
 
-| Dokument | Status | Amt |
+| Dokument | Status | Zweck |
 | --- | --- | --- |
-|  [`workspace_api.md`](workspace_api.md)  | **- ein gültiger Vertrag** | Kanonischer Kundenvertrag Workspace/Messenger REST, Events und WebSocket: Routen, JSON, Status, Filter, Pagination und Grenze runtime/OpenAPI. |
-|  [`workspace_ui_realtime_integration.md`](workspace_ui_realtime_integration.md)  | **- ein gültiger Vertrag** | REST-Überladen, Epoch-Cursor und Lieferung/Wiederholung WebSocket für Workspace UI. |
-|  [`architecture.md`](architecture.md)  | **historical reference** | Retired private bridge and provider API architecture. |
-|  [`workspace_server_v2_decisions.md`](workspace_server_v2_decisions.md)  | **historical reference** | Retired Provider API v2 and mTLS transport decisions. |
+| [`workspace_api.md`](workspace_api.md) | **aktiver Vertrag** | Kanonischer Client-Vertrag für Workspace/Messenger REST, Events und WebSocket: Routen, JSON, Statuscodes, Filter, Paginierung und die Laufzeit-/OpenAPI-Grenze. |
+| [`workspace_ui_realtime_integration.md`](workspace_ui_realtime_integration.md) | **aktiver Vertrag** | REST-Backfill, Epoch-Cursor und WebSocket-Zustellung/-Wiederholung für die Workspace-UI. |
+| [`architecture.md`](architecture.md) | **historische Referenz** | Eingestellte private Bridge- und Anbieter-API-Architektur. |
+| [`workspace_server_v2_decisions.md`](workspace_server_v2_decisions.md) | **historische Referenz** | Eingestellte Provider API v2 und mTLS-Transportentscheidungen. |
 
-## Proposal: Messenger Domain und Architektur API
+## Vorschlag: Messenger-Domänen- und API-Architektur
 
-| Dokument | Status | Amt |
+| Dokument | Status | Zweck |
 | --- | --- | --- |
-|  [`messenger_domain_model.md`](messenger_domain_model.md)  | **proposal** | Kanonisch `MESSAGE`, offensichtliche Platzierung, benutzerdefinierte Bindungen von Nachrichten/Containern, Invarianten und offene Lösungen. |
-|  [`messenger_api_domain_model.md`](messenger_api_domain_model.md)  | **proposal** | Drei Schichten RestAlchemy API → einfache Darstellungen → physikalische Wesen, Anfrage-/Hintergrundverarbeitungspfade und Parallelismus worker. |
-|  [`messenger_restalchemy_api_spec.md`](messenger_restalchemy_api_spec.md)  | **proposal der** | Konkrete Erklärungen RestAlchemy, Ressourcen/Controller, Herkunft der Felder und unveränderlicher öffentlicher JSON-Vertrag core API. |
-|  [`messenger_architecture_inventory.md`](messenger_architecture_inventory.md)  | **proposal; Kanonisches Inventar** | Ein einziges Wörterbuch class→table/view→fields→keys, UUID, task/event kinds, scope routing, Status risks und die verbleibenden OPEN-Lösungen. |
+| [`messenger_domain_model.md`](messenger_domain_model.md) | **Vorschlag** | Kanonisches `MESSAGE`, explizite Platzierung, Benutzer-Bindings für Nachrichten/Container, Invarianten und offene Entscheidungen. |
+| [`messenger_api_domain_model.md`](messenger_api_domain_model.md) | **Vorschlag** | Drei Schichten: RestAlchemy API → einfache Ansichten → physische Entitäten; Abfrage-/Hintergrundverarbeitungspfade und Worker-Parallelität. |
+| [`messenger_restalchemy_api_spec.md`](messenger_restalchemy_api_spec.md) | **Implementierungsvorschlag** | Spezifische RestAlchemy-Deklarationen, Ressourcen/Controller, Feldursprünge und der unveränderliche öffentliche JSON-Vertrag der Kern-API. |
+| [`messenger_architecture_inventory.md`](messenger_architecture_inventory.md) | **Vorschlag; kanonisches Inventar** | Vereinheitlichtes Wörterbuch: Klasse→Tabelle/Ansicht→Felder→Schlüssel, UUIDs, Aufgaben-/Ereignistypen, Scope-Routing, Risikostatus und verbleibende OPEN-Entscheidungen. |
 
-## Datenmodell und Übersichtsschemata von PlantUML
+## Datenmodell und PlantUML-Übersichtsdiagramme
 
-| Übersicht | Status | Ausgang | SVG |
+| Übersicht | Status | Quelle | SVG |
 | --- | --- | --- | --- |
-| ER-Modell der Domäne Messenger | **proposal** |  [`messenger_domain_model.puml`](diagrams/messenger_domain_model.puml)  |  [`messenger_domain_model.svg`](diagrams/messenger_domain_model.svg)  |
-| Schichten und Hintergrundbearbeitung Messenger API | **proposal** |  [`messenger_api_domain_model.puml`](diagrams/messenger_api_domain_model.puml)  |  [`messenger_api_domain_model.svg`](diagrams/messenger_api_domain_model.svg)  |
-| Anzeige route/resource/view/table RestAlchemy | **proposal** |  [`messenger_restalchemy_api_spec.puml`](diagrams/messenger_restalchemy_api_spec.puml)  |  [`messenger_restalchemy_api_spec.svg`](diagrams/messenger_restalchemy_api_spec.svg)  |
+| Messenger-Domänen-ER-Modell | **Vorschlag** | [`messenger_domain_model.puml`](diagrams/messenger_domain_model.puml) | [`messenger_domain_model.svg`](diagrams/messenger_domain_model.svg) |
+| Messenger-API-Schichten und Hintergrundverarbeitung | **Vorschlag** | [`messenger_api_domain_model.puml`](diagrams/messenger_api_domain_model.puml) | [`messenger_api_domain_model.svg`](diagrams/messenger_api_domain_model.svg) |
+| RestAlchemy-Routen-/Ressourcen-/Ansichts-/Tabellen-Mapping | **Vorschlag** | [`messenger_restalchemy_api_spec.puml`](diagrams/messenger_restalchemy_api_spec.puml) | [`messenger_restalchemy_api_spec.svg`](diagrams/messenger_restalchemy_api_spec.svg) |
 
-## Detaillierte Abfolge-Diagramme
+## Detaillierte Sequenzdiagramme für Operationen
 
-| Index | Status | Amt |
+| Index | Status | Zweck |
 | --- | --- | --- |
-|  [`diagrams/sequence/README.md`](diagrams/sequence/README.md)  | **proposal, auf dem laufenden Vertrag angezeigt** | Vollständige Matrix method+path: ein separater Markdown, der von PlantUML und SVG für jede öffentliche HTTP-Operation bearbeitet wird, sowie Events WebSocket. |
+| [`diagrams/sequence/README.md`](diagrams/sequence/README.md) | **Vorschlag, abgebildet auf den aktiven Vertrag** | Vollständige Methode+Pfad-Matrix: separates Markdown, bearbeitbares PlantUML und SVG für jede öffentliche HTTP-Operation sowie Events WebSocket. |
 
-Jede Operationenspezifikation behält die aktuellen Requests/response, aber
-zeigt die Zieltransaction/outbox/task/worker/event paths an. Diese Dokumente sind nicht
-ersetzen [`workspace_api.md`](workspace_api.md).
+Jede Operationsspezifikation bewahrt den aktiven Request/Response, zeigt aber Ziel-Transaktions-/Outbox-/Task-/Worker-/Event-Pfade. Diese Dokumente ersetzen nicht [`workspace_api.md`](workspace_api.md).
 
-## Worker, outbox, Projektion und Lieferung WebSocket
+## Worker, Outbox, Projektionen und WebSocket-Zustellung
 
-| Dokument | Status | Amt |
+| Dokument | Status | Zweck |
 | --- | --- | --- |
-|  [`worker_flows/README.md`](diagrams/sequence/worker_flows/README.md)  | **proposal** | Allgemeine Architektur der Worker und einzelne Prozesse `fanout`, `content_mentions`, `reaction_snapshot`, `read_counters`, `delivery_snapshot_event`, `topic_membership_policy_rebuild`. |
-|  [`worker_architecture.md`](diagrams/sequence/worker_flows/worker_architecture.md)  | **proposal** | Transactional outbox, Eine separate immutable task für jedes Ereignis, scoped ownership, newest-first, ready events und separate dispatcher. |
-|  [`migration_release_runbook.md`](diagrams/sequence/worker_flows/migration_release_runbook.md)  | **die durchgeführte Operatorenprozedur** | Backup/restore, native preserve, migration-time reset Zulip-derived messages/files, durable file cleanup und generation-triggered fresh reimport. |
+| [`worker_flows/README.md`](diagrams/sequence/worker_flows/README.md) | **Vorschlag** | Allgemeine Worker-Architektur und separate Prozesse `fanout`, `content_mentions`, `reaction_snapshot`, `read_counters`, `delivery_snapshot_event`, `topic_membership_policy_rebuild`. |
+| [`worker_architecture.md`](diagrams/sequence/worker_flows/worker_architecture.md) | **Vorschlag** | Transaktionale Outbox, separate unveränderliche Aufgabe für jedes Ereignis, beschränkte Eigentümerschaft, neueste zuerst, bereit-Ereignisse und ein separater Dispatcher. |
+| [`migration_release_runbook.md`](diagrams/sequence/worker_flows/migration_release_runbook.md) | **implementiertes Betreiber-Verfahren** | Backup/Restore, native Erhaltung, Migrationzeitpunkt-Reset von Zulip-abgeleiteten Nachrichten/Dateien, dauerhafte Dateibereinigung und generierungsausgelöster frischer Reimport. |
 
-## Migration, Bereitstellung und Umsetzung
+## Migrations-, Bereitstellungs- und Implementierungsleitfaden
 
-| Dokument | Status | Amt |
+| Dokument | Status | Zweck |
 | --- | --- | --- |
-|  [`messenger_unread_projection_rollout.md`](messenger_unread_projection_rollout.md)  | **die vorliegende Anleitung; eine Vereinbarung ist erforderlich** | Verfahren zur Aktualisierung, Abwanderung und Überprüfung der laufenden Migration unread projection. |
-|  [`messenger_regression_test_plan.md`](messenger_regression_test_plan.md)  | **der aktuelle Plan der Aufnahme** | Überprüfen native Messenger/API/realtime/S3, Wiederherstellen, rebuild, scale und Belastungen. |
+| [`messenger_unread_projection_rollout.md`](messenger_unread_projection_rollout.md) | **aktive Anweisung; erfordert Genehmigung** | Verfahren zum Aktualisieren, Zurückrollen und Verifizieren der aktuellen Migration der ungelesenen Projektion. |
+| [`messenger_regression_test_plan.md`](messenger_regression_test_plan.md) | **aktiver Abnahmeplan** | Prüfungen für native Messenger/API/Echtzeit/S3, Wiederherstellung, Neuaufbau, Skalierung und Last. |
 
-Proposal-die Dokumente sind nicht ein Migrations- oder Verkaufsplan. Production-
-Änderungen beginnen erst nach einer einzelnen Architekturentscheidung und
-die in Artikel 1 Absatz 2 genannten migration/test design.
+Vorschlagsdokumente sind kein Migrations- oder Implementierungsplan. Produktionsänderungen beginnen erst nach einer separaten architektonischen Entscheidung und einem vereinbarten Migrations-/Testdesign.

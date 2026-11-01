@@ -1,120 +1,119 @@
-# Provider identities
+# Идентичности провайдеров
 
-Messenger provider instances are stored in `messenger_providers` with `uuid`
-and unique `hostname`. Hostnames are normalized by URL parsing; scheme, port,
-and path are not part of the instance identity. Existing deterministic
-Workspace user, channel, topic, and message UUIDs are preserved.
+Экземпляры провайдеров мессенджеров хранятся в `messenger_providers` с `uuid`
+и уникальными `hostname`. Имена хостов нормализуются с помощью разбора URL; схема, порт
+и путь не являются частью идентичности экземпляра. Существующие детерминированные
+UUID пользователей, каналов, тем и сообщений Workspace сохраняются.
 
-Provider-aware domain models carry `source_name`, `provider_uuid` (a foreign
-key to the provider), and nullable `provider_identity` (a string of at most
-255 characters). `source_name = "native"` means strictly local: both provider
-fields are null and the object never produces a Zulip outgoing intention.
-A child created in a Zulip stream or message inherits `source_name = "zulip"`
-and its parent's non-null `provider_uuid`, even when the user creates it through
-Workspace. Its `provider_identity` stays null until the provider confirms it.
-Clients cannot choose or change this inherited provenance. The former JSON
-`source` object is removed from models, REST responses, and realtime payloads.
-`WorkspaceUser.source` remains unchanged.
+Доменные модели, учитывающие провайдеров, содержат `source_name`, `provider_uuid` (внешний
+ключ на провайдера) и необязательное поле `provider_identity` (строка длиной не более
+255 символов). Значение `source_name = "native"` означает строго локальный объект: оба поля
+провайдера равны null, и объект никогда не порождает исходящее намерение Zulip.
+Дочерний объект, созданный в потоке или сообщении Zulip, наследует `source_name = "zulip"`
+и ненулевое значение `provider_uuid` своего родителя, даже если пользователь создает его
+через Workspace. Его поле `provider_identity` остается null, пока провайдер не подтвердит его.
+Клиенты не могут выбирать или изменять это унаследованное происхождение. Бывший JSON-объект
+`source` удален из моделей, ответов REST и полезной нагрузки realtime.
+`WorkspaceUser.source` остается без изменений.
 
-| Model | Zulip provider identity |
+| Модель | Идентичность провайдера Zulip |
 | --- | --- |
-| `WorkspaceStream` | Channel ID; direct/group conversations use `dm:` followed by the existing deterministic conversation UUID. |
-| `WorkspaceStreamBinding` | Stream identity followed by the remote user ID, separated by `:`. |
-| `WorkspaceStreamTopic` | Stream identity followed by the topic name, separated by `:`. |
-| `WorkspaceUserTopicBinding` | Topic identity followed by the remote user ID, separated by `:`. |
-| `WorkspaceMessage` | Remote message ID. |
-| `WorkspaceUserMessageState` | Remote message ID followed by the observing remote user ID, separated by `:`. |
-| `WorkspaceMessageReactionFact` | Remote message ID, reacting remote user ID, reaction type, and emoji code, separated by `:`. |
-| `WorkspaceFile` | Remote upload path returned by Zulip. |
+| `WorkspaceStream` | ID канала; прямые/групповые беседы используют `dm:`, за которым следует существующий детерминированный UUID беседы. |
+| `WorkspaceStreamBinding` | Идентичность потока, за которой следует удаленный ID пользователя, разделенные `:`. |
+| `WorkspaceStreamTopic` | Идентичность потока, за которой следует название темы, разделенные `:`. |
+| `WorkspaceUserTopicBinding` | Идентичность темы, за которой следует удаленный ID пользователя, разделенные `:`. |
+| `WorkspaceMessage` | Удаленный ID сообщения. |
+| `WorkspaceUserMessageState` | Удаленный ID сообщения, за которым следует удаленный ID наблюдающего пользователя, разделенные `:`. |
+| `WorkspaceMessageReactionFact` | Удаленный ID сообщения, удаленный ID пользователя, поставившего реакцию, тип реакции и код эмодзи, разделенные `:`. |
+| `WorkspaceFile` | Удаленный путь загрузки, возвращаемый Zulip. |
 
-The canonical object owns its provider identity. Sending and receiving resolve
-that identity directly; a native object does not acquire a separate remote copy.
-File links retain account-scoped access observations, and reaction links retain
-custom emoji metadata. Technical placements, message-access bindings, and
-file-access rows inherit context through their existing foreign keys.
+Канонический объект владеет своей идентичностью провайдера. Отправка и получение
+разрешают эту идентичность напрямую; нативный объект не приобретает отдельную удаленную копию.
+Ссылки на файлы сохраняют наблюдения синхронизации в области аккаунта, а связи реакций
+сохраняют метаданные пользовательских эмодзи. Авторизация файлов использует ACL Workspace и активное
+членство в потоке, независимо от связанных аккаунтов провайдеров или квитанций.
+Технические размещения, привязки доступа к сообщениям и
+строки доступа к файлам наследуют контекст через свои существующие внешние ключи.
 
-`ExternalAccount.provider_uuid` references the same provider table.
-`external_account_id` stores the remote user ID without a hostname prefix.
-The account's `provider` string retains the provider type. Unconfigured accounts
-without a server hostname can retain a null provider link; supplying a provider
-UUID or configuring a server URL establishes the link. Account uniqueness
-includes `provider_uuid`, so the same owner can connect accounts on different
-servers and identical remote user IDs remain isolated. `settings.server_url`
-is retained as the transport endpoint, including scheme, port, and path;
-provider-scoped identity and hostname lookup use the provider foreign key.
+`ExternalAccount.provider_uuid` ссылается на ту же таблицу провайдеров.
+`external_account_id` хранит удаленный ID пользователя без префикса имени хоста.
+Строка `provider` аккаунта сохраняет тип провайдера. Не настроенные аккаунты
+без имени хоста сервера могут сохранить null-ссылку на провайдера; предоставление
+UUID провайдера или настройка URL сервера устанавливает связь. Уникальность аккаунта
+включает `provider_uuid`, поэтому один и тот же владелец может подключать аккаунты на разных
+серверах, и идентичные удаленные ID пользователей остаются изолированными. `settings.server_url`
+сохраняется как транспортная конечная точка, включая схему, порт и путь;
+идентичность в области провайдера и поиск имени хоста используют внешний ключ провайдера.
 
-Migration 0263 replaces canonical JSON source columns with provider fields.
-Migrations 0265 and 0266 retire the old outgoing and incoming task machinery.
-Migration 0267 inherits existing children's provider context from their parents,
-removes obsolete root identity links and native outgoing intentions, and allows
-a pending Zulip identity without an external ID. This cutover is irreversible;
-restore a verified database backup together with its matching application
-version when recovery is required. Provider deletion uses cascading foreign
-keys for provider-owned rows.
+Миграция 0263 заменяет канонические столбцы источника JSON полями провайдера.
+Миграции 0265 и 0266 выводят из эксплуатации старый механизм исходящих и входящих задач.
+Миграция 0267 наследует контекст провайдера существующих дочерних объектов от их родителей,
+удаляет устаревшие ссылки на корневую идентичность и нативные исходящие намерения, а также позволяет
+наличие ожидающей идентичности Zulip без внешнего ID. Этот переход необратим;
+при необходимости восстановления восстановите проверенную резервную копию базы данных вместе с соответствующей
+версией приложения. Удаление провайдера использует каскадные внешние ключи для строк, принадлежащих провайдеру.
 
 
-## Synchronization status
+## Статус синхронизации
 
-All eight provider-aware domain models expose a read-only `status` with values
-`new`, `syncing`, `active`, and `error`. Native entities start and remain
-`active`. A newly constructed provider entity starts as `new`; an import that
-creates an already complete entity persists it directly as `active`.
-Existing records are backfilled as `active` by migration 0264.
+Все восемь доменных моделей, учитывающих провайдеров, предоставляют доступное только для чтения поле `status` со значениями
+`new`, `syncing`, `active` и `error`. Нативные сущности начинаются и остаются
+в состоянии `active`. Новоконструированная сущность провайдера начинается как `new`; импорт, который
+создает уже полную сущность, сохраняет ее напрямую как `active`.
+Существующие записи заполняются как `active` миграцией 0264.
 
-Provider reconciliation transitions an existing entity to `syncing`, then to
-`active` after successful processing. A failed worker records `error` for its
-specific persisted entity after rolling back the failed data writes. A retry
-can return it to `active`. Existing data remains readable in every status.
-Account connectivity errors do not mark all imported objects as failed.
+Сверка провайдера переводит существующую сущность в состояние `syncing`, а затем в
+`active` после успешной обработки. Неудачный воркер записывает `error` для своей
+конкретной сохраненной сущности после отката неудачных записей данных. Повторная попытка
+может вернуть ее в состояние `active`. Существующие данные остаются читаемыми в любом статусе.
+Ошибки подключения аккаунта не помечают все импортированные объекты как неудачные.
 
-The outgoing worker persists preparation before making HTTP requests. A
-confirmed response or retained matching event completes the intention and fills
-the canonical provider identity. Incoming domain writes, client publication, and
-inbox acknowledgement commit together. Status-only updates do not change domain
-timestamps, counters, or enqueue new synchronization work. Archive, completion,
-read, starred and pinned fields remain independent.
+Исходящий воркер сохраняет подготовку перед выполнением HTTP-запросов.
+Подтвержденный ответ или сохраненное соответствующее событие завершает намерение и заполняет
+каноническую идентичность провайдера. Записи входящих доменов, публикация клиенту и
+подтверждение получения в почтовом ящике фиксируются вместе. Обновления только статуса не изменяют временные метки домена,
+счетчики или не ставят в очередь новую работу по синхронизации. Поля архивирования, завершения, прочтения,
+отметки «избранное» и закрепления остаются независимыми.
 
-## Optional send receipts
+## Необязательные квитанции об отправке
 
-Message sends pass the canonical Workspace message UUID as `local_id`, together
-with the sender's `queue_id`. Zulip returns it as `local_message_id` in that
-queue's message event. The outgoing worker can use a durably saved matching
-event after a lost HTTP response. The authoritative remote ID remains
-`provider_identity`; `local_id` is not a persistent lookup key or a provider
-idempotency guarantee. If neither a response nor a definitive receipt survives,
-the worker keeps the send uncertain instead of blindly creating a duplicate.
+Отправка сообщений передает канонический UUID сообщения Workspace как `local_id` вместе
+с `queue_id` отправителя. Zulip возвращает его как `local_message_id` в событии
+сообщения этой очереди. Исходящий воркер может использовать надежно сохраненное соответствующее
+событие после потери HTTP-ответа. Авторитетный удаленный ID остается
+`provider_identity`; `local_id` не является постоянным ключом поиска или гарантией
+идемпотентности провайдера. Если ни ответ, ни окончательная квитанция не сохраняются,
+воркер оставляет отправку неопределенной вместо слепого создания дубликата.
 
-## Linked users in imported direct conversations
+## Связанные пользователи в импортированных прямых беседах
 
-A provider import can create a user before that person links an IAM account.
-Linking adopts the imported external account while retaining the IAM user UUID.
-For imported direct conversations, initialization replaces the old participant
-reference in `owner_uuid` and `direct_user_uuid` and restores missing membership
-and topic access for the linked user. Existing membership preferences take
-precedence, including inactive membership. The superseded imported membership
-becomes inactive; its historical references remain available. Conversation UUIDs, message history, and native conversations keep their identities.
+Импорт провайдера может создать пользователя до того, как этот человек свяжет аккаунт IAM.
+Связывание принимает импортированный внешний аккаунт, сохраняя UUID пользователя IAM.
+Для импортированных прямых бесед инициализация заменяет старую ссылку на участника в `owner_uuid` и `direct_user_uuid` и восстанавливает отсутствующее членство
+и доступ к темам для связанного пользователя. Существующие предпочтения членства имеют
+приоритет, включая неактивное членство. Замененное импортированное членство
+становится неактивным; его исторические ссылки остаются доступными. UUID бесед, история сообщений и нативные беседы сохраняют свои идентичности.
 
-Direct sends resolve the other endpoint relative to the current sender, scoped
-to the project and provider. They also recognize deterministic imported user
-aliases when an account was linked before participant repair was available.
-A stale queued recipient snapshot is not authoritative. Group conversations
-continue to resolve active membership, and channels use their provider stream ID.
-An unresolved participant remains pending; it is never guessed from a name.
+Прямые отправки разрешают другой эндпоинт относительно текущего отправителя, в области
+проекта и провайдера. Они также распознают детерминированные импортированные псевдонимы пользователей,
+когда аккаунт был связан до того, как стало доступно восстановление участников. Устаревший снимок получателя в очереди
+не является авторитетным. Групповые беседы продолжают разрешать активное членство, а каналы используют свой ID потока провайдера.
+Неразрешенный участник остается в ожидании; он никогда не угадывается по имени.
 
-Migration 0283 repairs existing deterministic aliases and refreshes unprepared
-queued direct sends. Prepared requests, uncertain sends, and delivery receipts
-are preserved to avoid changing a request that might already have reached Zulip.
-Downgrading restores the prior recipient resolver but retains repaired identity
-references; it does not reconstruct obsolete aliases.
+Миграция 0283 исправляет существующие детерминированные псевдонимы и обновляет неподготовленные
+прямые отправки в очереди. Подготовленные запросы, неопределенные отправки и квитанции о доставке
+сохраняются, чтобы избежать изменения запроса, который мог уже достичь Zulip.
+Понижение версии восстанавливает предыдущий разрешатель получателей, но сохраняет исправленные ссылки на идентичность;
+оно не реконструирует устаревшие псевдонимы.
 
-## IAM user identity
+## Идентичность пользователя IAM
 
-IAM user UUIDs identify local Workspace users. A historical user or a provider
-user may have the same username or email as a current IAM user; both fields are
-mutable profile metadata, not globally unique identity keys. Request bootstrap
-first materializes the authenticated UUID and then registers that UUID in the
-project. It never adopts another UUID, private membership, or history based on a
-matching name or email. Migrations 0289 and 0290 remove the obsolete username and
-IAM email uniqueness constraints while preserving all existing user UUIDs and
-references. Their downgrades can only restore uniqueness when no conflicting
-values exist; they never rename, merge, or erase users.
+UUID пользователей IAM идентифицируют локальных пользователей Workspace. Исторический пользователь или пользователь
+провайдера может иметь то же имя пользователя или email, что и текущий пользователь IAM; оба поля являются
+изменяемыми метаданными профиля, а не глобально уникальными ключами идентичности. Инициализация запроса
+сначала материализует аутентифицированный UUID, а затем регистрирует этот UUID в
+проекте. Она никогда не принимает другой UUID, приватное членство или историю на основе
+совпадающего имени или email. Миграции 0289 и 0290 удаляют устаревшие ограничения уникальности имени пользователя и
+email IAM, сохраняя все существующие UUID пользователей и
+ссылки. Откаты этих миграций могут восстановить уникальность только при отсутствии конфликтующих
+значений; они никогда не переименовывают, не объединяют и не стирают пользователей.

@@ -1,10 +1,10 @@
-# Telegram external accounts
+# Telegram 外部账户
 
-This provider uses a Telegram user account through MTProto. Configure the client application on the server, then authenticate from the external-account dialog with a QR code and, if enabled, the Telegram two-step verification password. Application credentials alone do not authorize a user account.
+此提供方通过 MTProto 使用 Telegram 用户账户。请在服务器上配置客户端应用程序，然后通过外部账户会话使用二维码进行身份验证，如果已启用，还需提供 Telegram 两步验证密码。仅凭应用程序凭据无法授权用户账户。
 
-## Configuration
+## 配置
 
-The independent `workspace-telegram` process reads the same configuration file as the API. An unset application ID disables the provider. The platform generates a separate encryption key; preserve it with the database backup. Existing encrypted sessions cannot be restored without the matching key.
+独立的 `workspace-telegram` 进程读取与 API 相同的配置文件。未设置的应用程序 ID 会禁用该提供方。平台会生成一个单独的加密密钥；请将其与数据库备份一起保留。如果没有匹配的密钥，现有的加密会话将无法恢复。
 
 ```ini
 [telegram]
@@ -15,13 +15,13 @@ history_batch_size = 100
 poll_interval = 1
 ```
 
-Place application credentials in the operator-managed root-only `/etc/workspace/telegram.conf` override. The API and daemon read this after the generated main configuration. Keep the override in a separate platform configuration resource targeting the backend node, with its application hash supplied by a platform secret reference; element upgrades must not own or reset this credential. Use the platform secret store for credentials. Never place account sessions, login tokens, passwords, or application hashes in public external-account settings, messages, logs, or client caches. API authentication responses are owner and project scoped, never cached, and excluded from body logging even at DEBUG level.
+将应用程序凭据放在由操作员管理的、仅限 root 访问的 `/etc/workspace/telegram.conf` 覆盖配置中。API 和守护进程在读取生成的主配置后会读取此覆盖配置。将此覆盖配置保留在针对后端节点的单独平台配置资源中，其应用程序哈希由平台密钥引用提供；元素升级不得拥有或重置此凭据。使用平台密钥存储来管理凭据。切勿将账户会话、登录令牌、密码或应用程序哈希放在公开的外部账户设置、消息、日志或客户端缓存中。API 身份验证响应受所有者和项目范围限制，从不缓存，即使在 DEBUG 级别下也从正文日志记录中排除。
 
-## Account and authentication contract
+## 账户与身份验证契约
 
-Create an external account with `provider=telegram`. Public settings are empty: all accessible dialogs and their complete history are imported automatically. Legacy `history_depth`, `selection_mode`, and `peer_keys` inputs are discarded. The provider identity is the fixed Telegram hostname. The existing external-account route and status values remain available to older clients.
+使用 `provider=telegram` 创建外部账户。公共设置为空：所有可访问的会话及其完整历史记录都会自动导入。遗留的 `history_depth`、`selection_mode` 和 `peer_keys` 输入将被丢弃。提供方身份是固定的 Telegram 主机名。现有的外部账户路由和状态值对旧版客户端仍然可用。
 
-The owner invokes the following action using the existing external-account update permission:
+所有者使用现有的外部账户更新权限调用以下操作：
 
 ```text
 POST /v1/messenger/external_accounts/{uuid}/actions/telegram_auth/invoke
@@ -31,44 +31,44 @@ POST /v1/messenger/external_accounts/{uuid}/actions/telegram_auth/invoke
 {"operation":"cancel","generation":"attempt-uuid"}
 ```
 
-A login attempt expires after five minutes. The QR token renews within that attempt. Closing the form cancels only its current generation; an older form cannot cancel a newer attempt. Passwords are encrypted, consumed once, and expire with the attempt. The daemon revokes an authorization completed after cancellation. Account deletion disables synchronization, detaches the owner's memberships, and requests Telegram logout before removing the root account and its dependent state.
+登录尝试在五分钟后过期。QR 令牌在该尝试期间内刷新。关闭表单仅取消当前生成；较旧的表单无法取消较新的尝试。密码经过加密，仅消费一次，并随尝试过期。守护进程会撤销在取消后完成的授权。删除账户会禁用同步，分离所有者的成员资格，并在删除根账户及其依赖状态之前请求 Telegram 登出。
 
-## Synchronization and identity
+## 同步与身份
 
-Each account has one connection and a PostgreSQL advisory lock. The daemon runs direct/group differences, channel reconciliation, media replay, catalog and outgoing delivery as separate jobs. Private dialogs, basic groups and channels each run the same history loop independently, so a large channel file cannot postpone the first private or group history page. Their GetHistory retry deadline is shared and checked before every peer; account status remains syncing until all selected histories finish. Telegram and Zulip share COPY staging, set-based content/root/placement/binding merging, personal flag reconciliation, and counter scheduling. Fetched Telegram pages are persisted before merging; page removal and checkpoints commit with the canonical batch. Both importers yield to realtime and publication backlog. History does not emit one websocket event per imported message. Service-only pages still advance the checkpoint. History always reads everything Telegram makes accessible to that account. The catalog refreshes every 60 seconds. An unknown direct/group dialog in the common update difference wakes the same catalog job immediately, so its initial history does not wait for the periodic timer; known-dialog messages do not trigger another scan. Contacts, dialog counterparts and message authors become stable Telegram users in the Workspace directory. Verified IAM profiles remain authoritative.
+每个账户有一个连接和一个 PostgreSQL 咨询锁。守护进程将私聊/群组的差异更新、频道协调、媒体重放、目录和出站投递作为单独的任务运行。私聊、基本群组和频道各自独立运行相同的历史记录循环，因此大型频道文件不会推迟第一个私有或群组历史记录页面。它们的 GetHistory 重试截止时间是共享的，并在每个对等方之前检查；在所有选定的历史记录完成之前，账户状态始终为同步中。Telegram 和 Zulip 共享 COPY 暂存、基于集合的内容/根/放置/绑定合并、个人标志协调和计数器调度。获取的 Telegram 页面在合并前持久化；页面移除和检查点与规范批次一起提交。两个导入器都会让位于实时和发布积压。历史记录不会为每条导入的消息发出一个 websocket 事件。仅服务页面仍会推进检查点。历史记录始终读取 Telegram 向该账户开放的所有内容。目录每 60 秒刷新一次。公共更新差异中的未知直接/群组会话会立即唤醒相同的目录任务，因此其初始历史记录无需等待周期性计时器；已知会话的消息不会触发另一次扫描。联系人、会话对端和消息作者成为 Workspace 目录中的稳定 Telegram 用户。已验证的 IAM 配置文件保持权威。
 
-Private dialogs and basic-group messages use account-scoped identities. Channel and supergroup message identities are shared within the project and provider. Telegram streams keep membership-restricted Workspace access. Personal folders contain direct dialogs; Telegram channels and basic groups appear in Channels independently of this access flag. Telegram streams are private Workspace streams; another user's source account must independently import the same channel before that user receives membership. Ordinary chats use the default topic `telegram`; forum replies retain their source topic. Zulip conversations without a source subject use `zulip`. The web client groups visible unencrypted direct streams only by the exact counterpart Workspace UUID, project and viewer. Each provider topic retains its physical stream UUID for delivery and authorization; native topics use the existing canonical native direct stream. Names, emails and usernames never merge identities. Periodic catalog reconciliation reuses the same stream writer to update an existing direct counterpart after a verified account link; it preserves the physical conversation and grants no membership to the newly linked user.
+私聊和基本群组消息使用账户范围的身份。频道和超级群组消息身份在项目内和提供方内共享。Telegram 流保持成员资格限制的 Workspace 访问权限。个人文件夹包含直接会话；Telegram 频道和基本群组独立于此访问标志出现在 Channels 中。Telegram 流是私有 Workspace 流；另一个用户的源账户必须独立导入相同的频道，该用户才能获得成员资格。普通聊天使用默认主题 `telegram`；论坛回复保留其源主题。没有源主题的 Zulip 对话使用 `zulip`。Web 客户端仅按确切的对端 Workspace UUID、项目和查看者对可见的未加密直接流进行分组。每个提供方主题保留其物理流 UUID 用于投递和授权；原生主题使用现有的规范原生直接流。名称、电子邮件和用户名从不合并身份。周期性目录协调重用相同的流写入器，在验证账户链接后更新现有的直接对端；它保留物理对话，并不向新链接的用户授予成员资格。
 
-Reaction echoes reuse the canonical message/user/emoji key and preserve an existing Workspace reaction UUID; repeated source updates and subsequent removal do not create a second fact. The durable inbox fences source snapshots against newer updates. A source journal gap triggers an authoritative history rescan; covered page ranges reconcile deleted messages without deleting newer arrivals. Outgoing sends persist the random identifier before the remote write and use authoritative receipts. Early own-message echoes wait in the inbox until their receipt binds the original Workspace UUID. An uncertain duplicate identifier remains an explicit error rather than being correlated by message text.
+反应回声重用规范的消息/用户/表情符号键，并保留现有的 Workspace 反应 UUID；重复的源更新和随后的移除不会创建第二个事实。持久收件箱将源快照与较新的更新隔离。源日志缺口会触发权威历史记录重新扫描；覆盖的页面范围协调已删除的消息，而不会删除较新的到达项。出站发送在远程写入之前持久化随机标识符，并使用权威回执。早期的自身消息回声在收件箱中等待，直到其回执绑定原始 Workspace UUID。不确定的重复标识符保持为显式错误，而不是通过消息文本进行关联。
 
-Text, source timestamps, replies, individual photos/documents, edits, deletes, ordinary emoji reactions, and the owner's read acknowledgements use canonical Messenger entities. Read-only source chats reject sends. Secret Chats, calls, stories, payments, participant administration, custom emoji, and multi-attachment outgoing albums are outside the current implementation. Telegram may impose additional message, file, reaction, or rate limits; flood waits retain the durable checkpoint and retry deadline.
+文本、源时间戳、回复、单个照片/文档、编辑、删除、普通表情符号反应以及所有者的读取确认使用规范 Messenger 实体。只读源聊天拒绝发送。秘密聊天、通话、故事、支付、参与者管理、自定义表情符号和多附件出站相册不在当前实现范围内。Telegram 可能会施加额外的消息、文件、反应或速率限制；限流等待保留持久检查点和重试截止时间。
 
-## Measurements and acceptance
+## 测量与验收
 
-The authentication status includes per-chat history start, first committed message, completion, imported message/file/byte counts, history-fetch time, merge time, and preparation time. Throughput is imported messages divided by elapsed wall time; report file volume and provider flood waits separately. These local counters do not prove delivery at Telegram.
+身份验证状态包括每个聊天的历史记录开始、第一条提交的消息、完成、导入的消息/文件/字节数、历史记录获取时间、合并时间和准备时间。吞吐量是导入的消息除以经过的挂钟时间；分别报告文件体积和提供方限流等待。这些本地计数器不能证明在 Telegram 上的投递。
 
-Acceptance must record actual source and deployed artifacts, QR authorization, complete accessible chat scope, cold import, replay, restart recovery, realtime latency during backfill, attachment byte equality at both endpoints, and negative access checks. Verify native messaging and fresh Zulip traffic in both directions after the final restart. Keep synthetic/local timings separate from measured live Telegram results.
+验收必须记录实际的源和部署工件、QR 授权、完整的可访问聊天范围、冷导入、重放、重启恢复、回填期间的实时延迟、两端点的附件字节相等性以及负面访问检查。在最终重启后，双向验证原生消息传递和新的 Zulip 流量。将合成/本地计时与测量的实时 Telegram 结果分开。
 
-## Message conversion examples
+## 消息转换示例
 
-[Open the offline Telegram ↔ Workspace comparison](../telegram_messages_preview.html). Its synthetic Telegram view illustrates MTProto entities rather than reproducing a Telegram client. Workspace uses its actual renderer and theme. The same JSON examples are asserted against production conversion in unit tests; the generator also checks rendered DOM semantics.
+[打开离线 Telegram ↔ Workspace 比较](../telegram_messages_preview.html)。其合成 Telegram 视图展示了 MTProto 实体，而不是重现 Telegram 客户端。Workspace 使用其实际的渲染器和主题。相同的 JSON 示例在单元测试中针对生产转换进行断言；生成器还检查渲染的 DOM 语义。
 
-Run `node workspace/tests/fixtures/render_zulip_messages_preview.mjs --telegram` with local Workspace UI and Zulip source checkouts. `WORKSPACE_UI_SOURCE_DIR` and `ZULIP_SOURCE_DIR` override their paths. The common generator retains the existing Zulip page.
+使用本地 Workspace UI 和 Zulip 源码目录运行 `node workspace/tests/fixtures/render_zulip_messages_preview.mjs --telegram`。`WORKSPACE_UI_SOURCE_DIR` 和 `ZULIP_SOURCE_DIR` 覆盖其路径。通用生成器保留现有的 Zulip 页面。
 
-Telegram entities become escaped CommonMark: bold, italic, strike, spoilers, code, language-aware blocks, labeled links and block quotes. UTF-16 offsets preserve non-BMP text. Outgoing Workspace CommonMark is parsed into MTProto text/entities rather than Telethon's incompatible legacy Markdown. Underline currently retains plain text because Workspace has no underline syntax; this limitation is visible on the comparison page.
+Telegram 实体变为转义的 CommonMark：粗体、斜体、删除线、剧透、代码、语言感知块、带标签的链接和块引用。UTF-16 偏移量保留非 BMP 文本。出站 Workspace CommonMark 被解析为 MTProto 文本/实体，而不是 Telethon 不兼容的遗留 Markdown。下划线目前保留纯文本，因为 Workspace 没有下划线语法；此限制在比较页面上可见。
 
-当目标属于同一来源对话时，Workspace 引用和消息链接会转换为 Telegram 原生回复。附件和回复引用按 CommonMark 链接解析；代码中的示例保留为文本。不支持的 Workspace 内部链接保留可读标签，不生成无效的 Telegram URL。
+当目标属于同一源会话时，Workspace 引用/消息引用变为原生 Telegram 回复标题。附件和回复引用被解析为 CommonMark 链接；代码内的字面示例保留为文本。不支持的仅 Workspace 链接保留其可读标签，而不是无效的 Telegram URL。
 
 ## 实时隔离与发布权限
 
-私聊和群组更新、频道同步、持久化媒体重放、历史、目录和发送分别运行。缓慢的频道请求或下载不会阻塞私聊消息。频道实时更新会提高相应频道的同步优先级。推进游标之前先持久化媒体标识，重启后可重新获取并处理。撤销授权会停止账户；普通历史或目录错误保留检查点和独立重试时间。诊断仅包含时间和错误类型，不包含提供方的异常正文。
+私聊/群组的差异更新、频道协调、持久媒体重放、历史记录、目录刷新和出站投递作为单独的账户任务运行。缓慢的频道 RPC 或文件下载不会占用直接消息循环。原始频道更新在追赶期间优先处理该频道。媒体身份在推进差异游标之前提交到持久收件箱；重放重新获取它们并在重启后存活。身份验证撤销停止账户；普通历史/目录失败保留其检查点和范围限定的重试截止时间。状态诊断暴露重试截止时间和错误类型，而不包含提供方异常文本。
 
-`can_send` 根据每位参与者的成员身份、发布策略、来源权限和账户连接计算。无法发送时，API 在创建消息和发送任务之前拒绝请求。原生 `announcement_only` 频道允许所有者、管理员和版主发布；所有者和管理员管理此策略及高级角色。`announce` 仍表示创建频道时的通知。目前公告模式用于未加密的原生频道。Telegram 广播频道遵循订阅者实际拥有的发布权限。
+公共流能力 `can_send` 根据成员资格、发布策略、源权限和连接的账户按查看者计算。当发送不可用时，API 写入在创建规范消息或出站意图之前被拒绝。原生 `announcement_only` 频道允许所有者、管理员和版主发布；只有所有者/管理员管理此策略和提升角色。现有的 `announce` 创建通知标志具有单独的语义。仅公告创建目前可用于未加密的原生频道。Telegram 广播反映订阅者的实际发布权利。
 
-与 Zulip 一样，导入的 Telegram 身份使用不含授权会话的外部账户记录。经验证的登录可以绑定导入身份，但不能占用已连接到另一位 Workspace 用户的身份。提及仅通过所选主题的提供方及项目解析，并支持账户绑定前导入记录的稳定 UUID。姓名和邮箱不能作为身份匹配依据。
+导入的 Telegram 身份重用外部账户记录，无需授权会话，就像 Zulip 导入一样。后来的验证登录可以声明导入的身份，但不能获取已连接到另一个 Workspace 用户的身份。提及仅通过选定主题的提供者和项目解析，包括账户链接后的稳定导入 UUID 引用。名称和电子邮件地址不是身份匹配。
 
 ## Telegram 通知模式
 
-流通知模式双向同步。`all_messages` 显式取消 Telegram 静音。`muted` 和 `mentions_only` 都设置 Telegram 长期静音，同时保留 Workspace 各自的本地通知行为。同值回显不会覆盖本地模式。来源随后发生有效变化时，映射为 `muted` 或 `all_messages`。Telegram 并没有所有 Workspace 模式的精确对应。主题的 `default`、`follow`、`unmute` 和 `mute` 保持为本地偏好，不修改整个 Telegram 聊天。
+流模式双向同步。`all_messages` 显式取消静音 Telegram 聊天。`muted` 和 `mentions_only` 都使用 Telegram 的长静音；Workspace 保留其不同的本地通知行为。相同静音值的回声保留本地模式。后来的有效源更改映射到 `muted` 或 `all_messages`。Telegram 没有与每个 Workspace 模式完全对应的等效项。主题 `default`、`follow`、`unmute` 和 `mute` 仍然是 Workspace 主题偏好，不会重写整个 Telegram 聊天。
 
-同步会导入对话设置以及用户、群组和广播的继承默认值。没有 pts 的更新独立处理。待发送的本地修改与观测时间可防止过期响应覆盖新偏好。发送操作只修改 `mute_until`，保留声音和预览设置。验收测试必须保存并恢复目标来源的通知偏好。
+初始会话设置以及 Telegram 的用户/群组/广播默认值随继承一起导入。无 Pts 的通知更新单独消费。待处理的本地意图和观察时间戳防止过时的源快照覆盖较新的本地偏好。出站更改仅设置 `mute_until`，保留声音和预览设置。验收更改必须快照并恢复目标源偏好。
