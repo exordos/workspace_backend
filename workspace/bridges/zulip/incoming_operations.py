@@ -172,10 +172,15 @@ SELECT_MESSAGE_REFERENCES_SQL = """
       ON message.project_id=scope.project_id AND message.provider_uuid=scope.provider_uuid
      AND message.provider_identity=ANY(scope.identities)
     CROSS JOIN LATERAL (
+        SELECT uuid FROM messenger_message_placements
+        WHERE project_id=message.project_id AND message_uuid=message.uuid
+        OFFSET 0
+    ) placement
+    CROSS JOIN LATERAL (
         SELECT visible.uuid FROM messenger_api_user_messages_v1 visible
         WHERE visible.project_id=message.project_id AND visible.user_uuid=scope.user_uuid
-          AND visible.canonical_message_uuid=message.uuid AND visible.visible
-        -- Expand the full visibility view only for each requested message.
+          AND visible.uuid=placement.uuid AND visible.visible
+        -- Resolve canonical identities before expanding the keyed visibility view.
         OFFSET 0
     ) visible
 """

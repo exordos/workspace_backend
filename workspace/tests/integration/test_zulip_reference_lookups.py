@@ -62,19 +62,26 @@ def test_outgoing_message_reference_does_not_scan_unrelated_history(
 
 
 @pytest.mark.isolated_schema
-def test_message_reference_lookup_does_not_scan_unrelated_history(large_history):
+@pytest.mark.parametrize(
+    "identities", [["101"], ["101", "101", "missing"], ["missing"]]
+)
+def test_message_reference_lookup_does_not_scan_unrelated_history(
+    large_history, identities
+):
     db, account, target = large_history
-    args = parameters(account)
+    args = list(parameters(account))
+    args[2] = identities
     assert db.execute(
         incoming_operations.SELECT_MESSAGE_REFERENCES_SQL, args
-    ).fetchall() == [(target[3], "101")]
+    ).fetchall() == ([(target[3], "101")] if "101" in identities else [])
     plan = db.execute(
         "EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) "
         + incoming_operations.SELECT_MESSAGE_REFERENCES_SQL,
         args,
     ).fetchone()[0][0]
     scanned = sum(
-        node["Actual Rows"] * node["Actual Loops"]
+        (node["Actual Rows"] + node.get("Rows Removed by Filter", 0))
+        * node["Actual Loops"]
         for node in projection_tests._plan_nodes(plan["Plan"])
         if node.get("Relation Name")
         in {

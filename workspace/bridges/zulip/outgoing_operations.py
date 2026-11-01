@@ -208,12 +208,20 @@ SELECT_MESSAGE_REFERENCE_SQL = """
       AND uuid = %s
     LIMIT 1
     ) UNION ALL (
-    SELECT canonical_message_uuid AS message_uuid
-    FROM messenger_api_user_messages_v1
-    WHERE project_id = %s
-      AND user_uuid = %s
-      AND visible
-      AND canonical_message_uuid = %s
+    SELECT visible.canonical_message_uuid AS message_uuid
+    FROM (SELECT %s::uuid AS project_id,%s::uuid AS user_uuid,
+                 %s::uuid AS message_uuid) requested
+    CROSS JOIN LATERAL (
+        SELECT uuid FROM messenger_message_placements
+        WHERE project_id=requested.project_id AND message_uuid=requested.message_uuid
+        OFFSET 0
+    ) placement
+    CROSS JOIN LATERAL (
+        SELECT canonical_message_uuid FROM messenger_api_user_messages_v1
+        WHERE project_id=requested.project_id AND user_uuid=requested.user_uuid
+          AND uuid=placement.uuid AND visible
+        OFFSET 0
+    ) visible
     LIMIT 1
     )
     LIMIT 1
