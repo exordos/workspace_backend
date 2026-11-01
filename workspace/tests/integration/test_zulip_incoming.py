@@ -3479,6 +3479,8 @@ def test_duplicate_shared_event_does_not_rollback_useful_batch_events(incoming):
     api, db, account, http, url = incoming
     linked, peer = peer_account(incoming)
     peer_data = peer[2]
+    # Queue copies share the source timestamp even if admission crosses a second.
+    original = event(identifier=201)
     db.execute(
         zulip_incoming.SAVE_SUBSCRIPTION_SQL,
         (
@@ -3505,7 +3507,7 @@ def test_duplicate_shared_event_does_not_rollback_useful_batch_events(incoming):
                         connection,
                         account,
                         {"queue_id": "original-copy"},
-                        [{"id": 1, **event(identifier=201)}],
+                        [{"id": 1, **original}],
                         stage,
                     )
                 async with service.admission() as (connection, stage):
@@ -3514,7 +3516,7 @@ def test_duplicate_shared_event_does_not_rollback_useful_batch_events(incoming):
                         peer_data,
                         {"queue_id": "mixed-batch"},
                         [
-                            {"id": 4, **event(identifier=201)},
+                            {"id": 4, **original},
                             {"id": 5, **event("Useful next message", 202)},
                         ],
                         stage,
