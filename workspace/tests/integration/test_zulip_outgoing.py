@@ -182,7 +182,7 @@ class Server:
         assert http.headers["Authorization"] == self.auth
         with psycopg.connect(self.db_url) as connection:
             assert not connection.execute(
-                "SELECT 1 FROM pg_stat_activity WHERE application_name='workspace-zulip-outgoing' AND state='idle in transaction'"
+                "SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND application_name='workspace-zulip-outgoing' AND state='idle in transaction'"
             ).fetchall()
         self.active += 1
         self.maximum = max(self.maximum, self.active)
@@ -265,6 +265,26 @@ class Server:
             return web.json_response({"result": "success"})
         finally:
             self.active -= 1
+
+
+def test_provider_mock_ignores_outgoing_transactions_in_other_databases(
+    _test_database_url,
+):
+    server = Server(_test_database_url)
+    request = types.SimpleNamespace(
+        method="GET",
+        query={},
+        headers={"Authorization": server.auth},
+        transport=object(),
+        path="/api/v1/messages",
+    )
+    with psycopg.connect(
+        _test_database_url,
+        dbname="postgres",
+        application_name="workspace-zulip-outgoing",
+    ) as other_database:
+        other_database.execute("SELECT 1")
+        assert asyncio.run(server.handle(request)).status == 200
 
 
 @contextlib.asynccontextmanager
