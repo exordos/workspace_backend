@@ -620,6 +620,28 @@ try {
       .join("");
     return root.innerHTML;
   }
+  let roundtripRendered;
+  if (process.env.REVIEW_RENDER_OUTPUT) {
+    const captures = JSON.parse(await fs.readFile(path.join(directory, "telegram_message_types_review.json"), "utf8"));
+    const cases = [...captures.zulip_cases, ...captures.native_telegram_cases];
+    for (const row of cases) messagesById.set(String(row.example.message.id), row.example);
+    roundtripRendered = cases.map(row => {
+      const example = row.example;
+      const workspaceHtml = content => prepareBody(renderWorkspaceBody({
+        ...example, expected_payload: {kind:"markdown", content},
+      }, {...options}), example, "workspace", renderers);
+      const zulipHtml = prepareBody(renderers.zulip.parse({
+        raw_content: row.zulip.content, helper_config: helpers(),
+      }).content, example, "zulip");
+      return {
+        id: (row.fixture_source === "telegram" ? "native-" : "") + example.name,
+        workspace: workspaceHtml(example.expected_payload.content),
+        zulip: zulipHtml,
+        zulipReturned: workspaceHtml(row.zulip.returned.content),
+        telegramReturned: workspaceHtml(row.telegram.roundtrip),
+      };
+    });
+  }
   const cards = examples
     .map((example, index) => {
       if (!telegram && example.unsupported_features.length > 0) {
@@ -814,8 +836,10 @@ document.addEventListener('keydown', event => {
   }
 });
 </script></body></html>`;
-  const output = path.join(directory, `${fixtureName}_preview.html`);
-  await fs.writeFile(output, html.replace(/^[ \t]+$/gm, ""));
+  const output = process.env.REVIEW_RENDER_OUTPUT ?? path.join(directory, `${fixtureName}_preview.html`);
+  await fs.writeFile(output, roundtripRendered
+    ? JSON.stringify({cases:roundtripRendered, styles:html.match(/<style>([\s\S]*?)<\/style>/)[1]})
+    : html.replace(/^[ \t]+$/gm, ""));
   console.log(
     `Validated ${urnCount} Workspace URNs; rendered ${examples.length} comparison cards: ${output}`,
   );

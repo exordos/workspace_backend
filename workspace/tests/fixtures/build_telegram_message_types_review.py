@@ -1,13 +1,47 @@
 """Capture the current converters for an offline review; never modify expectations."""
 
+import copy
 import json
+import uuid
 import pathlib
 
-from telethon.tl import types
-
 from workspace.bridges.telegram import conversion
+from workspace.bridges.zulip import message_conversion
 
 DIRECTORY = pathlib.Path(__file__).parent
+EXAMPLES = json.loads((DIRECTORY / "zulip_messages.json").read_text())
+MESSAGES = {str(example["message"]["id"]): example["message"] for example in EXAMPLES}
+
+
+def telegram_cycle(content):
+    first = capture(content)
+    second = capture(first["roundtrip"])
+    return {
+        **first,
+        "second": second,
+        "exact_roundtrip": first["roundtrip"] == content,
+        "repeat_stable": first["roundtrip"] == second["roundtrip"],
+        "scope": "text-and-entities-only; reply, files and identities require runtime",
+    }
+
+
+def zulip_cycle(example):
+    context = {**example["conversion_context"], "messages": MESSAGES}
+    payload = copy.deepcopy(example["expected_payload"])
+    cycles = []
+    for _ in range(2):
+        content = message_conversion.workspace_to_zulip(payload, context)
+        payload = message_conversion.zulip_to_workspace(
+            {**example["message"], "content": content}, context
+        )
+        cycles.append({"content": content, "returned": payload})
+    return {
+        **cycles[0],
+        "second": cycles[1],
+        "exact_roundtrip": cycles[0]["returned"] == example["expected_payload"],
+        "repeat_stable": cycles[0]["returned"] == cycles[1]["returned"],
+        "scope": "converters with synthetic persisted identity, quote and file mappings",
+    }
 
 
 def capture(content):
@@ -54,9 +88,9 @@ def category(example):
 
 
 rows = []
-for example in json.loads((DIRECTORY / "zulip_messages.json").read_text()):
+for example in EXAMPLES:
     kind = category(example)
-    value = capture(example["expected_payload"]["content"])
+    value = telegram_cycle(example["expected_payload"]["content"])
     notes = []
     if "urn:forward:" in example["expected_payload"]["content"]:
         notes.append(
@@ -95,45 +129,67 @@ for example in json.loads((DIRECTORY / "zulip_messages.json").read_text()):
         proposal = "Сохранить читаемый текст, форматирование и назначение ссылок; отдельно проверить обратное преобразование."
     rows.append(
         {
-            "source": "zulip",
+            "fixture_source": "zulip",
             "category": kind,
             "example": example,
             "telegram": value,
+            "zulip": zulip_cycle(example),
             "notes": notes,
             "proposal": proposal,
         }
     )
 
 native = []
-for example in json.loads((DIRECTORY / "telegram_messages.json").read_text()):
-    if example.get("direction") == "outgoing":
-        value = capture(example["expected_payload"]["content"])
-    else:
-        entities = [
-            getattr(types, entity["type"])(
-                **{key: value for key, value in entity.items() if key != "type"}
-            )
-            for entity in example["message"]["entities"]
-        ]
-        value = {
-            "text": example["message"]["content"],
-            "entities": example["message"]["entities"],
-            "references": {},
-            "roundtrip": conversion.to_workspace(
-                example["message"]["content"], entities
-            ),
+for index, original in enumerate(
+    json.loads((DIRECTORY / "telegram_messages.json").read_text())
+):
+    example = copy.deepcopy(original)
+    message_id = 20000 + index
+    message_uuid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"review:{message_id}"))
+    # Give native-origin cases a synthetic Zulip destination and identity context.
+    # No provider API is called and these identities are never production data.
+    example["message"] = {
+        **EXAMPLES[0]["message"],
+        "id": message_id,
+        "content": example["expected_payload"]["content"],
+    }
+    example["conversion_context"] = {
+        "server_url": "https://zulip.example.test",
+        "original_url": f"https://zulip.example.test/#narrow/near/{message_id}",
+        "current_message_uuid": message_uuid,
+        "message_uuids": {str(message_id): message_uuid},
+    }
+    MESSAGES[str(message_id)] = example["message"]
+    native.append(
+        {
+            "fixture_source": "telegram",
+            "category": "native",
+            "example": example,
+            "original_fixture": original,
+            "telegram": telegram_cycle(example["expected_payload"]["content"]),
+            "zulip": zulip_cycle(example),
+            "notes": [],
+            "proposal": "Сохранить семантику Workspace в обоих направлениях. Различие Markdown не равно потере смысла; итог проверяется по тексту, структуре и ссылкам. Повторный цикл не должен добавлять экранирование или менять форматирование.",
         }
-    native.append({"source": "telegram", "example": example, "telegram": value})
+    )
 
 assert len(rows) == 79 and len(native) == 17
 result = {
-    "status": "review-before-converter-changes",
+    "status": "workspace-canonical-review-before-converter-changes",
     "zulip_cases": rows,
     "native_telegram_cases": native,
 }
 (DIRECTORY / "telegram_message_types_review.json").write_text(
     json.dumps(result, ensure_ascii=False, indent=2) + "\n"
 )
-print(
-    "Captured 79 Zulip cases and 17 native Telegram cases from the unchanged converter."
-)
+for provider in ("zulip", "telegram"):
+    cases = rows + native
+    print(
+        provider,
+        "cases",
+        len(cases),
+        "exact Markdown roundtrip",
+        sum(row[provider]["exact_roundtrip"] for row in cases),
+        "second cycle stable",
+        sum(row[provider]["repeat_stable"] for row in cases),
+    )
