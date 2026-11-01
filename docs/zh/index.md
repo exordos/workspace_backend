@@ -1,10 +1,10 @@
 # 文件 Workspace Backend
 
 Current contract: [Workspace public OpenAPI](../public_workspace_api.yaml).
-External accounts contain an owner, `provider` and generic `settings`.
-Workspace processes native messages and membership; provider synchronization and
-external delivery live elsewhere. The remaining design and architecture pages
-are historical references from before migration `0186`.
+External accounts are owner/project scoped. Zulip and Telegram synchronize
+through the canonical Messenger model, alongside native messaging.
+Provider guides describe the active implementation. Older design proposals
+remain historical references and do not authorize changes.
 
 文件的主导索引 Workspace 后端.每个人的状态
 文件明确表示: ** 现有合同/现有架构**
@@ -25,6 +25,10 @@ are historical references from before migration `0186`.
 
 文件中的实体,字段,路线,JSON值和任务类型名称
 它们是按照合同形式保存的.
+
+## Telegram provider
+
+[Telegram accounts, automatic full history and synchronization](telegram_provider.md).
 
 ## Public API and design history
 

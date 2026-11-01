@@ -195,8 +195,15 @@ async def compare(incoming, rows=(0,), messages=32, repeats=1):
                                 await connection.execute(
                                     "SET LOCAL statement_timeout='45s'"
                                 )
-                                with mock.patch.object(
-                                    history.LOG, "info", side_effect=logged
+                                with (
+                                    mock.patch.object(
+                                        history.LOG, "info", side_effect=logged
+                                    ),
+                                    mock.patch.object(
+                                        history.common_history.LOG,
+                                        "info",
+                                        side_effect=logged,
+                                    ),
                                 ):
                                     start = time.perf_counter()
                                     await service.operations.merge_batch(

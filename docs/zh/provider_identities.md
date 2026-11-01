@@ -106,3 +106,15 @@ queued direct sends. Prepared requests, uncertain sends, and delivery receipts
 are preserved to avoid changing a request that might already have reached Zulip.
 Downgrading restores the prior recipient resolver but retains repaired identity
 references; it does not reconstruct obsolete aliases.
+
+## IAM user identity
+
+IAM user UUIDs identify local Workspace users. A historical user or a provider
+user may have the same username or email as a current IAM user; both fields are
+mutable profile metadata, not globally unique identity keys. Request bootstrap
+first materializes the authenticated UUID and then registers that UUID in the
+project. It never adopts another UUID, private membership, or history based on a
+matching name or email. Migrations 0289 and 0290 remove the obsolete username and
+IAM email uniqueness constraints while preserving all existing user UUIDs and
+references. Their downgrades can only restore uniqueness when no conflicting
+values exist; they never rename, merge, or erase users.

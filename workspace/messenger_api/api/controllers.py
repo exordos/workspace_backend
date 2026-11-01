@@ -121,6 +121,11 @@ class TopicSummaryManagementJSONPacker(ContractJSONPacker):
         return result
 
 
+class TelegramAuthJSONPacker(TopicSummaryManagementJSONPacker):
+    def pack_resource(self, obj: typing.Any) -> typing.Any:
+        return obj if isinstance(obj, dict) else super().pack_resource(obj)
+
+
 class StoreResourceController(ra_controllers.BaseResourceControllerPaginated):
     __generate_location_for__ = ()
     resource_name = ""
@@ -1154,6 +1159,15 @@ class ExternalResourceController(ra_controllers.BaseResourceControllerPaginated)
 
 
 class ExternalAccountController(ExternalResourceController):
+    def get_packer(
+        self, content_type: typing.Any, resource_type: typing.Any = None
+    ) -> typing.Any:
+        if self.request.path_info.rstrip("/").endswith("/actions/telegram_auth/invoke"):
+            return TelegramAuthJSONPacker(
+                resource_type or self.get_resource(), request=self.request
+            )
+        return super().get_packer(content_type, resource_type)
+
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=external_models.ExternalAccount,
         fields_permissions=ra_field_permissions.FieldsPermissions(
@@ -1227,6 +1241,18 @@ class ExternalAccountController(ExternalResourceController):
             ),
             account,
         )
+
+    @ra_actions.post
+    def telegram_auth(self, resource: typing.Any, **kwargs: typing.Any) -> dict:
+        from workspace.messenger_api import telegram_accounts
+
+        self._require_permission("workspace.external_account.update")
+        session = contexts.Context().get_session()
+        account = self.model.objects.get_one(
+            filters=self._owner_filters({"uuid": dm_filters.EQ(resource.uuid)}),
+            session=session,
+        )
+        return telegram_accounts.perform(session, account, kwargs)
 
 
 class TopicSummaryEndpointController(

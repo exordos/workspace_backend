@@ -22,7 +22,8 @@ from workspace.bridges.zulip import (
     outgoing_operations,
 )
 from workspace.common import emoji
-from workspace.messenger_api import file_storage, publication
+from workspace.bridges import messenger
+from workspace.messenger_api import file_storage
 from workspace.messenger_api.dm import base
 
 ENQUEUE_FILE_CLEANUP_SQL = """
@@ -730,7 +731,7 @@ class MissingDependency(Exception):
         super().__init__(f"Waiting for Zulip {spec['kind']} {spec['identity']}")
 
 
-class Operations:
+class Operations(messenger.Operations):
     emit_public_event = True
 
     def __init__(
@@ -739,222 +740,9 @@ class Operations:
         self.db, self.http = db, http
         self.reaction_user_limit = reaction_user_limit
 
-    async def identity(
-        self,
-        account: dict,
-        kind: str,
-        identity: object,
-        *,
-        connection: typing.Any = None,
-    ) -> uuid.UUID:
-        remote = str(identity)
-        query = SELECT_IDENTITY_SQL.format(table=TABLES[kind])
-        parameters = (
-            account["project_id"],
-            account["provider_uuid"],
-            remote,
-        )
-        found = (
-            await self.db.sql(query, parameters)
-            if connection is None
-            else await rows(connection, query, parameters)
-        )
-        return (
-            found[0]["uuid"]
-            if found
-            else uuid.uuid5(
-                account["project_id"], f"{account['provider_uuid']}:{kind}:{remote}"
-            )
-        )
 
-    async def save(
-        self,
-        connection: typing.Any,
-        table: str,
-        values: dict,
-        *,
-        conflict: str = "project_id, uuid",
-    ) -> dict | None:
-        if table == "m_workspace_files":
-            conflict = "uuid"
-        old = await rows(
-            connection,
-            SELECT_ROW_SQL.format(table=table),
-            (
-                values["project_id"],
-                values["uuid"],
-            ),
-        )
-        values = dict(values)
-        if old:
-            values.pop("created_at", None)
-            if all(
-                (
-                    old[0][key].replace(tzinfo=None) == value.replace(tzinfo=None)
-                    if isinstance(value, datetime.datetime)
-                    and isinstance(old[0][key], datetime.datetime)
-                    else old[0][key] == value
-                )
-                for key, value in values.items()
-            ):
-                return None
-        if not old:
-            values.setdefault(
-                "created_at", datetime.datetime.now(datetime.timezone.utc)
-            )
-        values["updated_at"] = datetime.datetime.now(datetime.timezone.utc)
-        if old:
-            updates = {
-                key: value
-                for key, value in values.items()
-                if key not in ("uuid", "project_id")
-            }
-            saved = await rows(
-                connection,
-                UPDATE_ROW_SQL.format(
-                    table=table,
-                    assignments=", ".join(f"{key} = %s" for key in updates),
-                ),
-                tuple(
-                    json_value(value) if isinstance(value, (dict, list)) else value
-                    for value in updates.values()
-                )
-                + (values["project_id"], values["uuid"]),
-            )
-            return saved[0]
-        columns = list(values)
-        assignments = ", ".join(
-            f"{name} = EXCLUDED.{name}"
-            for name in columns
-            if name not in ("uuid", "project_id", "created_at")
-        )
-        saved = await rows(
-            connection,
-            INSERT_ROW_SQL.format(
-                table=table,
-                columns=", ".join(columns),
-                parameters=", ".join(["%s"] * len(columns)),
-                conflict=conflict,
-                assignments=assignments,
-            ),
-            tuple(
-                json_value(value) if isinstance(value, (dict, list)) else value
-                for value in values.values()
-            ),
-        )
-        return saved[0]
 
-    async def publish(
-        self,
-        connection: typing.Any,
-        account: dict,
-        kind: str,
-        entity_uuid: object,
-        snapshots: list[dict],
-        stream_uuid: object = None,
-        *,
-        recipients: list | None = None,
-        control_effect: bool = False,
-    ) -> None:
-        if not self.emit_public_event or not snapshots:
-            return
-        recipient_snapshots = recipients is None
-        if recipients is None:
-            recipients = [item["user_uuid"] for item in snapshots]
-        snapshots = [dict(item) for item in snapshots]
-        for snapshot in snapshots:
-            snapshot.pop("private_index", None)
-            snapshot.pop("canonical_message_uuid", None)
-        common = {
-            key: value
-            for key, value in snapshots[0].items()
-            if (key != "user_uuid" or not recipient_snapshots)
-            and all(item.get(key) == value for item in snapshots)
-        }
-        overrides = {
-            str(user): {
-                key: value
-                for key, value in snapshot.items()
-                if (key != "user_uuid" or not recipient_snapshots) and key not in common
-            }
-            for user, snapshot in zip(recipients, snapshots)
-        }
-        generations = {}
-        if stream_uuid is not None:
-            generations = {
-                str(member["user_uuid"]): member["membership_generation"]
-                for member in await rows(
-                    connection,
-                    SELECT_MEMBERS_SQL,
-                    (
-                        account["project_id"],
-                        stream_uuid,
-                    ),
-                )
-            }
-        recipients = sorted(set(recipients), key=str)
-        event_uuid = uuid.uuid4()
-        await connection.execute(
-            publication.ENQUEUE_SQL,
-            (
-                event_uuid,
-                account["project_id"],
-                entity_uuid,
-                kind,
-                recipients,
-                json_value(common),
-                json_value(overrides),
-                False,
-            ),
-        )
-        if stream_uuid is not None:
-            if control_effect:
-                for user in recipients:
-                    generations.setdefault(str(user), 1)
-                exists = await rows(
-                    connection,
-                    "SELECT 1 FROM messenger_streams WHERE project_id=%s AND uuid=%s",
-                    (account["project_id"], stream_uuid),
-                )
-                if not exists:
-                    stream_uuid = None
-            await connection.execute(
-                """INSERT INTO messenger_event_membership_guards
-                    (event_uuid,project_id,user_uuid,stream_uuid,
-                     membership_generation,control_effect)
-                    SELECT %s,%s,input.user_uuid,%s,input.generation,%s
-                    FROM unnest(%s::uuid[],%s::integer[]) AS input(user_uuid,generation)
-                    ON CONFLICT (event_uuid,user_uuid) DO NOTHING""",
-                (
-                    event_uuid,
-                    account["project_id"],
-                    stream_uuid,
-                    control_effect,
-                    recipients,
-                    [generations[str(user)] for user in recipients],
-                ),
-            )
 
-    async def snapshot(
-        self,
-        connection: typing.Any,
-        account: dict,
-        kind: str,
-        identifier: object,
-        action: str,
-        stream_uuid: object,
-    ) -> None:
-        snapshots = await rows(
-            connection,
-            SELECT_SNAPSHOT_SQL.format(view=VIEWS[kind]),
-            (
-                account["project_id"],
-                identifier,
-            ),
-        )
-        await self.publish(
-            connection, account, f"{kind}.{action}", identifier, snapshots, stream_uuid
-        )
 
     async def initialize(
         self, connection: typing.Any, account: dict, person: dict
@@ -1202,7 +990,7 @@ class Operations:
                         account["project_id"],
                         stream["uuid"],
                         remote,
-                        spec["subject"].removeprefix("✔ ") or "General",
+                        spec["subject"].removeprefix("✔ ") or "zulip",
                         spec["subject"].startswith("✔ "),
                     ),
                 )
@@ -2016,7 +1804,7 @@ class Operations:
                 account["project_id"],
                 stream["uuid"],
                 identity,
-                name.removeprefix("✔ ") or "General",
+                name.removeprefix("✔ ") or "zulip",
                 name.startswith("✔ "),
             ),
         )
@@ -2028,7 +1816,7 @@ class Operations:
                 "uuid": identifier,
                 "project_id": account["project_id"],
                 "stream_uuid": stream["uuid"],
-                "name": name.removeprefix("✔ ") or "General",
+                "name": name.removeprefix("✔ ") or "zulip",
                 "is_done": name.startswith("✔ "),
                 "deleted_at": None,
                 **origin(account, identity),
@@ -2150,34 +1938,6 @@ class Operations:
             )
         return stream
 
-    async def counters(
-        self,
-        connection: typing.Any,
-        account: dict,
-        placement: dict,
-        *,
-        user: object | None = None,
-    ) -> None:
-        members = (
-            [{"user_uuid": user}]
-            if user is not None
-            else await rows(
-                connection,
-                SELECT_MEMBERS_SQL,
-                (account["project_id"], placement["stream_uuid"]),
-            )
-        )
-        users = sorted({member["user_uuid"] for member in members}, key=str)
-        for user_uuid in users:
-            await connection.execute(
-                ENQUEUE_COUNTERS_SQL,
-                (
-                    account["project_id"],
-                    user_uuid,
-                    placement["stream_uuid"],
-                    placement["topic_uuid"],
-                ),
-            )
 
     async def delete_message(
         self, connection: typing.Any, account: dict, remote: object
@@ -3254,7 +3014,7 @@ class Operations:
                     {
                         "uuid": topic["uuid"],
                         "project_id": account["project_id"],
-                        "name": event["subject"].removeprefix("✔ ") or "General",
+                        "name": event["subject"].removeprefix("✔ ") or "zulip",
                         "is_done": event["subject"].startswith("✔ "),
                         "provider_identity": identity,
                     },

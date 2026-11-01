@@ -340,6 +340,7 @@ def add_message_encryption_contract(
                 "source_name",
                 "invite_only",
                 "announce",
+                "announcement_only",
                 "direct_user_uuid",
                 "private",
                 "color",
@@ -389,7 +390,14 @@ def add_message_encryption_contract(
     update_schema = _object_schema(
         {
             name: stream_properties[name]
-            for name in ("name", "description", "invite_only", "announce", "color")
+            for name in (
+                "name",
+                "description",
+                "invite_only",
+                "announce",
+                "announcement_only",
+                "color",
+            )
         },
         [],
     )
@@ -928,5 +936,87 @@ def add_events_cursor_contract(
     }
     specification["paths"][epoch_path]["get"]["responses"][200]["content"] = {
         "application/json": {"schema": copy.deepcopy(EVENT_CURSOR_SCHEMA)}
+    }
+    return specification
+
+
+def add_telegram_auth_contract(
+    specification: dict[str, typing.Any], root: str
+) -> dict[str, typing.Any]:
+    """Describe the ephemeral, owner-only login action separately from accounts."""
+    operation = next(
+        methods["post"]
+        for path, methods in specification["paths"].items()
+        if path.startswith(root + "external_accounts/")
+        and path.endswith("/actions/telegram_auth/invoke")
+    )
+    attempts = []
+    for name in ("start", "status", "password", "cancel"):
+        properties: dict[str, typing.Any] = {
+            "operation": {"type": "string", "enum": [name]}
+        }
+        required = ["operation"]
+        if name in ("password", "cancel"):
+            properties["generation"] = {"type": "string", "format": "uuid"}
+            required.append("generation")
+        if name == "password":
+            properties["password"] = {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "writeOnly": True,
+            }
+            required.append("password")
+        attempts.append(_object_schema(properties, required))
+    operation["description"] = (
+        "Manage Telegram QR login for the current owner and project. Requires "
+        "workspace.external_account.update. Attempts expire after five minutes. "
+        "QR tokens and passwords are ephemeral credentials, never account settings."
+    )
+    operation["requestBody"] = _request_body({"oneOf": attempts})
+    operation["responses"][200] = {
+        "description": "Private Telegram authentication status and import measurements.",
+        "headers": {
+            "Cache-Control": {"schema": {"type": "string", "enum": ["no-store"]}}
+        },
+        "content": {
+            "application/json": {
+                "schema": _object_schema(
+                    {
+                        "state": {
+                            "type": "string",
+                            "enum": [
+                                "disconnected",
+                                "starting",
+                                "qr_pending",
+                                "password_required",
+                                "authorized",
+                                "expired",
+                            ],
+                        },
+                        "generation": {
+                            "type": "string",
+                            "format": "uuid",
+                            "nullable": True,
+                        },
+                        "error_code": {"type": "string", "nullable": True},
+                        "qr_url": {
+                            "type": "string",
+                            "pattern": "^tg://login\\?token=",
+                            "readOnly": True,
+                        },
+                        "expires_at": {"type": "string", "format": "date-time"},
+                        "dialogs": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "description": "Owner-visible chat capabilities, selection, history checkpoints and timing counters.",
+                            },
+                        },
+                    },
+                    ["state", "generation", "dialogs"],
+                )
+            }
+        },
     }
     return specification

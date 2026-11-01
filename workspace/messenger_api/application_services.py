@@ -13,6 +13,8 @@ import dataclasses
 import typing
 import uuid as sys_uuid
 
+from restalchemy.common import exceptions
+
 
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api.dm import helpers
@@ -78,6 +80,28 @@ class ExternalAccountApplicationService:
             hidden_fields=("owner_user_uuid",),
             session=session,
         )
+        if account.provider == "telegram":
+            bindings = session.execute(
+                "SELECT member.uuid FROM messenger_stream_bindings member "
+                "JOIN telegram_peer_state peer ON peer.stream_uuid=member.stream_uuid "
+                "WHERE peer.external_account_uuid=%s AND member.project_id=%s AND member.user_uuid=%s AND member.active",
+                (account.uuid, account.project_id, actor.user_uuid),
+            ).fetchall()
+            for binding in bindings:
+                helpers.delete_workspace_stream_binding(
+                    account.project_id, binding["uuid"], session=session
+                )
+            pending = session.execute(
+                "UPDATE telegram_account_state SET disconnect_requested=true,next_attempt_at=now() "
+                "WHERE external_account_uuid=%s AND session_envelope IS NOT NULL RETURNING external_account_uuid",
+                (account.uuid,),
+            ).fetchone()
+            if pending:
+                account.disabled = True
+                account.update(session=session)
+            else:
+                account.delete(session=session)
+            return
         if account.provider != "zulip" or account.external_account_id is None:
             account.delete(session=session)
             return
@@ -143,6 +167,10 @@ class ExternalAccountApplicationService:
         account: external_models.ExternalAccount,
         spec: dict[str, typing.Any],
     ) -> external_models.ExternalAccount:
+        if spec.get(
+            "provider", account.provider
+        ) != account.provider and "telegram" in (account.provider, spec["provider"]):
+            raise exceptions.ValidationErrorException()
         connection = (
             account.provider,
             account.provider_uuid,

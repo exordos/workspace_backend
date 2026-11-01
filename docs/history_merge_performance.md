@@ -13,6 +13,16 @@ Pins, realtime initialization and native message initialization retain their
 existing behavior. No cursor, scheduling, receipt format or table/index layout
 changes are involved. The migration restores the previous function on downgrade.
 
+## Stream-scoped folder refreshes
+
+A stream counter refresh carries its stream UUID into the existing folder
+projection. Automatic folder items belonging to other streams retain their
+modification timestamps unless their classification changes. The selected
+stream still advances its item timestamps, and an unscoped authoritative
+rebuild retains the full refresh behavior. This keeps browser cache timestamp
+fences while avoiding an unrelated item rewrite after every message. Folder
+snapshots, aggregate counters and event ordering keep their existing contract.
+
 ## Measuring the merge
 
 Create the development environment with `tox -e develop`. Set

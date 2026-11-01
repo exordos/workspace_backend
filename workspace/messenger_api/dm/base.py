@@ -25,6 +25,7 @@ from restalchemy.dm import properties
 from restalchemy.dm import types
 
 from workspace.common import models as common_models
+from workspace.messenger_api import exceptions as messenger_exc
 from workspace.messenger_api.dm import message_payloads
 
 
@@ -78,16 +79,19 @@ class Color(types.Integer):
 class SourceName(str, enum.Enum):
     NATIVE = "native"
     ZULIP = "zulip"
+    TELEGRAM = "telegram"
 
 
 class StreamSourceName(str, enum.Enum):
     NATIVE = "native"
     ZULIP = "zulip"
+    TELEGRAM = "telegram"
 
 
 class TopicSourceName(str, enum.Enum):
     NATIVE = "native"
     ZULIP = "zulip"
+    TELEGRAM = "telegram"
 
 
 class WorkspaceSyncStatus(str, enum.Enum):
@@ -130,7 +134,7 @@ class WorkspaceProviderBase(WorkspaceSyncStatusBase):
             or self.status != "active"
         ):
             raise ra_exc.ValidationErrorException()
-        if self.source_name == "zulip" and self.provider_uuid is None:
+        if self.source_name != "native" and self.provider_uuid is None:
             raise ra_exc.ValidationErrorException()
 
     @staticmethod
@@ -335,6 +339,7 @@ class WorkspaceStreamBase(
         types.Boolean(),
         default=False,
     )
+    announcement_only = properties.property(types.Boolean(), default=False)
     private = properties.property(
         types.Boolean(),
         default=False,
@@ -386,7 +391,7 @@ class WorkspaceStreamEncryptionCreation(models.Model):
         super().validate()
         if self.encryption != (self.current_encryption_key_uuid is not None):
             raise ra_exc.ValidationErrorException()
-        if self.encryption and self.source_name == "zulip":
+        if self.encryption and self.source_name != "native":
             raise ra_exc.ValidationErrorException()
 
 
@@ -405,6 +410,8 @@ class WorkspaceUserStreamBase(
         types.Enum([role.value for role in WorkspaceStreamRole]),
         required=True,
     )
+    can_send = properties.property(types.Boolean(), default=True, read_only=True)
+    announcement_only = properties.property(types.Boolean(), default=False)
     encryption = properties.property(StrictBoolean(), default=False)
     current_encryption_key_uuid = properties.property(
         types.AllowNone(types.UUID()),
@@ -480,13 +487,38 @@ class WorkspaceUserStreamBase(
 
     @staticmethod
     def validate_message_kind(source_name: str, kind: str) -> None:
-        if source_name == "zulip" and kind == message_payloads.E2EEPayload.KIND:
+        if source_name != "native" and kind == message_payloads.E2EEPayload.KIND:
             raise ra_exc.ValidationErrorException()
 
     def validate_message_creation(self, kind: str) -> None:
+        if not self.can_send:
+            raise messenger_exc.StreamReadOnlyError()
         self.validate_message_kind(self.source_name, kind)
         if (
             kind == message_payloads.KeyAnnouncedPayload.KIND
             and self.role != WorkspaceStreamRole.OWNER.value
         ):
             raise ra_exc.ValidationErrorException()
+
+    def validate_announcement_only_update(
+        self, values: typing.Mapping[str, typing.Any]
+    ) -> None:
+        if "announcement_only" in values and (
+            self.source_name != "native" or self.role not in ("owner", "administrator")
+        ):
+            raise messenger_exc.StreamReadOnlyError()
+        if values.get("announcement_only") and self.encryption:
+            raise ra_exc.ValidationErrorException()
+
+    def validate_announcement_role_update(
+        self, role: str, previous: str | None = None
+    ) -> None:
+        if not self.announcement_only:
+            return
+        staff = ("owner", "administrator", "moderator")
+        if self.role not in ("owner", "administrator") and (
+            role in staff or (previous is not None and previous != role)
+        ):
+            raise messenger_exc.StreamReadOnlyError()
+        if self.role != "owner" and (role == "owner" or previous == "owner"):
+            raise messenger_exc.StreamReadOnlyError()

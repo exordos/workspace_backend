@@ -701,3 +701,23 @@ def test_external_account_status_contract():
     )
     for method in ("get", "put"):
         assert "ETag" not in resource[method]["responses"][200].get("headers", {})
+
+
+def test_telegram_auth_schema_keeps_credentials_out_of_account_settings():
+    spec = _build_openapi(workspace_app)
+    action = next(
+        value["post"]
+        for path, value in spec["paths"].items()
+        if path.endswith("/actions/telegram_auth/invoke")
+    )
+    variants = action["requestBody"]["content"]["application/json"]["schema"]["oneOf"]
+    password = next(
+        item
+        for item in variants
+        if item["properties"]["operation"]["enum"] == ["password"]
+    )
+    assert password["properties"]["password"]["writeOnly"]
+    assert password["required"] == ["operation", "generation", "password"]
+    assert action["responses"][200]["headers"]["Cache-Control"]["schema"]["enum"] == [
+        "no-store"
+    ]

@@ -50,11 +50,11 @@ from restalchemy.common import contexts
 from restalchemy.api import applications
 from restalchemy.api import middlewares
 from restalchemy.api.middlewares import contexts as contexts_mw
-from restalchemy.api.middlewares import logging as logging_mw
 from restalchemy.storage.sql import engines
 from restalchemy.storage.sql import migrations as ra_migrations
 from oslo_config import cfg
 
+from workspace.common import telegram_opts
 from workspace.common import file_storage_opts
 from workspace.common import database
 from workspace.common import messenger_reaction_opts
@@ -145,7 +145,7 @@ class FakeIamEngine:
     The enforcer is intentionally hostile: workspace must not call policies.
     """
 
-    def __init__(self, user_uuid, project_id, permissions=()):
+    def __init__(self, user_uuid, project_id, permissions=(), email=""):
         self._token = _FakeToken(user_uuid)
         self._info = {
             "project_id": str(project_id),
@@ -157,7 +157,7 @@ class FakeIamEngine:
                 "name": f"user-{user_uuid}",
                 "first_name": "",
                 "last_name": "",
-                "email": "",
+                "email": email,
             },
         }
 
@@ -202,7 +202,9 @@ class MockedIamAuthMiddleware(iam_mw.GenesisCoreAuthMiddleware):
             if value
         )
         with ctx.context_manager():
-            engine = FakeIamEngine(user_uuid, project_id, permissions)
+            engine = FakeIamEngine(
+                user_uuid, project_id, permissions, req.headers.get("X-Test-User-Email", "")
+            )
             with ctx.iam_session(engine):
                 req.iam_engine = engine
                 # Skip GenesisCoreAuthMiddleware auth logic, just dispatch.
@@ -237,7 +239,7 @@ def build_test_wsgi_application():
             app_middlewares.MutationResponseMiddleware,
             app_middlewares.DatabaseDeadlockRetryMiddleware,
             app_middlewares.ErrorsHandlerMiddleware,
-            logging_mw.LoggingMiddleware,
+            app_middlewares.RequestLoggingMiddleware,
         ],
     )
 
@@ -861,3 +863,23 @@ def seed_stream_topic_flags(conn, topic_uuid, user_uuid, project_id, is_done=Fal
             """,
             (str(topic_uuid), str(user_uuid), str(project_id), is_done),
         )
+
+
+@pytest.fixture
+def telegram_account(api):
+    try:
+        telegram_opts.register_opts()
+    except cfg.DuplicateOptError:
+        pass
+    for name, value in (("api_id", 12345), ("api_hash", "synthetic-app-hash"), ("secret_encryption_key", "synthetic-encryption-key")):
+        cfg.CONF.set_override(name, value, group=telegram_opts.DOMAIN)
+    identifier = str(sys_uuid.uuid4())
+    root = "/v1/messenger/external_accounts/" + identifier
+    created = api.post(
+        "/v1/messenger/external_accounts/",
+        json={"uuid": identifier, "provider": "telegram", "settings": {"history_depth": "30_days", "peer_keys": []}},
+        permissions=tuple(f"workspace.external_account.{action}" for action in ("read", "create", "update", "delete")),
+    )
+    assert created.status_code == 201, created.text
+    assert created.json()["provider_uuid"] is not None
+    yield api, root

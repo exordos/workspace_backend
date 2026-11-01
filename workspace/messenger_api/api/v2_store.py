@@ -460,6 +460,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             provider_identity=None,
             invite_only=values.get("invite_only", False),
             announce=values.get("announce", False),
+            announcement_only=values.get("announcement_only", False),
             direct_user_uuid=direct_user,
             private=private,
             private_index=private_index,
@@ -476,10 +477,10 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 source_name, provider_uuid, provider_identity, invite_only, announce,
                 direct_user_uuid, private, private_index, color,
                 default_topic_uuid, created_at, updated_at,
-                encryption, current_encryption_key_uuid
+                encryption, current_encryption_key_uuid, announcement_only
             ) VALUES (
                 %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s, %s, %s, %s, %s
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
             )
             """,
             (
@@ -502,6 +503,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 now,
                 encryption.encryption,
                 encryption.current_encryption_key_uuid,
+                stream_model.announcement_only,
             ),
         )
         for participant in participants:
@@ -1042,6 +1044,9 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
     ) -> dict[str, typing.Any]:
         session = contexts.Context().get_session()
         message = self._message(message_uuid)
+        self._stream(message.stream_uuid).validate_message_creation(
+            values["payload"]["kind"]
+        )
         if message.author_uuid != self.user_uuid:
             raise ra_exceptions.ValidationErrorException()
         message.validate_payload_update(
@@ -1251,6 +1256,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         if resource == "streams":
             stream = self._stream(resource_uuid)
             stream.validate_encryption_update(values)
+            stream.validate_announcement_only_update(values)
             forbidden = {
                 "source_name",
                 "provider_uuid",
@@ -1262,7 +1268,14 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             }
             if forbidden.intersection(values):
                 raise ra_exceptions.ValidationErrorException()
-            allowed = {"name", "description", "invite_only", "announce", "color"}
+            allowed = {
+                "name",
+                "description",
+                "invite_only",
+                "announce",
+                "announcement_only",
+                "color",
+            }
             updates = {name: values[name] for name in allowed if name in values}
             if not updates:
                 raise ra_exceptions.ValidationErrorException()
@@ -1309,6 +1322,8 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 )
             )
             stream = self._stream(binding.stream_uuid)
+            if "role" in values:
+                stream.validate_announcement_role_update(values["role"], binding.role)
             if stream.private:
                 raise ra_exceptions.ValidationErrorException()
             allowed = {"role", "notification_mode"}
@@ -1641,7 +1656,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 for user_uuid in user_uuids:
                     existing = session.execute(
                         """
-                        SELECT uuid, active, membership_generation
+                        SELECT uuid, active, membership_generation, role
                         FROM messenger_stream_bindings
                         WHERE project_id = %s AND stream_uuid = %s
                           AND user_uuid = %s
@@ -1649,6 +1664,9 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                         """,
                         (self.project_uuid, stream.uuid, user_uuid),
                     ).fetchone()
+                    stream.validate_announcement_role_update(
+                        role, existing["role"] if existing else None
+                    )
                     if existing is None:
                         binding_uuid = sys_uuid.uuid4()
                         membership_generation = 1
