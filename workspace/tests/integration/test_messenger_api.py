@@ -7465,14 +7465,34 @@ def test_read_up_to_plan_starts_from_small_unread_tail(api, db):
     uuid_seed = str(sys_uuid.uuid4())
     created_at = datetime.datetime(2026, 7, 29)
     with db.cursor() as cursor:
+        # Reserve the fresh project's live range once instead of updating the
+        # same allocator row 100,000 times within one INSERT statement.
+        cursor.execute("SET statement_timeout = '90s'")
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_project_ingest_ranges_v2 (
+                project_id, range_number, last_live_sequence
+            )
+            VALUES (%s, nextval('m_workspace_project_ingest_range_v2_seq'), %s)
+            RETURNING range_number * %s + last_live_sequence - %s
+            """,
+            (
+                api.project_id,
+                read_state.PROJECT_SEQUENCE_BACKFILL_MAX + history_size,
+                read_state.PROJECT_SEQUENCE_RANGE_SIZE,
+                history_size,
+            ),
+        )
+        sequence_base = cursor.fetchone()[0]
         cursor.execute(
             """
             INSERT INTO m_workspace_messages (
                 uuid, project_id, stream_uuid, topic_uuid, user_uuid,
-                payload, created_at, updated_at
+                payload, ingest_sequence, created_at, updated_at
             )
             SELECT md5(%s || ':' || series)::uuid, %s, %s, %s, %s,
                    '{"kind":"markdown","content":"history"}'::jsonb,
+                   %s::bigint + series,
                    %s::timestamp + series * interval '1 microsecond',
                    %s::timestamp + series * interval '1 microsecond'
             FROM generate_series(1, %s) AS series
@@ -7483,6 +7503,7 @@ def test_read_up_to_plan_starts_from_small_unread_tail(api, db):
                 str(stream_uuid),
                 str(topic_uuid),
                 api.user_uuid,
+                sequence_base,
                 created_at,
                 created_at,
                 history_size,
@@ -7508,6 +7529,21 @@ def test_read_up_to_plan_starts_from_small_unread_tail(api, db):
                 api.project_id,
                 str(stream_uuid),
             ),
+        )
+        assert cursor.rowcount == history_size
+        cursor.execute("RESET statement_timeout")
+        cursor.execute(
+            """
+            SELECT count(*), min(ingest_sequence), max(ingest_sequence)
+            FROM m_workspace_messages
+            WHERE project_id = %s AND stream_uuid = %s
+            """,
+            (api.project_id, str(stream_uuid)),
+        )
+        assert cursor.fetchone() == (
+            history_size,
+            sequence_base + 1,
+            sequence_base + history_size,
         )
         cursor.execute(
             """
@@ -7611,6 +7647,32 @@ def test_read_up_to_plan_starts_from_small_unread_tail(api, db):
     )
     assert sum(node.get("Temp Read Blocks", 0) for node in access_nodes) == 0
     assert sum(node.get("Temp Written Blocks", 0) for node in access_nodes) == 0
+
+    # Normal writes must continue after the reserved range without collisions.
+    with db.transaction(force_rollback=True):
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO m_workspace_messages (
+                    uuid, project_id, stream_uuid, topic_uuid, user_uuid,
+                    payload, created_at, updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s,
+                        '{"kind":"markdown","content":"next"}'::jsonb,
+                        %s, %s)
+                RETURNING ingest_sequence
+                """,
+                (
+                    sys_uuid.uuid4(),
+                    api.project_id,
+                    str(stream_uuid),
+                    str(topic_uuid),
+                    api.user_uuid,
+                    created_at + datetime.timedelta(microseconds=history_size + 1),
+                    created_at + datetime.timedelta(microseconds=history_size + 1),
+                ),
+            )
+            assert cursor.fetchone()[0] == sequence_base + history_size + 1
 
 
 def test_unbound_user_cannot_send_message(api, db):
