@@ -175,11 +175,15 @@ def test_sparse_mention_pages_preserve_access_and_deletion_checks(
 
 
 @pytest.mark.isolated_schema
+@pytest.mark.parametrize(
+    "migration_prefix",
+    ["0289-Expose-sparse-message-flags-", "0290-Keep-message-view-history-joins-"],
+)
 def test_sparse_flag_view_upgrade_and_downgrade_preserve_existing_rows(
-    api, db, flag_messages
+    api, db, flag_messages, migration_prefix
 ):
     _stream, _topic, _expected = flag_messages
-    path = next(conftest.MIGRATIONS_DIR.glob("0289-Expose-sparse-message-flags-*.py"))
+    path = next(conftest.MIGRATIONS_DIR.glob(migration_prefix + "*.py"))
     spec = importlib.util.spec_from_file_location("sparse_view_migration", path)
     migration = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(migration)
