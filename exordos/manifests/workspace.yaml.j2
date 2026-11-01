@@ -301,6 +301,14 @@ resources:
         kind: plain
       method: AUTO_HEX
 
+    workspace_telegram_secret_key:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace_telegram_secret_key
+      description: "Workspace Telegram account encryption key"
+      default_length: 64
+      constructor:
+        kind: plain
+      method: AUTO_HEX
   $dbaas.types.postgres.instances:
     workspace_projection_cluster:
       name: "workspace-projection-pg-cluster"
@@ -446,6 +454,12 @@ resources:
           send_queue_limit = 32
           poll_interval = 3
 
+
+          [telegram]
+          api_id = 0
+          api_hash =
+          secret_encryption_key = {$core.secret.passwords.$workspace_telegram_secret_key:value}
+          poll_interval = 1
 
           [zulip_outgoing]
           concurrency = 128
@@ -619,7 +633,7 @@ resources:
     workspace_api:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       name: workspace-api
-      path: /usr/bin/workspace-api --config-file /etc/workspace/workspace.conf
+      path: /usr/bin/workspace-api --config-file /etc/workspace/workspace.conf --config-file /etc/workspace/telegram.conf
       user: root
       target:
         kind: node
@@ -665,6 +679,21 @@ resources:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       name: workspace-zulip-outgoing
       path: /usr/bin/workspace-zulip-outgoing --config-file /etc/workspace/workspace.conf
+      user: root
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_backend:uuid
+      service_type:
+        kind: simple
+        count: 1
+      target_status: enabled
+      before:
+        - kind: shell
+          command: /usr/local/bin/workspace-bootstrap
+    workspace_telegram:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace-telegram
+      path: /usr/bin/workspace-telegram --config-file /etc/workspace/workspace.conf --config-file /etc/workspace/telegram.conf
       user: root
       target:
         kind: node

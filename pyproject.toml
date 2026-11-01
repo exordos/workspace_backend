@@ -28,8 +28,10 @@ dependencies = [
     "websockets>=10.4,<13.0",  # BSD License (BSD-3-Clause)
     "requests>=2.32.0,<3.0.0",  # Apache-2.0
     "aiohttp>=3.12.0,<4.0.0",
+    "telethon>=1.45.0,<2.0.0",  # MIT License
     "psycopg>=3.2.0,<4.0.0",  # LGPL-3.0  # Apache-2.0
     "cryptography>=43.0.0,<47.0.0",  # Apache-2.0 or BSD-3-Clause
+    "markdown-it-py>=4.2.0,<5.0.0",  # MIT License
 ]
 [project.urls]
 homepage = "https://github.com/infraguys/workspace/"
@@ -135,6 +137,7 @@ where = ["."]
 workspace-api = "workspace.cmd.workspace_api:main"
 workspace-zulip-history = "workspace.cmd.zulip_history:main"
 workspace-zulip-incoming = "workspace.cmd.zulip_incoming:main"
+workspace-telegram = "workspace.cmd.telegram:main"
 workspace-zulip-outgoing = "workspace.cmd.zulip_outgoing:main"
 workspace-messenger-worker = "workspace.cmd.messenger_worker:main"
 workspace-messenger-events = "workspace.cmd.messenger_events:main"

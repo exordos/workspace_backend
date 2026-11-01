@@ -194,8 +194,8 @@ SELECT_USER_REFERENCE_SQL = """
     FROM m_external_accounts_v2 account
     JOIN m_workspace_users users ON users.uuid = account.owner_user_uuid
     WHERE account.project_id = %s
-      AND account.owner_user_uuid = %s
-      AND account.provider_uuid = %s
+      AND %s IN (account.owner_user_uuid,messenger_uuid_v5(account.provider_uuid,'user:'||account.external_account_id))
+      AND account.provider_uuid = %s AND account.provider='zulip' AND account.external_account_id IS NOT NULL
 """
 
 SELECT_MESSAGE_REFERENCE_SQL = """

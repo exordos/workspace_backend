@@ -1679,14 +1679,7 @@ Sie zeigen nie Roh `provider_metadata` oder `delivery_metadata` für
 
 ## Dateien {#files}
 
-Imported file `provider_identity` values may contain complete provider upload
-paths and can exceed 255 characters, up to 2048 bytes in UTF-8. The byte limit
-also applies to stored file links and keeps the full path below the database index
-entry limit. Oversized paths render a `file path too long` notice without preventing
-message synchronization. File UUIDs remain stable. Other entity identity limits
-are unchanged. Temporary Zulip download links are resolved to authenticated
-upload paths; a currently inaccessible or deleted attachment renders an explicit
-notice without preventing message synchronization.
+Importierte Datei `provider_identity` Werte können vollständige Anbieter-Upload-Pfade enthalten und können 255 Zeichen überschreiten, bis zu 2048 Bytes in UTF-8. Das Byte-Limit gilt auch für gespeicherte Datei-Links und hält den vollständigen Pfad unterhalb des Limits für Datenbank-Indexeinträge. Überlange Pfade zeigen einen `file path too long` Hinweis an, ohne die Nachrichtensynchronisierung zu verhindern. Datei-UUIDs bleiben stabil. Andere Identitätsgrenzen für Entitäten bleiben unverändert. Temporäre Zulip-Download-Links werden zu authentifizierten Upload-Pfaden aufgelöst; ein derzeit nicht zugänglicher oder gelöschter Anhang zeigt einen expliziten Hinweis an, ohne die Nachrichtensynchronisierung zu verhindern.
 
 Die Dateibytes und ein separater JSON Sidecar werden über die konfigurierte
 S3 ist das bereitgestellte Backend; das lokale Backend

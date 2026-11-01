@@ -9,7 +9,6 @@ from gcl_iam import middlewares as iam_mw
 from restalchemy.api import applications
 from restalchemy.api import middlewares
 from restalchemy.api import routes
-from restalchemy.api.middlewares import logging as logging_mw
 from restalchemy.openapi import constants as openapi_constants
 from restalchemy.openapi import engines as openapi_engines
 from restalchemy.openapi import structures as openapi_structures
@@ -84,6 +83,9 @@ class WorkspaceOpenApiPaths(openapi_structures.OpenApiPaths):
             "/v1/messenger/",
             components,
         )
+        specification = openapi_contract.add_telegram_auth_contract(
+            specification, "/v1/messenger/"
+        )
         specification = openapi_contract.add_events_cursor_contract(
             specification,
             "/v1/events/",
@@ -134,6 +136,6 @@ def build_wsgi_application(iam_engine_driver: typing.Any) -> typing.Any:
             app_middlewares.MutationResponseMiddleware,
             app_middlewares.DatabaseDeadlockRetryMiddleware,
             app_middlewares.ErrorsHandlerMiddleware,
-            logging_mw.LoggingMiddleware,
+            app_middlewares.RequestLoggingMiddleware,
         ],
     )
