@@ -199,12 +199,23 @@ SELECT_USER_REFERENCE_SQL = """
 """
 
 SELECT_MESSAGE_REFERENCE_SQL = """
+    (
     SELECT canonical_message_uuid AS message_uuid
     FROM messenger_api_user_messages_v1
     WHERE project_id = %s
       AND user_uuid = %s
       AND visible
-      AND (uuid = %s OR canonical_message_uuid = %s)
+      AND uuid = %s
+    LIMIT 1
+    ) UNION ALL (
+    SELECT canonical_message_uuid AS message_uuid
+    FROM messenger_api_user_messages_v1
+    WHERE project_id = %s
+      AND user_uuid = %s
+      AND visible
+      AND canonical_message_uuid = %s
+    LIMIT 1
+    )
     LIMIT 1
 """
 
@@ -872,6 +883,8 @@ class Operations:
                         intent["project_id"],
                         account["owner_user_uuid"],
                         identifier,
+                        intent["project_id"],
+                        account["owner_user_uuid"],
                         identifier,
                     ),
                 )

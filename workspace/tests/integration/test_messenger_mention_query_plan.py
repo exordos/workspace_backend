@@ -5,6 +5,8 @@
 import json
 import uuid
 
+import pytest
+
 from workspace.tests.integration import conftest
 
 
@@ -14,7 +16,10 @@ def _nodes(plan):
         yield from _nodes(child)
 
 
-def test_unread_mentions_avoid_scanning_the_users_entire_history(api, db):
+@pytest.mark.parametrize("has_unread_mention", [False, True])
+def test_unread_mentions_avoid_scanning_the_users_entire_history(
+    api, db, has_unread_mention
+):
     stream = conftest.seed_user_stream(db, api.project_id, api.user_uuid, "Mentions")
     topic = conftest.seed_stream_topic(
         db, api.project_id, stream, api.user_uuid, "General", is_default=True
@@ -62,6 +67,13 @@ def test_unread_mentions_avoid_scanning_the_users_entire_history(api, db):
                SELECT %s,%s,placement,%s,%s FROM mention_plan_ids WHERE i=%s""",
             (api.project_id, api.user_uuid, stream, topic, count),
         )
+        if not has_unread_mention:
+            db.execute(
+                "DELETE FROM messenger_user_message_unreads WHERE project_id=%s "
+                "AND user_uuid=%s AND placement_uuid=("
+                "SELECT placement FROM mention_plan_ids WHERE i=%s)",
+                (api.project_id, api.user_uuid, count),
+            )
         for table in (
             "messenger_messages",
             "messenger_message_contents",
@@ -93,6 +105,25 @@ def test_unread_mentions_avoid_scanning_the_users_entire_history(api, db):
             )
             < 50
         ), json.dumps(plan)
+        history_scans = [
+            node
+            for node in _nodes(plan["Plan"])
+            if node.get("Relation Name")
+            in {
+                "messenger_messages",
+                "messenger_message_placements",
+                "messenger_user_message_bindings",
+            }
+        ]
+        # Counting returned flag rows alone misses thousands of unsuccessful
+        # probes and the history scan/sort which happens before those probes.
+        assert history_scans
+        assert all(
+            (node["Actual Rows"] + node.get("Rows Removed by Filter", 0))
+            * node["Actual Loops"]
+            < 50
+            for node in history_scans
+        ), json.dumps(plan)
         expected = db.execute(
             "SELECT placement FROM mention_plan_ids WHERE i=%s", (count,)
         ).fetchone()[0]
@@ -108,7 +139,9 @@ def test_unread_mentions_avoid_scanning_the_users_entire_history(api, db):
             },
         )
         assert response.status_code == 200, response.text
-        assert [row["uuid"] for row in response.json()] == [str(expected)]
+        assert [row["uuid"] for row in response.json()] == (
+            [str(expected)] if has_unread_mention else []
+        )
         print(
             json.dumps(
                 {"history_messages": count, "mention_query_ms": plan["Execution Time"]}
