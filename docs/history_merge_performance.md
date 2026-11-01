@@ -62,3 +62,25 @@ reactions, concurrent workers and storage latency. These ratios do not predict
 the speedup of an entire production batch or guarantee constant database time.
 After a separately authorized release, compare phase median/p95, completed-page
 throughput, errors, realtime latency and operation-level timings under real load.
+
+## Receipt context inside the transaction
+
+The service's `merge_ms` also includes receipt context calculation after the SQL
+merge. Measure this interval separately before attributing a gap between SQL
+timings and `merge_ms` to database round trips. The connection can be idle in its
+transaction while the caller calculates the receipt; its last reported query
+does not identify the operation currently using CPU.
+
+Receipt context matches catalog names against the decoded page with a shared
+substring matcher and extracts standard channel links once. Small catalogs use
+native substring searches. Prepared batches already contain the reference
+catalog, so the database topic lookup reads only topics used by page placements;
+fresh receipt checks still read the full relevant topic scope. These changes
+preserve the receipt format and dependency matching, including overlapping
+names, direct messages and nonstandard provider identities.
+
+Keep receipt calculation and cursor advancement in the same transaction. The
+transaction can still hold locks on counter scopes and last-message pointers;
+verify concurrent realtime inserts into the same stream as well as isolated
+history throughput. A synthetic database result does not establish provider or
+client delivery latency.

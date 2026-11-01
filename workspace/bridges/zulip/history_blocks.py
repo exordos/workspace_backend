@@ -3,6 +3,7 @@
 
 """Account-scoped receipts for stable, completely fetched history ranges."""
 
+import collections
 import hashlib
 import json
 import re
@@ -62,6 +63,69 @@ def fingerprints(messages: list[dict]) -> tuple[bytes, bytes]:
             [message["id"], sorted(set(message["flags"]) & {"read", "starred"})]
         )
     return digest(data), digest(state)
+
+
+def matching_names(text: str, names: typing.Iterable[str]) -> set[str]:
+    """Find every catalog name without rescanning the page for every name.
+
+    A trie with failure links preserves substring semantics, including nested
+    and overlapping names. Construction visits each name character once; the
+    page is then scanned once, rather than once per topic in a growing catalog.
+    """
+    names = set(names)
+    if len(names) < 32:
+        return {name for name in names if name in text}
+    edges: list[dict[str, int]] = [{}]
+    failures = [0]
+    outputs: list[set[str]] = [set()]
+    for name in names:
+        state = 0
+        for character in name:
+            if character not in edges[state]:
+                edges[state][character] = len(edges)
+                edges.append({})
+                failures.append(0)
+                outputs.append(set())
+            state = edges[state][character]
+        outputs[state].add(name)
+    pending = collections.deque(edges[0].values())
+    while pending:
+        state = pending.popleft()
+        for character, target in edges[state].items():
+            pending.append(target)
+            fallback = failures[state]
+            while fallback and character not in edges[fallback]:
+                fallback = failures[fallback]
+            failures[target] = edges[fallback].get(character, 0)
+            outputs[target].update(outputs[failures[target]])
+    found = set(outputs[0])
+    state = 0
+    visited = set()
+    for character in text:
+        while state and character not in edges[state]:
+            state = failures[state]
+        state = edges[state].get(character, 0)
+        if state not in visited:
+            visited.add(state)
+            found.update(outputs[state])
+    return found
+
+
+def linked_stream_identities(text: str, identities: typing.Iterable[str]) -> set[str]:
+    # Zulip streams use numeric IDs or a deterministic DM UUID. Extract those
+    # links once, while preserving legacy/nonstandard identity matching.
+    standard = r"(?:\d+|dm:[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12})"
+    found = set(re.findall(r"channel/(" + standard + r")(?=\D|$)", text))
+    return {
+        identity
+        for identity in identities
+        if identity in found
+        or (
+            not re.fullmatch(standard, identity)
+            and "channel/" in text
+            and re.search(r"channel/" + re.escape(identity) + r"(?:\D|$)", text)
+        )
+    }
 
 
 async def context(
@@ -143,6 +207,15 @@ async def context(
             (account["owner_user_uuid"], *scope),
         )
     )
+    stream_names = matching_names(decoded, (row["name"] for row in streams))
+    channel_ids = linked_stream_identities(
+        decoded,
+        (
+            row["provider_identity"]
+            for row in streams
+            if row["provider_identity"] is not None
+        ),
+    )
     streams = sorted(
         [
             {
@@ -160,11 +233,8 @@ async def context(
             if row["provider_identity"] is not None
             and (
                 row["provider_identity"] in identities
-                or row["name"] in decoded
-                or re.search(
-                    r"channel/" + re.escape(row["provider_identity"]) + r"(?:\D|$)",
-                    decoded,
-                )
+                or row["name"] in stream_names
+                or row["provider_identity"] in channel_ids
             )
         ],
         key=lambda row: str(row["uuid"]),
@@ -196,18 +266,26 @@ async def context(
             binding["content_updated_at"] = prepared["edited"].get(
                 str(binding["uuid"]), binding["content_updated_at"]
             )
+    binding_topics = {binding["topic_uuid"] for binding in bindings}
+    topic_parameters: tuple = (*scope, [row["uuid"] for row in streams])
+    if prepared is not None:
+        topic_parameters += (list(binding_topics),)
     current_topics = await incoming_operations.rows(
         connection,
-        """
+        f"""
         SELECT uuid,stream_uuid,provider_identity,name,is_done,deleted_at
         FROM messenger_topics WHERE project_id=%s AND provider_uuid=%s
-          AND stream_uuid=ANY(%s::uuid[]) ORDER BY uuid
+          AND stream_uuid=ANY(%s::uuid[])
+          {"AND uuid=ANY(%s::uuid[])" if prepared is not None else ""}
+        ORDER BY uuid
     """,
-        (*scope, [row["uuid"] for row in streams]),
+        topic_parameters,
     )
     topics = prepared["topics"] if prepared is not None else current_topics
-    binding_topics = {binding["topic_uuid"] for binding in bindings}
     stream_ids = {row["uuid"] for row in streams}
+    topics = [row for row in topics if row["stream_uuid"] in stream_ids]
+    topic_names = matching_names(decoded, (row["name"] for row in topics))
+    remote_topics = set(refs["remote_topics"])
     topics = sorted(
         [
             {
@@ -222,11 +300,7 @@ async def context(
             }
             | {"deleted_at": row.get("deleted_at")}
             for row in topics
-            if row["stream_uuid"] in stream_ids
-            and (
-                row["provider_identity"] in refs["remote_topics"]
-                or row["name"] in decoded
-            )
+            if row["provider_identity"] in remote_topics or row["name"] in topic_names
         ],
         key=lambda row: str(row["uuid"]),
     )
