@@ -36,6 +36,42 @@ The migration replaces only this view and restores migration 0289's definition
 on downgrade. It adds no tables or indexes and changes no planner settings,
 stored data, API fields, access rules or pagination markers.
 
+Migration 0291 adds four fixed-size page keys to access bindings: canonical
+message UUID, stream UUID, topic UUID and canonical creation time. They copy
+existing identities and ordering data; message content remains in its existing
+immutable content table. Binding inserts, placement moves, canonical changes
+and timestamp corrections maintain the keys in the same transaction. Source
+INSERT synchronization uses statement-level transition tables, including combined
+data-modifying CTEs and deferred foreign-key restore order; it does not repeat
+source repair once per inserted message. Three
+indexes cover the user history, stream history and topic history with the
+existing `(created_at, placement_uuid)` ordering.
+
+Limited HTTP pages first select visible UUIDs through
+`messenger_api_message_page_candidates_v1`. This projection uses the indexed
+binding keys and sparse facts, leaving content out of a key-only selection.
+The materialized page then expands only its selected UUIDs through the unchanged
+protected message view. Both stages use the same typed filters and statement
+snapshot, including project/user scope, visibility and keyset predicates.
+Recheck those filters in the final lookup as well. Preserve the controller's
+extra-row pagination probe and both ordering directions. Unbounded reads retain
+their existing path.
+
+The candidate projection keeps explicit project guards on canonical lookups.
+Singleton `ANY` guards prevent a stale project estimate from becoming an
+equality class across history relations while retaining the project check.
+Public payloads and visibility still come from the authoritative final view.
+
+The online migration installs synchronization before backfilling existing
+bindings in bounded physical windows. It verifies the whole population after
+each pass so concurrent row movement cannot leave a key behind. Indexes are
+built concurrently; a retry removes only this migration's invalid indexes.
+Vacuum the updated bindings and analyze the new keys before installing the
+candidate view, rather than leaving backfill debris for a later autovacuum.
+Install the candidate view after this preparation finishes. Old application
+versions can keep using the unchanged message view with the added schema.
+Switch back to old application code before explicitly downgrading this migration.
+
 Outgoing Zulip reference resolution accepts both placement and canonical
 message UUIDs. Use two indexed branches with `UNION ALL` and a final `LIMIT 1`,
 keeping the same visibility conditions in each branch. Resolve canonical message
@@ -76,6 +112,16 @@ equal timestamps, payloads and sparse flags, including cross-user/project checks
 Its SQL timeout bounds a broken plan; it is not an increased API timeout. Also
 run the existing bridge modules in order (`test_zulip_history.py`,
 `test_zulip_incoming.py`, `test_zulip_outgoing.py`) to check the original trigger.
+
+`test_message_page_selectivity.py` captures the real HTTP page SQL and bounds
+unrelated history work for present and absent stream/topic filters. It also
+checks dense positive/negative flags against the earlier flat-view baseline.
+Do not equate buffer hits or rows examined with elapsed time: indexed probes and
+hash scans have different costs. Compare repeated HTTP latency and throughput
+under the same workload, including ordinary resource reads and message writes.
+`test_message_page_keys.py` verifies committed-batch interruption/resume,
+idempotent migration, row/flag preservation, online indexes, placement moves,
+canonical changes and corrected dates.
 
 For a live incident, compare completed HTTP request durations with
 `pg_stat_activity` wait events and blocking PIDs before attributing latency to
