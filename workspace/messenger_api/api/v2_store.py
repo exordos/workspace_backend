@@ -13,6 +13,7 @@ import uuid as sys_uuid
 from restalchemy.common import contexts
 from restalchemy.common import exceptions as ra_exceptions
 from restalchemy.dm import filters as dm_filters
+from restalchemy.storage.sql import filters as sql_filters
 
 from workspace.messenger_api import message_flags
 from workspace.messenger_api import events as messenger_events
@@ -26,6 +27,21 @@ from workspace.messenger_api.dm import base
 from workspace.messenger_api.dm import helpers
 from workspace.messenger_api.dm import message_payloads
 from workspace.messenger_api.dm import v2_models
+
+
+SELECT_MESSAGE_PAGE_SQL = """
+WITH page AS MATERIALIZED (
+    SELECT uuid,created_at FROM messenger_api_message_page_candidates_v1
+    WHERE {predicate}
+    ORDER BY created_at {direction},uuid {direction} LIMIT %s
+)
+SELECT message.* FROM page
+CROSS JOIN LATERAL (
+    SELECT * FROM messenger_api_user_messages_v1
+    WHERE uuid=page.uuid AND {predicate} LIMIT 1
+) message
+ORDER BY page.created_at {direction},page.uuid {direction}
+"""
 
 
 CORE_RESOURCE_MODELS: dict[str, typing.Any] = {
@@ -116,16 +132,25 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 ),
             )
             scoped_filters = dm_filters.AND(scoped_filters, keyset)
-        query: dict[str, typing.Any] = {
-            "filters": scoped_filters,
-            "order_by": {
-                "created_at": sort_direction,
-                "uuid": sort_direction,
-            },
-        }
-        if limit is not None:
-            query["limit"] = limit
-        rows = v2_models.WorkspaceUserMessage.objects.get_all(**query)
+        if limit is None:
+            rows = v2_models.WorkspaceUserMessage.objects.get_all(
+                filters=scoped_filters,
+                order_by={"created_at": sort_direction, "uuid": sort_direction},
+            )
+            return [_public(row, "messages") for row in rows]
+        session = contexts.Context().get_session()
+        predicate = sql_filters.convert_filters(
+            v2_models.WorkspaceUserMessage, scoped_filters, session=session
+        )
+        direction = {"asc": "ASC", "desc": "DESC"}[sort_direction]
+        statement = SELECT_MESSAGE_PAGE_SQL.format(
+            predicate=predicate.construct_expression(), direction=direction
+        )
+        values = [*predicate.value, limit, *predicate.value]
+        result = session.execute(statement, values).fetchall()
+        rows = v2_models.WorkspaceUserMessage.restore_many_from_storage(
+            result, session=session
+        )
         return [_public(row, "messages") for row in rows]
 
     def get_resource(
