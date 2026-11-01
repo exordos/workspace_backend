@@ -11,7 +11,7 @@ from unittest import mock
 
 import pytest
 
-from workspace.bridges.zulip import history_blocks, incoming_operations
+from workspace.bridges.zulip import content_cache, history_blocks, incoming_operations
 
 
 def uid(number):
@@ -127,7 +127,8 @@ def context_rows(prepared, bindings, observed):
 
 
 # Recorded from the released context implementation, including ordering and
-# conservative substring dependencies. Existing receipts must remain reusable.
+# conservative substring dependencies. Pin converter version 1 below to isolate
+# context selection from intentional converter-version invalidation.
 EXPECTED = {
     "stream": "952bba6f08757dd457ddc1f60516a4ac4627e1841dddccaaa0067ea57f7994f7",
     "done": "6aecd626393c844382136b239fbdd2d1b8863190f4825c93b34505760394d83b",
@@ -139,8 +140,13 @@ EXPECTED = {
 @pytest.mark.parametrize("prepared_context", [False, True])
 def test_context_keeps_released_fingerprint(profile, prepared_context):
     account, messages, prepared, bindings = context_data(profile)
-    with mock.patch.object(
-        incoming_operations, "rows", side_effect=context_rows(prepared, bindings, [])
+    with (
+        mock.patch.object(content_cache, "CONVERTER_VERSION", 1),
+        mock.patch.object(
+            incoming_operations,
+            "rows",
+            side_effect=context_rows(prepared, bindings, []),
+        ),
     ):
         actual = asyncio.run(
             history_blocks.context(
