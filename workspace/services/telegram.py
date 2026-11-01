@@ -1,7 +1,7 @@
 # Copyright 2026 Genesis Corporation.
 # Licensed under the Apache License, Version 2.0 (the "License").
 
-"""One Telegram connection per account with durable realtime cursors."""
+"""One Telegram connection per account, durable cursors and bounded backfill."""
 
 import asyncio
 import base64
@@ -20,6 +20,7 @@ from telethon import errors, events, sessions, utils
 from telethon.extensions import binaryreader
 from telethon.tl import functions, types
 
+from workspace.bridges import history as common_history
 from workspace.bridges import messenger
 from workspace.bridges.telegram import conversion, credentials, operations
 from workspace.common import async_database
@@ -85,14 +86,18 @@ class TelegramService:
         api_hash: str,
         key: str,
         *,
+        batch_size: int = 100,
         poll_interval: float = 1.0,
+        publication_limit: int = 256,
+        realtime_delay: float = 0.5,
         client_factory: typing.Any = telethon.TelegramClient,
     ) -> None:
         self.db = async_database.Database(
             db_url, size=8, application_name="workspace-telegram"
         )
         self.api_id, self.api_hash, self.key = api_id, api_hash, key
-        self.poll_interval = poll_interval
+        self.batch_size, self.poll_interval = batch_size, poll_interval
+        self.publication_limit, self.realtime_delay = publication_limit, realtime_delay
         self.client_factory = client_factory
         self.operations = operations.Operations(self.db)
         self.tasks: dict[uuid.UUID, asyncio.Task] = {}
@@ -285,6 +290,9 @@ class TelegramService:
                         account, client, channel_wake, dirty_channels, catalog_wake
                     ),
                     self.replay_loop(account, client),
+                    self.history_loop(account, client, "user"),
+                    self.history_loop(account, client, "chat"),
+                    self.history_loop(account, client, "channel"),
                     self.outgoing_loop(account, client),
                     self.catalog_loop(account, client, catalog_wake),
                     self.notification_loop(account, notifications),
@@ -519,7 +527,7 @@ class TelegramService:
                 )
             rows = await messenger.rows(
                 connection,
-                "UPDATE m_external_accounts_v2 SET external_account_id=%s,status='active',error_description=NULL,updated_at=now() WHERE uuid=%s RETURNING *",
+                "UPDATE m_external_accounts_v2 SET external_account_id=%s,status='syncing',error_description=NULL,updated_at=now() WHERE uuid=%s RETURNING *",
                 (str(me.id), account["uuid"]),
             )
             account.update(rows[0])
@@ -1027,12 +1035,80 @@ class TelegramService:
             (f"telegram:{account['project_id']}:{account['provider_uuid']}:{scope}",),
         )
 
+    async def history_observations(
+        self, connection: typing.Any, account: dict, peer: dict, prepared: list[dict]
+    ) -> list[dict]:
+        observations = []
+        for data in prepared:
+            observed = (
+                datetime.datetime.fromisoformat(data["observed_at"]).replace(
+                    tzinfo=None
+                )
+                if "observed_at" in data
+                else datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+            )
+            key = f"{data['identity']}:{data['edited_at']}:{hashlib.sha256(data['text'].encode()).hexdigest()}"
+            observations.append(
+                {
+                    "external_account_uuid": account["uuid"],
+                    "event_key": key,
+                    "payload": data,
+                    "received_at": observed,
+                }
+            )
+        await common_history.stage(connection, "telegram_incoming_events", observations)
+        # Serialize with native edits before inspecting their durable outgoing intents.
+        await connection.execute(
+            """
+            SELECT message.uuid FROM messenger_messages message
+            JOIN history_telegram_incoming_events src ON message.provider_identity=src.payload->>'identity'
+            WHERE message.project_id=%s AND message.provider_uuid=%s AND message.source_name='telegram'
+            ORDER BY message.uuid FOR UPDATE OF message
+        """,
+            (account["project_id"], account["provider_uuid"]),
+        )
+        await connection.execute(
+            """
+            INSERT INTO telegram_incoming_events(external_account_uuid,event_key,payload,received_at)
+            SELECT src.external_account_uuid,src.event_key,src.payload,src.received_at
+            FROM history_telegram_incoming_events src WHERE NOT EXISTS (
+                SELECT 1 FROM telegram_incoming_events event
+                JOIN m_external_accounts_v2 source ON source.uuid=event.external_account_uuid
+                WHERE source.project_id=%s AND source.provider_uuid=%s
+                    AND event.payload->>'identity'=src.payload->>'identity' AND event.received_at>src.received_at
+            ) ON CONFLICT(external_account_uuid,event_key) DO UPDATE SET received_at=EXCLUDED.received_at,payload=EXCLUDED.payload
+        """,
+            (account["project_id"], account["provider_uuid"]),
+        )
+        return await messenger.rows(
+            connection,
+            """
+            SELECT src.event_key,src.payload FROM history_telegram_incoming_events src
+            JOIN telegram_incoming_events event ON event.external_account_uuid=src.external_account_uuid
+                AND event.event_key=src.event_key AND event.received_at=src.received_at
+            WHERE NOT EXISTS (
+                SELECT 1 FROM telegram_outgoing_intents intent
+                JOIN messenger_messages message ON message.uuid=intent.entity_uuid AND message.project_id=intent.project_id
+                WHERE intent.external_account_uuid=%s AND message.provider_identity=src.payload->>'identity'
+                    AND (intent.status IN ('new','checking') OR intent.error_code='SEND_UNCERTAIN')
+            ) AND NOT (coalesce((src.payload->>'out')::boolean,false) AND EXISTS (
+                SELECT 1 FROM telegram_outgoing_intents intent WHERE intent.external_account_uuid=%s
+                    AND intent.peer_key=%s AND intent.entity_type='message' AND intent.operation='insert'
+                    AND (intent.status IN ('new','checking') OR intent.error_code='SEND_UNCERTAIN')
+                    AND intent.created_at<=(src.payload->>'date')::timestamp+interval '2 seconds'
+                    AND NOT(coalesce(intent.request,'{}'::jsonb) ? 'receipt_id')
+            ))
+        """,
+            (account["uuid"], account["uuid"], peer["peer_key"]),
+        )
+
     async def merge_batch(
         self,
         account: dict,
         peer: dict,
         prepared: list[dict],
         *,
+        history: dict | None = None,
         cursor: dict | None = None,
     ) -> int:
         created = 0
@@ -1046,75 +1122,161 @@ class TelegramService:
             )
             if not selected:
                 raise asyncio.CancelledError()
+            if (
+                history is not None
+                and "anchor" in history
+                and selected[0]["history_before_id"] != history["anchor"]
+            ):
+                await connection.execute(
+                    "DELETE FROM telegram_history_batches WHERE external_account_uuid=%s AND peer_key=%s AND before_id=%s",
+                    (account["uuid"], peer["peer_key"], history["anchor"]),
+                )
+                return 0
             await connection.execute(
                 "SELECT set_config('workspace.outgoing_actor','',true)"
             )
             await self.lock_peer(connection, account, peer["peer_key"])
             stream = await self.operations.stream(connection, account, peer)
-            for data in prepared:
-                event_key = f"{data['identity']}:{data['edited_at']}:{hashlib.sha256(data['text'].encode()).hexdigest()}"
-                observed = (
-                    datetime.datetime.fromisoformat(data["observed_at"]).replace(
-                        tzinfo=None
-                    )
-                    if "observed_at" in data
-                    else datetime.datetime.now(datetime.timezone.utc).replace(
-                        tzinfo=None
-                    )
-                )
-                latest = await messenger.rows(
-                    connection,
-                    "SELECT max(event.received_at) AS observed_at FROM telegram_incoming_events event JOIN m_external_accounts_v2 source ON source.uuid=event.external_account_uuid WHERE source.project_id=%s AND source.provider_uuid=%s AND event.payload->>'identity'=%s",
-                    (
-                        account["project_id"],
-                        account["provider_uuid"],
-                        data["identity"],
-                    ),
-                )
-                if latest[0]["observed_at"] and latest[0]["observed_at"] > observed:
-                    continue
+            if history is not None:
                 await connection.execute(
-                    "INSERT INTO telegram_incoming_events(external_account_uuid,event_key,payload,received_at) VALUES(%s,%s,%s,%s) ON CONFLICT(external_account_uuid,event_key) DO UPDATE SET received_at=EXCLUDED.received_at,payload=EXCLUDED.payload",
+                    "SELECT set_config('workspace.zulip_history','on',true),set_config('workspace.batch_flags','on',true)"
+                )
+                observations = await self.history_observations(
+                    connection, account, peer, prepared
+                )
+                created = await self.operations.history_batch(
+                    connection,
+                    account,
+                    peer,
+                    stream,
+                    [row["payload"] for row in observations],
+                )
+                await connection.execute(
+                    "UPDATE telegram_incoming_events SET processed_at=now() WHERE external_account_uuid=%s AND event_key=ANY(%s::text[])",
+                    (account["uuid"], [row["event_key"] for row in observations]),
+                )
+            else:
+                for data in prepared:
+                    event_key = f"{data['identity']}:{data['edited_at']}:{hashlib.sha256(data['text'].encode()).hexdigest()}"
+                    observed = (
+                        datetime.datetime.fromisoformat(data["observed_at"]).replace(
+                            tzinfo=None
+                        )
+                        if "observed_at" in data
+                        else datetime.datetime.now(datetime.timezone.utc).replace(
+                            tzinfo=None
+                        )
+                    )
+                    latest = await messenger.rows(
+                        connection,
+                        "SELECT max(event.received_at) AS observed_at FROM telegram_incoming_events event JOIN m_external_accounts_v2 source ON source.uuid=event.external_account_uuid WHERE source.project_id=%s AND source.provider_uuid=%s AND event.payload->>'identity'=%s",
+                        (
+                            account["project_id"],
+                            account["provider_uuid"],
+                            data["identity"],
+                        ),
+                    )
+                    if latest[0]["observed_at"] and latest[0]["observed_at"] > observed:
+                        continue
+                    await connection.execute(
+                        "INSERT INTO telegram_incoming_events(external_account_uuid,event_key,payload,received_at) VALUES(%s,%s,%s,%s) ON CONFLICT(external_account_uuid,event_key) DO UPDATE SET received_at=EXCLUDED.received_at,payload=EXCLUDED.payload",
+                        (
+                            account["uuid"],
+                            event_key,
+                            messenger.json_value(data),
+                            observed,
+                        ),
+                    )
+                    bound = await messenger.rows(
+                        connection,
+                        "SELECT uuid FROM messenger_messages WHERE project_id=%s AND provider_uuid=%s AND source_name='telegram' AND provider_identity=%s",
+                        (
+                            account["project_id"],
+                            account["provider_uuid"],
+                            data["identity"],
+                        ),
+                    )
+                    if bound:
+                        pending_edit = await messenger.rows(
+                            connection,
+                            "SELECT id FROM telegram_outgoing_intents WHERE external_account_uuid=%s AND entity_uuid=%s AND (status IN ('new','checking') OR error_code='SEND_UNCERTAIN') LIMIT 1",
+                            (account["uuid"], bound[0]["uuid"]),
+                        )
+                        if pending_edit:
+                            continue
+                    elif data["out"]:
+                        uncertain = await messenger.rows(
+                            connection,
+                            "SELECT id FROM telegram_outgoing_intents WHERE external_account_uuid=%s AND peer_key=%s AND entity_type='message' AND operation='insert' AND (status IN ('new','checking') OR error_code='SEND_UNCERTAIN') AND created_at<=%s::timestamp+interval '2 seconds' AND NOT(coalesce(request,'{}'::jsonb) ? 'receipt_id') LIMIT 1",
+                            (account["uuid"], peer["peer_key"], data["date"]),
+                        )
+                        if uncertain:
+                            continue
+                    added, _identifier = await self.operations.message(
+                        connection, account, peer, data, stream=stream
+                    )
+                    created += int(added)
+                    await connection.execute(
+                        "UPDATE telegram_incoming_events SET processed_at=now() WHERE external_account_uuid=%s AND event_key=%s",
+                        (account["uuid"], event_key),
+                    )
+            if history is not None:
+                # Only reconcile an authoritative page range, fenced against newer updates.
+                if "covered_ids" in history:
+                    prefix = (
+                        conversion.stream_identity(
+                            account["external_account_id"], peer["peer_key"]
+                        )
+                        + ":message:"
+                    )
+                    absent = await messenger.rows(
+                        connection,
+                        "SELECT message.provider_identity FROM messenger_messages message WHERE message.project_id=%s AND message.source_name='telegram' AND message.provider_uuid=%s AND message.provider_identity LIKE %s AND message.deleted_at IS NULL "
+                        "AND split_part(message.provider_identity,':message:',2)::bigint >= %s AND split_part(message.provider_identity,':message:',2)::bigint < %s "
+                        "AND NOT(split_part(message.provider_identity,':message:',2)::bigint=ANY(%s::bigint[])) "
+                        "AND NOT EXISTS(SELECT 1 FROM telegram_incoming_events event JOIN m_external_accounts_v2 source ON source.uuid=event.external_account_uuid WHERE source.project_id=message.project_id AND source.provider_uuid=message.provider_uuid AND event.payload->>'identity'=message.provider_identity AND event.received_at>%s)",
+                        (
+                            account["project_id"],
+                            account["provider_uuid"],
+                            prefix + "%",
+                            history["lower"],
+                            history["upper"],
+                            history["covered_ids"],
+                            history["started_at"],
+                        ),
+                    )
+                    await self.operations.delete(
+                        connection,
+                        account,
+                        peer,
+                        [
+                            int(item["provider_identity"].rsplit(":message:", 1)[1])
+                            for item in absent
+                        ],
+                    )
+                await connection.execute(
+                    "UPDATE telegram_peer_state SET history_retry_at=NULL,history_error_code=NULL,history_before_id=%s,history_done=%s,history_started_at=coalesce(history_started_at,%s),first_message_at=CASE WHEN %s>0 THEN coalesce(first_message_at,now()) ELSE first_message_at END,history_finished_at=CASE WHEN %s THEN now() ELSE NULL END,imported_messages=imported_messages+%s,imported_files=imported_files+%s,imported_bytes=imported_bytes+%s,fetch_seconds=fetch_seconds+%s,file_seconds=file_seconds+%s,merge_seconds=merge_seconds+%s,updated_at=now() WHERE external_account_uuid=%s AND peer_key=%s",
                     (
+                        history["before"],
+                        history["done"],
+                        history["started_at"],
+                        created,
+                        history["done"],
+                        created,
+                        history["files"],
+                        history["bytes"],
+                        history["fetch_seconds"],
+                        history["file_seconds"],
+                        time.monotonic() - history["merge_started"],
                         account["uuid"],
-                        event_key,
-                        messenger.json_value(data),
-                        observed,
+                        peer["peer_key"],
                     ),
                 )
-                bound = await messenger.rows(
-                    connection,
-                    "SELECT uuid FROM messenger_messages WHERE project_id=%s AND provider_uuid=%s AND source_name='telegram' AND provider_identity=%s",
-                    (
-                        account["project_id"],
-                        account["provider_uuid"],
-                        data["identity"],
-                    ),
-                )
-                if bound:
-                    pending_edit = await messenger.rows(
-                        connection,
-                        "SELECT id FROM telegram_outgoing_intents WHERE external_account_uuid=%s AND entity_uuid=%s AND (status IN ('new','checking') OR error_code='SEND_UNCERTAIN') LIMIT 1",
-                        (account["uuid"], bound[0]["uuid"]),
+                if "anchor" in history:
+                    await connection.execute(
+                        "DELETE FROM telegram_history_batches WHERE external_account_uuid=%s AND peer_key=%s AND before_id=%s",
+                        (account["uuid"], peer["peer_key"], history["anchor"]),
                     )
-                    if pending_edit:
-                        continue
-                elif data["out"]:
-                    uncertain = await messenger.rows(
-                        connection,
-                        "SELECT id FROM telegram_outgoing_intents WHERE external_account_uuid=%s AND peer_key=%s AND entity_type='message' AND operation='insert' AND (status IN ('new','checking') OR error_code='SEND_UNCERTAIN') AND created_at<=%s::timestamp+interval '2 seconds' AND NOT(coalesce(request,'{}'::jsonb) ? 'receipt_id') LIMIT 1",
-                        (account["uuid"], peer["peer_key"], data["date"]),
-                    )
-                    if uncertain:
-                        continue
-                added, _identifier = await self.operations.message(
-                    connection, account, peer, data, stream=stream
-                )
-                created += int(added)
-                await connection.execute(
-                    "UPDATE telegram_incoming_events SET processed_at=now() WHERE external_account_uuid=%s AND event_key=%s",
-                    (account["uuid"], event_key),
-                )
             if cursor is not None:
                 if "pts" in cursor:
                     await connection.execute(
@@ -1122,6 +1284,131 @@ class TelegramService:
                         (cursor["pts"], account["uuid"], peer["peer_key"]),
                     )
         return created
+
+    async def history_page(
+        self, account: dict, peer: dict, client: typing.Any
+    ) -> tuple[list[dict], dict]:
+        rows = await self.db.sql(
+            "SELECT prepared,info FROM telegram_history_batches WHERE external_account_uuid=%s AND peer_key=%s AND before_id=%s",
+            (account["uuid"], peer["peer_key"], peer["history_before_id"]),
+        )
+        if rows:
+            info = rows[0]["info"]
+            info["started_at"] = datetime.datetime.fromisoformat(info["started_at"])
+            return rows[0]["prepared"], info
+        started_at = datetime.datetime.now(datetime.timezone.utc)
+        started = time.monotonic()
+        result = await client(
+            functions.messages.GetHistoryRequest(
+                peer=self.input_peer(account, peer),
+                offset_id=peer["history_before_id"],
+                offset_date=None,
+                add_offset=0,
+                limit=self.batch_size,
+                max_id=0,
+                min_id=0,
+                hash=0,
+            )
+        )
+        fetch_seconds = time.monotonic() - started
+        messages = result.messages
+        before = common_history.page_before(
+            [message.id for message in messages], peer["history_before_id"], "Telegram"
+        )
+        prepared, files, size, file_seconds = await self.prepare(
+            account,
+            peer,
+            [message for message in messages if isinstance(message, types.Message)],
+            client,
+            {utils.get_peer_id(user): user for user in result.users + result.chats},
+            started_at,
+        )
+        done = len(messages) < self.batch_size
+        info = {
+            "anchor": peer["history_before_id"],
+            "before": before,
+            "done": done,
+            "started_at": started_at,
+            "files": files,
+            "bytes": size,
+            "fetch_seconds": fetch_seconds,
+            "file_seconds": file_seconds,
+            "covered_ids": [message.id for message in messages],
+            "lower": 0 if done else before,
+            "upper": peer["history_before_id"] or 9223372036854775807,
+        }
+        await self.db.sql(
+            "INSERT INTO telegram_history_batches(external_account_uuid,peer_key,before_id,prepared,info) VALUES(%s,%s,%s,%s,%s) ON CONFLICT(external_account_uuid,peer_key) DO UPDATE SET before_id=EXCLUDED.before_id,prepared=EXCLUDED.prepared,info=EXCLUDED.info",
+            (
+                account["uuid"],
+                peer["peer_key"],
+                peer["history_before_id"],
+                messenger.json_value(prepared),
+                messenger.json_value(info),
+            ),
+        )
+        return prepared, info
+
+    async def history_loop(
+        self, account: dict, client: typing.Any, peer_kind: str | None = None
+    ) -> None:
+        while True:
+            await self.wait_retry(account, "history")
+            peers = await self.selected(account)
+            pending = [peer for peer in peers if not peer["history_done"]]
+            await self.status(account, "syncing" if pending else "active")
+            if peer_kind is not None:
+                pending = [peer for peer in pending if peer["peer_kind"] == peer_kind]
+            worked = False
+            for peer in pending:
+                # GetHistory flood waits are shared by all three history jobs.
+                await self.wait_retry(account, "history")
+                if peer["history_retry_at"] is not None and peer[
+                    "history_retry_at"
+                ] > datetime.datetime.now(datetime.timezone.utc):
+                    continue
+                if await common_history.busy(
+                    self.db,
+                    account["project_id"],
+                    self.publication_limit,
+                    self.realtime_delay,
+                ):
+                    break
+                try:
+                    prepared, info = await self.history_page(account, peer, client)
+                    if await common_history.busy(
+                        self.db,
+                        account["project_id"],
+                        self.publication_limit,
+                        self.realtime_delay,
+                    ):
+                        break
+                    info["merge_started"] = time.monotonic()
+                    await self.merge_batch(account, peer, prepared, history=info)
+                    worked = True
+                except errors.FloodWaitError as error:
+                    await self.defer_worker(account, "history", error.seconds)
+                    break
+                except (
+                    errors.AuthKeyUnregisteredError,
+                    errors.SessionRevokedError,
+                    errors.UserDeactivatedError,
+                ):
+                    raise
+                except Exception as error:
+                    code = type(error).__name__
+                    LOG.warning(
+                        "Telegram history %s %s paused: %s",
+                        account["uuid"],
+                        peer["peer_key"],
+                        code,
+                    )
+                    await self.defer_peer(account, peer, "history_retry_at", 30)
+                    await self.db.sql(
+                        "UPDATE telegram_peer_state SET history_error_code=%s WHERE external_account_uuid=%s AND peer_key=%s",
+                        (code, account["uuid"], peer["peer_key"]),
+                    )
+            await asyncio.sleep(0.01 if worked else self.poll_interval)
 
     async def replay_pending(
         self, account: dict, peer: dict, client: typing.Any

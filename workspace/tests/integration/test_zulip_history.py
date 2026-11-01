@@ -971,6 +971,8 @@ def test_history_joins_an_existing_dm_when_this_account_has_no_membership(incomi
         asyncio.run(run())
         incoming_tests.drain()
         assert len(api.get("/v1/messenger/messages/").json()) == 2
+        topics = api.get("/v1/messenger/stream_topics/").json()
+        assert {topic["name"] for topic in topics} == {"zulip"}
     finally:
         linked.delete()
 

@@ -11,6 +11,7 @@ OPTIONS = [
     cfg.IntOpt("api-id", default=0, min=0),
     cfg.StrOpt("api-hash", default="", secret=True),
     cfg.StrOpt("secret-encryption-key", default="", secret=True),
+    cfg.IntOpt("history-batch-size", default=100, min=1, max=100),
     cfg.FloatOpt("poll-interval", default=1.0, min=0.1),
 ]
 

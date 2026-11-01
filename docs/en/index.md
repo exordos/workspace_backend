@@ -21,7 +21,7 @@ Entity names, fields, routes, JSON values, and task types in the documents are p
 
 ## Telegram provider
 
-[Telegram accounts and realtime synchronization](telegram_provider.md).
+[Telegram accounts, automatic full history and synchronization](telegram_provider.md).
 
 ## Public API and design history
 

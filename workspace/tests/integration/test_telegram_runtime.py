@@ -2,7 +2,10 @@
 
 import asyncio
 import base64
+import time
 import datetime
+import importlib.util
+import pathlib
 import types as python_types
 import uuid
 from unittest import mock
@@ -53,6 +56,7 @@ def telegram_runtime(telegram_account, db, _test_database_url):
             12345,
             "synthetic",
             "synthetic",
+            batch_size=2,
             poll_interval=0.01,
         )
         await service.db.open()
@@ -114,6 +118,140 @@ def test_old_history_cannot_overwrite_live_edit_in_the_same_second(telegram_runt
 
     run(scenario)
     assert api.get("/v1/messenger/messages/").json()[0]["payload"]["content"] == "After"
+
+
+def test_checkpoint_and_messages_rollback_together(telegram_runtime):
+    api, db, run = telegram_runtime
+
+    async def scenario(service, account, peer):
+        original = service.operations.history_batch
+
+        async def failed_after_write(*args, **kwargs):
+            await original(*args, **kwargs)
+            raise ValueError("synthetic import failure")
+
+        with mock.patch.object(
+            service.operations, "history_batch", side_effect=failed_after_write
+        ):
+            with pytest.raises(ValueError):
+                await service.merge_batch(
+                    account, peer, [message()], history={"before": 41}
+                )
+
+    run(scenario)
+    assert (
+        db.execute(
+            "SELECT count(*) FROM telegram_incoming_events WHERE external_account_uuid IN (SELECT uuid FROM m_external_accounts_v2 WHERE project_id=%s)",
+            (uuid.UUID(api.project_id),),
+        ).fetchone()[0]
+        == 0
+    )
+    assert (
+        db.execute(
+            "SELECT history_before_id FROM telegram_peer_state WHERE external_account_uuid IN (SELECT uuid FROM m_external_accounts_v2 WHERE project_id=%s)",
+            (uuid.UUID(api.project_id),),
+        ).fetchone()[0]
+        == 0
+    )
+    assert api.get("/v1/messenger/messages/").json() == []
+
+
+def test_service_only_history_page_advances_and_resumes_after_restart(telegram_runtime):
+    api, db, run = telegram_runtime
+    now = datetime.datetime.now(datetime.timezone.utc)
+    calls = []
+
+    async def client(request):
+        assert isinstance(request, functions.messages.GetHistoryRequest)
+        calls.append(request.offset_id)
+        if request.offset_id == 0:
+            messages = [
+                types.MessageService(
+                    id=i,
+                    peer_id=types.PeerUser(8),
+                    date=now,
+                    action=types.MessageActionHistoryClear(),
+                )
+                for i in (10, 9)
+            ]
+        else:
+            messages = [
+                types.Message(
+                    id=8,
+                    peer_id=types.PeerUser(8),
+                    from_id=types.PeerUser(8),
+                    date=now,
+                    message="Oldest",
+                )
+            ]
+        return python_types.SimpleNamespace(messages=messages, users=[], chats=[])
+
+    async def first(service, account, peer):
+        original = service.merge_batch
+
+        async def merge(*args, **kwargs):
+            await original(*args, **kwargs)
+            raise asyncio.CancelledError()
+
+        with mock.patch.object(service, "merge_batch", side_effect=merge):
+            with pytest.raises(asyncio.CancelledError):
+                await service.history_loop(account, client)
+
+    run(first)
+    assert (
+        db.execute(
+            "SELECT history_before_id FROM telegram_peer_state WHERE external_account_uuid IN (SELECT uuid FROM m_external_accounts_v2 WHERE project_id=%s)",
+            (uuid.UUID(api.project_id),),
+        ).fetchone()[0]
+        == 9
+    )
+
+    async def resumed(service, account, peer):
+        task = asyncio.create_task(service.history_loop(account, client))
+        for _ in range(100):
+            if (await service.selected(account))[0]["history_done"]:
+                break
+            await asyncio.sleep(0.01)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    run(resumed)
+    assert calls == [0, 9]
+    assert (
+        api.get("/v1/messenger/messages/").json()[0]["payload"]["content"] == "Oldest"
+    )
+    assert db.execute(
+        "SELECT history_done FROM telegram_peer_state WHERE external_account_uuid IN (SELECT uuid FROM m_external_accounts_v2 WHERE project_id=%s)",
+        (uuid.UUID(api.project_id),),
+    ).fetchone()[0]
+
+
+def test_authoritative_gap_reconciliation_keeps_newer_live_messages(telegram_runtime):
+    api, db, run = telegram_runtime
+
+    async def scenario(service, account, peer):
+        old = message(41)
+        await service.merge_batch(account, peer, [old])
+        started = datetime.datetime.now(datetime.timezone.utc)
+        await service.merge_batch(account, peer, [message(42, "New during fetch")])
+        history = {
+            "before": 0,
+            "done": True,
+            "started_at": started,
+            "files": 0,
+            "bytes": 0,
+            "fetch_seconds": 0,
+            "file_seconds": 0,
+            "merge_started": time.monotonic(),
+            "covered_ids": [],
+            "lower": 0,
+            "upper": 100,
+        }
+        await service.merge_batch(account, peer, [], history=history)
+
+    run(scenario)
+    values = api.get("/v1/messenger/messages/").json()
+    assert [item["payload"]["content"] for item in values] == ["New during fetch"]
 
 
 def test_abandoned_qr_attempt_expires_without_remote_calls(telegram_runtime):
@@ -244,6 +382,75 @@ def test_remote_source_creation_and_edit_timestamps_survive_sql_triggers(
         assert saved["content_updated_at"] == datetime.datetime(2024, 1, 3, 1, 2, 3)
 
     run(scenario)
+
+
+@pytest.mark.parametrize(
+    ("mime", "kind"),
+    [("text/plain", "file"), ("image/png", "image"), ("video/mp4", "video")],
+)
+def test_imported_attachments_use_real_http_acl_and_media_urns(
+    telegram_runtime, monkeypatch, tmp_path, mime, kind
+):
+    api, db, run = telegram_runtime
+    monkeypatch.setenv("WORKSPACE_FILE_STORAGE_PATH", str(tmp_path))
+    content = b"Telegram attachment bytes"
+    now = datetime.datetime.now(datetime.timezone.utc)
+    document = types.Document(
+        id=90,
+        access_hash=1,
+        file_reference=b"",
+        date=now,
+        mime_type=mime,
+        size=len(content),
+        dc_id=2,
+        attributes=[types.DocumentAttributeFilename("example.bin")],
+    )
+    value = types.Message(
+        id=88,
+        peer_id=types.PeerUser(8),
+        from_id=types.PeerUser(8),
+        date=now,
+        message="Attachment",
+        media=types.MessageMediaDocument(document=document),
+    )
+    client = mock.Mock(download_media=mock.AsyncMock(return_value=content))
+
+    async def scenario(service, account, peer):
+        prepared, *_ = await service.prepare(account, peer, [value], client)
+        info = {
+            "anchor": 0,
+            "before": 88,
+            "done": True,
+            "started_at": now,
+            "files": 1,
+            "bytes": len(content),
+            "fetch_seconds": 0.01,
+            "file_seconds": 0.01,
+            "merge_started": time.monotonic(),
+            "covered_ids": [88],
+            "lower": 0,
+            "upper": 9223372036854775807,
+        }
+        await service.merge_batch(account, peer, prepared, history=info)
+        # Replay reads the stored object, avoiding another provider download.
+        repeated, *_ = await service.prepare(account, peer, [value], client)
+        await service.merge_batch(account, peer, repeated)
+
+    run(scenario)
+    file = db.execute(
+        "SELECT uuid FROM m_workspace_files WHERE project_id=%s", (api.project_id,)
+    ).fetchone()[0]
+    path = f"/v1/messenger/files/{file}"
+    response = api.get(path + "/actions/download")
+    assert response.status_code == 200, response.text
+    assert response.content == content
+    assert api.get(path + "/actions/download", user=uuid.uuid4()).status_code == 404
+    assert api.get(path + "/actions/download", project=uuid.uuid4()).status_code == 404
+    assert (
+        f"(urn:{kind}:{file})"
+        in api.get("/v1/messenger/messages/").json()[0]["payload"]["content"]
+    )
+    assert client.download_media.await_count == 1
 
 
 def test_marking_message_read_captures_only_the_owner_receipt(telegram_runtime):
@@ -613,6 +820,117 @@ def test_all_discovered_dialogs_are_enabled_without_a_saved_selection(telegram_r
     run(scenario)
 
 
+def test_full_history_ignores_legacy_depth_and_imports_old_messages(telegram_runtime):
+    api, db, run = telegram_runtime
+    old = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=365)
+
+    async def scenario(service, account, peer):
+        await service.db.sql(
+            "UPDATE m_external_accounts_v2 SET settings=%s WHERE uuid=%s",
+            (
+                messenger.json_value(
+                    {"history_depth": "30_days", "peer_keys": ["user:8"]}
+                ),
+                account["uuid"],
+            ),
+        )
+
+        async def client(request):
+            return python_types.SimpleNamespace(
+                messages=[
+                    types.Message(
+                        id=17,
+                        peer_id=types.PeerUser(8),
+                        from_id=types.PeerUser(8),
+                        date=old,
+                        message="A year of history",
+                    )
+                ],
+                users=[],
+                chats=[],
+            )
+
+        original = service.merge_batch
+
+        async def merge(*args, **kwargs):
+            await original(*args, **kwargs)
+            raise asyncio.CancelledError()
+
+        with mock.patch.object(service, "merge_batch", side_effect=merge):
+            with pytest.raises(asyncio.CancelledError):
+                await service.history_loop(account, client)
+
+    run(scenario)
+    rows = api.get("/v1/messenger/messages/").json()
+    assert [row["payload"]["content"] for row in rows] == ["A year of history"]
+
+
+def test_buffered_bulk_page_survives_failure_and_restart_without_refetch(
+    telegram_runtime,
+):
+    api, db, run = telegram_runtime
+    now = datetime.datetime.now(datetime.timezone.utc)
+    client = mock.AsyncMock(
+        return_value=python_types.SimpleNamespace(
+            messages=[
+                types.Message(
+                    id=17,
+                    peer_id=types.PeerUser(8),
+                    from_id=types.PeerUser(8),
+                    date=now,
+                    message="Durable page",
+                )
+            ],
+            users=[],
+            chats=[],
+        )
+    )
+
+    async def failed(service, account, peer):
+        prepared, info = await service.history_page(account, peer, client)
+        info["merge_started"] = time.monotonic()
+        original = service.operations.history_batch
+
+        async def after_write(*args, **kwargs):
+            await original(*args, **kwargs)
+            raise ValueError("synthetic failure after bulk write")
+
+        with mock.patch.object(
+            service.operations, "history_batch", side_effect=after_write
+        ):
+            with pytest.raises(ValueError):
+                await service.merge_batch(account, peer, prepared, history=info)
+        assert (await service.selected(account))[0]["history_before_id"] == 0
+
+    run(failed)
+    assert api.get("/v1/messenger/messages/").json() == []
+
+    async def resumed(service, account, peer):
+        prepared, info = await service.history_page(account, peer, client)
+        info["merge_started"] = time.monotonic()
+        with mock.patch.object(
+            service.operations,
+            "message",
+            side_effect=AssertionError("History must use the shared bulk writer"),
+        ):
+            assert await service.merge_batch(account, peer, prepared, history=info) == 1
+        assert not await service.db.sql(
+            "SELECT 1 FROM telegram_history_batches WHERE external_account_uuid=%s",
+            (account["uuid"],),
+        )
+        assert not await service.db.sql(
+            "SELECT 1 FROM messenger_publication_outbox WHERE project_id=%s AND kind LIKE 'message.%%'",
+            (account["project_id"],),
+        )
+
+    run(resumed)
+    client.assert_awaited_once()
+    assert (
+        api.get("/v1/messenger/messages/").json()[0]["payload"]["content"]
+        == "Durable page"
+    )
+
+
 def test_contacts_create_stable_directory_users_without_overwriting_iam_profile(
     telegram_runtime,
 ):
@@ -759,6 +1077,67 @@ def test_new_direct_update_discovers_the_dialog_before_the_periodic_catalog(
     assert any(user["uuid"] == identifier for user in api.get("/v1/users/").json())
 
 
+def test_history_does_not_restore_a_read_flag_while_its_provider_ack_is_pending(
+    telegram_runtime,
+):
+    api, db, run = telegram_runtime
+
+    async def seed(service, account, peer):
+        await service.merge_batch(account, peer, [message()])
+
+    run(seed)
+    row = api.get("/v1/messenger/messages/").json()[0]
+    assert (
+        api.post(
+            f"/v1/messenger/messages/{row['uuid']}/actions/read/invoke"
+        ).status_code
+        == 200
+    )
+
+    async def scenario(service, account, peer):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        source = mock.AsyncMock(
+            return_value=python_types.SimpleNamespace(
+                messages=[
+                    types.Message(
+                        id=41,
+                        peer_id=types.PeerUser(8),
+                        from_id=types.PeerUser(8),
+                        date=now,
+                        message="History",
+                    )
+                ],
+                users=[],
+                chats=[],
+            )
+        )
+        prepared, info = await service.history_page(account, peer, source)
+        info["merge_started"] = time.monotonic()
+        await service.merge_batch(account, peer, prepared, history=info)
+        assert not await service.db.sql(
+            "SELECT 1 FROM messenger_user_message_unreads WHERE project_id=%s",
+            (account["project_id"],),
+        )
+        intent = (
+            await service.db.sql(
+                "SELECT * FROM telegram_outgoing_intents WHERE external_account_uuid=%s AND entity_type='read'",
+                (account["uuid"],),
+            )
+        )[0]
+        await service.send(account, intent, mock.AsyncMock())
+        latest = (await service.selected(account))[0]
+        assert latest["read_max_id"] >= 41
+        info["anchor"] = latest["history_before_id"]
+        info["merge_started"] = time.monotonic()
+        await service.merge_batch(account, latest, prepared, history=info)
+        assert not await service.db.sql(
+            "SELECT 1 FROM messenger_user_message_unreads WHERE project_id=%s",
+            (account["project_id"],),
+        )
+
+    run(scenario)
+
+
 @pytest.mark.parametrize(
     "kind,remote,folder",
     [
@@ -812,6 +1191,112 @@ def test_telegram_system_folders_separate_direct_chats_from_channels_without_exp
         ).status_code
         == 404
     )
+
+
+def test_history_yields_to_pending_realtime_then_resumes(telegram_runtime):
+    api, db, run = telegram_runtime
+
+    async def scenario(service, account, peer):
+        await service.db.sql(
+            "INSERT INTO telegram_incoming_events(external_account_uuid,event_key,payload,received_at) VALUES(%s,'pressure',%s,now()-interval '1 second')",
+            (account["uuid"], messenger.json_value({"peer": peer["peer_key"]})),
+        )
+        client = mock.AsyncMock(
+            return_value=python_types.SimpleNamespace(messages=[], users=[], chats=[])
+        )
+        task = asyncio.create_task(service.history_loop(account, client))
+        try:
+            await asyncio.sleep(0.05)
+            client.assert_not_awaited()
+            await service.db.sql(
+                "UPDATE telegram_incoming_events SET processed_at=now() WHERE external_account_uuid=%s",
+                (account["uuid"],),
+            )
+
+            async def completed():
+                while not (await service.selected(account))[0]["history_done"]:
+                    await asyncio.sleep(0.01)
+
+            await asyncio.wait_for(completed(), 2)
+            client.assert_awaited_once()
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    run(scenario)
+
+
+@pytest.mark.isolated_schema
+@pytest.mark.parametrize("revision", ["0298"])
+def test_identity_upgrade_preserves_history_and_canonical_messages(
+    telegram_runtime,
+    revision,
+):
+    api, db, run = telegram_runtime
+
+    async def scenario(service, account, peer):
+        await service.merge_batch(account, peer, [message()])
+        await service.db.sql(
+            "UPDATE telegram_peer_state SET history_before_id=41,history_done=true,imported_messages=1 WHERE external_account_uuid=%s",
+            (account["uuid"],),
+        )
+        await service.db.sql(
+            "INSERT INTO telegram_history_batches(external_account_uuid,peer_key,before_id,prepared,info) VALUES(%s,%s,41,'[]','{}')",
+            (account["uuid"], peer["peer_key"]),
+        )
+        if revision == "0298":
+            # Reproduce a pre-upgrade imported person without the provider
+            # identity needed by outgoing mentions. Never remove the owner.
+            await service.db.sql(
+                "DELETE FROM m_external_accounts_v2 WHERE project_id=%s AND provider='telegram' AND external_account_id='8'",
+                (account["project_id"],),
+            )
+
+    run(scenario)
+    before = api.get("/v1/messenger/messages/").json()[0]["uuid"]
+    path = next(
+        (pathlib.Path(__file__).parents[3] / "migrations").glob(revision + "-*.py")
+    )
+    spec = importlib.util.spec_from_file_location("telegram_conversion_upgrade", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    with incoming_tests.contexts.Context().session_manager() as session:
+        module.migration_step.upgrade(session)
+
+    async def verify(service, account, peer):
+        assert peer["history_before_id"] == 41 and peer["history_done"]
+        assert peer["imported_messages"] == 1
+        assert account["external_account_id"] == "7"
+        state = (
+            await service.db.sql(
+                "SELECT auth_state,pts FROM telegram_account_state WHERE external_account_uuid=%s",
+                (account["uuid"],),
+            )
+        )[0]
+        assert state == {"auth_state": "authorized", "pts": 1}
+        if revision == "0298":
+            identities = await service.db.sql(
+                "SELECT identity.owner_user_uuid,state.auth_state FROM m_external_accounts_v2 identity "
+                "LEFT JOIN telegram_account_state state ON state.external_account_uuid=identity.uuid "
+                "WHERE identity.project_id=%s AND identity.provider='telegram' AND identity.external_account_id='8'",
+                (account["project_id"],),
+            )
+            assert identities == [
+                {
+                    "owner_user_uuid": uuid.uuid5(account["provider_uuid"], "user:8"),
+                    "auth_state": None,
+                }
+            ]
+        assert await service.db.sql(
+            "SELECT 1 FROM telegram_history_batches WHERE external_account_uuid=%s",
+            (account["uuid"],),
+        )
+        await service.merge_batch(account, peer, [message(text="*Fixed italic*")])
+
+    run(verify)
+    messages = api.get("/v1/messenger/messages/").json()
+    assert len(messages) == 1 and messages[0]["uuid"] == before
+    assert messages[0]["payload"]["content"] == "*Fixed italic*"
 
 
 def test_periodic_catalog_rebinds_existing_direct_counterpart_after_verified_link(

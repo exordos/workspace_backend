@@ -40,6 +40,7 @@ def main() -> None:
         options.api_id,
         options.api_hash,
         options.secret_encryption_key,
+        batch_size=options.history_batch_size,
         poll_interval=options.poll_interval,
     )
     asyncio.run(service.run())

@@ -90,14 +90,14 @@ def snapshot(
             "state": "disconnected",
             "generation": None,
             "dialogs": [],
-            "history_enabled": False,
+            "history_enabled": True,
         }
     result = {
         "state": state["auth_state"],
         "generation": str(state["generation"]),
         "error_code": state["error_code"],
         "dialogs": [],
-        "history_enabled": False,
+        "history_enabled": True,
         "catalog_error_code": state["catalog_error_code"],
         "retry_at": {
             name: conversion.timestamp(state[name]).replace("+00:00", "Z")
