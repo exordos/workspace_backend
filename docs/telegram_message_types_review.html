@@ -7962,7 +7962,7 @@ First comment.
 @_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1002):
 ```quote
 First line.
-Second line.  
+Second line.&#32;&#32;
 Third line.
 
 A separate paragraph.
@@ -8146,7 +8146,7 @@ First comment.
 @_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1002):
 ```quote
 First line.
-Second line.  
+Second line.&#32;&#32;
 Third line.
 
 A separate paragraph.
@@ -8187,7 +8187,7 @@ Reply outside all quotes.</pre></details></section><section class="column telegr
 │ │ The deployment finished successfully.
 │ └
 │ First comment.
-│ 
+│&#32;
 │ ┌ Alice Example
 │ │ First line.
 │ │ Second line.
@@ -8197,7 +8197,7 @@ Reply outside all quotes.</pre></details></section><section class="column telegr
 │ └
 │ Immediate second comment.
 │ Another comment line.
-│ 
+│&#32;
 │ ┌ Bob Example
 │ │ ┌ Alice Example
 │ │ │ deployment finished successfully.
@@ -8312,7 +8312,7 @@ First comment.
 @_**Alice Example|9** [said](https://zulip.example.test/#narrow/channel/42-general/topic/Formatting.20examples/near/1002):
 ```quote
 First line.
-Second line.  
+Second line.&#32;&#32;
 Third line.
 
 A separate paragraph.
@@ -8353,7 +8353,7 @@ Reply outside the excerpt\.</pre></details></section></div>
 │ │ The deployment finished successfully.
 │ └
 │ First comment.
-│ 
+│&#32;
 │ ┌ Alice Example
 │ │ First line.
 │ │ Second line.
@@ -8363,7 +8363,7 @@ Reply outside the excerpt\.</pre></details></section></div>
 │ └
 │ Immediate second comment.
 │ Another comment line.
-│ 
+│&#32;
 │ ┌ Bob Example
 │ │ ┌ Alice Example
 │ │ │ deployment finished successfully.
@@ -8652,7 +8652,7 @@ Outside reply.</pre></details></div>
   &quot;references&quot;: {},
   &quot;roundtrip&quot;: &quot;The deployment finished successfully\\.&quot;
 }</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre>The deployment finished successfully\.</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Сохранить читаемый текст, форматирование и назначение ссылок; отдельно проверить обратное преобразование.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -8716,13 +8716,13 @@ Second line.<br>
 Third line.</p>
 <p>A separate paragraph.</p>
 <p>Final paragraph.</p></div></div><details><summary>Markdown source</summary><pre>First line.
-Second line.  
+Second line.&#32;&#32;
 Third line.
 
 A separate paragraph.
 
 Final paragraph.</pre></details></section><section class="column workspace"><h3>Workspace <small>Эталон содержимого перед отправкой</small></h3><div class="message"><div class="author"><span class="avatar">A</span><strong>Alice Example</strong><span>13:40</span></div><div class="workspace-native"><div class="fixture-bubble" data-message-owner="own"><div class="message-body min-w-0 max-w-full break-words [overflow-wrap:anywhere] [word-break:break-word] [&amp;_a]:max-w-full [&amp;_a]:[overflow-wrap:anywhere] [&amp;_a]:[word-break:break-word] [&amp;_a]:text-accent [&amp;_a]:underline hover:[&amp;_a]:opacity-90 [&amp;_img:not(:where(.message-media-thumbnail))]:my-1 [&amp;_img:not(:where(.message-media-thumbnail))]:h-auto [&amp;_img:not(:where(.message-media-thumbnail))]:max-w-full [&amp;_img:not(:where(.message-media-thumbnail))]:rounded [&amp;_ol]:my-1 [&amp;_ol]:list-decimal [&amp;_ol]:list-outside [&amp;_ol]:pl-5 [&amp;_ul]:my-1 [&amp;_ul]:list-disc [&amp;_ul]:list-outside [&amp;_ul]:pl-5 [&amp;_li]:my-0.5 [&amp;_li>p]:mb-0 [&amp;_p+ol]:mt-1 [&amp;_p+ul]:mt-1 [&amp;_ol+p]:mt-1 [&amp;_ul+p]:mt-1 [&amp;_p:last-child]:mb-0 [&amp;_p]:mb-1 [&amp;_h1]:mb-1.5 [&amp;_h1]:mt-2 [&amp;_h1]:text-lg [&amp;_h1]:font-semibold [&amp;_h2]:mb-1.5 [&amp;_h2]:mt-2 [&amp;_h2]:text-base [&amp;_h2]:font-semibold [&amp;_h3]:mb-1 [&amp;_h3]:mt-1.5 [&amp;_h3]:text-base [&amp;_h3]:font-semibold [&amp;_h4]:mb-1 [&amp;_h4]:mt-1.5 [&amp;_h4]:text-sm [&amp;_h4]:font-semibold [&amp;_h5]:mb-1 [&amp;_h5]:mt-1.5 [&amp;_h5]:text-sm [&amp;_h5]:font-medium [&amp;_h6]:mb-1 [&amp;_h6]:mt-1.5 [&amp;_h6]:text-sm [&amp;_h6]:font-medium [&amp;_hr]:my-2 [&amp;_hr]:border-0 [&amp;_hr]:border-t [&amp;_hr]:border-border-subtle [&amp;_del]:text-text-muted [&amp;_.zulip-quote-block+p]:mt-0 [&amp;_.zulip-quote-body>:last-child]:mb-0 [&amp;_pre]:my-0.5 [&amp;_pre]:min-w-0 [&amp;_pre]:max-w-full [&amp;_pre]:whitespace-pre-wrap [&amp;_pre]:border-l-2 [&amp;_pre]:border-border-subtle [&amp;_pre]:py-1 [&amp;_pre]:pl-1.5 [&amp;_pre]:pr-1.5 [&amp;_pre]:font-mono [&amp;_pre]:text-sm [&amp;_pre]:italic [&amp;_pre]:text-text-muted [&amp;_pre]:[overflow-wrap:anywhere] [&amp;_pre_code]:min-w-0 [&amp;_pre_code]:max-w-full [&amp;_pre_code]:whitespace-pre-wrap [&amp;_pre_code]:[overflow-wrap:anywhere] [&amp;_span.user-mention]:text-accent hover:[&amp;_span.user-mention]:opacity-90 [&amp;_.workspace-message-table-scroll]:max-w-full [&amp;_.workspace-message-table-scroll]:overflow-x-auto [&amp;_table]:my-2 [&amp;_table]:min-w-max [&amp;_table]:border-collapse [&amp;_table]:text-sm [&amp;_td]:border [&amp;_td]:border-border-subtle [&amp;_td]:px-2 [&amp;_td]:py-1 [&amp;_td]:align-top [&amp;_th]:border [&amp;_th]:border-border-subtle [&amp;_th]:px-2 [&amp;_th]:py-1 [&amp;_th]:text-left [&amp;_th]:align-top [&amp;_th]:whitespace-nowrap [&amp;_.contains-task-list]:list-none [&amp;_.contains-task-list]:pl-0 [&amp;_.task-list-item]:list-none [&amp;_.workspace-message-task-marker]:mr-1.5 [&amp;_.workspace-message-gap]:block [&amp;_.workspace-message-gap]:w-0 [&amp;_.workspace-message-gap]:max-w-full [&amp;_.workspace-message-gap]:overflow-hidden [&amp;_.workspace-message-gap]:pointer-events-none select-text [&amp;_img:not(.message-media-preview):not(:where(.message-media-thumbnail))]:max-h-[160px] [&amp;_img:not(.message-media-preview):not(:where(.message-media-thumbnail))]:w-auto [&amp;_img:not(.message-media-preview):not(:where(.message-media-thumbnail))]:object-contain [&amp;_img.message-media-preview]:block [&amp;_img.message-media-preview]:h-40 [&amp;_img.message-media-preview]:w-60 [&amp;_img.message-media-preview]:max-w-full [&amp;_img.message-media-preview]:cursor-pointer [&amp;_img.message-media-preview]:object-contain [&amp;_img.message-media-preview]:object-center [&amp;_span.user-mention]:cursor-pointer workspace-message-body [&amp;_.workspace-message-file-placeholder]:inline-flex [&amp;_.workspace-message-file-placeholder]:align-middle [&amp;_.workspace-message-file-placeholder]:[overflow-anchor:none] [&amp;_.workspace-message-file-placeholder]:max-w-full [&amp;_.workspace-message-file-placeholder]:cursor-pointer [&amp;_.workspace-message-file-placeholder]:items-center [&amp;_.workspace-message-file-placeholder]:rounded-md [&amp;_.workspace-message-file-placeholder]:border [&amp;_.workspace-message-file-placeholder]:border-border-subtle [&amp;_.workspace-message-file-placeholder]:bg-bg/40 [&amp;_.workspace-message-file-placeholder]:px-2.5 [&amp;_.workspace-message-file-placeholder]:py-1.5 [&amp;_.workspace-message-file-placeholder]:text-left [&amp;_.workspace-message-file-placeholder]:font-medium [&amp;_.workspace-message-file-placeholder]:text-text-primary [&amp;_.workspace-message-file-placeholder]:no-underline [&amp;_.workspace-message-file-placeholder]:transition-colors [&amp;_.workspace-message-file-placeholder]:hover:bg-bg/60 [&amp;_.workspace-message-file-placeholder]:hover:text-text-primary [&amp;_.workspace-message-file-placeholder]:focus-visible:outline-none [&amp;_.workspace-message-file-placeholder]:focus-visible:ring-2 [&amp;_.workspace-message-file-placeholder]:focus-visible:ring-accent-soft [&amp;_.workspace-message-attachment-host]:my-1 [&amp;_.workspace-message-attachment-host]:inline-flex [&amp;_.workspace-message-attachment-host]:max-w-full [&amp;_.workspace-message-attachment-host]:align-middle [&amp;_.workspace-message-attachment-host]:cursor-pointer [&amp;_.workspace-message-attachment-host--static]:cursor-default [&amp;_.workspace-message-attachment-host]:rounded-lg [&amp;_.workspace-message-attachment-host]:focus-visible:outline-none [&amp;_.workspace-message-attachment-host]:focus-visible:ring-2 [&amp;_.workspace-message-attachment-host]:focus-visible:ring-accent-soft [&amp;_.workspace-message-file-placeholder[data-workspace-media-kind='image']]:my-1 [&amp;_.workspace-message-file-placeholder[data-workspace-media-kind='image']]:h-40 [&amp;_.workspace-message-file-placeholder[data-workspace-media-kind='image']]:w-60 [&amp;_.workspace-message-file-placeholder[data-workspace-media-kind='image']]:max-w-full [&amp;_.workspace-message-file-placeholder[data-workspace-media-kind='image']]:justify-center [&amp;_.workspace-message-file-placeholder[data-workspace-media-kind='image']]:overflow-hidden [&amp;_.workspace-message-file-placeholder[data-workspace-media-kind='image']]:p-0 [&amp;_.workspace-message-image-composition]:inline-flex [&amp;_.workspace-message-image-composition]:max-w-full [&amp;_.workspace-message-image-composition]:flex-wrap [&amp;_.workspace-message-image-composition]:gap-1 [&amp;_.workspace-message-image-composition]:align-middle [&amp;_.workspace-message-file-placeholder--composition]:!my-0 [&amp;_.workspace-message-file-placeholder--composition]:!h-[100px] [&amp;_.workspace-message-file-placeholder--composition]:!max-w-full [&amp;_.workspace-message-file-placeholder[data-workspace-media-kind='video']]:my-1 [&amp;_.workspace-message-file-placeholder[data-workspace-media-kind='video']]:w-80 [&amp;_.workspace-message-file-placeholder[data-workspace-media-kind='video']]:max-w-full [&amp;_.workspace-message-file-placeholder[data-workspace-media-kind='video']]:flex-col [&amp;_.workspace-message-file-placeholder[data-workspace-media-kind='video']]:items-stretch [&amp;_.workspace-message-file-placeholder[data-workspace-media-kind='video']]:p-0 [&amp;_.workspace-message-file-placeholder[data-workspace-media-kind='video']]:overflow-hidden [&amp;_.workspace-message-file-placeholder[data-workspace-media-reserved='true']]:border-transparent [&amp;_.workspace-message-file-placeholder[data-workspace-media-reserved='true']]:bg-transparent [&amp;_.workspace-message-file-placeholder[data-workspace-media-reserved='true']]:p-0 [&amp;_.workspace-message-file-placeholder[data-workspace-media-reserved='true']]:overflow-hidden [&amp;_.workspace-message-file-placeholder[data-workspace-media-reserved='true']]:max-w-full [&amp;_.workspace-message-file-placeholder[data-workspace-media-reserved='true']_.workspace-message-file-placeholder__image]:h-full [&amp;_.workspace-message-file-placeholder[data-workspace-media-reserved='true']_.workspace-message-file-placeholder__image]:w-full [&amp;_.workspace-message-file-placeholder[data-workspace-media-reserved='true']_.workspace-message-file-placeholder__image]:object-contain [&amp;_.workspace-message-file-preview-loaded[data-workspace-media-kind='image']]:!h-auto [&amp;_.workspace-message-file-preview-loaded[data-workspace-media-kind='image']]:!w-auto [&amp;_.workspace-message-file-preview-loaded[data-workspace-media-kind='image']]:!max-h-[180px] [&amp;_.workspace-message-file-preview-loaded[data-workspace-media-kind='image']]:!overflow-visible [&amp;_.workspace-message-file-preview-loaded[data-workspace-media-kind='image']]:items-center [&amp;_.workspace-message-file-preview-loaded]:border-transparent [&amp;_.workspace-message-file-preview-loaded]:bg-transparent [&amp;_.workspace-message-file-preview-loaded]:p-0 [&amp;_.workspace-message-file-preview-image]:!block [&amp;_.workspace-message-file-preview-image]:!h-auto [&amp;_.workspace-message-file-preview-image]:!max-h-[180px] [&amp;_.workspace-message-file-preview-image]:!w-auto [&amp;_.workspace-message-file-preview-image]:!max-w-full [&amp;_.workspace-message-file-preview-image]:!object-contain [&amp;_.workspace-message-file-preview-loaded.workspace-message-file-placeholder--composition[data-workspace-media-kind='image']]:!max-h-[100px] [&amp;_.workspace-message-file-preview-loaded.workspace-message-file-placeholder--composition[data-workspace-media-kind='image']]:!h-[100px] [&amp;_.workspace-message-file-preview-loaded.workspace-message-file-placeholder--composition[data-workspace-media-kind='image']_.workspace-message-file-preview-image]:!max-h-[100px] [&amp;_.workspace-message-file-preview-loaded.workspace-message-file-placeholder--composition[data-workspace-media-kind='image']_.workspace-message-file-preview-image]:!h-auto [&amp;_.workspace-message-file-preview-video]:!block [&amp;_.workspace-message-file-preview-video]:!h-auto [&amp;_.workspace-message-file-preview-video]:!max-h-[320px] [&amp;_.workspace-message-file-preview-video]:!w-auto [&amp;_.workspace-message-file-preview-video]:!max-w-full [&amp;_.workspace-message-file-placeholder__label]:min-w-0 [&amp;_.workspace-message-file-placeholder__label]:truncate [&amp;_.workspace-message-file-placeholder[data-workspace-media-kind='image']_.workspace-message-file-placeholder__label]:px-2.5 [&amp;_.workspace-message-file-placeholder[data-workspace-media-kind='image']_.workspace-message-file-placeholder__label]:py-1.5 [&amp;_.workspace-message-mention]:inline [&amp;_.workspace-message-mention]:cursor-pointer [&amp;_.workspace-message-mention]:border-0 [&amp;_.workspace-message-mention]:bg-transparent [&amp;_.workspace-message-mention]:p-0 [&amp;_.workspace-message-mention]:font-medium [&amp;_.workspace-message-mention]:text-accent hover:[&amp;_.workspace-message-mention]:opacity-90 [&amp;_.workspace-message-mention]:focus-visible:outline-none [&amp;_.workspace-message-mention]:focus-visible:ring-2 [&amp;_.workspace-message-mention]:focus-visible:ring-accent-soft " data-message-body="true" data-message-content-kind="block-rich" data-message-meta-preferred-placement="inline"><p>First line.<br>Second line.<br>Third line.</p><span class="workspace-message-gap workspace-message-gap--1" aria-hidden="true"></span><p>A separate paragraph.</p><span class="workspace-message-gap workspace-message-gap--1" aria-hidden="true"></span><p>Final paragraph.</p></div><div class="fixture-time">13:40</div></div></div></div><details><summary>Workspace Markdown</summary><pre>First line.
-Second line.  
+Second line.&#32;&#32;
 Third line.
 
 A separate paragraph.
@@ -8745,7 +8745,7 @@ Third line\.
 A separate paragraph\.
 
 Final paragraph\.</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Сохранить читаемый текст, форматирование и назначение ссылок; отдельно проверить обратное преобразование.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -8810,7 +8810,7 @@ A nonbreaking space: first second. Emoji: 👍🏽 👩‍💻 👨‍👩‍�
   &quot;roundtrip&quot;: &quot;Zoë and José reviewed the café notes\\. The same accent can be written as é or é\\.\nA nonbreaking space\\: first second\\. Emoji\\: 👍🏽 👩‍💻 👨‍👩‍👧‍👦\\.&quot;
 }</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre>Zoë and José reviewed the café notes\. The same accent can be written as é or é\.
 A nonbreaking space\: first second\. Emoji\: 👍🏽 👩‍💻 👨‍👩‍👧‍👦\.</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Сохранить читаемый текст, форматирование и назначение ссылок; отдельно проверить обратное преобразование.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -8911,7 +8911,7 @@ bold with nested italic inside.">
 }</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre>**Bold** and *italic* and *also italic* and ~~removed~~\.
 
 **Bold with *nested italic* inside**\.</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Сохранить читаемый текст, форматирование и назначение ссылок; отдельно проверить обратное преобразование.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -9018,7 +9018,7 @@ bold with nested italic inside.">
   &quot;roundtrip&quot;: &quot;\\*not italic\\* and \\_not italic\\_ and \\~\\~not removed\\~\\~\\.\n\\@**Bob Example\\|12** and \\#**general**\\.&quot;
 }</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre>\*not italic\* and \_not italic\_ and \~\~not removed\~\~\.
 \@**Bob Example\|12** and \#**general**\.</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Сохранить читаемый текст, форматирование и назначение ссылок; отдельно проверить обратное преобразование.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -9634,10 +9634,10 @@ My reply is outside the quote\.</pre></details></section></div>
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Сохранить все цитируемые тексты, авторов, уровни вложенности и комментарии в исходном порядке. Одну reply-ссылку использовать дополнительно. Для вложенных уровней предлагаются явные маркеры │ / › в тексте, без недопустимых вложенных Telegram blockquote entities. Частичные цитаты должны сохранять выделенный фрагмент.</p><details class="proposal-text"><summary>Схема сохранения всех цитат и комментариев</summary><pre>┌ unknown
 │ Original proposal.
 │ • Keep the import idempotent.
-│ 
+│&#32;
 │ • Preserve message order.
-│ 
-│ 
+│&#32;
+│&#32;
 │ A reply inside the quote.
 └
 My reply is outside the quote.</pre></details></div>
@@ -9987,7 +9987,7 @@ A backtick inside a code span: <code>value = `literal` </code>.</div></div><deta
 }</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre>Run `python -m pytest`\.
 Keep `@**Bob Example|12**` literal\.
 A backtick inside a code span\: ``value = `literal` ``\.</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Сохранить читаемый текст, форматирование и назначение ссылок; отдельно проверить обратное преобразование.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -10100,7 +10100,7 @@ def greeting(name: str) -&gt; str:
 
 print(greeting(&quot;Alice&quot;))
 ```</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Сохранить читаемый текст, форматирование и назначение ссылок; отдельно проверить обратное преобразование.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -10231,7 +10231,7 @@ Outside code: Bob Example.
 Outside code\: Bob Example\.
 
 [Original message](&lt;urn:url:https://zulip.example.test/#narrow/near/1016&gt;)</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Сохранить читаемый текст, форматирование и назначение ссылок; отдельно проверить обратное преобразование.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -10365,7 +10365,7 @@ Example input:
 print(&quot;hello&quot;)
 ```
 ````</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Сохранить читаемый текст, форматирование и назначение ссылок; отдельно проверить обратное преобразование.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -10454,7 +10454,7 @@ print("unfinished")</pre></details></section><section class="column telegram"><h
 ```python
 print(&quot;unfinished&quot;)
 ```</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Сохранить читаемый текст, форматирование и назначение ссылок; отдельно проверить обратное преобразование.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -10535,7 +10535,7 @@ original message">
 }</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre>Not supported in Workspace\: inline LaTeX
 
 [Original message](&lt;urn:url:https://zulip.example.test/#narrow/near/1019&gt;)</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Сохранить весь смысл и текст. Для отсутствующего интерактива предложить явный текстовый снимок; формулы, время, пользовательские emoji и действия не должны молча исчезать. Нативные функции требуют отдельной проверки доставки.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -10626,7 +10626,7 @@ x - y &amp;= 1
 }</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre>Not supported in Workspace\: LaTeX block
 
 [Original message](&lt;urn:url:https://zulip.example.test/#narrow/near/1020&gt;)</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Сохранить весь смысл и текст. Для отсутствующего интерактива предложить явный текстовый снимок; формулы, время, пользовательские emoji и действия не должны молча исчезать. Нативные функции требуют отдельной проверки доставки.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -10738,7 +10738,7 @@ The **feature flag** is enabled.
 - Check the import.
 ```
 Visible text after the spoiler\.</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Сохранить читаемый текст, форматирование и назначение ссылок; отдельно проверить обратное преобразование.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -10913,7 +10913,7 @@ Two different users: Alex Example and Alex Example.</div></div><div class="refer
   &quot;roundtrip&quot;: &quot;Bob Example, please ask Zoë Example to review this\\.\nTwo different users\\: Alex Example and Alex Example\\.&quot;
 }</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre>Bob Example, please ask Zoë Example to review this\.
 Two different users\: Alex Example and Alex Example\.</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Сохранить видимую подпись; разрешать пользователя через Telegram-аккаунт выбранного топика. Скрытые упоминания не должны превращаться в уведомляющие. Для групп и @all согласовать читаемый текстовый fallback.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -11011,7 +11011,7 @@ Two different users\: Alex Example and Alex Example\.</pre></details></section><
   },
   &quot;roundtrip&quot;: &quot;Thanks, Bob Example\\!&quot;
 }</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre>Thanks, Bob Example\!</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Сохранить видимую подпись; разрешать пользователя через Telegram-аккаунт выбранного топика. Скрытые упоминания не должны превращаться в уведомляющие. Для групп и @all согласовать читаемый текстовый fallback.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -11091,7 +11091,7 @@ Two different users\: Alex Example and Alex Example\.</pre></details></section><
   },
   &quot;roundtrip&quot;: &quot;Following Bob Example&#39;s suggestion\\.&quot;
 }</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre>Following Bob Example&#39;s suggestion\.</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Сохранить видимую подпись; разрешать пользователя через Telegram-аккаунт выбранного топика. Скрытые упоминания не должны превращаться в уведомляющие. Для групп и @all согласовать читаемый текстовый fallback.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -11176,7 +11176,7 @@ original message">
 }</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre>\(Not supported in Workspace\: mention of user group Engineering\) please review the migration\.
 
 [Original message](&lt;urn:url:https://zulip.example.test/#narrow/near/1026&gt;)</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Сохранить видимую подпись; разрешать пользователя через Telegram-аккаунт выбранного топика. Скрытые упоминания не должны превращаться в уведомляющие. Для групп и @all согласовать читаемый текстовый fallback.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -11264,7 +11264,7 @@ original message">
 }</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre>\(Not supported in Workspace\: channel\-wide mention\) the maintenance window starts in ten minutes\.
 
 [Original message](&lt;urn:url:https://zulip.example.test/#narrow/near/1027&gt;)</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Сохранить видимую подпись; разрешать пользователя через Telegram-аккаунт выбранного топика. Скрытые упоминания не должны превращаться в уведомляющие. Для групп и @all согласовать читаемый текстовый fallback.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -11350,7 +11350,7 @@ original message">
 }</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre>\(Not supported in Workspace\: topic\-wide mention\) the issue is resolved\.
 
 [Original message](&lt;urn:url:https://zulip.example.test/#narrow/near/1028&gt;)</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Сохранить видимую подпись; разрешать пользователя через Telegram-аккаунт выбранного топика. Скрытые упоминания не должны превращаться в уведомляющие. Для групп и @all согласовать читаемый текстовый fallback.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -11436,7 +11436,7 @@ original message">
 }</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre>Please ask \(Not supported in Workspace\: unresolved user Former member\) or \(Not supported in Workspace\: unresolved user group Missing group\) about the old deployment\.
 
 [Original message](&lt;urn:url:https://zulip.example.test/#narrow/near/1029&gt;)</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Сохранить видимую подпись; разрешать пользователя через Telegram-аккаунт выбранного топика. Скрытые упоминания не должны превращаться в уведомляющие. Для групп и @all согласовать читаемый текстовый fallback.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -11542,7 +11542,7 @@ Contact support@example.test.</div></div><details><summary>Текст, UTF-16 en
 [https\://example\.test/path\_\(v2\)](&lt;urn:url:https://example.test/path_(v2)&gt;)
 [https\://example\.test/contact](&lt;urn:url:https://example.test/contact&gt;)
 Contact support\@example\.test\.</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Сохранить читаемый текст, форматирование и назначение ссылок; отдельно проверить обратное преобразование.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -11639,7 +11639,7 @@ report">
   &quot;roundtrip&quot;: &quot;[Release notes \\(v2\\)](&lt;urn:url:https://docs.example.test/releases/v2%20notes&gt;)\n[Report](&lt;urn:url:https://files.example.test/reports/annual%20report.pdf?download=1&amp;version=2&gt;)&quot;
 }</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre>[Release notes \(v2\)](&lt;urn:url:https://docs.example.test/releases/v2%20notes&gt;)
 [Report](&lt;urn:url:https://files.example.test/reports/annual%20report.pdf?download=1&amp;version=2&gt;)</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Сохранить читаемый текст, форматирование и назначение ссылок; отдельно проверить обратное преобразование.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -11788,7 +11788,7 @@ Message\: </pre></details></section></div>
   ],
   &quot;proposal&quot;: &quot;Сохранить читаемый текст, форматирование и назначение ссылок; отдельно проверить обратное преобразование.&quot;
 }</pre></details></article>
-<article class="example" id="internal_message_urls" data-category="links" data-review="true" data-search="internal_message_urls absolute and relative links to messages and narrow views. ссылки 
+<article class="example" id="internal_message_urls" data-category="links" data-review="true" data-search="internal_message_urls absolute and relative links to messages and narrow views. ссылки&#32;
 conversation
 search">
  <header class="example-heading"><div><span class="case-number">41</span><a href="#internal_message_urls">internal message urls</a></div><span class="badge attention">Ссылки · нужно проверить</span></header>
@@ -11913,7 +11913,7 @@ Conversation
   &quot;references&quot;: {},
   &quot;roundtrip&quot;: &quot;See [TASK\\-123](&lt;urn:url:https://issues.example.test/TASK-123&gt;) and [TASK\\-456](&lt;urn:url:https://issues.example.test/TASK-456&gt;) for the implementation\\.&quot;
 }</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre>See [TASK\-123](&lt;urn:url:https://issues.example.test/TASK-123&gt;) and [TASK\-456](&lt;urn:url:https://issues.example.test/TASK-456&gt;) for the implementation\.</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Сохранить читаемый текст, форматирование и назначение ссылок; отдельно проверить обратное преобразование.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -11998,7 +11998,7 @@ Conversation
   },
   &quot;roundtrip&quot;: &quot;&quot;
 }</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre></pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Доставить все файлы/изображения/видео/аудио и подписи; проверить содержимое и порядок в реальном Telegram. Превью и references на странице не являются подтверждением загрузки.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -12081,7 +12081,7 @@ Conversation
   },
   &quot;roundtrip&quot;: &quot;The requested files\\:&quot;
 }</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre>The requested files\:</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Доставить все файлы/изображения/видео/аудио и подписи; проверить содержимое и порядок в реальном Telegram. Превью и references на странице не являются подтверждением загрузки.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -12166,7 +12166,7 @@ Conversation
   },
   &quot;roundtrip&quot;: &quot;**Figure 1\\:** The API and history worker\\.&quot;
 }</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre>**Figure 1\:** The API and history worker\.</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Доставить все файлы/изображения/видео/аудио и подписи; проверить содержимое и порядок в реальном Telegram. Превью и references на странице не являются подтверждением загрузки.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -12229,7 +12229,7 @@ Conversation
   &quot;notes&quot;: [],
   &quot;proposal&quot;: &quot;Доставить все файлы/изображения/видео/аудио и подписи; проверить содержимое и порядок в реальном Telegram. Превью и references на странице не являются подтверждением загрузки.&quot;
 }</pre></details></article>
-<article class="example" id="image_link" data-category="media" data-review="false" data-search="image_link a plain link to an image can produce an inline image preview in zulip. файлы и медиа screenshot: 
+<article class="example" id="image_link" data-category="media" data-review="false" data-search="image_link a plain link to an image can produce an inline image preview in zulip. файлы и медиа screenshot:&#32;
 
 external image: ">
  <header class="example-heading"><div><span class="case-number">46</span><a href="#image_link">image link</a></div><span class="badge supported">Файлы и медиа · снимок конвертера</span></header>
@@ -12239,7 +12239,7 @@ external image: ">
 
 External image: https://images.example.test/diagram.png</pre></details></section><section class="column workspace"><h3>Workspace <small>Эталон содержимого перед отправкой</small></h3><div class="message"><div class="author"><span class="avatar">A</span><strong>Alice Example</strong><span>13:40</span></div><div class="workspace-native"><div class="fixture-bubble" data-message-owner="own"><div class="message-body min-w-0 max-w-full break-words [overflow-wrap:anywhere] [word-break:break-word] [&amp;_a]:max-w-full [&amp;_a]:[overflow-wrap:anywhere] [&amp;_a]:[word-break:break-word] [&amp;_a]:text-accent [&amp;_a]:underline hover:[&amp;_a]:opacity-90 [&amp;_img:not(:where(.message-media-thumbnail))]:my-1 [&amp;_img:not(:where(.message-media-thumbnail))]:h-auto [&amp;_img:not(:where(.message-media-thumbnail))]:max-w-full [&amp;_img:not(:where(.message-media-thumbnail))]:rounded [&amp;_ol]:my-1 [&amp;_ol]:list-decimal [&amp;_ol]:list-outside [&amp;_ol]:pl-5 [&amp;_ul]:my-1 [&amp;_ul]:list-disc [&amp;_ul]:list-outside [&amp;_ul]:pl-5 [&amp;_li]:my-0.5 [&amp;_li>p]:mb-0 [&amp;_p+ol]:mt-1 [&amp;_p+ul]:mt-1 [&amp;_ol+p]:mt-1 [&amp;_ul+p]:mt-1 [&amp;_p:last-child]:mb-0 [&amp;_p]:mb-1 [&amp;_h1]:mb-1.5 [&amp;_h1]:mt-2 [&amp;_h1]:text-lg [&amp;_h1]:font-semibold [&amp;_h2]:mb-1.5 [&amp;_h2]:mt-2 [&amp;_h2]:text-base [&amp;_h2]:font-semibold [&amp;_h3]:mb-1 [&amp;_h3]:mt-1.5 [&amp;_h3]:text-base [&amp;_h3]:font-semibold [&amp;_h4]:mb-1 [&amp;_h4]:mt-1.5 [&amp;_h4]:text-sm [&amp;_h4]:font-semibold [&amp;_h5]:mb-1 [&amp;_h5]:mt-1.5 [&amp;_h5]:text-sm [&amp;_h5]:font-medium [&amp;_h6]:mb-1 [&amp;_h6]:mt-1.5 [&amp;_h6]:text-sm [&amp;_h6]:font-medium [&amp;_hr]:my-2 [&amp;_hr]:border-0 [&amp;_hr]:border-t [&amp;_hr]:border-border-subtle [&amp;_del]:text-text-muted [&amp;_.zulip-quote-block+p]:mt-0 [&amp;_.zulip-quote-body>:last-child]:mb-0 [&amp;_pre]:my-0.5 [&amp;_pre]:min-w-0 [&amp;_pre]:max-w-full [&amp;_pre]:whitespace-pre-wrap [&amp;_pre]:border-l-2 [&amp;_pre]:border-border-subtle [&amp;_pre]:py-1 [&amp;_pre]:pl-1.5 [&amp;_pre]:pr-1.5 [&amp;_pre]:font-mono [&amp;_pre]:text-sm [&amp;_pre]:italic [&amp;_pre]:text-text-muted [&amp;_pre]:[overflow-wrap:anywhere] [&amp;_pre_code]:min-w-0 [&amp;_pre_code]:max-w-full [&amp;_pre_code]:whitespace-pre-wrap [&amp;_pre_code]:[overflow-wrap:anywhere] [&amp;_span.user-mention]:text-accent hover:[&amp;_span.user-mention]:opacity-90 [&amp;_.workspace-message-table-scroll]:max-w-full [&amp;_.workspace-message-table-scroll]:overflow-x-auto [&amp;_table]:my-2 [&amp;_table]:min-w-max [&amp;_table]:border-collapse [&amp;_table]:text-sm [&amp;_td]:border [&amp;_td]:border-border-subtle [&amp;_td]:px-2 [&amp;_td]:py-1 [&amp;_td]:align-top [&amp;_th]:border [&amp;_th]:border-border-subtle [&amp;_th]:px-2 [&amp;_th]:py-1 [&amp;_th]:text-left [&amp;_th]:align-top [&amp;_th]:whitespace-nowrap [&amp;_.contains-task-list]:list-none [&amp;_.contains-task-list]:pl-0 [&amp;_.task-list-item]:list-none [&amp;_.workspace-message-task-marker]:mr-1.5 [&amp;_.workspace-message-gap]:block [&amp;_.workspace-message-gap]:w-0 [&amp;_.workspace-message-gap]:max-w-full [&amp;_.workspace-message-gap]:overflow-hidden [&amp;_.workspace-message-gap]:pointer-events-none select-text [&amp;_img:not(.message-media-preview):not(:where(.message-media-thumbnail))]:max-h-[160px] [&amp;_img:not(.message-media-preview):not(:where(.message-media-thumbnail))]:w-auto [&amp;_img:not(.message-media-preview):not(:where(.message-media-thumbnail))]:object-contain [&amp;_img.message-media-preview]:block [&amp;_img.message-media-preview]:h-40 [&amp;_img.message-media-preview]:w-60 [&amp;_img.message-media-preview]:max-w-full [&amp;_img.message-media-preview]:cursor-pointer [&amp;_img.message-media-preview]:object-contain [&amp;_img.message-media-preview]:object-center [&amp;_span.user-mention]:cursor-pointer workspace-message-body [&amp;_.workspace-message-file-placeholder]:inline-flex [&amp;_.workspace-message-file-placeholder]:align-middle [&amp;_.workspace-message-file-placeholder]:[overflow-anchor:none] [&amp;_.workspace-message-file-placeholder]:max-w-full [&amp;_.workspace-message-file-placeholder]:cursor-pointer [&amp;_.workspace-message-file-placeholder]:items-center [&amp;_.workspace-message-file-placeholder]:rounded-md [&amp;_.workspace-message-file-placeholder]:border [&amp;_.workspace-message-file-placeholder]:border-border-subtle [&amp;_.workspace-message-file-placeholder]:bg-bg/40 [&amp;_.workspace-message-file-placeholder]:px-2.5 [&amp;_.workspace-message-file-placeholder]:py-1.5 [&amp;_.workspace-message-file-placeholder]:text-left [&amp;_.workspace-message-file-placeholder]:font-medium [&amp;_.workspace-message-file-placeholder]:text-text-primary [&amp;_.workspace-message-file-placeholder]:no-underline [&amp;_.workspace-message-file-placeholder]:transition-colors [&amp;_.workspace-message-file-placeholder]:hover:bg-bg/60 [&amp;_.workspace-message-file-placeholder]:hover:text-text-primary [&amp;_.workspace-message-file-placeholder]:focus-visible:outline-none [&amp;_.workspace-message-file-placeholder]:focus-visible:ring-2 [&amp;_.workspace-message-file-placeholder]:focus-visible:ring-accent-soft [&amp;_.workspace-message-attachment-host]:my-1 [&amp;_.workspace-message-attachment-host]:inline-flex [&amp;_.workspace-message-attachment-host]:max-w-full [&amp;_.workspace-message-attachment-host]:align-middle [&amp;_.workspace-message-attachment-host]:cursor-pointer [&amp;_.workspace-message-attachment-host--static]:cursor-default [&amp;_.workspace-message-attachment-host]:rounded-lg [&amp;_.workspace-message-attachment-host]:focus-visible:outline-none [&amp;_.workspace-message-attachment-host]:focus-visible:ring-2 [&amp;_.workspace-message-attachment-host]:focus-visible:ring-accent-soft [&amp;_.workspace-message-file-placeholder[data-workspace-media-kind='image']]:my-1 [&amp;_.workspace-message-file-placeholder[data-workspace-media-kind='image']]:h-40 [&amp;_.workspace-message-file-placeholder[data-workspace-media-kind='image']]:w-60 [&amp;_.workspace-message-file-placeholder[data-workspace-media-kind='image']]:max-w-full [&amp;_.workspace-message-file-placeholder[data-workspace-media-kind='image']]:justify-center [&amp;_.workspace-message-file-placeholder[data-workspace-media-kind='image']]:overflow-hidden [&amp;_.workspace-message-file-placeholder[data-workspace-media-kind='image']]:p-0 [&amp;_.workspace-message-image-composition]:inline-flex [&amp;_.workspace-message-image-composition]:max-w-full [&amp;_.workspace-message-image-composition]:flex-wrap [&amp;_.workspace-message-image-composition]:gap-1 [&amp;_.workspace-message-image-composition]:align-middle [&amp;_.workspace-message-file-placeholder--composition]:!my-0 [&amp;_.workspace-message-file-placeholder--composition]:!h-[100px] [&amp;_.workspace-message-file-placeholder--composition]:!max-w-full [&amp;_.workspace-message-file-placeholder[data-workspace-media-kind='video']]:my-1 [&amp;_.workspace-message-file-placeholder[data-workspace-media-kind='video']]:w-80 [&amp;_.workspace-message-file-placeholder[data-workspace-media-kind='video']]:max-w-full [&amp;_.workspace-message-file-placeholder[data-workspace-media-kind='video']]:flex-col [&amp;_.workspace-message-file-placeholder[data-workspace-media-kind='video']]:items-stretch [&amp;_.workspace-message-file-placeholder[data-workspace-media-kind='video']]:p-0 [&amp;_.workspace-message-file-placeholder[data-workspace-media-kind='video']]:overflow-hidden [&amp;_.workspace-message-file-placeholder[data-workspace-media-reserved='true']]:border-transparent [&amp;_.workspace-message-file-placeholder[data-workspace-media-reserved='true']]:bg-transparent [&amp;_.workspace-message-file-placeholder[data-workspace-media-reserved='true']]:p-0 [&amp;_.workspace-message-file-placeholder[data-workspace-media-reserved='true']]:overflow-hidden [&amp;_.workspace-message-file-placeholder[data-workspace-media-reserved='true']]:max-w-full [&amp;_.workspace-message-file-placeholder[data-workspace-media-reserved='true']_.workspace-message-file-placeholder__image]:h-full [&amp;_.workspace-message-file-placeholder[data-workspace-media-reserved='true']_.workspace-message-file-placeholder__image]:w-full [&amp;_.workspace-message-file-placeholder[data-workspace-media-reserved='true']_.workspace-message-file-placeholder__image]:object-contain [&amp;_.workspace-message-file-preview-loaded[data-workspace-media-kind='image']]:!h-auto [&amp;_.workspace-message-file-preview-loaded[data-workspace-media-kind='image']]:!w-auto [&amp;_.workspace-message-file-preview-loaded[data-workspace-media-kind='image']]:!max-h-[180px] [&amp;_.workspace-message-file-preview-loaded[data-workspace-media-kind='image']]:!overflow-visible [&amp;_.workspace-message-file-preview-loaded[data-workspace-media-kind='image']]:items-center [&amp;_.workspace-message-file-preview-loaded]:border-transparent [&amp;_.workspace-message-file-preview-loaded]:bg-transparent [&amp;_.workspace-message-file-preview-loaded]:p-0 [&amp;_.workspace-message-file-preview-image]:!block [&amp;_.workspace-message-file-preview-image]:!h-auto [&amp;_.workspace-message-file-preview-image]:!max-h-[180px] [&amp;_.workspace-message-file-preview-image]:!w-auto [&amp;_.workspace-message-file-preview-image]:!max-w-full [&amp;_.workspace-message-file-preview-image]:!object-contain [&amp;_.workspace-message-file-preview-loaded.workspace-message-file-placeholder--composition[data-workspace-media-kind='image']]:!max-h-[100px] [&amp;_.workspace-message-file-preview-loaded.workspace-message-file-placeholder--composition[data-workspace-media-kind='image']]:!h-[100px] [&amp;_.workspace-message-file-preview-loaded.workspace-message-file-placeholder--composition[data-workspace-media-kind='image']_.workspace-message-file-preview-image]:!max-h-[100px] [&amp;_.workspace-message-file-preview-loaded.workspace-message-file-placeholder--composition[data-workspace-media-kind='image']_.workspace-message-file-preview-image]:!h-auto [&amp;_.workspace-message-file-preview-video]:!block [&amp;_.workspace-message-file-preview-video]:!h-auto [&amp;_.workspace-message-file-preview-video]:!max-h-[320px] [&amp;_.workspace-message-file-preview-video]:!w-auto [&amp;_.workspace-message-file-preview-video]:!max-w-full [&amp;_.workspace-message-file-placeholder__label]:min-w-0 [&amp;_.workspace-message-file-placeholder__label]:truncate [&amp;_.workspace-message-file-placeholder[data-workspace-media-kind='image']_.workspace-message-file-placeholder__label]:px-2.5 [&amp;_.workspace-message-file-placeholder[data-workspace-media-kind='image']_.workspace-message-file-placeholder__label]:py-1.5 [&amp;_.workspace-message-mention]:inline [&amp;_.workspace-message-mention]:cursor-pointer [&amp;_.workspace-message-mention]:border-0 [&amp;_.workspace-message-mention]:bg-transparent [&amp;_.workspace-message-mention]:p-0 [&amp;_.workspace-message-mention]:font-medium [&amp;_.workspace-message-mention]:text-accent hover:[&amp;_.workspace-message-mention]:opacity-90 [&amp;_.workspace-message-mention]:focus-visible:outline-none [&amp;_.workspace-message-mention]:focus-visible:ring-2 [&amp;_.workspace-message-mention]:focus-visible:ring-accent-soft " data-message-body="true" data-message-content-kind="media" data-message-meta-preferred-placement="row"><p>Screenshot: <span role="button" tabindex="0" class="workspace-message-file-placeholder workspace-message-file-preview-loaded" data-workspace-file="true" data-workspace-file-uuid="60000000-0000-4000-8000-000000000006" data-workspace-file-kind="media" data-workspace-media-kind="image" data-workspace-file-name="screen.png" data-workspace-file-content-type="image/png" data-workspace-media-reserved="true" title="Изображение" aria-label="Изображение" data-workspace-preview-status="loaded"><img class="workspace-message-file-placeholder__image message-media-preview workspace-message-file-preview-image" src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI0ODAiIGhlaWdodD0iMjQwIiB2aWV3Qm94PSIwIDAgNDgwIDI0MCI+CiAgPHJlY3Qgd2lkdGg9IjQ4MCIgaGVpZ2h0PSIyNDAiIHJ4PSIxMiIgZmlsbD0iI2VlZjNmOCIvPgogIDxwYXRoIGQ9Ik0wIDE3NUwxMjUgOTBMMjMwIDE3MEwzNTAgNjVMNDgwIDE1NVYyNDBIMFoiIGZpbGw9IiNkN2UzZWYiLz4KICA8Y2lyY2xlIGN4PSIzOTIiIGN5PSI1MSIgcj0iMTkiIGZpbGw9IiNhOWMyZGEiLz4KICAKICA8cmVjdCB4PSIxOCIgeT0iMTgyIiB3aWR0aD0iNDQ0IiBoZWlnaHQ9IjQyIiByeD0iNyIgZmlsbD0id2hpdGUiIGZpbGwtb3BhY2l0eT0iLjk0Ii8+CiAgPHRleHQgeD0iMzMiIHk9IjIwOCIgZmlsbD0iIzM0NGU2OCIgZm9udC1mYW1pbHk9InNhbnMtc2VyaWYiIGZvbnQtc2l6ZT0iMTUiPnNjcmVlbi5wbmc8L3RleHQ+CiAgPC9zdmc+" alt="screen.png — synthetic preview asset" decoding="async"><span class="workspace-message-file-placeholder__label sr-only" hidden="">Изображение</span></span></p><span class="workspace-message-gap workspace-message-gap--1" aria-hidden="true"></span><p>External image: <span role="button" tabindex="0" class="workspace-message-file-placeholder workspace-message-file-preview-loaded" data-workspace-file="true" data-workspace-file-uuid="60000000-0000-4000-8000-000000000007" data-workspace-file-kind="media" data-workspace-media-kind="image" data-workspace-file-name="diagram.png" data-workspace-file-content-type="image/png" data-workspace-media-reserved="true" title="Изображение" aria-label="Изображение" data-workspace-preview-status="loaded"><img class="workspace-message-file-placeholder__image message-media-preview workspace-message-file-preview-image" src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI0ODAiIGhlaWdodD0iMjQwIiB2aWV3Qm94PSIwIDAgNDgwIDI0MCI+CiAgPHJlY3Qgd2lkdGg9IjQ4MCIgaGVpZ2h0PSIyNDAiIHJ4PSIxMiIgZmlsbD0iI2VlZjNmOCIvPgogIDxwYXRoIGQ9Ik0wIDE3NUwxMjUgOTBMMjMwIDE3MEwzNTAgNjVMNDgwIDE1NVYyNDBIMFoiIGZpbGw9IiNkN2UzZWYiLz4KICA8Y2lyY2xlIGN4PSIzOTIiIGN5PSI1MSIgcj0iMTkiIGZpbGw9IiNhOWMyZGEiLz4KICAKICA8cmVjdCB4PSIxOCIgeT0iMTgyIiB3aWR0aD0iNDQ0IiBoZWlnaHQ9IjQyIiByeD0iNyIgZmlsbD0id2hpdGUiIGZpbGwtb3BhY2l0eT0iLjk0Ii8+CiAgPHRleHQgeD0iMzMiIHk9IjIwOCIgZmlsbD0iIzM0NGU2OCIgZm9udC1mYW1pbHk9InNhbnMtc2VyaWYiIGZvbnQtc2l6ZT0iMTUiPmRpYWdyYW0ucG5nPC90ZXh0PgogIDwvc3ZnPg==" alt="diagram.png — synthetic preview asset" decoding="async"><span class="workspace-message-file-placeholder__label sr-only" hidden="">Изображение</span></span></p></div><div class="fixture-time">13:40</div></div></div></div><details><summary>Workspace Markdown</summary><pre>Screenshot: ![screen.png](urn:image:60000000-0000-4000-8000-000000000006?name=screen.png&amp;content_type=image%2Fpng)
 
-External image: ![diagram.png](urn:image:60000000-0000-4000-8000-000000000007?name=diagram.png&amp;content_type=image%2Fpng)</pre></details></section><section class="column telegram"><h3>Telegram <small>Текущий результат, без исправлений</small></h3><div class="telegram-bubble"><div class="telegram-text">Screenshot: 
+External image: ![diagram.png](urn:image:60000000-0000-4000-8000-000000000007?name=diagram.png&amp;content_type=image%2Fpng)</pre></details></section><section class="column telegram"><h3>Telegram <small>Текущий результат, без исправлений</small></h3><div class="telegram-bubble"><div class="telegram-text">Screenshot:&#32;
 
 External image: </div></div><div class="reference-note">Служебные references переданы в отправку; их доставка и разрешение здесь не выполняются.</div><details><summary>Текст, UTF-16 entities и references</summary><pre>{
   &quot;text&quot;: &quot;Screenshot: \n\nExternal image: &quot;,
@@ -12251,10 +12251,10 @@ External image: </div></div><div class="reference-note">Служебные refer
     ]
   },
   &quot;roundtrip&quot;: &quot;Screenshot\\: \n\nExternal image\\: &quot;
-}</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre>Screenshot\: 
+}</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre>Screenshot\:&#32;
 
 External image\: </pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Доставить все файлы/изображения/видео/аудио и подписи; проверить содержимое и порядок в реальном Telegram. Превью и references на странице не являются подтверждением загрузки.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -12326,7 +12326,7 @@ External image\: </pre></details></section></div>
   },
   &quot;roundtrip&quot;: &quot;&quot;
 }</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre></pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Доставить все файлы/изображения/видео/аудио и подписи; проверить содержимое и порядок в реальном Telegram. Превью и references на странице не являются подтверждением загрузки.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -12383,7 +12383,7 @@ External image\: </pre></details></section></div>
   &quot;notes&quot;: [],
   &quot;proposal&quot;: &quot;Доставить все файлы/изображения/видео/аудио и подписи; проверить содержимое и порядок в реальном Telegram. Превью и references на странице не являются подтверждением загрузки.&quot;
 }</pre></details></article>
-<article class="example" id="video_attachment" data-category="media" data-review="false" data-search="video_attachment an uploaded video and an external video link. файлы и медиа 
+<article class="example" id="video_attachment" data-category="media" data-review="false" data-search="video_attachment an uploaded video and an external video link. файлы и медиа&#32;
 https://video.example.test/watch/demo">
  <header class="example-heading"><div><span class="case-number">48</span><a href="#video_attachment">video attachment</a></div><span class="badge supported">Файлы и медиа · снимок конвертера</span></header>
  <p class="description">An uploaded video and an external video link.</p>
@@ -12409,7 +12409,7 @@ https://video.example.test/watch/demo</pre></details></section><section class="c
   &quot;roundtrip&quot;: &quot;\n[https\\://video\\.example\\.test/watch/demo](&lt;urn:url:https://video.example.test/watch/demo&gt;)&quot;
 }</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre>
 [https\://video\.example\.test/watch/demo](&lt;urn:url:https://video.example.test/watch/demo&gt;)</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Доставить все файлы/изображения/видео/аудио и подписи; проверить содержимое и порядок в реальном Telegram. Превью и references на странице не являются подтверждением загрузки.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -12486,7 +12486,7 @@ https://video.example.test/watch/demo</pre></details></section><section class="c
   },
   &quot;roundtrip&quot;: &quot;&quot;
 }</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre></pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Доставить все файлы/изображения/видео/аудио и подписи; проверить содержимое и порядок в реальном Telegram. Превью и references на странице не являются подтверждением загрузки.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -12573,7 +12573,7 @@ Custom organization emoji: (Not supported in Workspace: custom emoji party_parro
 Custom organization emoji\: \(Not supported in Workspace\: custom emoji party\_parrot\)
 
 [Original message](&lt;urn:url:https://zulip.example.test/#narrow/near/1042&gt;)</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Сохранить весь смысл и текст. Для отсутствующего интерактива предложить явный текстовый снимок; формулы, время, пользовательские emoji и действия не должны молча исчезать. Нативные функции требуют отдельной проверки доставки.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -12665,7 +12665,7 @@ A Unix timestamp also works: (Not supported in Workspace: global time 1496701800
 A Unix timestamp also works\: \(Not supported in Workspace\: global time 1496701800\)\.
 
 [Original message](&lt;urn:url:https://zulip.example.test/#narrow/near/1043&gt;)</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Сохранить весь смысл и текст. Для отсутствующего интерактива предложить явный текстовый снимок; формулы, время, пользовательские emoji и действия не должны молча исчезать. Нативные функции требуют отдельной проверки доставки.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -12748,7 +12748,7 @@ original message">
 }</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre>Not supported in Workspace\: /me action
 
 [Original message](&lt;urn:url:https://zulip.example.test/#narrow/near/1044&gt;)</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Сохранить весь смысл и текст. Для отсутствующего интерактива предложить явный текстовый снимок; формулы, время, пользовательские emoji и действия не должны молча исчезать. Нативные функции требуют отдельной проверки доставки.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -12822,7 +12822,7 @@ original message">
   &quot;references&quot;: {},
   &quot;roundtrip&quot;: &quot;The deployment starts at **18\\:00**\\.&quot;
 }</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre>The deployment starts at **18\:00**\.</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Проверить в живом потоке: адресата/тип чата, топик, редактирование, реакции и служебные поля. Статическая конвертация текста этого не доказывает.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -12895,7 +12895,7 @@ original message">
   &quot;references&quot;: {},
   &quot;roundtrip&quot;: &quot;The migration is ready for review\\.&quot;
 }</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre>The migration is ready for review\.</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Проверить в живом потоке: адресата/тип чата, топик, редактирование, реакции и служебные поля. Статическая конвертация текста этого не доказывает.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -12995,7 +12995,7 @@ Wednesday</pre></details></section><section class="column workspace"><h3>Workspa
 }</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre>Not supported in Workspace\: interactive poll
 
 [Original message](&lt;urn:url:https://zulip.example.test/#narrow/near/1047&gt;)</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Сохранить весь смысл и текст. Для отсутствующего интерактива предложить явный текстовый снимок; формулы, время, пользовательские emoji и действия не должны молча исчезать. Нативные функции требуют отдельной проверки доставки.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -13097,7 +13097,7 @@ Restart worker</pre></details></section><section class="column workspace"><h3>Wo
 }</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre>Not supported in Workspace\: collaborative to\-do list
 
 [Original message](&lt;urn:url:https://zulip.example.test/#narrow/near/1048&gt;)</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Сохранить весь смысл и текст. Для отсутствующего интерактива предложить явный текстовый снимок; формулы, время, пользовательские emoji и действия не должны молча исчезать. Нативные функции требуют отдельной проверки доставки.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -13180,7 +13180,7 @@ Restart worker</pre></details></section><section class="column workspace"><h3>Wo
   &quot;references&quot;: {},
   &quot;roundtrip&quot;: &quot;This message has no topic\\.&quot;
 }</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre>This message has no topic\.</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Проверить в живом потоке: адресата/тип чата, топик, редактирование, реакции и служебные поля. Статическая конвертация текста этого не доказывает.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -13239,7 +13239,7 @@ Restart worker</pre></details></section><section class="column workspace"><h3>Wo
   &quot;references&quot;: {},
   &quot;roundtrip&quot;: &quot;All changes are deployed\\.&quot;
 }</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre>All changes are deployed\.</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Проверить в живом потоке: адресата/тип чата, топик, редактирование, реакции и служебные поля. Статическая конвертация текста этого не доказывает.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -13313,7 +13313,7 @@ Restart worker</pre></details></section><section class="column workspace"><h3>Wo
   },
   &quot;roundtrip&quot;: &quot;Hi Alice Example\\! Can you review [the proposal](&lt;urn:url:https://docs.example.test/proposal&gt;)?&quot;
 }</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre>Hi Alice Example\! Can you review [the proposal](&lt;urn:url:https://docs.example.test/proposal&gt;)?</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Проверить в живом потоке: адресата/тип чата, топик, редактирование, реакции и служебные поля. Статическая конвертация текста этого не доказывает.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -13435,7 +13435,7 @@ Restart worker</pre></details></section><section class="column workspace"><h3>Wo
 • Alice\: API
 • Bob\: worker
 • Zoë\: UI</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Проверить в живом потоке: адресата/тип чата, топик, редактирование, реакции и служебные поля. Статическая конвертация текста этого не доказывает.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -13524,7 +13524,7 @@ Restart worker</pre></details></section><section class="column workspace"><h3>Wo
   &quot;references&quot;: {},
   &quot;roundtrip&quot;: &quot;Note to self\\: run `python -m pytest` before the next commit\\.&quot;
 }</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre>Note to self\: run `python -m pytest` before the next commit\.</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Проверить в живом потоке: адресата/тип чата, топик, редактирование, реакции и служебные поля. Статическая конвертация текста этого не доказывает.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -13613,7 +13613,7 @@ review settings">
 }</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre>Your organization settings have been updated\.
 
 [Review settings](&lt;urn:url:https://zulip.example.test/#organization/settings&gt;)</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Проверить в живом потоке: адресата/тип чата, топик, редактирование, реакции и служебные поля. Статическая конвертация текста этого не доказывает.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -13823,7 +13823,7 @@ Restart the worker at (Not supported in Workspace: global time 2026-10-18T18:00:
 Thanks\! \:\+1\:
 
 [Original message](&lt;urn:url:https://zulip.example.test/#narrow/near/1055&gt;)</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Сохранить читаемый текст, форматирование и назначение ссылок; отдельно проверить обратное преобразование.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -13946,7 +13946,7 @@ The mirror is healthy.</div></div><details><summary>Текст, UTF-16 entities 
   &quot;roundtrip&quot;: &quot;The backup is complete\\.\nThe mirror is healthy\\.&quot;
 }</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre>The backup is complete\.
 The mirror is healthy\.</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Сохранить все цитируемые тексты, авторов, уровни вложенности и комментарии в исходном порядке. Одну reply-ссылку использовать дополнительно. Для вложенных уровней предлагаются явные маркеры │ / › в тексте, без недопустимых вложенных Telegram blockquote entities. Частичные цитаты должны сохранять выделенный фрагмент.</p><details class="proposal-text"><summary>Схема сохранения всех цитат и комментариев</summary><pre>The backup is complete.
 The mirror is healthy.</pre></details></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
@@ -14123,7 +14123,7 @@ Direct reply.</pre></details></div>
   &quot;references&quot;: {},
   &quot;roundtrip&quot;: &quot;The team review is complete\\.&quot;
 }</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre>The team review is complete\.</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Сохранить все цитируемые тексты, авторов, уровни вложенности и комментарии в исходном порядке. Одну reply-ссылку использовать дополнительно. Для вложенных уровней предлагаются явные маркеры │ / › в тексте, без недопустимых вложенных Telegram blockquote entities. Частичные цитаты должны сохранять выделенный фрагмент.</p><details class="proposal-text"><summary>Схема сохранения всех цитат и комментариев</summary><pre>The team review is complete.</pre></details></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -14475,7 +14475,7 @@ The backup is complete.
   },
   &quot;roundtrip&quot;: &quot;Bob Example marked this topic as unresolved\\.&quot;
 }</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre>Bob Example marked this topic as unresolved\.</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Сохранить видимую подпись; разрешать пользователя через Telegram-аккаунт выбранного топика. Скрытые упоминания не должны превращаться в уведомляющие. Для групп и @all согласовать читаемый текстовый fallback.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -14732,7 +14732,7 @@ The backup is complete.
   },
   &quot;roundtrip&quot;: &quot;Bob Example&quot;
 }</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre>Bob Example</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Сохранить видимую подпись; разрешать пользователя через Telegram-аккаунт выбранного топика. Скрытые упоминания не должны превращаться в уведомляющие. Для групп и @all согласовать читаемый текстовый fallback.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -14817,7 +14817,7 @@ The backup is complete.
   },
   &quot;roundtrip&quot;: &quot;Bob Example&quot;
 }</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre>Bob Example</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Сохранить видимую подпись; разрешать пользователя через Telegram-аккаунт выбранного топика. Скрытые упоминания не должны превращаться в уведомляющие. Для групп и @all согласовать читаемый текстовый fallback.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -14907,7 +14907,7 @@ The backup is complete.
   },
   &quot;roundtrip&quot;: &quot;Bob Example and Bob Example&quot;
 }</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre>Bob Example and Bob Example</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Сохранить видимую подпись; разрешать пользователя через Telegram-аккаунт выбранного топика. Скрытые упоминания не должны превращаться в уведомляющие. Для групп и @all согласовать читаемый текстовый fallback.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -15099,7 +15099,7 @@ The backup is complete.
 ```text
 @_**Bob Example|12**
 ```</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Сохранить видимую подпись; разрешать пользователя через Telegram-аккаунт выбранного топика. Скрытые упоминания не должны превращаться в уведомляющие. Для групп и @all согласовать читаемый текстовый fallback.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -15195,7 +15195,7 @@ original message">
 }</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre>\(Not supported in Workspace\: mention of user group Engineering\)
 
 [Original message](&lt;urn:url:https://zulip.example.test/#narrow/near/1078&gt;)</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Сохранить видимую подпись; разрешать пользователя через Telegram-аккаунт выбранного топика. Скрытые упоминания не должны превращаться в уведомляющие. Для групп и @all согласовать читаемый текстовый fallback.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,
@@ -15291,7 +15291,7 @@ original message">
 }</pre></details><details><summary>Обратная конвертация в Workspace — точный Markdown</summary><pre>\(Not supported in Workspace\: channel\-wide mention\) \(Not supported in Workspace\: channel\-wide mention\) \(Not supported in Workspace\: channel\-wide mention\) \(Not supported in Workspace\: topic\-wide mention\)
 
 [Original message](&lt;urn:url:https://zulip.example.test/#narrow/near/1079&gt;)</pre></details></section></div>
- 
+&#32;
  <div class="proposal"><strong>Предложение для ревью — ещё не реализовано</strong><p>Сохранить видимую подпись; разрешать пользователя через Telegram-аккаунт выбранного топика. Скрытые упоминания не должны превращаться в уведомляющие. Для групп и @all согласовать читаемый текстовый fallback.</p></div>
  <details class="fixture-data"><summary>Полный исходный пример Zulip и данные конвертации</summary><pre>{
   &quot;source&quot;: &quot;zulip&quot;,

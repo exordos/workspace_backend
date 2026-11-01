@@ -101,7 +101,9 @@ const html=`<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta nam
 <main class="container"><h2 class="source-section">Каталог Zulip: 79 случаев · ${quoteCount} с цитатами · ${attentionCount} с явными замечаниями</h2>${cards}<h2 class="source-section" id="native-cases">Нативный Telegram: 17 исходных примеров</h2>${native}<p id="empty" class="empty-state" hidden>Нет подходящих примеров.</p></main><footer class="footer">Offline · Из production-конвертера до исправлений · 79/79 примеров zulip_messages.json + 17/17 telegram_messages.json<br>Исходные тексты, entities, references и обратная конвертация доступны под каждым примером. Встроенные иллюстрации медиа синтетические.</footer>
 <script>const cards=[...document.querySelectorAll('article.example')];function filter(){const q=document.querySelector('#search').value.toLowerCase().trim(),category=document.querySelector('#category').value,review=document.querySelector('#review-only').checked;let visible=0;for(const card of cards){card.hidden=!(card.dataset.search.includes(q)&&(category==='all'||category===card.dataset.category)&&(!review||card.dataset.review==='true'));if(!card.hidden)visible++;}document.querySelector('#count').textContent=visible+' / '+cards.length;document.querySelector('#empty').hidden=visible!==0;}document.querySelector('#search').addEventListener('input',filter);document.querySelector('#category').addEventListener('change',filter);document.querySelector('#review-only').addEventListener('change',filter);function toggle(header){const block=header.parentElement,open=block.classList.toggle('open');block.classList.toggle('is-open',open);header.setAttribute('aria-expanded',String(open));block.querySelector(':scope > .spoiler-content')?.setAttribute('aria-hidden',String(!open));}document.addEventListener('click',event=>{const h=event.target.closest('.spoiler-header');if(h)toggle(h);});document.addEventListener('keydown',event=>{if((event.key==='Enter'||event.key===' ')&&event.target.matches('.spoiler-header')){event.preventDefault();toggle(event.target);}});</script></body></html>`;
 const output=path.join(repository,'docs/telegram_message_types_review.html');
-await fs.writeFile(output,html);
+const styleEnd=html.indexOf('</style>')+8;
+const outputHtml=html.slice(0,styleEnd).replace(/[ \t]+$/gm,'')+html.slice(styleEnd).replace(/[ \t]+$/gm,spaces=>spaces.replaceAll(' ','&#32;').replaceAll('\t','&#9;'));
+await fs.writeFile(output,outputHtml);
 const rendered=new JSDOM(html,{virtualConsole:new VirtualConsole()});
 assert.equal(rendered.window.document.querySelectorAll('article.example').length,96);
 assert.equal(rendered.window.document.querySelectorAll('.comparison').length,79);
@@ -109,4 +111,4 @@ assert.equal(rendered.window.document.querySelectorAll('.comparison>.column').le
 for (const id of priority) assert.ok(rendered.window.document.getElementById(id),id);
 for(const element of rendered.window.document.querySelectorAll('[src]')) assert.match(element.getAttribute('src'),/^data:/);
 rendered.window.close();source.window.close();
-console.log(JSON.stringify({file:output,zulip:79,nativeTelegram:17,quotes:quoteCount,attention:attentionCount,sizeBytes:Buffer.byteLength(html)}));
+console.log(JSON.stringify({file:output,zulip:79,nativeTelegram:17,quotes:quoteCount,attention:attentionCount,sizeBytes:Buffer.byteLength(outputHtml)}));
