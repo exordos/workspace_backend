@@ -55,6 +55,7 @@ SERVICE_NAMES=(
     workspace-zulip-incoming
     workspace-zulip-history
     workspace-zulip-outgoing
+    workspace-telegram
     workspace-external-bridge-control
     workspace-external-bridge-api
     workspace-messenger-worker

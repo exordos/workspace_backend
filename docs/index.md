@@ -21,11 +21,11 @@ and protocol descriptions remain one canonical source of truth.
 
 - [Workspace public API](public_workspace_api.yaml)
 
-External accounts contain their owner, provider and generic settings.
-Workspace does not process external chats, provider delivery or synchronization.
-Messages, streams and topics retain `source_name` and `source` as
-`native` and `{"kind":"native"}`. Architecture proposals below predate this
-cleanup; the generated public API describes the current supported contract.
+External accounts are scoped to their owner and project. Zulip and Telegram
+synchronize through the canonical Messenger model. Streams, topics and messages
+retain their provider identity; native resources remain independent. Telegram
+application credentials and account sessions stay server-side. See the provider
+guides and generated public API for the current contracts.
 
 ## Translation contract
 
@@ -33,3 +33,5 @@ All four language trees contain the same Markdown and PlantUML paths. Code
 blocks, routes, JSON fields, model names, task kinds, UUID formulas, and other
 machine identifiers are intentionally identical across translations. Every
 PlantUML source has a rendered SVG beside it in the same language tree.
+
+[Open the rendered Telegram ↔ Workspace conversion comparison](telegram_messages_preview.html).

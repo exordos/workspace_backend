@@ -269,3 +269,10 @@ def test_only_workspace_rest_service_is_deployed():
     assert "location /api/workspace/v1/messenger/" not in manifest
     assert "proxy_pass http://127.0.0.1:21084/;" in manifest
     assert "proxy_pass http://127.0.0.1:21082/v1/events/ws;" in manifest
+
+
+def test_telegram_override_is_readable_only_by_root_and_the_api_group():
+    installer = _read("exordos/images/backend-install.sh")
+    assert 'sudo chown root:workspace "$GC_CFG_DIR/telegram.conf"' in installer
+    assert 'sudo chmod 0640 "$GC_CFG_DIR/telegram.conf"' in installer
+    assert "User=workspace" in _read("etc/systemd/workspace-api.service")

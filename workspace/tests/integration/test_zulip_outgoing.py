@@ -128,10 +128,7 @@ def outgoing(api, db, monkeypatch):
     # Delete their canonical roots without loading the current metadata model.
     db.execute("DELETE FROM messenger_messages WHERE project_id=%s", (api.project_id,))
     account.delete()
-    for stream in v2_models.WorkspaceStream.objects.get_all(
-        filters={"project_id": filters.EQ(api.project_id)}
-    ):
-        stream.delete()
+    db.execute("DELETE FROM messenger_streams WHERE project_id=%s", (api.project_id,))
     for table in (
         "bridge_zulip_v5_topic_changes",
         "bridge_zulip_v5_message_changes",
@@ -185,7 +182,7 @@ class Server:
         assert http.headers["Authorization"] == self.auth
         with psycopg.connect(self.db_url) as connection:
             assert not connection.execute(
-                "SELECT 1 FROM pg_stat_activity WHERE application_name='workspace-zulip-outgoing' AND state='idle in transaction'"
+                "SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND application_name='workspace-zulip-outgoing' AND state='idle in transaction'"
             ).fetchall()
         self.active += 1
         self.maximum = max(self.maximum, self.active)
@@ -268,6 +265,26 @@ class Server:
             return web.json_response({"result": "success"})
         finally:
             self.active -= 1
+
+
+def test_provider_mock_ignores_outgoing_transactions_in_other_databases(
+    _test_database_url,
+):
+    server = Server(_test_database_url)
+    request = types.SimpleNamespace(
+        method="GET",
+        query={},
+        headers={"Authorization": server.auth},
+        transport=object(),
+        path="/api/v1/messages",
+    )
+    with psycopg.connect(
+        _test_database_url,
+        dbname="postgres",
+        application_name="workspace-zulip-outgoing",
+    ) as other_database:
+        other_database.execute("SELECT 1")
+        assert asyncio.run(server.handle(request)).status == 200
 
 
 @contextlib.asynccontextmanager
@@ -1973,5 +1990,51 @@ def test_canonical_message_has_one_destination_and_copy_gets_new_uuid(
             assert len(sends) == 2
             assert {str(call[2]["to"]) for call in sends} == {"42", "43"}
             assert len(server.messages) == 2
+
+    asyncio.run(run())
+
+
+def test_legacy_mention_after_account_link_still_uses_the_selected_provider(
+    outgoing, db, _test_database_url
+):
+    api, account, channel, remote, *_ = outgoing
+    person = uuid.uuid4()
+    legacy = uuid.uuid5(account.provider_uuid, "user:99")
+    for identifier in (person, legacy):
+        conftest.seed_workspace_user(db, identifier, f"mention-{identifier}")
+    db.execute("UPDATE m_workspace_users SET source='zulip' WHERE uuid=%s", (legacy,))
+    linked = external_models.ExternalAccount(
+        project_id=api.project_id,
+        owner_user_uuid=person,
+        provider="zulip",
+        external_account_id="99",
+        settings={
+            "server_url": "https://zulip.example.com",
+            "email": "synthetic@example.test",
+        },
+        status="active",
+    )
+    linked.insert()
+    telegram_account = external_models.ExternalAccount(
+        project_id=api.project_id,
+        owner_user_uuid=person,
+        provider="telegram",
+        external_account_id="888",
+        settings={},
+        status="active",
+    )
+    telegram_account.insert()
+    remote["content"] = f"Hello [peer](urn:user:{legacy})"
+    create(outgoing)
+
+    async def run():
+        async with sender(account, _test_database_url) as (service, server):
+            await drain(service)
+            sent = [
+                data["content"]
+                for method, path, data in server.calls
+                if method == "POST" and path == "/api/v1/messages"
+            ]
+            assert len(sent) == 1 and "|99**" in sent[0] and "urn:user:" not in sent[0]
 
     asyncio.run(run())

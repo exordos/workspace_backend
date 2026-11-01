@@ -5,6 +5,7 @@ on:
     paths:
       - "docs/**"
       - workspace/tests/fixtures/zulip_messages_preview.html
+      - workspace/tests/fixtures/telegram_messages_preview.html
       - mkdocs.yml
       - pyproject.toml
       - tox.ini

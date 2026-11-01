@@ -159,6 +159,7 @@ def _recount_scope(
                 "project_id": project,
                 "payload": {
                     "source_kind": "counters.updated",
+                    "counter_stream_uuid": stream,
                     "emit_public_event": update["publish_updates"],
                     "user_uuid": user,
                     "folder_uuid": folder["folder_uuid"],

@@ -8,6 +8,7 @@ import uuid
 import psycopg
 import pytest
 from restalchemy.common import contexts
+from restalchemy.storage.sql import migrations
 
 from migrations import zulip_upgrade_data
 from workspace.tests.integration import conftest
@@ -55,6 +56,10 @@ def test_merge_preserves_unarchived_direct_conversation(
         }
         with contexts.Context().session_manager() as session:
             zulip_upgrade_data.rekey(session, mapping)
+        # Current API models require the current schema. Verify that the
+        # historical rekey result also survives the supported forward upgrade.
+        engine = migrations.MigrationEngine(str(conftest.MIGRATIONS_DIR))
+        engine.apply_migration(engine.get_latest_migration())
         response = conftest.ApiClient(http_server, owner, project).get(
             "/v1/messenger/streams/" + str(destination)
         )

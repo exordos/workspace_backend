@@ -78,6 +78,31 @@ class ExternalAccount(
         default=None,
     )
 
+    def validate(self) -> None:
+        super().validate()
+        if self.provider != "telegram":
+            return
+        if self.provider_uuid not in (
+            None,
+            sys_uuid.uuid5(sys_uuid.NAMESPACE_DNS, "telegram.org"),
+        ):
+            raise exceptions.ValidationErrorException()
+        if set(self.settings) - {"history_depth", "peer_keys", "selection_mode"}:
+            raise exceptions.ValidationErrorException()
+        if self.settings.get("history_depth", "30_days") not in ("30_days", "all"):
+            raise exceptions.ValidationErrorException()
+        peers = self.settings.get("peer_keys", [])
+        if (
+            not isinstance(peers, list)
+            or len(peers) > 128
+            or any(not isinstance(peer, str) or len(peer) > 64 for peer in peers)
+        ):
+            raise exceptions.ValidationErrorException()
+        if self.settings.get("selection_mode", "explicit") not in ("explicit", "all"):
+            raise exceptions.ValidationErrorException()
+        # Old clients may still send these fields; they never restrict import.
+        self.settings = {}
+
     @classmethod
     def restore_row(cls, row: typing.Any, pour: typing.Any = None) -> "ExternalAccount":
         account = super().restore_row(row, pour=pour)
@@ -85,7 +110,11 @@ class ExternalAccount(
         return account
 
     def _register_provider(self, session: typing.Any = None) -> None:
-        hostname = urllib.parse.urlsplit(self.settings["server_url"]).hostname
+        hostname = (
+            "telegram.org"
+            if self.provider == "telegram"
+            else urllib.parse.urlsplit(self.settings["server_url"]).hostname
+        )
         if hostname is None:
             raise exceptions.ValidationErrorException()
         provider = Provider.register(hostname, session=session)
@@ -94,7 +123,9 @@ class ExternalAccount(
 
     def insert(self, session: typing.Any = None) -> None:
         with self._get_engine().session_manager(session=session) as current_session:
-            if self.provider_uuid is None and "server_url" in self.settings:
+            if self.provider == "telegram" or (
+                self.provider_uuid is None and "server_url" in self.settings
+            ):
                 self._register_provider(session=current_session)
             elif self.provider_uuid is not None:
                 self._normalize_endpoint_host()
