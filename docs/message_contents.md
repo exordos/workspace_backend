@@ -36,6 +36,30 @@ late preparation can attach it only while its saved message revision still
 matches. Concurrent cache misses may perform duplicate conversion work, but share
 the resulting immutable page.
 
+## Bounded incoming Zulip conversion
+
+Incoming conversion uses the native Markdown limit of 40,000 characters as its
+output budget. Inline text, block text and unsupported-content notices stop
+accumulating when they exceed that budget. Forward snapshots check their final
+link size, including Base64 expansion of UTF-8 bytes, before encoding. Nested
+quote conversion is limited to 32 body levels. Sources already larger than the
+output budget bypass formatted conversion.
+
+Exceeding these limits switches the whole message to an explicit notice, a
+literal copy of the original provider Markdown and an original-message link.
+The literal fence is longer than any backtick run in the source. The notice,
+fences and link count toward the same limit. If that representation does not
+fit, the payload contains only the notice and link; if the link itself cannot
+fit, it contains only the notice. No partial source text is silently truncated.
+The complete raw provider representation remains on the immutable content page.
+
+Fallback results are message-specific and are not shared conversion-cache
+entries. Import and replay use the ordinary transaction and cursor rules:
+there is no special cursor advancement or skipped-message path. Acceptance
+tests must cover successful history and realtime import, a subsequent healthy
+message, preserved provider content, per-message original links and idempotent
+replay, in addition to converter size and nesting boundaries.
+
 Migration 0273 normalizes current roots and retained delivery snapshots, preserves
 prepared requests verbatim, and seeds the current revision of existing messages.
 It cannot reconstruct earlier edits that were not retained before normalization.

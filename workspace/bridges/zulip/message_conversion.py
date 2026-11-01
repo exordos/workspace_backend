@@ -51,6 +51,25 @@ _REFERENCE_URN = re.compile(
     re.IGNORECASE,
 )
 _SILENT_USER_LINK = re.compile(r'\]\(urn:user:[\da-f-]{36} "silent"\)', re.IGNORECASE)
+_MAX_QUOTE_DEPTH = 32
+
+
+class _ConversionLimitExceeded(Exception):
+    pass
+
+
+class _ConversionParts(list[str]):
+    """Stop accumulating converted text before it exceeds the payload budget."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.length = 0
+
+    def append(self, value: str) -> None:
+        self.length += len(value)
+        if self.length > message_payloads.MARKDOWN_CONTENT_MAX_LENGTH:
+            raise _ConversionLimitExceeded
+        super().append(value)
 
 
 def _escape_label(value: str) -> str:
@@ -322,6 +341,15 @@ class _ZulipToWorkspace:
         text = f"Not supported in Workspace: {description}"
         return text if block else f"({text})"
 
+    def original_link(self) -> str:
+        url = self.context["original_url"]
+        if (
+            len(url) + len("[Original message](urn:url:)")
+            > message_payloads.MARKDOWN_CONTENT_MAX_LENGTH
+        ):
+            raise _ConversionLimitExceeded
+        return _markdown_link("Original message", f"urn:url:{url}")
+
     def unavailable_file(self, target: str, label: str | None = None) -> str | None:
         if target in self.context.get("inaccessible_files", ()):
             reason = "access denied"
@@ -340,8 +368,10 @@ class _ZulipToWorkspace:
         return f"{label} ({reason})"
 
     def block_notice(self, description: str, source: str) -> str:
-        parts = [self.notice(description, block=True)]
+        parts = _ConversionParts()
+        parts.append(self.notice(description, block=True))
         for url in get_zulip_files({"content": source}, self.context):
+            parts.append("\n\n")
             unavailable = self.unavailable_file(url)
             if unavailable is not None:
                 parts.append(unavailable)
@@ -358,7 +388,7 @@ class _ZulipToWorkspace:
                     _escape_label(name), target, image=target.startswith("urn:image:")
                 )
             )
-        return "\n\n".join(parts)
+        return "".join(parts)
 
     def message_uuid(self, message_id: str) -> str:
         if message_id == str(self.message["id"]):
@@ -379,15 +409,41 @@ class _ZulipToWorkspace:
     ) -> str:
         if message_id is None:
             self.uses_current_message = True
-        encoded = base64.urlsafe_b64encode(content.encode()).decode().rstrip("=")
         identifier = (
             self.message_uuid(message_id)
             if message_id is not None
             else self.context.get("current_message_uuid")
             or self.message_uuid(str(self.message["id"]))
         )
+        label = _escape_label(author)
+        prefix = _markdown_link(label, f"urn:forward:{identifier}?snapshot=")
+        data = content.encode()
+        encoded_length = (len(data) * 4 + 2) // 3
+        if len(prefix) + encoded_length > message_payloads.MARKDOWN_CONTENT_MAX_LENGTH:
+            raise _ConversionLimitExceeded
+        encoded = base64.urlsafe_b64encode(data).decode().rstrip("=")
         target = f"urn:forward:{identifier}?snapshot={encoded}"
-        return _markdown_link(_escape_label(author), target)
+        return _markdown_link(label, target)
+
+    def oversized_message(self) -> str:
+        notice = self.notice("formatted message is too large", block=True)
+        try:
+            original = self.original_link()
+        except _ConversionLimitExceeded:
+            return notice
+        suffix = f"\n\n{original}"
+        limit = message_payloads.MARKDOWN_CONTENT_MAX_LENGTH
+        if len(notice) + len(suffix) > limit:
+            return notice
+        source = self.message["content"]
+        if len(notice) + len(source) + len(suffix) + 10 > limit:
+            return notice + suffix
+        longest = max((len(run[0]) for run in re.finditer(r"`+", source)), default=2)
+        fence_length = max(3, longest + 1)
+        if len(notice) + len(source) + len(suffix) + 2 * fence_length + 4 > limit:
+            return notice + suffix
+        fence = "`" * fence_length
+        return f"{notice}\n\n{fence}\n{source}\n{fence}{suffix}"
 
     def target(self, target: str) -> str | None:
         files = self.context.get("files", {})
@@ -452,7 +508,7 @@ class _ZulipToWorkspace:
         return f"urn:url:{absolute}"
 
     def inline(self, text: str, *, quoted: bool = False, literal: bool = False) -> str:
-        output = []
+        output = _ConversionParts()
         position = 0
         while match := self.tokens.search(text, position):
             output.append(text[position : match.start()])
@@ -593,7 +649,9 @@ class _ZulipToWorkspace:
         output.append(text[position:])
         return "".join(output)
 
-    def body(self, text: str, *, quoted: bool = False) -> str:
+    def body(self, text: str, *, quoted: bool = False, depth: int = 0) -> str:
+        if depth >= _MAX_QUOTE_DEPTH:
+            raise _ConversionLimitExceeded
         command = re.match(r"^/(me|poll|todo)(?:\s|$)", text)
         if command:
             return self.block_notice(
@@ -610,7 +668,7 @@ class _ZulipToWorkspace:
             and re.search(r"(?<!\\)\$\$.+?\$\$", text)
         ):
             return self.block_notice("inline LaTeX", text)
-        output: list[str] = []
+        output = _ConversionParts()
         position = 0
         while position < len(text):
             header = _QUOTE_HEADER.match(text, position)
@@ -641,7 +699,7 @@ class _ZulipToWorkspace:
                             # Fragment URNs hold plain text; nested blocks need a snapshot.
                             output.append(
                                 self.snapshot(
-                                    self.body(content, quoted=True),
+                                    self.body(content, quoted=True, depth=depth + 1),
                                     header["name"],
                                     message_id,
                                 )
@@ -721,13 +779,16 @@ def zulip_to_workspace_cached(
 ) -> tuple[dict[str, str], bool]:
     """Return the payload and whether it is independent of this message's identity."""
     converter = _ZulipToWorkspace(message, context)
-    content = converter.body(message["content"])
-    if converter.unsupported:
-        content = (
-            content.rstrip()
-            + "\n\n"
-            + _markdown_link("Original message", f"urn:url:{context['original_url']}")
-        )
+    try:
+        if len(message["content"]) > message_payloads.MARKDOWN_CONTENT_MAX_LENGTH:
+            raise _ConversionLimitExceeded
+        content = converter.body(message["content"])
+        if converter.unsupported:
+            content = content.rstrip() + "\n\n" + converter.original_link()
+        if len(content) > message_payloads.MARKDOWN_CONTENT_MAX_LENGTH:
+            raise _ConversionLimitExceeded
+    except _ConversionLimitExceeded:
+        content = converter.oversized_message()
     payload = message_payloads.MarkdownPayload(content=content)
     reusable = not (
         converter.unsupported
