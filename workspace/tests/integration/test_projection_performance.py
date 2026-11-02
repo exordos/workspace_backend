@@ -29,6 +29,9 @@ from workspace.messenger_api.api import store_factory
 from workspace.services.messenger_workers import counters
 from workspace.services.messenger_workers import v2_projection
 from workspace.tests.integration import conftest
+from workspace.tests.integration import (
+    test_message_view_stale_statistics as history_plan,
+)
 
 
 V1 = "/v1"
@@ -3347,4 +3350,192 @@ def test_existing_empty_reaction_users_do_not_break_message_pages_or_replay(api,
             (canonical_uuid,),
         ).fetchone()[0]
         == old_users
+    )
+
+
+@pytest.mark.isolated_schema
+@pytest.mark.parametrize("operation", ["reaction", "edit"])
+def test_canonical_message_publication_does_not_scan_project_history(
+    api, db, monkeypatch, operation
+):
+    stream, message = _create_message(api, "cassi-canonical-publication")
+    recipient = sys_uuid.uuid4()
+    conftest.seed_workspace_user(db, recipient, f"cassi-recipient-{recipient}")
+    conftest.seed_user_stream_binding(db, api.project_id, stream["uuid"], recipient)
+    db.execute(
+        "INSERT INTO messenger_user_topic_bindings(uuid,project_id,user_uuid,topic_uuid) "
+        "VALUES (%s,%s,%s,%s)",
+        (sys_uuid.uuid4(), api.project_id, recipient, stream["default_topic_uuid"]),
+    )
+    db.execute(
+        "INSERT INTO messenger_user_message_bindings "
+        "(uuid,project_id,user_uuid,placement_uuid) VALUES (%s,%s,%s,%s) "
+        "ON CONFLICT (project_id,placement_uuid,user_uuid) DO NOTHING",
+        (sys_uuid.uuid4(), api.project_id, recipient, message["uuid"]),
+    )
+    _drain()
+    secondary = api.post(
+        STREAMS,
+        json={
+            "name": "cassi-other-placement",
+            "description": "",
+            "source_name": "native",
+        },
+    ).json()
+    other_placement = sys_uuid.uuid4()
+    canonical = db.execute(
+        "SELECT message_uuid FROM messenger_message_placements WHERE uuid=%s",
+        (message["uuid"],),
+    ).fetchone()[0]
+    db.execute(
+        "INSERT INTO messenger_message_placements "
+        "(uuid,project_id,message_uuid,stream_uuid,topic_uuid) VALUES (%s,%s,%s,%s,%s)",
+        (
+            other_placement,
+            api.project_id,
+            canonical,
+            secondary["uuid"],
+            secondary["default_topic_uuid"],
+        ),
+    )
+    db.execute(
+        "INSERT INTO messenger_user_message_bindings "
+        "(uuid,project_id,user_uuid,placement_uuid) VALUES (%s,%s,%s,%s)",
+        (sys_uuid.uuid4(), api.project_id, api.user_uuid, other_placement),
+    )
+    _drain()
+    fresh = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream["uuid"],
+            "topic_uuid": stream["default_topic_uuid"],
+            "payload": {"kind": "markdown", "content": "New unread during publication"},
+        },
+    )
+    assert fresh.status_code == 201, fresh.text
+    if operation == "reaction":
+        response = api.post(
+            MESSAGE_REACTIONS,
+            json={"message_uuid": message["uuid"], "emoji_name": "eyes"},
+        )
+        assert response.status_code == 201, response.text
+    else:
+        response = api.put(
+            MESSAGES + message["uuid"],
+            json={"payload": {"kind": "markdown", "content": "Edited"}},
+        )
+        assert response.status_code == 200, response.text
+    for table in history_plan.TABLES:
+        db.execute(f"ALTER TABLE {table} SET (autovacuum_enabled=false)")
+    history_plan._seed(db, sys_uuid.uuid4(), sys_uuid.uuid4(), 4096)
+    for table in history_plan.TABLES:
+        db.execute(f"ANALYZE {table}")
+    history_plan._seed(db, api.project_id, api.user_uuid, 1001)
+    plans = []
+    execute = psycopg.Cursor.execute
+
+    def measured(cursor, query, params=None, **kwargs):
+        if (
+            isinstance(query, str)
+            and query.lstrip().upper().startswith("SELECT")
+            and "messenger_api_user_messages_v1" in query
+            and "CANONICAL_MESSAGE_UUID" in query.upper().split("WHERE", 1)[-1]
+        ):
+            with cursor.connection.cursor(row_factory=psycopg.rows.tuple_row) as probe:
+                execute(
+                    probe,
+                    "EXPLAIN (ANALYZE,BUFFERS,TIMING OFF,FORMAT JSON) " + query,
+                    params,
+                )
+                plans.append(probe.fetchone()[0][0])
+        return execute(cursor, query, params, **kwargs)
+
+    monkeypatch.setattr(psycopg.Cursor, "execute", measured)
+    _drain()
+    if operation == "edit":
+        # Provider/shared edits publish once for every canonical placement;
+        # the native HTTP edit also has a recipient-specific delivery path.
+        with contexts.Context().session_manager() as session:
+            assert v2_projection._process_delivery_snapshot(
+                session,
+                {
+                    "project_id": api.project_id,
+                    "payload": {
+                        "source_kind": "message.updated",
+                        "canonical_message_uuid": str(canonical),
+                    },
+                },
+                100,
+            )
+    with contexts.Context().session_manager() as session:
+        publication.publish_pending(session)
+    assert plans, "The real publication path must read canonical message recipients"
+    for plan in plans:
+        assert (
+            plan["Plan"]["Shared Hit Blocks"] + plan["Plan"]["Shared Read Blocks"]
+            < 10000
+        ), json.dumps(plan)
+        scans = [
+            node
+            for node in history_plan._nodes(plan["Plan"])
+            if node.get("Relation Name")
+            in {
+                "messenger_user_message_bindings",
+                "messenger_message_placements",
+                "messenger_messages",
+            }
+        ]
+        assert scans
+        assert all(
+            (node["Actual Rows"] + node.get("Rows Removed by Filter", 0))
+            * node["Actual Loops"]
+            <= 30
+            for node in scans
+        ), json.dumps(plan)
+    for placement, user in (
+        (message["uuid"], api.user_uuid),
+        (message["uuid"], recipient),
+        (str(other_placement), api.user_uuid),
+    ):
+        response = api.get(MESSAGES + placement, user=user)
+        assert response.status_code == 200, response.text
+        row = response.json()
+        if operation == "reaction":
+            assert row["reactions"] == {"eyes": 1}
+        else:
+            assert row["payload"]["content"] == "Edited"
+        event = db.execute(
+            "SELECT payload FROM m_workspace_visible_events "
+            "WHERE project_id=%s AND user_uuid=%s AND object_type='message' "
+            "AND action='updated' AND payload->>'uuid'=%s "
+            "ORDER BY epoch_version DESC LIMIT 1",
+            (api.project_id, user, placement),
+        ).fetchone()
+        assert event is not None
+        assert event[0]["uuid"] == placement
+    assert db.execute(
+        "SELECT unread_count FROM messenger_user_topic_bindings "
+        "WHERE project_id=%s AND user_uuid=%s AND topic_uuid=%s",
+        (api.project_id, recipient, stream["default_topic_uuid"]),
+    ).fetchone() == (1,)
+    counter_event = db.execute(
+        "SELECT payload FROM m_workspace_visible_events "
+        "WHERE project_id=%s AND user_uuid=%s AND object_type='topic' "
+        "AND action='updated' AND payload->>'uuid'=%s "
+        "ORDER BY epoch_version DESC LIMIT 1",
+        (api.project_id, recipient, stream["default_topic_uuid"]),
+    ).fetchone()
+    assert counter_event is not None
+    assert counter_event[0]["unread_count"] == 1
+    print(
+        json.dumps(
+            {
+                "operation": operation,
+                "message_reads": len(plans),
+                "max_shared_blocks": max(
+                    p["Plan"]["Shared Hit Blocks"] + p["Plan"]["Shared Read Blocks"]
+                    for p in plans
+                ),
+            }
+        )
     )
