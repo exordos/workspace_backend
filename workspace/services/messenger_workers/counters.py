@@ -15,27 +15,31 @@ LOG = logging.getLogger(__name__)
 
 COUNT_TOPIC_SQL = """
     SELECT count(*) AS unread_count,
-           count(*) FILTER (WHERE CASE
+           count(*) FILTER (WHERE is_active) AS active_unread_count
+    FROM (
+        SELECT CASE
                WHEN personal.notification_mode='mute' THEN stream.source_name='zulip' AND mention.placement_uuid IS NOT NULL
                WHEN personal.notification_mode='follow' THEN true
                WHEN personal.notification_mode='unmute' THEN stream.source_name='zulip' OR mention.placement_uuid IS NOT NULL
                WHEN membership.notification_mode='all_messages' THEN true
                WHEN membership.notification_mode='mentions_only' THEN mention.placement_uuid IS NOT NULL
-               ELSE false END) AS active_unread_count
-    FROM messenger_user_message_unreads unread
-    JOIN messenger_user_message_bindings access ON
-        (access.project_id,access.user_uuid,access.placement_uuid)=(unread.project_id,unread.user_uuid,unread.placement_uuid)
-    JOIN messenger_message_placements placement ON placement.project_id=unread.project_id AND placement.uuid=unread.placement_uuid
-    JOIN messenger_messages message ON message.project_id=placement.project_id AND message.uuid=placement.message_uuid AND message.deleted_at IS NULL
-    JOIN messenger_topics topic ON topic.project_id=unread.project_id AND topic.uuid=unread.topic_uuid AND topic.deleted_at IS NULL
-    JOIN messenger_streams stream ON stream.project_id=unread.project_id AND stream.uuid=unread.stream_uuid AND stream.deleted_at IS NULL
-    JOIN messenger_stream_bindings membership ON membership.project_id=unread.project_id AND membership.user_uuid=unread.user_uuid
-        AND membership.stream_uuid=unread.stream_uuid AND membership.active
-    LEFT JOIN messenger_user_topic_bindings personal ON personal.project_id=unread.project_id
-        AND personal.user_uuid=unread.user_uuid AND personal.topic_uuid=unread.topic_uuid
-    LEFT JOIN messenger_user_message_mentions mention ON
-        (mention.project_id,mention.user_uuid,mention.placement_uuid)=(unread.project_id,unread.user_uuid,unread.placement_uuid)
-    WHERE unread.project_id=%s AND unread.user_uuid=%s AND unread.topic_uuid=%s
+               ELSE false END AS is_active
+        FROM messenger_user_message_unreads unread
+        JOIN messenger_user_message_bindings access ON
+            (access.project_id,access.user_uuid,access.placement_uuid)=(unread.project_id,unread.user_uuid,unread.placement_uuid)
+        JOIN messenger_message_placements placement ON placement.project_id=unread.project_id AND placement.uuid=unread.placement_uuid
+        JOIN messenger_messages message ON message.project_id=placement.project_id AND message.uuid=placement.message_uuid AND message.deleted_at IS NULL
+        JOIN messenger_topics topic ON topic.project_id=unread.project_id AND topic.uuid=unread.topic_uuid AND topic.deleted_at IS NULL
+        JOIN messenger_streams stream ON stream.project_id=unread.project_id AND stream.uuid=unread.stream_uuid AND stream.deleted_at IS NULL
+        JOIN messenger_stream_bindings membership ON membership.project_id=unread.project_id AND membership.user_uuid=unread.user_uuid
+            AND membership.stream_uuid=unread.stream_uuid AND membership.active
+        LEFT JOIN messenger_user_topic_bindings personal ON personal.project_id=unread.project_id
+            AND personal.user_uuid=unread.user_uuid AND personal.topic_uuid=unread.topic_uuid
+        LEFT JOIN messenger_user_message_mentions mention ON
+            (mention.project_id,mention.user_uuid,mention.placement_uuid)=(unread.project_id,unread.user_uuid,unread.placement_uuid)
+        WHERE unread.project_id=%s AND unread.user_uuid=%s AND unread.topic_uuid=%s
+        LIMIT 1001
+    ) bounded
 """
 
 
