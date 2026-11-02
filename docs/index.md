@@ -30,6 +30,7 @@ cleanup; the generated public API describes the current supported contract.
 ## Query plan validation
 
 - [Message pages, sparse flags and reference lookups](message_page_queries.md)
+- [Topic summary refresh and stale statistics](topic_summary_refresh.md)
 
 ## Translation contract
 
