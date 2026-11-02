@@ -67,23 +67,41 @@ ADVANCE_CURSOR_SQL = """
 """
 # Prerequisites may be newer than a full window of their waiting parents.
 # Rotate retries within each class so dependency chains can also make progress.
+# Compute blockers once for the whole pending inbox. Deferred and in-flight
+# events still block later events; dependency intentions never do.
 SELECT_EVENT_SQL = """
-    SELECT event.* FROM zulip_incoming_events event
-    WHERE event.processed_at IS NULL AND event.next_retry_at <= now()
-      AND NOT (event.id = ANY(%s::bigint[]))
-      AND (event.payload->>'type'='ensure_dependency' OR NOT EXISTS (
-          SELECT 1 FROM zulip_incoming_events earlier
-          WHERE earlier.project_id = event.project_id
-            AND earlier.provider_uuid = event.provider_uuid
-            AND earlier.id < event.id AND earlier.processed_at IS NULL
-            AND earlier.payload->>'type'<>'ensure_dependency'
-            AND (earlier.ordering_keys && event.ordering_keys
-                 OR earlier.ordering_keys = ARRAY['*']::text[]
-                 OR event.ordering_keys = ARRAY['*']::text[])
-      ))
-    ORDER BY CASE WHEN event.payload->>'type'='ensure_dependency' THEN 0 ELSE 1 END,
-             event.next_retry_at, event.id LIMIT %s
+WITH pending AS MATERIALIZED (
+ SELECT id, project_id, provider_uuid, ordering_keys, next_retry_at,
+        payload->>'type' AS kind
+ FROM zulip_incoming_events WHERE processed_at IS NULL
+), keyed AS (
+ SELECT id, min(id) FILTER (WHERE kind<>'ensure_dependency')
+  OVER (PARTITION BY project_id,provider_uuid,k.key) AS first_id
+ FROM pending CROSS JOIN LATERAL unnest(ordering_keys) AS k(key)
+ WHERE k.key IS NOT NULL
+), blocked AS (
+ SELECT DISTINCT id FROM keyed WHERE first_id<id
+), barriers AS (
+ SELECT project_id, provider_uuid, min(id) AS first_id,
+  min(id) FILTER (WHERE ordering_keys=ARRAY['*']::text[]) AS first_wildcard
+ FROM pending WHERE kind<>'ensure_dependency' GROUP BY project_id,provider_uuid
+), chosen AS MATERIALIZED (
+ SELECT event.id, event.kind, event.next_retry_at
+ FROM pending event LEFT JOIN blocked ON blocked.id=event.id
+ LEFT JOIN barriers ON barriers.project_id=event.project_id AND barriers.provider_uuid=event.provider_uuid
+ WHERE event.next_retry_at<=now() AND NOT (event.id=ANY(%s::bigint[]))
+  AND (event.kind='ensure_dependency' OR (
+   blocked.id IS NULL
+   AND (barriers.first_wildcard IS NULL OR barriers.first_wildcard>=event.id)
+   AND (event.ordering_keys<>ARRAY['*']::text[] OR barriers.first_id IS NULL OR barriers.first_id>=event.id)
+  ))
+ ORDER BY CASE WHEN event.kind='ensure_dependency' THEN 0 ELSE 1 END,event.next_retry_at,event.id
+ LIMIT %s
+)
+SELECT event.* FROM chosen JOIN zulip_incoming_events event ON event.id=chosen.id
+ORDER BY CASE WHEN chosen.kind='ensure_dependency' THEN 0 ELSE 1 END,chosen.next_retry_at,chosen.id
 """
+
 INSERT_DEPENDENCY_SQL = """
     INSERT INTO zulip_incoming_events (
         project_id, external_account_uuid, provider_uuid, owner_user_uuid,
