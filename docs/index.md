@@ -31,6 +31,8 @@ cleanup; the generated public API describes the current supported contract.
 
 - [Message pages, sparse flags and reference lookups](message_page_queries.md)
 - [Topic summary refresh and stale statistics](topic_summary_refresh.md)
+- [Physical deletion and prepared unread facts](messenger_physical_deletion.md)
+- [Unread and deletion validation](messenger_physical_deletion_testing.md)
 
 ## Translation contract
 

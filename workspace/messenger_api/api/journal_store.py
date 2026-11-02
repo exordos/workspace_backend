@@ -246,7 +246,7 @@ class JournalStore(v2_store.MessengerV2Store):
                 response = v2_store._public(self._stream(resource_uuid), resource)
                 topics = session.execute(
                     """SELECT uuid AS topic_uuid, stream_uuid FROM messenger_topics
-                       WHERE project_id=%s AND stream_uuid=%s AND deleted_at IS NULL
+                       WHERE project_id=%s AND stream_uuid=%s
                        ORDER BY uuid""",
                     (self.project_uuid, resource_uuid),
                 ).fetchall()
@@ -268,7 +268,7 @@ class JournalStore(v2_store.MessengerV2Store):
                          ON membership.project_id=access.project_id AND membership.user_uuid=access.user_uuid
                         AND membership.stream_uuid=placement.stream_uuid AND membership.active
                        WHERE placement.project_id=%s AND placement.topic_uuid=%s
-                         AND message.deleted_at IS NULL
+
                        ORDER BY message.created_at DESC, placement.uuid DESC LIMIT 1""",
                     (self.user_uuid, self.project_uuid, topic["topic_uuid"]),
                 ).fetchone()

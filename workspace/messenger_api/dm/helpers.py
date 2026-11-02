@@ -190,7 +190,7 @@ def _lock_workspace_draft_scope(
         """
         SELECT "uuid"
         FROM "messenger_streams"
-        WHERE "uuid" = %s AND "project_id" = %s AND deleted_at IS NULL
+        WHERE "uuid" = %s AND "project_id" = %s
         FOR KEY SHARE
         """,
         (stream_uuid, project_id),
@@ -203,7 +203,7 @@ def _lock_workspace_draft_scope(
         FROM "messenger_topics"
         WHERE "uuid" = %s
             AND "project_id" = %s
-            AND "stream_uuid" = %s AND deleted_at IS NULL
+            AND "stream_uuid" = %s
         FOR KEY SHARE
         """,
         (topic_uuid, project_id, stream_uuid),
@@ -1075,7 +1075,7 @@ def get_or_create_workspace_stream_bindings(
                     "(uuid, project_id, user_uuid, topic_uuid, notification_mode, source_name, provider_uuid, status) "
                     "SELECT messenger_uuid_v5(uuid, %s), project_id, %s, uuid, 'default', "
                     "source_name, provider_uuid, CASE WHEN source_name='native' THEN 'active' ELSE 'new' END "
-                    "FROM messenger_topics WHERE project_id=%s AND stream_uuid=%s AND deleted_at IS NULL "
+                    "FROM messenger_topics WHERE project_id=%s AND stream_uuid=%s "
                     "ON CONFLICT (project_id, user_uuid, topic_uuid) DO NOTHING",
                     (str(user_uuid), user_uuid, project_id, stream_uuid),
                 )
@@ -1095,7 +1095,7 @@ def get_or_create_workspace_stream_bindings(
                     "ON membership.project_id=topic.project_id "
                     "AND membership.stream_uuid=topic.stream_uuid "
                     "WHERE topic.project_id=%s AND topic.stream_uuid=%s "
-                    "AND topic.deleted_at IS NULL AND membership.user_uuid=%s "
+                    "AND membership.user_uuid=%s "
                     "AND membership.active",
                     (project_id, stream_uuid, user_uuid),
                 )
@@ -1201,8 +1201,7 @@ def _get_workspace_topic_message(
     row = session.execute(
         "SELECT placement.uuid, message.created_at FROM messenger_message_placements AS placement "
         "JOIN messenger_messages AS message ON message.project_id=placement.project_id AND message.uuid=placement.message_uuid "
-        "WHERE placement.project_id=%s AND placement.topic_uuid=%s AND placement.uuid=%s "
-        "AND message.deleted_at IS NULL",
+        "WHERE placement.project_id=%s AND placement.topic_uuid=%s AND placement.uuid=%s",
         (project_id, topic.uuid, message_uuid),
     ).fetchone()
     if row is None:

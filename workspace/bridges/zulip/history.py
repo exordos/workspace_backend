@@ -191,6 +191,31 @@ async def merge(
         )
 
 
+async def lock_memberships(
+    connection: typing.Any, project: object, user: object, expected: dict
+) -> None:
+    """Fence the prepared audience until its facts have committed."""
+    streams = sorted(expected, key=str)
+    await connection.execute(
+        "SELECT uuid FROM messenger_streams WHERE project_id=%s AND uuid=ANY(%s::uuid[]) ORDER BY uuid FOR KEY SHARE",
+        (project, streams),
+    )
+    current = {
+        row["stream_uuid"]: row["membership_generation"]
+        for row in await incoming_operations.rows(
+            connection,
+            "SELECT stream_uuid,membership_generation FROM messenger_stream_bindings "
+            "WHERE project_id=%s AND user_uuid=%s AND stream_uuid=ANY(%s::uuid[]) AND active "
+            "ORDER BY stream_uuid FOR KEY SHARE",
+            (project, user, streams),
+        )
+    }
+    if current != expected:
+        raise outgoing_operations.Pending(
+            "Membership changed while preparing history; prepare the page again"
+        )
+
+
 class Operations(incoming_operations.Operations):
     emit_public_event = False
 
@@ -715,6 +740,72 @@ class Operations(incoming_operations.Operations):
         self, connection: typing.Any, account: dict, batch: dict
     ) -> None:
         await execute(connection, "setup", TRANSACTION_SQL)
+        streams = {row["stream_uuid"] for row in batch["messenger_message_placements"]}
+        await lock_memberships(
+            connection,
+            account["project_id"],
+            account["owner_user_uuid"],
+            {
+                row["uuid"]: row["membership_generation"]
+                for row in batch["_context"]["streams"]
+                if row["uuid"] in streams
+            },
+        )
+        await connection.execute(
+            "SELECT uuid FROM messenger_topics WHERE project_id=%s AND uuid=ANY(%s::uuid[]) ORDER BY uuid FOR KEY SHARE",
+            (
+                account["project_id"],
+                list(
+                    {row["topic_uuid"] for row in batch["messenger_message_placements"]}
+                ),
+            ),
+        )
+        identifiers = sorted(
+            (row["uuid"] for row in batch["messenger_messages"]), key=str
+        )
+        await connection.execute(
+            "SELECT messenger_lock_message(%s,identifier) FROM unnest(%s::uuid[]) identifier ORDER BY identifier",
+            (account["project_id"], identifiers),
+        )
+        deleted = {
+            row["canonical_message_uuid"]
+            for row in await incoming_operations.rows(
+                connection,
+                "SELECT canonical_message_uuid FROM messenger_message_delete_tombstones "
+                "WHERE project_id=%s AND canonical_message_uuid=ANY(%s::uuid[])",
+                (account["project_id"], identifiers),
+            )
+        }
+        if deleted:
+            batch = {**batch}
+            batch["messenger_messages"] = [
+                row for row in batch["messenger_messages"] if row["uuid"] not in deleted
+            ]
+            batch["messenger_message_placements"] = [
+                row
+                for row in batch["messenger_message_placements"]
+                if row["message_uuid"] not in deleted
+            ]
+            placements = {row["uuid"] for row in batch["messenger_message_placements"]}
+            for table in (
+                "messenger_user_message_bindings",
+                "messenger_user_message_unreads",
+                "messenger_user_message_stars",
+                "messenger_user_message_mentions",
+            ):
+                batch[table] = [
+                    row for row in batch[table] if row["placement_uuid"] in placements
+                ]
+            batch["messenger_message_reaction_facts"] = [
+                row
+                for row in batch["messenger_message_reaction_facts"]
+                if row["canonical_message_uuid"] not in deleted
+            ]
+            batch["zulip_entity_links"] = [
+                row
+                for row in batch["zulip_entity_links"]
+                if row["entity_uuid"] not in deleted
+            ]
         for table, values in batch.items():
             if table != "_context":
                 await stage(connection, table, values)
@@ -922,7 +1013,7 @@ class Operations(incoming_operations.Operations):
     async def prepare_flags(self, account: dict, messages: list[dict]) -> dict | None:
         records = await self.db.sql(
             """
-            SELECT message.provider_identity,access.*,placement.message_uuid,placement.stream_uuid,placement.topic_uuid
+            SELECT message.provider_identity,access.*,placement.message_uuid,placement.stream_uuid,placement.topic_uuid,member.membership_generation
             FROM messenger_messages message
             JOIN LATERAL (
                 SELECT * FROM messenger_message_placements
@@ -933,7 +1024,7 @@ class Operations(incoming_operations.Operations):
                 WHERE project_id=placement.project_id AND placement_uuid=placement.uuid AND user_uuid=%s LIMIT 1
             ) access ON true
             JOIN LATERAL (
-                SELECT 1 FROM messenger_stream_bindings
+                SELECT membership_generation FROM messenger_stream_bindings
                 WHERE project_id=placement.project_id AND stream_uuid=placement.stream_uuid
                   AND user_uuid=access.user_uuid AND active LIMIT 1
             ) member ON true
@@ -950,7 +1041,7 @@ class Operations(incoming_operations.Operations):
         if len(records) != len(messages):
             return None
         by_id = {row["provider_identity"]: row for row in records}
-        batch: dict[str, list] = {
+        batch: dict = {
             table: []
             for table in (
                 "messenger_message_placements",
@@ -993,11 +1084,56 @@ class Operations(incoming_operations.Operations):
                 batch["messenger_user_message_unreads"].append(flag)
             if "starred" in item["flags"]:
                 batch["messenger_user_message_stars"].append(flag)
+        batch["_context"] = {
+            "memberships": {
+                row["stream_uuid"]: row["membership_generation"] for row in records
+            }
+        }
         return batch
 
     async def merge_personal_flags(self, connection: typing.Any, batch: dict) -> None:
         await execute(connection, "setup", TRANSACTION_SQL)
+        placements = batch["messenger_message_placements"]
+        if not placements:
+            return
+        project = placements[0]["project_id"]
+        await lock_memberships(
+            connection,
+            project,
+            batch["messenger_user_message_bindings"][0]["user_uuid"],
+            batch["_context"]["memberships"],
+        )
+        identifiers = sorted({row["message_uuid"] for row in placements}, key=str)
+        await connection.execute(
+            "SELECT messenger_lock_message(%s,identifier) FROM unnest(%s::uuid[]) identifier ORDER BY identifier",
+            (project, identifiers),
+        )
+        deleted = {
+            row["canonical_message_uuid"]
+            for row in await incoming_operations.rows(
+                connection,
+                "SELECT canonical_message_uuid FROM messenger_message_delete_tombstones "
+                "WHERE project_id=%s AND canonical_message_uuid=ANY(%s::uuid[])",
+                (project, identifiers),
+            )
+        }
+        live = {row["uuid"] for row in placements if row["message_uuid"] not in deleted}
+        batch = {
+            **batch,
+            "messenger_message_placements": [
+                row for row in placements if row["uuid"] in live
+            ],
+        }
+        for table in (
+            "messenger_user_message_bindings",
+            "messenger_user_message_unreads",
+            "messenger_user_message_stars",
+        ):
+            batch[table] = [
+                row for row in batch[table] if row["placement_uuid"] in live
+            ]
         for table, values in batch.items():
-            await stage(connection, table, values)
+            if table != "_context":
+                await stage(connection, table, values)
         await self.merge_flags(connection, ("unreads", "stars"))
         await self.queue_counters(connection)

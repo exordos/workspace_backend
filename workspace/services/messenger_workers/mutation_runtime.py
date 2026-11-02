@@ -482,8 +482,6 @@ class MutationRuntime:
                     task["uuid"],
                 ),
             )
-            if completed:
-                v2_projection._purge_completed_tombstone(session, task)
             if task["task_kind"] == "folder_projection" and task["payload"].get(
                 "user_uuid"
             ):

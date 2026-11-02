@@ -44,6 +44,11 @@ def _refresh_plan(db, project, topic, user):
         "SELECT prosrc FROM pg_proc "
         "WHERE oid='messenger_refresh_topic_summary_state(uuid,uuid,uuid[])'::regprocedure"
     ).fetchone()[0]
+    # The current function has a PL/pgSQL fast path before this UPDATE.
+    # Keep the boundary-plan regression focused on its installed history path;
+    # the empty-summary fast path has a separate function-call buffer budget.
+    query = query[query.index("UPDATE messenger_user_topic_bindings AS binding") :]
+    query = query.rsplit("\nEND;", 1)[0]
     query = (
         query.replace("target_project_id", "%(project)s::uuid")
         .replace("target_topic_uuid", "%(topic)s::uuid")
@@ -306,7 +311,7 @@ def test_summary_refresh_preserves_flags_boundaries_and_scope(api, db):
                 )
                 if scenario == "deleted_boundary":
                     db.execute(
-                        "UPDATE messenger_messages SET deleted_at=NOW() WHERE uuid=%s",
+                        "DELETE FROM messenger_messages WHERE uuid=%s",
                         (boundary,),
                     )
                 if scenario in {"deleted_topic", "deleted_stream"}:
@@ -315,9 +320,10 @@ def test_summary_refresh_preserves_flags_boundaries_and_scope(api, db):
                         if scenario == "deleted_topic"
                         else ("messenger_streams", stream)
                     )
-                    db.execute(
-                        f"UPDATE {table} SET deleted_at=NOW() WHERE uuid=%s", (key,)
-                    )
+                    db.execute(f"DELETE FROM {table} WHERE uuid=%s", (key,))
+                if scenario in {"deleted_topic", "deleted_stream"}:
+                    assert flags() == {}
+                    continue
                 if scenario == "inactive_peer":
                     db.execute(
                         "UPDATE messenger_stream_bindings SET active=false "

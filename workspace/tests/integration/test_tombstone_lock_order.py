@@ -6,7 +6,6 @@
 
 import concurrent.futures
 import threading
-import time
 import uuid
 from unittest import mock
 
@@ -22,10 +21,10 @@ from workspace.tests.integration import test_mutation_journal as journal
 conversation = journal.conversation
 
 
-@pytest.mark.parametrize("purged_index", [0, 1])
+@pytest.mark.parametrize("deleted_index", [0, 1])
 @pytest.mark.parametrize("fanout_batch_size", [1, 128])
-def test_public_delete_during_previous_message_purge_does_not_deadlock(
-    api, db, conversation, purged_index, fanout_batch_size
+def test_public_delete_finishes_while_previous_snapshot_delivery_is_paused(
+    api, db, conversation, deleted_index, fanout_batch_size
 ):
     stream, messages, peer = conversation
     cfg.CONF.set_override("enabled", False, group=mutation_journal_opts.DOMAIN)
@@ -45,21 +44,17 @@ def test_public_delete_during_previous_message_purge_does_not_deadlock(
         (provider, api.project_id),
     )
     assert (
-        api.delete(f"{native.MESSAGES}{messages[purged_index]['uuid']}").status_code
+        api.delete(f"{native.MESSAGES}{messages[deleted_index]['uuid']}").status_code
         == 204
     )
-    purging, release = threading.Event(), threading.Event()
-    original = v2_projection._purge_completed_tombstone
-    worker_pid = []
+    delivering, release = threading.Event(), threading.Event()
+    original = v2_projection._process_delivery_snapshot
 
-    def gated_purge(session, task):
+    def gated_delivery(session, task, batch_size):
         if task["payload"].get("source_kind") == "message.deleted":
-            worker_pid.append(
-                session.execute("SELECT pg_backend_pid() AS pid").fetchone()["pid"]
-            )
-            purging.set()
-            assert release.wait(10), "Tombstone purge was not released"
-        return original(session, task)
+            delivering.set()
+            assert release.wait(10), "Snapshot delivery was not released"
+        return original(session, task, batch_size)
 
     def project():
         for _ in range(20):
@@ -69,36 +64,27 @@ def test_public_delete_during_previous_message_purge_does_not_deadlock(
                     "tombstone-lock-regression",
                     fanout_batch_size=fanout_batch_size,
                 )
-            if purging.is_set():
+            if delivering.is_set():
                 return processed
-        raise AssertionError("Deletion fanout did not reach its purge")
+        raise AssertionError("Deletion fanout did not reach its delivery")
 
     with mock.patch.object(
-        v2_projection, "_purge_completed_tombstone", side_effect=gated_purge
+        v2_projection, "_process_delivery_snapshot", side_effect=gated_delivery
     ):
         with concurrent.futures.ThreadPoolExecutor(2) as pool:
             worker = pool.submit(project)
             try:
-                assert purging.wait(5), "Deletion fanout did not reach its purge"
+                assert delivering.wait(5), "Deletion fanout did not reach its delivery"
                 deleting = pool.submit(
-                    api.delete, f"{native.MESSAGES}{messages[1 - purged_index]['uuid']}"
+                    api.delete,
+                    f"{native.MESSAGES}{messages[1 - deleted_index]['uuid']}",
                 )
-                deadline = time.monotonic() + 5
-                while True:
-                    waiting = db.execute(
-                        "SELECT EXISTS(SELECT 1 FROM pg_stat_activity "
-                        "WHERE %s=ANY(pg_blocking_pids(pid)) AND wait_event_type='Lock')",
-                        (worker_pid[0],),
-                    ).fetchone()[0]
-                    if waiting:
-                        break
-                    assert not deleting.done(), (
-                        "Public delete finished before overlapping purge"
-                    )
-                    assert time.monotonic() < deadline, (
-                        "Public delete did not wait on the worker"
-                    )
-                    time.sleep(0.002)
+                response = deleting.result(timeout=5)
+                assert response.status_code == 204, response.text
+                assert not db.execute(
+                    "SELECT 1 FROM messenger_messages WHERE project_id=%s",
+                    (api.project_id,),
+                ).fetchall()
             finally:
                 release.set()
             assert worker.result(timeout=10)

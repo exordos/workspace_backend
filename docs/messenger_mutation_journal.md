@@ -81,10 +81,11 @@ are required for batching; migration 0258 is required for bounded admission and
 receipt collection. The owned flag batch also respects the history snapshot
 observation barrier, so a delayed realtime event cannot replace a newer snapshot.
 
-No explicit row or advisory locks coordinate new mutation/counter jobs.
 PostgreSQL INSERT/UPDATE/DELETE, foreign keys, schema migration and process
-ownership still use locks. The dispatcher uses a filesystem lock to reject a
-second owner on the same node. The lock is created with mode 0600 and rejects a
+ownership use locks. Import, native message creation and physical deletion share
+a transaction-scoped canonical-message fence; see
+[physical deletion](messenger_physical_deletion.md). The dispatcher uses a
+filesystem lock to reject a second owner on the same node. The lock is created with mode 0600 and rejects a
 final-component symlink; a newly created run directory has mode 0700. Provision
 existing run directories for the service UID and prevent untrusted writes.
 Running multiple dispatcher nodes is unsupported;
@@ -106,9 +107,9 @@ Applied deletes persist the canonical message UUID and ingest generation in
 tombstones have no membership FK and survive removal of the requesting project
 user and expiry of the command receipt. Migration 0258 backfills existing applied
 deletes before collection can run. **Do not purge these tombstones**: later
-provider observations must not recreate deleted messages. A new explicit native
-creation using the same UUID has a different ingest generation. Terminal commands
-discard accepted message bodies; successful result bodies are not retained.
+provider observations must not recreate deleted messages. Native creation with a
+deleted canonical UUID is rejected; a new message needs a fresh UUID. Terminal
+commands discard accepted message bodies; successful result bodies are not retained.
 
 Provider flag and reaction HTTP calls use prepare, HTTP without an open database
 transaction, and a fenced confirmation transaction. Immediately before issuing

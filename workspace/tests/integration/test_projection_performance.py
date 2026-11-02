@@ -410,7 +410,7 @@ def test_shared_preview_preserves_canonical_dates_and_uuid_ties(api, db, scope):
             (api.project_id, scope_uuid),
         ).fetchone() == (expected,)
         db.execute(
-            "UPDATE messenger_messages SET deleted_at=NOW() WHERE project_id=%s AND uuid=("
+            "DELETE FROM messenger_messages WHERE project_id=%s AND uuid=("
             "SELECT message_uuid FROM messenger_message_placements WHERE project_id=%s AND uuid=%s)",
             (api.project_id, api.project_id, expected),
         )

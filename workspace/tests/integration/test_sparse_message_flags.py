@@ -6,6 +6,7 @@ import time
 import uuid
 
 import psycopg
+import pytest
 
 from workspace.tests.integration import conftest, test_messenger_v2
 
@@ -113,9 +114,9 @@ def _scope_message(api, stream, topic_uuid, content):
     return response.json()
 
 
-def _soft_delete_canonical(db, project_id, placement_uuid):
+def _delete_canonical(db, project_id, placement_uuid):
     db.execute(
-        "UPDATE messenger_messages SET deleted_at=NOW() WHERE project_id=%s AND uuid=("
+        "DELETE FROM messenger_messages WHERE project_id=%s AND uuid=("
         "SELECT message_uuid FROM messenger_message_placements WHERE project_id=%s AND uuid=%s)",
         (project_id, project_id, placement_uuid),
     )
@@ -155,19 +156,19 @@ def test_shared_preview_is_independent_of_personal_message_visibility(api, db):
     )
 
 
-def test_restoring_a_topic_does_not_restore_a_deleted_canonical_as_last(api, db):
+def test_unarchiving_stream_does_not_restore_a_deleted_canonical_as_last(api, db):
     stream, _peer = _shared_scope(api, db)
     topic = stream["default_topic_uuid"]
     first = _scope_message(api, stream, topic, "Alive")
     last = _scope_message(api, stream, topic, "Deleted canonical")
-    _soft_delete_canonical(db, api.project_id, last["uuid"])
+    _delete_canonical(db, api.project_id, last["uuid"])
     db.execute(
-        "UPDATE messenger_topics SET deleted_at=NOW() WHERE project_id=%s AND uuid=%s",
-        (api.project_id, topic),
+        "UPDATE messenger_streams SET is_archived=true WHERE project_id=%s AND uuid=%s",
+        (api.project_id, stream["uuid"]),
     )
     db.execute(
-        "UPDATE messenger_topics SET deleted_at=NULL WHERE project_id=%s AND uuid=%s",
-        (api.project_id, topic),
+        "UPDATE messenger_streams SET is_archived=false WHERE project_id=%s AND uuid=%s",
+        (api.project_id, stream["uuid"]),
     )
     assert (
         api.get(f"{test_messenger_v2.STREAMS}{stream['uuid']}").json()[
@@ -190,21 +191,22 @@ def test_placement_moved_into_a_deleted_topic_cannot_become_a_shared_preview(api
     )
     assert topic_response.status_code == 201, topic_response.text
     second_topic = topic_response.json()["uuid"]
-    first = _scope_message(api, stream, first_topic, "Visible")
+    _scope_message(api, stream, first_topic, "Visible")
     moved = _scope_message(api, stream, first_topic, "Moved to deleted scope")
     db.execute(
-        "UPDATE messenger_topics SET deleted_at=NOW() WHERE project_id=%s AND uuid=%s",
+        "DELETE FROM messenger_topics WHERE project_id=%s AND uuid=%s",
         (api.project_id, second_topic),
     )
-    db.execute(
-        "UPDATE messenger_message_placements SET topic_uuid=%s WHERE project_id=%s AND uuid=%s",
-        (second_topic, api.project_id, moved["uuid"]),
-    )
+    with pytest.raises(psycopg.errors.ForeignKeyViolation):
+        db.execute(
+            "UPDATE messenger_message_placements SET topic_uuid=%s WHERE project_id=%s AND uuid=%s",
+            (second_topic, api.project_id, moved["uuid"]),
+        )
     assert (
         api.get(f"{test_messenger_v2.STREAMS}{stream['uuid']}").json()[
             "last_message_uuid"
         ]
-        == first["uuid"]
+        == moved["uuid"]
     )
     assert (
         db.execute(
@@ -230,7 +232,7 @@ def test_counter_worker_refreshes_summary_when_first_and_last_message_changes(ap
             ]
             is True
         )
-    _soft_delete_canonical(db, api.project_id, message["uuid"])
+    _delete_canonical(db, api.project_id, message["uuid"])
     test_messenger_v2._drain()
     for user in (api.user_uuid, peer):
         result = api.get(f"{test_messenger_v2.STREAM_TOPICS}{topic}", user=user).json()
@@ -271,12 +273,12 @@ def test_concurrent_deletion_of_last_and_previous_messages_keeps_a_live_preview(
             (api.project_id, stream["uuid"]),
         )
         last_future = pool.submit(
-            _soft_delete_canonical, deleting_last, api.project_id, last["uuid"]
+            _delete_canonical, deleting_last, api.project_id, last["uuid"]
         )
         try:
             _wait_for_database_lock(db, deleting_last.info.backend_pid, last_future)
             previous_future = pool.submit(
-                _soft_delete_canonical,
+                _delete_canonical,
                 deleting_previous,
                 api.project_id,
                 previous["uuid"],
@@ -305,18 +307,19 @@ def test_moving_a_placement_into_a_deleted_stream_does_not_set_shared_previews(a
         json={"name": "Deleted stream destination", "description": ""},
     ).json()
     db.execute(
-        "UPDATE messenger_streams SET deleted_at=NOW() WHERE project_id=%s AND uuid=%s",
+        "DELETE FROM messenger_streams WHERE project_id=%s AND uuid=%s",
         (api.project_id, destination["uuid"]),
     )
-    db.execute(
-        "UPDATE messenger_message_placements SET stream_uuid=%s,topic_uuid=%s WHERE project_id=%s AND uuid=%s",
-        (
-            destination["uuid"],
-            destination["default_topic_uuid"],
-            api.project_id,
-            message["uuid"],
-        ),
-    )
+    with pytest.raises(psycopg.errors.ForeignKeyViolation):
+        db.execute(
+            "UPDATE messenger_message_placements SET stream_uuid=%s,topic_uuid=%s WHERE project_id=%s AND uuid=%s",
+            (
+                destination["uuid"],
+                destination["default_topic_uuid"],
+                api.project_id,
+                message["uuid"],
+            ),
+        )
     for scope, scope_uuid in (
         ("stream", destination["uuid"]),
         ("topic", destination["default_topic_uuid"]),
@@ -327,23 +330,18 @@ def test_moving_a_placement_into_a_deleted_stream_does_not_set_shared_previews(a
         ).fetchall()
 
 
-def test_stream_restore_rebuilds_only_live_shared_previews(api, db):
+def test_archive_roundtrip_keeps_only_live_shared_previews(api, db):
     stream, peer = _shared_scope(api, db)
     topic = stream["default_topic_uuid"]
     first = _scope_message(api, stream, topic, "Restored live message")
     last = _scope_message(api, stream, topic, "Deleted before stream restore")
-    _soft_delete_canonical(db, api.project_id, last["uuid"])
+    _delete_canonical(db, api.project_id, last["uuid"])
     db.execute(
-        "UPDATE messenger_streams SET deleted_at=NOW() WHERE project_id=%s AND uuid=%s",
+        "UPDATE messenger_streams SET is_archived=true WHERE project_id=%s AND uuid=%s",
         (api.project_id, stream["uuid"]),
     )
-    for scope, scope_uuid in (("stream", stream["uuid"]), ("topic", topic)):
-        assert not db.execute(
-            f"SELECT placement_uuid FROM messenger_{scope}_last_messages WHERE project_id=%s AND {scope}_uuid=%s",
-            (api.project_id, scope_uuid),
-        ).fetchall()
     db.execute(
-        "UPDATE messenger_streams SET deleted_at=NULL WHERE project_id=%s AND uuid=%s",
+        "UPDATE messenger_streams SET is_archived=false WHERE project_id=%s AND uuid=%s",
         (api.project_id, stream["uuid"]),
     )
     for user in (api.user_uuid, peer):

@@ -68,23 +68,19 @@ def mark_read(
             predicates.append(f"unread.{name}=%s")
             values.append(value)
     if boundary is not None:
-        predicates.append("(message.created_at,placement.uuid)<=(%s,%s)")
+        predicates.append(
+            "(binding.preview_created_at,binding.placement_uuid)<=(%s,%s)"
+        )
         values.extend(boundary)
+        using = "USING messenger_user_message_bindings binding"
+        predicates.append(
+            "(binding.project_id,binding.user_uuid,binding.placement_uuid)="
+            "(unread.project_id,unread.user_uuid,unread.placement_uuid)"
+        )
+    else:
+        using = ""
     return session.execute(
-        f"""DELETE FROM messenger_user_message_unreads unread
-            USING messenger_user_message_bindings binding,
-                  messenger_message_placements placement,messenger_messages message,
-                  messenger_stream_bindings membership,messenger_topics topic,messenger_streams stream
-            WHERE {" AND ".join(predicates)}
-              AND (binding.project_id,binding.user_uuid,binding.placement_uuid)=
-                  (unread.project_id,unread.user_uuid,unread.placement_uuid)
-              AND placement.project_id=unread.project_id AND placement.uuid=unread.placement_uuid
-              AND message.project_id=placement.project_id AND message.uuid=placement.message_uuid
-              AND message.deleted_at IS NULL
-              AND topic.project_id=unread.project_id AND topic.uuid=unread.topic_uuid AND topic.deleted_at IS NULL
-              AND stream.project_id=unread.project_id AND stream.uuid=unread.stream_uuid AND stream.deleted_at IS NULL
-              AND membership.project_id=unread.project_id AND membership.user_uuid=unread.user_uuid
-              AND membership.stream_uuid=unread.stream_uuid AND membership.active
-            RETURNING unread.placement_uuid""",
+        f"""DELETE FROM messenger_user_message_unreads unread {using}
+            WHERE {" AND ".join(predicates)} RETURNING unread.placement_uuid""",
         values,
     ).fetchall()

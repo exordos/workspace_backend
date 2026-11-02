@@ -134,7 +134,7 @@ def test_message_references_keep_the_complete_visibility_rules(incoming, case):
             "deleted_stream": ("messenger_streams", stream),
         }[case]
         db.execute(
-            f"UPDATE {table} SET deleted_at=now() WHERE project_id=%s AND uuid=%s",
+            f"DELETE FROM {table} WHERE project_id=%s AND uuid=%s",
             (account["project_id"], identifier),
         )
     elif case == "inactive_membership":
