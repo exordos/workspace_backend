@@ -142,6 +142,18 @@ Die Ebenen werden direkt in diesen Bindungen gespeichert, weil die Aggregat-Bere
 Eine separate State-Tabelle wird nicht ohne eine bewiesene
 Die Notwendigkeit , den Lebenszyklus von Zugriff und Projektion zu trennen.
 
+Der unabhängige Zähler-Worker begrenzt jede Neuberechnung eines Themas pro
+Benutzer auf 1001 geeignete ungelesene Platzierungen nach den bestehenden
+Zugriffs-, Mitgliedschafts- und Löschprüfungen. `unread_count` und
+`active_unread_count` verwenden dieselbe begrenzte Eingabe und die bisherigen
+Benachrichtigungsregeln; `passive_unread_count` bleibt ihre Differenz.
+Oberhalb der Grenze beschreiben die Kategorien die ausgewählte Teilmenge mit
+unbestimmter Reihenfolge; Erwähnungen außerhalb können fehlen. Die UI zeigt
+Werte über 1000 in ganzen Tausenderstufen (`1k+`, `2k+` und so weiter).
+Stream-, Ordner- und Projektzähler behalten ihre Summierungsregeln und können
+1001 überschreiten. API-Felder und Ungelesen-Fakten bleiben unverändert;
+bestehende Themen-Caches übernehmen die Grenze bei der nächsten Neuberechnung.
+
 `FOLDER_ITEM` verbindet die kanonische `FOLDER` mit einem unterstützten
 kannonisches Objekt, z.B. `STREAM`, streng in Form eines wirksamen
 Der öffentliche Vertrag folders/folder_items. kopiert kein Objekt und gibt kein

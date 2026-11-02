@@ -101,6 +101,16 @@ The shape of public JSON and URLs does not change, but the UUID semantics do. Th
 
 Ready `unread_count`, `mention_count` and other aggregates of the corresponding level are stored directly in these bindings because the aggregate scope matches the row cardinality. A separate state table is not introduced without proven necessity to separate access lifecycle and projection.
 
+The independent counter worker limits each topic/user recount to 1001 eligible
+unread placements after the existing access, membership and deletion checks.
+Both `unread_count` and `active_unread_count` use that same bounded input and
+the existing notification rules; `passive_unread_count` remains their difference.
+Above the limit, category counts describe the selected subset, whose order is
+unspecified, and may omit mentions outside it. The UI displays unread values
+above 1000 in whole-thousand buckets (`1k+`, `2k+`, and so on). Stream, folder and project counters retain their existing
+summation rules and may exceed 1001. No API fields or unread facts are changed;
+existing cached topics adopt the limit on their next recount.
+
 `FOLDER_ITEM` links a canonical `FOLDER` with one supported canonical object, for example `STREAM`, strictly in the form of the current public contract folders/folder_items. It does not copy the object and does not introduce new public actions. Folder and item views use only simple indexed joins; `COUNT` and message traversal in the request path are prohibited.
 
 Normalized `FOLDER_ITEM` — source of truth for composition. For the current nested public `folder_items` without N+1 and aggregation when reading `USER_FOLDER_BINDING` stores ready read-only JSONB

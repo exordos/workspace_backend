@@ -702,6 +702,193 @@ def _project_count(db, api, user):
     ).fetchone()
 
 
+def _add_counter_unreads(db, api, stream, user, count, topic=None):
+    db.execute(
+        """WITH template AS (
+               SELECT content_uuid FROM messenger_messages WHERE project_id=%s LIMIT 1
+           ), messages AS (
+               INSERT INTO messenger_messages(uuid,project_id,author_uuid,content_uuid)
+               SELECT gen_random_uuid(),%s,%s,content_uuid
+               FROM generate_series(1,%s) CROSS JOIN template
+               RETURNING uuid,project_id
+           ), placements AS (
+               INSERT INTO messenger_message_placements(uuid,project_id,message_uuid,stream_uuid,topic_uuid)
+               SELECT gen_random_uuid(),project_id,uuid,%s,%s FROM messages RETURNING *
+           ), bindings AS (
+               INSERT INTO messenger_user_message_bindings(uuid,project_id,placement_uuid,user_uuid)
+               SELECT gen_random_uuid(),project_id,uuid,%s FROM placements RETURNING *
+           ) INSERT INTO messenger_user_message_unreads(project_id,user_uuid,placement_uuid,stream_uuid,topic_uuid)
+             SELECT binding.project_id,binding.user_uuid,binding.placement_uuid,placement.stream_uuid,placement.topic_uuid
+             FROM bindings binding JOIN placements placement ON placement.uuid=binding.placement_uuid""",
+        (
+            api.project_id,
+            api.project_id,
+            api.user_uuid,
+            count,
+            stream["uuid"],
+            topic or stream["default_topic_uuid"],
+            user,
+        ),
+    )
+
+
+@pytest.mark.parametrize("count", [999, 1000, 1001, 1002, 5000])
+def test_counter_limits_shared_input_without_removing_unread_facts(
+    api, db, conversation, count
+):
+    stream, _messages, peer = conversation
+    _add_counter_unreads(db, api, stream, peer, count - 2)
+    values = (api.project_id, peer, stream["default_topic_uuid"])
+    assert db.execute(counters.COUNT_TOPIC_SQL, values).fetchone() == (
+        min(count, 1001),
+        min(count, 1001),
+    )
+    assert db.execute(
+        "SELECT count(*) FROM messenger_user_message_unreads "
+        "WHERE project_id=%s AND user_uuid=%s AND topic_uuid=%s",
+        values,
+    ).fetchone() == (count,)
+
+
+@pytest.mark.isolated_schema
+def test_large_counter_scope_bounds_message_lookups(api, db, conversation):
+    stream, _messages, peer = conversation
+    db.execute("ANALYZE messenger_messages,messenger_message_placements")
+    _add_counter_unreads(db, api, stream, peer, 29998)
+    db.execute(
+        "ANALYZE messenger_messages,messenger_message_placements,"
+        "messenger_user_message_bindings,messenger_user_message_unreads,"
+        "messenger_user_message_mentions,messenger_user_topic_bindings,"
+        "messenger_stream_bindings,messenger_topics,messenger_streams"
+    )
+    values = (api.project_id, peer, stream["default_topic_uuid"])
+    assert db.execute(counters.COUNT_TOPIC_SQL, values).fetchone() == (1001, 1001)
+    plan = db.execute(
+        "EXPLAIN (ANALYZE,BUFFERS,TIMING OFF,FORMAT JSON) " + counters.COUNT_TOPIC_SQL,
+        values,
+    ).fetchone()[0][0]
+
+    def nodes(node):
+        yield node
+        for child in node.get("Plans", []):
+            yield from nodes(child)
+
+    work = {
+        table: sum(
+            node["Actual Rows"] * node["Actual Loops"]
+            for node in nodes(plan["Plan"])
+            if node.get("Relation Name") == table
+        )
+        for table in (
+            "messenger_messages",
+            "messenger_message_placements",
+            "messenger_user_message_bindings",
+        )
+    }
+    assert all(rows <= 2000 for rows in work.values()), plan
+    print(
+        json.dumps(
+            {"counter_lookup_rows": work, "execution_ms": plan["Execution Time"]}
+        )
+    )
+
+
+def test_bounded_topic_counts_sum_and_publish_without_capping_parent_totals(
+    api, db, conversation
+):
+    stream, _messages, peer = conversation
+    cfg.CONF.set_override("enabled", False, group=mutation_journal_opts.DOMAIN)
+    topic = stream["default_topic_uuid"]
+    _add_counter_unreads(db, api, stream, peer, 4998)
+    db.execute(
+        "UPDATE messenger_user_topic_bindings SET notification_mode='mute' "
+        "WHERE project_id=%s AND user_uuid=%s AND topic_uuid=%s",
+        (api.project_id, peer, topic),
+    )
+    response = api.post(
+        native.STREAM_TOPICS,
+        json={"stream_uuid": stream["uuid"], "name": "Small counter scope"},
+    )
+    assert response.status_code == 201, response.text
+    small_topic = response.json()["uuid"]
+    native._drain()
+    _add_counter_unreads(db, api, stream, peer, 3, small_topic)
+    second_stream = api.post(
+        native.STREAMS, json={"name": "Second counter stream"}
+    ).json()
+    added = api.post(
+        f"{native.STREAMS}{second_stream['uuid']}/actions/add_users/invoke",
+        json={"member": [str(peer)]},
+    )
+    assert added.status_code == 200, added.text
+    native._drain()
+    _add_counter_unreads(db, api, second_stream, peer, 1002)
+    folder = api.post(native.FOLDERS, user=peer, json={"title": "Counter folder"})
+    assert folder.status_code == 201, folder.text
+    item = api.post(
+        native.FOLDER_ITEMS,
+        user=peer,
+        json={
+            "folder_uuid": folder.json()["uuid"],
+            "stream_uuid": stream["uuid"],
+            "chat_type": "stream",
+        },
+    )
+    assert item.status_code == 201, item.text
+    item = api.post(
+        native.FOLDER_ITEMS,
+        user=peer,
+        json={
+            "folder_uuid": folder.json()["uuid"],
+            "stream_uuid": second_stream["uuid"],
+            "chat_type": "stream",
+        },
+    )
+    assert item.status_code == 201, item.text
+    native._drain()
+    for resource, identifier, expected in (
+        (native.STREAM_TOPICS, topic, (1001, 0, 1001)),
+        (native.STREAM_TOPICS, small_topic, (3, 3, 0)),
+        (native.STREAMS, stream["uuid"], (1004, 3, 1001)),
+        (native.STREAMS, second_stream["uuid"], (1001, 1001, 0)),
+    ):
+        snapshot = api.get(f"{resource}{identifier}", user=peer).json()
+        assert (
+            tuple(
+                snapshot[key]
+                for key in (
+                    "unread_count",
+                    "active_unread_count",
+                    "passive_unread_count",
+                )
+            )
+            == expected
+        )
+    folder_snapshot = api.get(
+        f"{native.FOLDERS}{folder.json()['uuid']}", user=peer
+    ).json()
+    # Folder badges retain their existing sum of stream active counts.
+    assert folder_snapshot["unread_count"] == 1004
+    assert {
+        item["stream_uuid"]: item["unread_count"]
+        for item in folder_snapshot["folder_items"]
+    } == {
+        stream["uuid"]: 1004,
+        second_stream["uuid"]: 1001,
+    }
+    assert _project_count(db, api, peer) == (2005, 1004, 1001)
+    published = db.execute(
+        "SELECT payload FROM m_workspace_visible_events WHERE project_id=%s AND user_uuid=%s "
+        "AND payload->>'uuid'=%s AND payload ? 'unread_count' ORDER BY epoch_version DESC LIMIT 1",
+        (api.project_id, peer, stream["uuid"]),
+    ).fetchone()[0]
+    assert (
+        published["unread_count"],
+        published["active_unread_count"],
+        published["passive_unread_count"],
+    ) == (1004, 3, 1001)
+
+
 def test_stream_read_preserves_unreads_in_a_deleted_topic(api, db, conversation):
     stream, messages, peer = conversation
     cfg.CONF.set_override("enabled", False, group=mutation_journal_opts.DOMAIN)
