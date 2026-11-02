@@ -79,6 +79,16 @@ Small INSERTs retain normal indexed plans. Planner settings apply only within
 the two repair functions and are restored before the caller continues; other
 request work and connections keep their settings.
 
+Canonical message publication first resolves every placement UUID through
+`messenger_message_placements(project_id, message_uuid)`, then constrains the
+protected message view by those public UUIDs as well as the canonical identity.
+The canonical predicate alone is behind a `LATERAL` limit and can expand every
+project binding before filtering. Reaction snapshots and edited-message events
+share this lookup. Keep the existing project, optional recipient and active
+membership guards, and include every placement of the canonical message.
+The lookup runs while a global projection owns project event ordering; bounding
+it also prevents unrelated counter snapshots from waiting on a history scan.
+
 Outgoing Zulip reference resolution accepts both placement and canonical
 message UUIDs. Use two indexed branches with `UNION ALL` and a final `LIMIT 1`,
 keeping the same visibility conditions in each branch. Resolve canonical message

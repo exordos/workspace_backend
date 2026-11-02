@@ -1125,6 +1125,22 @@ def _v2_rows(
     )
 
 
+def _canonical_message_filters(
+    session: typing.Any, project_id: object, message_uuid: object
+) -> dict[str, typing.Any]:
+    # The canonical identity is behind a LATERAL limit in the message view.
+    # Resolve placements first so the view starts from their access bindings.
+    placements = session.execute(
+        "SELECT uuid FROM messenger_message_placements "
+        "WHERE project_id=%s AND message_uuid=%s",
+        (project_id, message_uuid),
+    ).fetchall()
+    return {
+        "canonical_message_uuid": dm_filters.EQ(message_uuid),
+        "uuid": dm_filters.In([row["uuid"] for row in placements]),
+    }
+
+
 def _emit_message_updated_rows(
     session: typing.Any,
     project_id: object,
@@ -1800,7 +1816,9 @@ def _process_reaction_snapshot(
         rows = _v2_rows(
             v2_models.WorkspaceUserMessage,
             task["project_id"],
-            {"canonical_message_uuid": dm_filters.EQ(message.canonical_message_uuid)},
+            _canonical_message_filters(
+                session, task["project_id"], message.canonical_message_uuid
+            ),
             order_by={"uuid": "asc", "user_uuid": "asc"},
         )
         _emit_message_updated_rows(session, task["project_id"], rows)
@@ -2535,11 +2553,9 @@ def _deliver_snapshot_batch(
         return
     if source_kind == "message.updated":
         if payload.get("canonical_message_uuid"):
-            filters = {
-                "canonical_message_uuid": dm_filters.EQ(
-                    _uuid(payload["canonical_message_uuid"])
-                )
-            }
+            filters = _canonical_message_filters(
+                session, task["project_id"], _uuid(payload["canonical_message_uuid"])
+            )
         else:
             filters = {"uuid": dm_filters.EQ(_uuid(payload["placement_uuid"]))}
         if payload.get("recipient_uuid"):
