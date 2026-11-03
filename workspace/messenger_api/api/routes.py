@@ -181,6 +181,10 @@ class WorkspaceDraftRoute(routes.Route):
     ]
 
 
+class TelegramAuthAction(routes.Action):
+    __controller__ = controllers.ExternalAccountController
+
+
 class ExternalAccountRoute(routes.Route):
     __controller__ = controllers.ExternalAccountController
     __allow_methods__ = [
@@ -190,6 +194,8 @@ class ExternalAccountRoute(routes.Route):
         routes.UPDATE,
         routes.DELETE,
     ]
+
+    telegram_auth = routes.action(TelegramAuthAction, invoke=True)
 
 
 class TopicSummaryEndpointRoute(routes.Route):

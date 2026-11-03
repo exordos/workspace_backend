@@ -1,0 +1,621 @@
+[
+  {
+    "name": "literal_markup",
+    "description": "Plain Telegram text must not acquire Markdown formatting.",
+    "message": {
+      "id": 1,
+      "content": "**bold?** _text_ [x](https://example.test) <tag> :smile: @alice",
+      "entities": [],
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "timestamp": 1767225600,
+      "type": "private",
+      "display_recipient": [
+        9,
+        12
+      ]
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "\\*\\*bold?\\*\\* \\_text\\_ \\[x\\]\\(https\\://example\\.test\\) \\<tag\\> \\:smile\\: \\@alice"
+    },
+    "unsupported_features": [],
+    "conversion_context": {
+      "message_uuids": {},
+      "original_url": "https://example.test/synthetic"
+    },
+    "workspace_assertion": {
+      "text": "**bold?** _text_ [x](https://example.test) <tag> :smile: @alice",
+      "absent": [
+        "strong",
+        "em",
+        "a",
+        "script"
+      ]
+    }
+  },
+  {
+    "name": "italic",
+    "description": "Telegram italic uses CommonMark emphasis in Workspace.",
+    "message": {
+      "id": 2,
+      "content": "italic",
+      "entities": [
+        {
+          "type": "MessageEntityItalic",
+          "offset": 0,
+          "length": 6
+        }
+      ],
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "timestamp": 1767225600,
+      "type": "private",
+      "display_recipient": [
+        9,
+        12
+      ]
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "*italic*"
+    },
+    "unsupported_features": [],
+    "conversion_context": {
+      "message_uuids": {},
+      "original_url": "https://example.test/synthetic"
+    },
+    "workspace_assertion": {
+      "selector": "em",
+      "text": "italic"
+    }
+  },
+  {
+    "name": "bold",
+    "description": "Bold survives conversion.",
+    "message": {
+      "id": 3,
+      "content": "bold",
+      "entities": [
+        {
+          "type": "MessageEntityBold",
+          "offset": 0,
+          "length": 4
+        }
+      ],
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "timestamp": 1767225600,
+      "type": "private",
+      "display_recipient": [
+        9,
+        12
+      ]
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "**bold**"
+    },
+    "unsupported_features": [],
+    "conversion_context": {
+      "message_uuids": {},
+      "original_url": "https://example.test/synthetic"
+    },
+    "workspace_assertion": {
+      "selector": "strong",
+      "text": "bold"
+    }
+  },
+  {
+    "name": "nested_unicode",
+    "description": "Nested entities use UTF-16 offsets after a non-BMP character.",
+    "message": {
+      "id": 4,
+      "content": "😀 bold italic",
+      "entities": [
+        {
+          "type": "MessageEntityBold",
+          "offset": 3,
+          "length": 11
+        },
+        {
+          "type": "MessageEntityItalic",
+          "offset": 8,
+          "length": 6
+        }
+      ],
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "timestamp": 1767225600,
+      "type": "private",
+      "display_recipient": [
+        9,
+        12
+      ]
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "😀 **bold *italic***"
+    },
+    "unsupported_features": [],
+    "conversion_context": {
+      "message_uuids": {},
+      "original_url": "https://example.test/synthetic"
+    },
+    "workspace_assertion": {
+      "selector": "strong em",
+      "text": "italic"
+    }
+  },
+  {
+    "name": "spoiler",
+    "description": "Hidden content remains a spoiler.",
+    "message": {
+      "id": 5,
+      "content": "secret",
+      "entities": [
+        {
+          "type": "MessageEntitySpoiler",
+          "offset": 0,
+          "length": 6
+        }
+      ],
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "timestamp": 1767225600,
+      "type": "private",
+      "display_recipient": [
+        9,
+        12
+      ]
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "||secret||"
+    },
+    "unsupported_features": [],
+    "conversion_context": {
+      "message_uuids": {},
+      "original_url": "https://example.test/synthetic"
+    },
+    "workspace_assertion": {
+      "selector": "[data-workspace-spoiler-inline]",
+      "text": "secret"
+    }
+  },
+  {
+    "name": "strike",
+    "description": "Strikethrough survives conversion.",
+    "message": {
+      "id": 6,
+      "content": "removed",
+      "entities": [
+        {
+          "type": "MessageEntityStrike",
+          "offset": 0,
+          "length": 7
+        }
+      ],
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "timestamp": 1767225600,
+      "type": "private",
+      "display_recipient": [
+        9,
+        12
+      ]
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "~~removed~~"
+    },
+    "unsupported_features": [],
+    "conversion_context": {
+      "message_uuids": {},
+      "original_url": "https://example.test/synthetic"
+    },
+    "workspace_assertion": {
+      "selector": "del",
+      "text": "removed"
+    }
+  },
+  {
+    "name": "code",
+    "description": "Code preserves literal Markdown and backticks.",
+    "message": {
+      "id": 7,
+      "content": "a`b *x*",
+      "entities": [
+        {
+          "type": "MessageEntityCode",
+          "offset": 0,
+          "length": 7
+        }
+      ],
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "timestamp": 1767225600,
+      "type": "private",
+      "display_recipient": [
+        9,
+        12
+      ]
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "``a`b *x*``"
+    },
+    "unsupported_features": [],
+    "conversion_context": {
+      "message_uuids": {},
+      "original_url": "https://example.test/synthetic"
+    },
+    "workspace_assertion": {
+      "selector": "code",
+      "text": "a`b *x*"
+    }
+  },
+  {
+    "name": "pre_language",
+    "description": "A code block preserves its language and literal contents.",
+    "message": {
+      "id": 8,
+      "content": "print(\"😀\")",
+      "entities": [
+        {
+          "type": "MessageEntityPre",
+          "offset": 0,
+          "length": 11,
+          "language": "python"
+        }
+      ],
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "timestamp": 1767225600,
+      "type": "private",
+      "display_recipient": [
+        9,
+        12
+      ]
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "```python\nprint(\"😀\")\n```"
+    },
+    "unsupported_features": [],
+    "conversion_context": {
+      "message_uuids": {},
+      "original_url": "https://example.test/synthetic"
+    },
+    "workspace_assertion": {
+      "selector": "pre code",
+      "text": "print(\"😀\")"
+    }
+  },
+  {
+    "name": "text_link",
+    "description": "A labeled URL preserves parentheses in its target.",
+    "message": {
+      "id": 9,
+      "content": "Example",
+      "entities": [
+        {
+          "type": "MessageEntityTextUrl",
+          "offset": 0,
+          "length": 7,
+          "url": "https://example.test/a(b)"
+        }
+      ],
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "timestamp": 1767225600,
+      "type": "private",
+      "display_recipient": [
+        9,
+        12
+      ]
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "[Example](<urn:url:https://example.test/a(b)>)"
+    },
+    "unsupported_features": [],
+    "conversion_context": {
+      "message_uuids": {},
+      "original_url": "https://example.test/synthetic"
+    },
+    "workspace_assertion": {
+      "selector": "a",
+      "href": "https://example.test/a(b)",
+      "text": "Example"
+    }
+  },
+  {
+    "name": "blockquote",
+    "description": "A multiline quote remains a block quote.",
+    "message": {
+      "id": 10,
+      "content": "one\ntwo",
+      "entities": [
+        {
+          "type": "MessageEntityBlockquote",
+          "offset": 0,
+          "length": 7
+        }
+      ],
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "timestamp": 1767225600,
+      "type": "private",
+      "display_recipient": [
+        9,
+        12
+      ]
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "> one\n> two"
+    },
+    "unsupported_features": [],
+    "conversion_context": {
+      "message_uuids": {},
+      "original_url": "https://example.test/synthetic"
+    },
+    "workspace_assertion": {
+      "selector": "blockquote",
+      "text": "one two"
+    }
+  },
+  {
+    "name": "underline_fallback",
+    "description": "Underline retains readable text; Workspace has no underline syntax.",
+    "message": {
+      "id": 11,
+      "content": "underlined",
+      "entities": [
+        {
+          "type": "MessageEntityUnderline",
+          "offset": 0,
+          "length": 10
+        }
+      ],
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "timestamp": 1767225600,
+      "type": "private",
+      "display_recipient": [
+        9,
+        12
+      ]
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "underlined"
+    },
+    "unsupported_features": [
+      "Underline is rendered as plain text."
+    ],
+    "conversion_context": {
+      "message_uuids": {},
+      "original_url": "https://example.test/synthetic"
+    },
+    "workspace_assertion": {
+      "text": "underlined"
+    }
+  },
+  {
+    "name": "edge_whitespace",
+    "description": "Entity edge spaces remain outside Markdown delimiters.",
+    "message": {
+      "id": 12,
+      "content": " bold ",
+      "entities": [
+        {
+          "type": "MessageEntityBold",
+          "offset": 0,
+          "length": 6
+        }
+      ],
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "timestamp": 1767225600,
+      "type": "private",
+      "display_recipient": [
+        9,
+        12
+      ]
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": " **bold** "
+    },
+    "unsupported_features": [],
+    "conversion_context": {
+      "message_uuids": {},
+      "original_url": "https://example.test/synthetic"
+    },
+    "workspace_assertion": {
+      "selector": "strong",
+      "text": "bold"
+    }
+  },
+  {
+    "name": "outgoing_italic",
+    "direction": "outgoing",
+    "description": "Workspace → Telegram: actual CommonMark semantics and UTF-16 entities.",
+    "message": {
+      "id": 13,
+      "content": "italic",
+      "entities": [
+        {
+          "type": "MessageEntityItalic",
+          "offset": 0,
+          "length": 6
+        }
+      ],
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "timestamp": 1767225600,
+      "type": "private",
+      "display_recipient": [
+        9,
+        12
+      ]
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "*italic*"
+    },
+    "unsupported_features": [],
+    "conversion_context": {
+      "message_uuids": {},
+      "original_url": "https://example.test/synthetic"
+    }
+  },
+  {
+    "name": "outgoing_bold",
+    "direction": "outgoing",
+    "description": "Workspace → Telegram: actual CommonMark semantics and UTF-16 entities.",
+    "message": {
+      "id": 14,
+      "content": "bold",
+      "entities": [
+        {
+          "type": "MessageEntityBold",
+          "offset": 0,
+          "length": 4
+        }
+      ],
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "timestamp": 1767225600,
+      "type": "private",
+      "display_recipient": [
+        9,
+        12
+      ]
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "__bold__"
+    },
+    "unsupported_features": [],
+    "conversion_context": {
+      "message_uuids": {},
+      "original_url": "https://example.test/synthetic"
+    }
+  },
+  {
+    "name": "outgoing_spoiler",
+    "direction": "outgoing",
+    "description": "Workspace → Telegram: actual CommonMark semantics and UTF-16 entities.",
+    "message": {
+      "id": 15,
+      "content": "secret",
+      "entities": [
+        {
+          "type": "MessageEntitySpoiler",
+          "offset": 0,
+          "length": 6
+        }
+      ],
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "timestamp": 1767225600,
+      "type": "private",
+      "display_recipient": [
+        9,
+        12
+      ]
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "||secret||"
+    },
+    "unsupported_features": [],
+    "conversion_context": {
+      "message_uuids": {},
+      "original_url": "https://example.test/synthetic"
+    }
+  },
+  {
+    "name": "outgoing_literal",
+    "direction": "outgoing",
+    "description": "Workspace → Telegram: actual CommonMark semantics and UTF-16 entities.",
+    "message": {
+      "id": 16,
+      "content": "*literal*",
+      "entities": [],
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "timestamp": 1767225600,
+      "type": "private",
+      "display_recipient": [
+        9,
+        12
+      ]
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "\\*literal\\*"
+    },
+    "unsupported_features": [],
+    "conversion_context": {
+      "message_uuids": {},
+      "original_url": "https://example.test/synthetic"
+    }
+  },
+  {
+    "name": "outgoing_mixed_spoiler",
+    "direction": "outgoing",
+    "description": "Workspace → Telegram: a spoiler must not corrupt surrounding CommonMark delimiter positions.",
+    "message": {
+      "id": 17,
+      "content": "😀 Bold italic strike hidden code",
+      "entities": [
+        {
+          "type": "MessageEntityBold",
+          "offset": 3,
+          "length": 4
+        },
+        {
+          "type": "MessageEntityItalic",
+          "offset": 8,
+          "length": 6
+        },
+        {
+          "type": "MessageEntityStrike",
+          "offset": 15,
+          "length": 6
+        },
+        {
+          "type": "MessageEntitySpoiler",
+          "offset": 22,
+          "length": 6
+        },
+        {
+          "type": "MessageEntityCode",
+          "offset": 29,
+          "length": 4
+        }
+      ],
+      "sender_id": 9,
+      "sender_full_name": "Alice Example",
+      "timestamp": 1767225600,
+      "type": "private",
+      "display_recipient": [
+        9,
+        12
+      ]
+    },
+    "expected_payload": {
+      "kind": "markdown",
+      "content": "😀 **Bold** *italic* ~~strike~~ ||hidden|| `code`"
+    },
+    "unsupported_features": [],
+    "conversion_context": {
+      "message_uuids": {},
+      "original_url": "https://example.test/synthetic"
+    }
+  }
+]

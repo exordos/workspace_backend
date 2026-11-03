@@ -1,0 +1,14 @@
+[Unit]
+Description=Workspace Telegram Synchronization
+After=network-online.target
+
+[Service]
+TimeoutStopSec=40
+Restart=always
+RestartSec=5s
+KillSignal=SIGINT
+ExecStartPre=/bin/sleep 2
+ExecStart=workspace-telegram --config-file /etc/workspace/workspace.conf --config-file /etc/workspace/telegram.conf
+
+[Install]
+WantedBy=multi-user.target

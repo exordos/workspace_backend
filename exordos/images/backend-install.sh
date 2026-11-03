@@ -29,6 +29,7 @@ WORKSPACE_BINARIES=(
     workspace-zulip-incoming
     workspace-zulip-history
     workspace-zulip-outgoing
+    workspace-telegram
     workspace-messenger-worker
     workspace-messenger-events
 )
@@ -88,6 +89,11 @@ sudo mkdir -p \
     /var/lib/workspace/messenger/files \
     /usr/local/bin
 sudo cp "$GC_PATH/etc/workspace/logging.yaml" "$GC_CFG_DIR/"
+if [ ! -e "$GC_CFG_DIR/telegram.conf" ]; then
+    sudo install -o root -g workspace -m 0640 /dev/null "$GC_CFG_DIR/telegram.conf"
+fi
+sudo chown root:workspace "$GC_CFG_DIR/telegram.conf"
+sudo chmod 0640 "$GC_CFG_DIR/telegram.conf"
 
 cd "$GC_PATH"
 uv sync --locked --no-dev

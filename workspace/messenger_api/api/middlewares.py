@@ -25,9 +25,27 @@ import webob
 
 from gcl_iam import middlewares as iam_middlewares
 from restalchemy.api import middlewares
+from restalchemy.api.middlewares import logging as logging_mw
 
 from workspace.messenger_api import exceptions as messenger_exceptions
 from workspace.messenger_api.api import versions
+
+
+class RequestLoggingMiddleware(logging_mw.LoggingMiddleware):
+    """Login payloads remain private even when API debug logging is enabled."""
+
+    def process_request(self, req: typing.Any) -> typing.Any:
+        if not req.path_info.rstrip("/").endswith("/actions/telegram_auth/invoke"):
+            return super().process_request(req)
+        started = time.monotonic()
+        response = req.get_response(self.application)
+        self.logger.info(
+            "Telegram authentication: HTTP %s %dms",
+            response.status_code,
+            int((time.monotonic() - started) * 1000),
+        )
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
 
 SERVER_SETTINGS_PATH = f"/{versions.API_VERSION_1_0}/messenger/server_settings"

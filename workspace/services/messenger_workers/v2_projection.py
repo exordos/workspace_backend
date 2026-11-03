@@ -1285,6 +1285,10 @@ def _enqueue_counter_outbox_events(
         )
 
 
+# Source-private Telegram channels are channels in the catalog, with unchanged ACLs.
+PERSONAL_STREAM_SQL = "(stream.private AND (stream.source_name<>'telegram' OR stream.direct_user_uuid IS NOT NULL))"
+
+
 def _enqueue_folder_outbox_events(
     session: typing.Any,
     *,
@@ -1297,7 +1301,7 @@ def _enqueue_folder_outbox_events(
 ) -> None:
     stream = session.execute(
         """
-        SELECT private FROM messenger_streams
+        SELECT private AND (source_name<>'telegram' OR direct_user_uuid IS NOT NULL) AS private FROM messenger_streams
         WHERE project_id = %s AND uuid = %s
         """,
         (project_id, stream_uuid),
@@ -1914,6 +1918,7 @@ def _process_folder_projection(
     user_uuid = _uuid(payload["user_uuid"])
     source_kind = payload["source_kind"]
     stream_uuid = payload.get("stream_uuid")
+    counter_stream_uuid = payload.get("counter_stream_uuid", stream_uuid)
     if (
         owned_projection.CURRENT.get() is None
         and source_kind in LEGACY_FOLDER_SNAPSHOT_SOURCE_KINDS
@@ -1985,7 +1990,7 @@ def _process_folder_projection(
     rule = binding["rule"]
     if rule != "custom":
         session.execute(
-            """
+            f"""
             DELETE FROM messenger_folder_items AS item
             WHERE item.project_id = %s AND item.user_uuid = %s
               AND item.folder_uuid = %s AND item.automatic
@@ -2002,8 +2007,8 @@ def _process_folder_projection(
                     AND stream.deleted_at IS NULL
                     AND (
                         %s = 'all_chats'
-                        OR (%s = 'personal' AND stream.private)
-                        OR (%s = 'channels' AND NOT stream.private)
+                        OR (%s = 'personal' AND {PERSONAL_STREAM_SQL})
+                        OR (%s = 'channels' AND NOT {PERSONAL_STREAM_SQL})
                     )
               )
             """,
@@ -2011,7 +2016,7 @@ def _process_folder_projection(
         )
         prefix = {"all_chats": "00", "personal": "11", "channels": "22"}[rule]
         session.execute(
-            """
+            f"""
             INSERT INTO messenger_folder_items (
                 uuid, project_id, user_uuid, folder_uuid, stream_uuid,
                 chat_type, automatic, created_at, updated_at
@@ -2019,7 +2024,7 @@ def _process_folder_projection(
             SELECT (%s || substr(stream.uuid::text, 3))::uuid,
                    membership.project_id, membership.user_uuid, %s,
                    stream.uuid,
-                   CASE WHEN %s = 'personal' OR stream.private
+                   CASE WHEN %s = 'personal' OR {PERSONAL_STREAM_SQL}
                         THEN 'private' ELSE 'stream' END,
                    true, NOW(), NOW()
             FROM messenger_stream_bindings AS membership
@@ -2031,13 +2036,17 @@ def _process_folder_projection(
               AND stream.deleted_at IS NULL
               AND (
                   %s = 'all_chats'
-                  OR (%s = 'personal' AND stream.private)
-                  OR (%s = 'channels' AND NOT stream.private)
+                  OR (%s = 'personal' AND {PERSONAL_STREAM_SQL})
+                  OR (%s = 'channels' AND NOT {PERSONAL_STREAM_SQL})
               )
             ON CONFLICT (project_id, user_uuid, folder_uuid, stream_uuid)
             DO UPDATE SET chat_type = EXCLUDED.chat_type,
                           automatic = true,
                           updated_at = NOW()
+            WHERE %s::uuid IS NULL
+               OR messenger_folder_items.stream_uuid = %s::uuid
+               OR messenger_folder_items.chat_type IS DISTINCT FROM EXCLUDED.chat_type
+               OR NOT messenger_folder_items.automatic
             """,
             (
                 prefix,
@@ -2048,6 +2057,8 @@ def _process_folder_projection(
                 rule,
                 rule,
                 rule,
+                counter_stream_uuid,
+                counter_stream_uuid,
             ),
         )
     session.execute(

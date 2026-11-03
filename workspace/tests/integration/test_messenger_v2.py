@@ -2274,3 +2274,169 @@ def test_native_v2_fanout_supports_more_than_five_thousand_recipients(api, db):
     assert batch_count == 6
     assert max_batch_size == 1000
     assert embeds_audience is False
+
+
+def test_native_announcement_stream_allows_staff_and_denies_members(api, db):
+    peer_uuid = sys_uuid.uuid4()
+    conftest.seed_workspace_user(db, peer_uuid, f"reader-{peer_uuid}")
+    _register_project_user(db, api.project_id, peer_uuid)
+    created = api.post(
+        STREAMS, json={"name": "Announcements", "announcement_only": True}
+    )
+    assert created.status_code == 201
+    stream = created.json()
+    assert stream["can_send"] is True
+    response = api.post(
+        f"{STREAMS}{stream['uuid']}/actions/add_users/invoke",
+        json={"member": [str(peer_uuid)]},
+    )
+    assert response.status_code == 200
+    binding_uuid = response.json()[0]["uuid"]
+    assert (
+        api.put(
+            f"{STREAM_BINDINGS}{binding_uuid}", user=peer_uuid, json={"role": "owner"}
+        ).status_code
+        == 403
+    )
+    assert (
+        api.post(
+            f"{STREAMS}{stream['uuid']}/actions/add_users/invoke",
+            user=peer_uuid,
+            json={"owner": [str(peer_uuid)]},
+        ).status_code
+        == 403
+    )
+    assert (
+        api.put(
+            f"{STREAMS}{stream['uuid']}",
+            user=peer_uuid,
+            json={"announcement_only": False},
+        ).status_code
+        == 403
+    )
+    reader_stream = api.get(f"{STREAMS}{stream['uuid']}", user=peer_uuid).json()
+    assert reader_stream["can_send"] is False
+    denied = api.post(
+        MESSAGES,
+        user=peer_uuid,
+        json={
+            "stream_uuid": stream["uuid"],
+            "payload": {"kind": "markdown", "content": "No write permission"},
+        },
+    )
+    assert denied.status_code == 403
+    assert denied.json()["type"] == "StreamReadOnlyError"
+    allowed = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream["uuid"],
+            "payload": {"kind": "markdown", "content": "Announcement"},
+        },
+    )
+    assert allowed.status_code == 201
+    changed = api.put(f"{STREAMS}{stream['uuid']}", json={"announcement_only": False})
+    assert changed.status_code == 200
+    assert (
+        api.get(f"{STREAMS}{stream['uuid']}", user=peer_uuid).json()["can_send"] is True
+    )
+    assert (
+        api.post(
+            MESSAGES,
+            user=peer_uuid,
+            json={
+                "stream_uuid": stream["uuid"],
+                "payload": {"kind": "markdown", "content": "Now allowed"},
+            },
+        ).status_code
+        == 201
+    )
+
+
+def test_creation_announcement_flag_does_not_make_a_native_stream_read_only(api, db):
+    peer_uuid = sys_uuid.uuid4()
+    conftest.seed_workspace_user(db, peer_uuid, f"reader-{peer_uuid}")
+    _register_project_user(db, api.project_id, peer_uuid)
+    created = api.post(STREAMS, json={"name": "Announced creation", "announce": True})
+    assert created.status_code == 201
+    stream = created.json()
+    assert stream["announce"] is True and not stream["announcement_only"]
+    assert (
+        api.post(
+            f"{STREAMS}{stream['uuid']}/actions/add_users/invoke",
+            json={"member": [str(peer_uuid)]},
+        ).status_code
+        == 200
+    )
+    assert api.get(f"{STREAMS}{stream['uuid']}", user=peer_uuid).json()["can_send"]
+    assert (
+        api.post(
+            MESSAGES,
+            user=peer_uuid,
+            json={
+                "stream_uuid": stream["uuid"],
+                "payload": {
+                    "kind": "markdown",
+                    "content": "Ordinary member can still send",
+                },
+            },
+        ).status_code
+        == 201
+    )
+
+
+def test_counter_folder_refresh_does_not_rewrite_unrelated_stream_items(api, db):
+    streams = []
+    for suffix in ("affected", "unrelated"):
+        response = api.post(STREAMS, json={"name": "Folder timestamp " + suffix})
+        assert response.status_code == 201, response.text
+        streams.append(response.json()["uuid"])
+    _drain()
+    with db.cursor() as cursor:
+        cursor.execute(
+            "SELECT uuid,updated_at FROM messenger_folder_items "
+            "WHERE project_id=%s AND user_uuid=%s AND stream_uuid=%s",
+            (api.project_id, api.user_uuid, streams[1]),
+        )
+        before = dict(cursor.fetchall())
+    assert len(before) >= 2
+    response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": streams[0],
+            "payload": {"kind": "markdown", "content": "Refresh one stream only"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    _drain()
+    with db.cursor() as cursor:
+        cursor.execute(
+            "SELECT uuid,updated_at FROM messenger_folder_items "
+            "WHERE project_id=%s AND user_uuid=%s AND stream_uuid=%s",
+            (api.project_id, api.user_uuid, streams[1]),
+        )
+        assert dict(cursor.fetchall()) == before
+
+
+def test_counter_folder_refresh_survives_a_removed_source_membership(api, db):
+    response = api.post(STREAMS, json={"name": "Detached counter scope"})
+    assert response.status_code == 201, response.text
+    stream_uuid = response.json()["uuid"]
+    _drain()
+    topic_uuid = db.execute(
+        "SELECT uuid FROM messenger_topics WHERE project_id=%s AND stream_uuid=%s",
+        (api.project_id, stream_uuid),
+    ).fetchone()[0]
+    db.execute(
+        "DELETE FROM messenger_stream_bindings WHERE project_id=%s AND user_uuid=%s AND stream_uuid=%s",
+        (api.project_id, api.user_uuid, stream_uuid),
+    )
+    db.execute(
+        "INSERT INTO messenger_counter_updates(project_id,user_uuid,stream_uuid,topic_uuid,publish_updates) VALUES (%s,%s,%s,%s,true) ON CONFLICT (project_id,user_uuid,topic_uuid) DO UPDATE SET publish_updates=true,next_retry_at=NULL",
+        (api.project_id, api.user_uuid, stream_uuid, topic_uuid),
+    )
+    with contexts.Context().session_manager() as session:
+        counters.process_pending(session, limit=100)
+    assert db.execute(
+        "SELECT count(*) FROM messenger_counter_updates WHERE project_id=%s AND user_uuid=%s AND topic_uuid=%s",
+        (api.project_id, api.user_uuid, topic_uuid),
+    ).fetchone() == (0,)

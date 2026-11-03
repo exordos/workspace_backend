@@ -157,3 +157,8 @@ class DraftPreconditionFailedError(ra_exc.RestAlchemyException):
 class ExternalResourceForbiddenError(ra_exc.RestAlchemyException):
     message = "External resource access is forbidden"
     code = 403
+
+
+class StreamReadOnlyError(ra_exc.RestAlchemyException):
+    message = "Sending messages to this stream is not permitted"
+    code = 403

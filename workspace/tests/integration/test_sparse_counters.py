@@ -34,6 +34,37 @@ from workspace.tests.integration import test_mutation_journal as journal_tests
 conversation = journal_tests.conversation
 
 
+@pytest.fixture
+def counter_provider_account(api, db):
+    provider = uuid.uuid5(uuid.NAMESPACE_DNS, "counter.example.com")
+    identifier = uuid.uuid4()
+    db.execute(
+        "INSERT INTO messenger_providers VALUES(%s,'counter.example.com') ON CONFLICT DO NOTHING",
+        (provider,),
+    )
+    db.execute(
+        "INSERT INTO m_external_accounts_v2(uuid,project_id,owner_user_uuid,provider,provider_uuid,external_account_id,status,settings) "
+        "VALUES(%s,%s,%s,'zulip',%s,'7','active',%s::jsonb)",
+        (
+            identifier,
+            api.project_id,
+            api.user_uuid,
+            provider,
+            json.dumps(
+                {
+                    "server_url": "https://counter.example.com",
+                    "email": "sender@example.com",
+                    "api_key": "synthetic",
+                }
+            ),
+        ),
+    )
+    try:
+        yield provider
+    finally:
+        db.execute("DELETE FROM m_external_accounts_v2 WHERE uuid=%s", (identifier,))
+
+
 def _count_one():
     with contexts.Context().session_manager() as session:
         return counters.process_pending(session)
@@ -130,15 +161,11 @@ def test_delete_after_read_change_does_not_deadlock_counter_acknowledgement(
 
 
 def test_public_provider_message_delete_during_count_preserves_revision_and_realtime(
-    api, db, conversation, _test_database_url
+    api, db, conversation, _test_database_url, counter_provider_account
 ):
     stream, messages, peer = conversation
     cfg.CONF.set_override("enabled", False, group=mutation_journal_opts.DOMAIN)
-    provider = uuid.uuid5(uuid.NAMESPACE_DNS, "counter.example.com")
-    db.execute(
-        "INSERT INTO messenger_providers VALUES(%s,'counter.example.com') ON CONFLICT DO NOTHING",
-        (provider,),
-    )
+    provider = counter_provider_account
     db.execute(
         "UPDATE messenger_streams SET source_name='zulip',provider_uuid=%s,provider_identity='42' "
         "WHERE project_id=%s AND uuid=%s",

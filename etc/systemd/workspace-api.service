@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=workspace
-ExecStart=workspace-api --config-file /etc/workspace/workspace.conf
+ExecStart=workspace-api --config-file /etc/workspace/workspace.conf --config-file /etc/workspace/telegram.conf
 Restart=on-failure
 
 [Install]

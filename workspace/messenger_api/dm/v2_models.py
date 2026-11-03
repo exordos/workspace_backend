@@ -16,6 +16,7 @@ import typing
 import uuid as sys_uuid
 
 from restalchemy.common import contexts
+from restalchemy.common import exceptions as ra_exceptions
 from restalchemy.dm import filters as dm_filters
 from restalchemy.dm import models
 from restalchemy.dm import properties
@@ -344,6 +345,7 @@ class WorkspaceStream(
     )
     invite_only = properties.property(types.Boolean(), default=False)
     announce = properties.property(types.Boolean(), default=False)
+    announcement_only = properties.property(types.Boolean(), default=False)
     direct_user_uuid = properties.property(types.AllowNone(types.UUID()), default=None)
     private = properties.property(types.Boolean(), default=False)
     is_archived = properties.property(types.Boolean(), default=False)
@@ -360,6 +362,8 @@ class WorkspaceStream(
         base.WorkspaceStreamBase.validate_private_identity(
             self.private, self.direct_user_uuid
         )
+        if self.announcement_only and self.encryption:
+            raise ra_exceptions.ValidationErrorException()
 
 
 class WorkspaceStreamBinding(

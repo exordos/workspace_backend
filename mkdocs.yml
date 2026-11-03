@@ -99,6 +99,7 @@ nav:
     - Architecture and contracts:
       - en/architecture.md
       - en/workspace_api.md
+      - en/telegram_provider.md
       - en/workspace_ui_realtime_integration.md
       - en/workspace_server_v2_decisions.md
     - Messenger design:
@@ -120,6 +121,7 @@ nav:
     - Архитектура и контракты:
       - ru/architecture.md
       - ru/workspace_api.md
+      - ru/telegram_provider.md
       - ru/workspace_ui_realtime_integration.md
       - ru/workspace_server_v2_decisions.md
     - Проектирование Messenger:
@@ -141,6 +143,7 @@ nav:
     - Architektur und Verträge:
       - de/architecture.md
       - de/workspace_api.md
+      - de/telegram_provider.md
       - de/workspace_ui_realtime_integration.md
       - de/workspace_server_v2_decisions.md
     - Messenger-Entwurf:
@@ -162,6 +165,7 @@ nav:
     - 架构和契约:
       - zh/architecture.md
       - zh/workspace_api.md
+      - zh/telegram_provider.md
       - zh/workspace_ui_realtime_integration.md
       - zh/workspace_server_v2_decisions.md
     - Messenger 设计:

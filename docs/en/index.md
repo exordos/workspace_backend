@@ -1,10 +1,10 @@
 # Workspace Backend Documentation
 
 Current contract: [Workspace public OpenAPI](../public_workspace_api.yaml).
-External accounts contain an owner, `provider` and generic `settings`.
-Workspace processes native messages and membership; provider synchronization and
-external delivery live elsewhere. The remaining design and architecture pages
-are historical references from before migration `0186`.
+External accounts are owner/project scoped. Zulip and Telegram synchronize
+through the canonical Messenger model, alongside native messaging.
+Provider guides describe the active implementation. Older design proposals
+remain historical references and do not authorize changes.
 
 The main navigation index for the Workspace Backend documentation. The status of each document is explicitly stated: **active contract/active architecture** describes current behavior, while a **proposal (design proposal)** applies only to future refactoring design and does not authorize code changes.
 
@@ -18,6 +18,10 @@ The main navigation index for the Workspace Backend documentation. The status of
 - worker (background executor) — handler for typed tasks and projections.
 
 Entity names, fields, routes, JSON values, and task types in the documents are preserved in their exact contractual form.
+
+## Telegram provider
+
+[Telegram accounts and realtime synchronization](telegram_provider.md).
 
 ## Public API and design history
 

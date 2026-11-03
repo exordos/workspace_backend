@@ -3,8 +3,11 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
+import difflib
 import pathlib
 import re
+
+import pytest
 
 
 PROJECT_ROOT = pathlib.Path(__file__).parents[3]
@@ -91,9 +94,37 @@ def test_local_documentation_links_resolve():
     assert not failures
 
 
-def test_added_file_identity_contract_is_english_in_every_language_tree():
-    for language in LANGUAGES:
-        text = (DOCS_ROOT / language / "workspace_api.md").read_text()
-        paragraph = text.split("{#files}", 1)[1].strip().split("\n\n", 1)[0]
-        assert paragraph.startswith("Imported file `provider_identity`")
-        assert paragraph.isascii()
+def _prose_words(text):
+    text = FENCE_RE.sub("", text)
+    text = INLINE_CODE_RE.sub("", text)
+    text = re.sub(r"\]\([^)]+\)", "]", text)
+    return re.findall(r"[^\W\d_]+", text.lower())
+
+
+@pytest.mark.parametrize("language", LANGUAGES[1:])
+@pytest.mark.parametrize(
+    "document", ("telegram_provider.md", "provider_identities.md", "index.md")
+)
+def test_provider_documentation_is_not_an_english_copy(language, document):
+    english = (DOCS_ROOT / "en" / document).read_text()
+    translated = (DOCS_ROOT / language / document).read_text()
+
+    similarity = difflib.SequenceMatcher(
+        None, _prose_words(english), _prose_words(translated), autojunk=False
+    ).ratio()
+    assert similarity < 0.5, f"{language}/{document} contains untranslated English prose"
+
+
+@pytest.mark.parametrize("language", LANGUAGES[1:])
+def test_file_identity_contract_is_localized_without_changing_machine_values(language):
+    def paragraph(locale):
+        text = (DOCS_ROOT / locale / "workspace_api.md").read_text()
+        return text.split("{#files}", 1)[1].strip().split("\n\n", 1)[0]
+
+    english = paragraph("en")
+    translated = paragraph(language)
+    assert set(INLINE_CODE_RE.findall(english)) <= set(INLINE_CODE_RE.findall(translated))
+    similarity = difflib.SequenceMatcher(
+        None, _prose_words(english), _prose_words(translated), autojunk=False
+    ).ratio()
+    assert similarity < 0.5, f"{language} file identity contract is not localized"

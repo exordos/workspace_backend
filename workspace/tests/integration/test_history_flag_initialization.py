@@ -49,8 +49,9 @@ def test_history_imports_final_flags_without_enqueuing_provider_repairs(incoming
         (account["project_id"],),
     ).fetchone() == (0,)
     assert db.execute(
-        "SELECT count(*),bool_or(publish_updates) FROM messenger_counter_updates "
-        "WHERE project_id=%s",
+        "SELECT count(*),bool_or(publish_updates) FROM messenger_counter_updates queued "
+        "WHERE project_id=%s AND EXISTS (SELECT 1 FROM messenger_message_placements placement "
+        "WHERE placement.project_id=queued.project_id AND placement.topic_uuid=queued.topic_uuid)",
         (account["project_id"],),
     ).fetchone() == (1, False)
 

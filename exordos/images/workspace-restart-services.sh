@@ -23,6 +23,7 @@ SERVICE_NAMES=(
     workspace-api
     workspace-zulip-incoming
     workspace-zulip-outgoing
+    workspace-telegram
     workspace-messenger-worker
     workspace-messenger-events
 )

@@ -121,6 +121,7 @@ class WorkspaceUserSource(str, enum.Enum):
     IAM = "iam"
     NATIVE = "native"
     ZULIP = "zulip"
+    TELEGRAM = "telegram"
     HIDDEN = "hidden"
 
 
@@ -286,10 +287,6 @@ class WorkspaceUser(
             )
             workspace_user = cls.objects.get_one_or_none(
                 filters={"uuid": dm_filters.EQ(user_uuid)},
-            )
-        if workspace_user is None:
-            workspace_user = cls.objects.get_one_or_none(
-                filters={"username": dm_filters.EQ(username)},
             )
         if workspace_user is None:
             workspace_user = cls(
