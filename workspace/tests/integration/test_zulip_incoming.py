@@ -4489,3 +4489,94 @@ def test_incoming_reaction_snapshots_omit_count_only_user_lists(incoming, limit)
         (canonical_uuid,),
     ).fetchone()[0]
     assert stored == expected_users
+
+
+@pytest.mark.parametrize("concurrent_receipt", [False, True])
+def test_late_send_echo_keeps_the_chosen_identity_and_imports_the_duplicate(
+    incoming, concurrent_receipt
+):
+    api, db, account, _http, url = incoming
+    apply(incoming, event())
+    drain()
+    stream = api.get("/v1/messenger/streams/").json()[0]
+    response = api.post(
+        "/v1/messenger/messages/",
+        json={
+            "stream_uuid": stream["uuid"],
+            "payload": {"kind": "markdown", "content": "Retry marker"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    canonical = db.execute(
+        "SELECT message_uuid FROM messenger_message_placements WHERE uuid=%s",
+        (uuid.UUID(response.json()["uuid"]),),
+    ).fetchone()[0]
+    delivery = uuid.uuid4()
+    db.execute(zulip_incoming.INCOMING_TRANSACTION_SQL)
+    db.execute(
+        "INSERT INTO bridge_zulip_v5_deliveries(uuid,project_id,message_uuid,stream_uuid,external_account_uuid,hostname,external_account_id,recipient,topic_name,sending) VALUES(%s,%s,%s,%s,%s,%s,'7','{}','General',true)",
+        (
+            delivery,
+            account["project_id"],
+            canonical,
+            uuid.UUID(stream["uuid"]),
+            account["uuid"],
+            account["hostname"],
+        ),
+    )
+    db.execute(
+        "UPDATE zulip_outgoing_intents SET status='done' WHERE project_id=%s",
+        (account["project_id"],),
+    )
+    late = event("Retry marker", 203)
+    late["local_message_id"] = str(canonical)
+
+    def choose(connection):
+        connection.execute(
+            "UPDATE messenger_messages SET provider_identity='202',status='active' WHERE uuid=%s",
+            (canonical,),
+        )
+        connection.execute(
+            "UPDATE bridge_zulip_v5_deliveries SET zulip_message_id=202,sending=false WHERE uuid=%s",
+            (delivery,),
+        )
+
+    if concurrent_receipt:
+        with (
+            psycopg.connect(url) as receipt,
+            concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor,
+        ):
+            receipt.execute(
+                "SELECT messenger_lock_message(%s,%s)",
+                (account["project_id"], canonical),
+            )
+            blocker = receipt.info.backend_pid
+            pending = executor.submit(apply, incoming, late)
+            for _ in range(100):
+                if db.execute(
+                    "SELECT 1 FROM pg_stat_activity WHERE %s=ANY(pg_blocking_pids(pid))",
+                    (blocker,),
+                ).fetchone():
+                    break
+                time.sleep(0.02)
+            else:
+                receipt.rollback()
+                pytest.fail("Incoming echo did not reach the canonical message lock")
+            choose(receipt)
+            receipt.commit()
+            pending.result(timeout=10)
+    else:
+        choose(db)
+        apply(incoming, late)
+    assert db.execute(
+        "SELECT provider_identity FROM messenger_messages WHERE uuid=%s", (canonical,)
+    ).fetchone() == ("202",)
+    assert db.execute(
+        "SELECT zulip_message_id FROM bridge_zulip_v5_deliveries WHERE uuid=%s",
+        (delivery,),
+    ).fetchone() == (202,)
+    duplicate = db.execute(
+        "SELECT uuid FROM messenger_messages WHERE project_id=%s AND provider_identity='203'",
+        (account["project_id"],),
+    ).fetchone()
+    assert duplicate and duplicate[0] != canonical

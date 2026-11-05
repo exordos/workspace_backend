@@ -33,7 +33,7 @@ UPDATE_ENTITY_STATUS_SQL = """
             WHERE entity_type = %s
               AND entity_uuid = %s
               AND id <> %s
-              AND status <> 'done'
+              AND status IN ('new', 'checking')
         ) THEN 'new' ELSE %s END AS status
     )
     UPDATE {table} target
@@ -49,6 +49,17 @@ SELECT_ENTITY_IDENTITY_SQL = """
     SELECT provider_identity FROM {table}
     WHERE project_id = %s AND uuid = %s AND provider_uuid = %s
       AND source_name = 'zulip' AND provider_identity IS NOT NULL
+"""
+
+SELECT_FAILED_DEPENDENCY_SQL = """
+    SELECT intent.id, intent.status, intent.error
+    FROM zulip_outgoing_intents intent
+    JOIN m_external_accounts_v2 account ON account.uuid = intent.external_account_uuid
+    WHERE intent.project_id = %s AND intent.entity_type = %s
+      AND intent.entity_uuid = %s AND account.provider_uuid = %s
+      AND intent.operation = 'insert'
+      AND intent.status <> 'done'
+    ORDER BY intent.id DESC LIMIT 1
 """
 
 UPDATE_ENTITY_IDENTITY_SQL = """
@@ -253,11 +264,17 @@ SELECT_DELIVERY_MESSAGE_SQL = """
     WHERE uuid = %s
 """
 
+SELECT_SEND_DELIVERY_SQL = """
+    SELECT uuid FROM bridge_zulip_v5_deliveries
+    WHERE project_id = %s AND message_uuid = %s AND stream_uuid = %s
+"""
+
 SELECT_MESSAGE_RECEIPT_SQL = """
     SELECT payload
     FROM zulip_incoming_events
-    WHERE external_account_uuid = %s AND payload->>'local_message_id' = %s
-    LIMIT 1
+    WHERE external_account_uuid = %s AND payload->>'local_message_id' = ANY(%s::text[])
+      AND payload ? 'local_message_id'
+    ORDER BY id LIMIT 1
 """
 
 
@@ -280,6 +297,28 @@ COMPLETE_DELIVERY_SQL = """
         sending = false,
         delivered_at = coalesce(delivered_at, now() AT TIME ZONE 'UTC')
     WHERE uuid = %s
+"""
+
+COMPLETE_SEND_RECEIPT_SQL = """
+    WITH locked AS MATERIALIZED (
+        SELECT messenger_lock_message(%s,%s)
+    ), receipt AS (
+        -- Choose from the row being updated, including a receipt committed
+        -- while this statement waited for the canonical message lock.
+        UPDATE bridge_zulip_v5_deliveries delivery
+        SET zulip_message_id=coalesce(delivery.zulip_message_id,%s::bigint),sending=false,
+            delivered_at=coalesce(delivery.delivered_at,now() AT TIME ZONE 'UTC')
+        FROM locked WHERE delivery.uuid=%s
+        RETURNING delivery.project_id,delivery.message_uuid,delivery.zulip_message_id
+    ), canonical AS (
+        UPDATE messenger_messages message
+        SET provider_identity=receipt.zulip_message_id::text
+        FROM receipt
+        WHERE message.project_id=receipt.project_id AND message.uuid=receipt.message_uuid
+          AND message.source_name='zulip' AND message.provider_uuid=%s
+          AND message.provider_identity IS DISTINCT FROM receipt.zulip_message_id::text
+    )
+    SELECT zulip_message_id::text AS identity FROM receipt
 """
 
 COMPLETE_INTENT_SQL = """
@@ -306,6 +345,18 @@ SELECT_FILE_REFERENCES_SQL = """
 
 class Pending(Exception):
     pass
+
+
+class RetrySend(Exception):
+    pass
+
+
+def lost_queue(error: "ApiError") -> bool:
+    return error.data.get("code") == "BAD_EVENT_QUEUE_ID" or (
+        error.status == 400
+        and error.data.get("msg", "").startswith("An event newer than ")
+        and error.data.get("msg", "").endswith(" has already been pruned!")
+    )
 
 
 class ApiError(Exception):
@@ -352,6 +403,15 @@ class Operations:
             (intent["project_id"], entity_uuid, account["provider_uuid"]),
         )
         if not identities:
+            parents = await self.db.sql(
+                SELECT_FAILED_DEPENDENCY_SQL,
+                (intent["project_id"], kind, entity_uuid, account["provider_uuid"]),
+            )
+            if parents and parents[0]["status"] == "error":
+                raise ValueError(
+                    f"Cannot resolve {kind} {entity_uuid}: outgoing intent "
+                    f"{parents[0]['id']} failed: {parents[0]['error']}"
+                )
             raise Pending(f"Waiting for {kind} {entity_uuid}")
         return identities[0]["provider_identity"]
 
@@ -392,7 +452,14 @@ class Operations:
                     )
                 except Pending:
                     return await self.send_message(intent, account)
-                return request("noop", "", "", identity=remote)
+                deliveries = await self.db.sql(
+                    SELECT_SEND_DELIVERY_SQL,
+                    (intent["project_id"], intent["entity_uuid"], data["stream_uuid"]),
+                )
+                prepared = request("noop", "", "", identity=remote)
+                if deliveries:
+                    prepared["delivery_uuid"] = str(deliveries[0]["uuid"])
+                return prepared
             remote = data.get("remote_identity") or await self.identity(
                 intent, account, "message", intent["entity_uuid"]
             )
@@ -741,6 +808,24 @@ class Operations:
         )
 
     async def send_message(self, intent: dict, account: dict) -> dict:
+        delivery_id = uuid.uuid5(
+            account["uuid"], f"{intent['entity_uuid']}:{intent['data']['stream_uuid']}"
+        )
+        deliveries = await self.db.sql(
+            SELECT_SEND_DELIVERY_SQL,
+            (
+                intent["project_id"],
+                intent["entity_uuid"],
+                intent["data"]["stream_uuid"],
+            ),
+        )
+        if deliveries:
+            delivery_id = deliveries[0]["uuid"]
+            remote = await self.send_receipt_identity(intent, account, str(delivery_id))
+            if remote is not None:
+                return request(
+                    "noop", "", "", identity=str(remote), delivery_uuid=str(delivery_id)
+                )
         route = await self.route(intent, account)
         data = intent["data"]
         if route["channel_type"] == "channel":
@@ -780,9 +865,6 @@ class Operations:
         if not subscriptions:
             raise Pending("Waiting for the sender's event subscription")
         content = await self.convert(intent, account)
-        delivery_id = uuid.uuid5(
-            account["uuid"], f"{intent['entity_uuid']}:{data['stream_uuid']}"
-        )
         deliveries = await self.db.sql(
             UPSERT_SENDING_MESSAGE_SQL,
             (
@@ -983,6 +1065,29 @@ class Operations:
         await self.db.sql(content_cache.SAVE_SQL, (*cache_key, content["uuid"]))
         return {"uuid": content["uuid"], "provider_content": text}
 
+    async def send_receipt_identity(
+        self,
+        intent: dict,
+        account: dict,
+        delivery_uuid: str,
+        local_id: str | None = None,
+    ) -> int | None:
+        deliveries = await self.db.sql(SELECT_DELIVERY_MESSAGE_SQL, (delivery_uuid,))
+        if deliveries and deliveries[0]["zulip_message_id"] is not None:
+            return deliveries[0]["zulip_message_id"]
+        events = await self.db.sql(
+            SELECT_MESSAGE_RECEIPT_SQL,
+            (
+                account["uuid"],
+                [
+                    local_id or str(intent["entity_uuid"]),
+                    str(intent["entity_uuid"]),
+                    delivery_uuid,
+                ],
+            ),
+        )
+        return events[0]["payload"]["message"]["id"] if events else None
+
     async def verify(
         self, intent: dict, account: dict, prepared: dict
     ) -> tuple[bool, dict]:
@@ -992,17 +1097,12 @@ class Operations:
         if kind == "send":
             delivery_uuid = prepared["delivery_uuid"]
             local_id = prepared["data"]["local_id"]
-            deliveries = await self.db.sql(
-                SELECT_DELIVERY_MESSAGE_SQL,
-                (delivery_uuid,),
+            remote = await self.send_receipt_identity(
+                intent, account, delivery_uuid, local_id
             )
-            remote = deliveries[0]["zulip_message_id"] if deliveries else None
             if remote is None:
-                events = await self.db.sql(
-                    SELECT_MESSAGE_RECEIPT_SQL,
-                    (account["uuid"], local_id),
-                )
-                if not events and "data" in prepared:
+                events = []
+                if "data" in prepared:
                     try:
                         response = await self.http.request(
                             account,
@@ -1015,9 +1115,9 @@ class Operations:
                             },
                         )
                     except ApiError as error:
-                        if error.data.get("code") == "BAD_EVENT_QUEUE_ID":
-                            raise Pending(
-                                "Waiting for the retained send receipt after queue expiry"
+                        if lost_queue(error):
+                            raise RetrySend(
+                                "Retrying send after its receipt queue expired or was pruned"
                             ) from error
                         raise
                     events = [
@@ -1028,8 +1128,9 @@ class Operations:
                 if events:
                     remote = events[0]["payload"]["message"]["id"]
             if remote is None:
-                # No hit cannot prove that a timed-out POST was never applied.
-                raise Pending("GET found no definitive send receipt yet")
+                raise RetrySend(
+                    "Retrying send without a definitive receipt; a duplicate is possible"
+                )
             try:
                 await self.http.request(
                     account, "GET", f"/messages/{remote}", {"apply_markdown": False}
@@ -1248,6 +1349,18 @@ class Operations:
         self, intent: dict, account: dict, prepared: dict, result: dict
     ) -> None:
         identity = result.get("identity")
+        if "delivery_uuid" in prepared:
+            receipt = await self.db.sql(
+                COMPLETE_SEND_RECEIPT_SQL,
+                (
+                    intent["project_id"],
+                    intent["entity_uuid"],
+                    identity,
+                    prepared["delivery_uuid"],
+                    account["provider_uuid"],
+                ),
+            )
+            identity = receipt[0]["identity"]
         if intent["entity_type"] == "file" and identity is not None:
             # Publish the access receipt before the identity makes the file
             # leave the pending-upload visibility branch.
@@ -1263,16 +1376,19 @@ class Operations:
                 ),
             )
         if identity is not None and intent["entity_type"] != "message_state":
-            await self.db.sql(
-                UPDATE_ENTITY_IDENTITY_SQL.format(table=TABLES[intent["entity_type"]]),
-                (
-                    identity,
-                    intent["project_id"],
-                    intent["entity_uuid"],
-                    account["provider_uuid"],
-                    identity,
-                ),
-            )
+            if "delivery_uuid" not in prepared:
+                await self.db.sql(
+                    UPDATE_ENTITY_IDENTITY_SQL.format(
+                        table=TABLES[intent["entity_type"]]
+                    ),
+                    (
+                        identity,
+                        intent["project_id"],
+                        intent["entity_uuid"],
+                        account["provider_uuid"],
+                        identity,
+                    ),
+                )
             await self.db.sql(
                 SAVE_RECEIPT_SQL,
                 (
@@ -1297,14 +1413,6 @@ class Operations:
                     account["provider_uuid"],
                     intent["entity_uuid"],
                     intent["project_id"],
-                ),
-            )
-        if prepared["kind"] == "send":
-            await self.db.sql(
-                COMPLETE_DELIVERY_SQL,
-                (
-                    int(typing.cast(str, identity)),
-                    prepared["delivery_uuid"],
                 ),
             )
         await self.status(intent, "active")

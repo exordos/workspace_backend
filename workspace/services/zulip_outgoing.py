@@ -38,7 +38,7 @@ SELECT_READY_INTENTS_SQL = """
               )
           )
             AND earlier.id < intent.id
-            AND earlier.status <> 'done'
+            AND earlier.status IN ('new', 'checking')
       )
     ORDER BY next_attempt_at, id
     LIMIT %s
@@ -77,6 +77,17 @@ RETRY_INTENT_SQL = """
     UPDATE zulip_outgoing_intents
     SET status = CASE WHEN request IS NULL THEN 'new' ELSE 'checking' END,
         error = %s,
+        next_attempt_at = now() + %s * interval '1 second'
+    WHERE id = %s
+"""
+
+RETRY_SEND_SQL = """
+    WITH released AS (
+        UPDATE bridge_zulip_v5_deliveries SET sending = false
+        WHERE uuid = %s AND zulip_message_id IS NULL
+    )
+    UPDATE zulip_outgoing_intents
+    SET request = NULL, status = 'new', error = %s,
         next_attempt_at = now() + %s * interval '1 second'
     WHERE id = %s
 """
@@ -242,13 +253,13 @@ class ZulipOutgoingService:
         *,
         concurrency: int = 128,
         connections: int = 128,
-        dependency_delay: float = 0.01,
+        dependency_delay: float = 1,
         poll_interval: float = 1,
     ) -> None:
         self.db = Database(db_url)
         self.concurrency = concurrency
         self.connections = connections
-        self.dependency_delay = dependency_delay
+        self.dependency_delay = max(1, dependency_delay)
         self.poll_interval = poll_interval
         self.ready = asyncio.Event()
         self.stopping = asyncio.Event()
@@ -355,8 +366,7 @@ class ZulipOutgoingService:
                     request = await self.operations.prepare(intent, account)
                 except outgoing_operations.Pending as error:
                     # Release the task slot too: a newly queued parent can run.
-                    await asyncio.sleep(self.dependency_delay)
-                    await self.retry(intent, str(error), 0)
+                    await self.retry(intent, str(error), self.dependency_delay)
                     return
                 await self.db.sql(
                     SAVE_REQUEST_SQL,
@@ -369,8 +379,18 @@ class ZulipOutgoingService:
             await self.operations.finish(intent, account, request, result)
         except asyncio.CancelledError:
             raise
+        except outgoing_operations.RetrySend as error:
+            await self.db.sql(
+                RETRY_SEND_SQL,
+                (
+                    request["delivery_uuid"],
+                    str(error),
+                    self.dependency_delay,
+                    intent["id"],
+                ),
+            )
         except outgoing_operations.Pending as error:
-            await self.retry(intent, str(error), 0.1)
+            await self.retry(intent, str(error), self.dependency_delay)
         except aiohttp.ClientConnectorError as error:
             if not checking:
                 await self.db.sql(
@@ -386,6 +406,21 @@ class ZulipOutgoingService:
         ) as error:
             await self.retry(intent, type(error).__name__, 1)
         except outgoing_operations.ApiError as error:
+            if (
+                request is not None
+                and request["kind"] == "send"
+                and outgoing_operations.lost_queue(error)
+            ):
+                await self.db.sql(
+                    RETRY_SEND_SQL,
+                    (
+                        request["delivery_uuid"],
+                        str(error),
+                        self.dependency_delay,
+                        intent["id"],
+                    ),
+                )
+                return
             if error.status == 429 and error.method != "GET":
                 await self.db.sql(
                     CLEAR_REQUEST_SQL,
@@ -393,7 +428,7 @@ class ZulipOutgoingService:
                 )
             if error.status in (408, 429) or error.status >= 500:
                 await self.retry(
-                    intent, str(error), float(error.data.get("retry-after", 1))
+                    intent, str(error), max(1, float(error.data.get("retry-after", 1)))
                 )
             else:
                 await self.fail(intent, str(error))
