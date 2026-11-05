@@ -642,11 +642,6 @@ class ZulipIncomingService:
 
     async def recover_shared_message(self, event: dict, account: dict) -> None:
         source = event["payload"]
-        remote = (
-            source["message"]["id"]
-            if source["type"] == "message"
-            else source["message_id"]
-        )
         metadata = source["_shared_key"]
         previous = await self.db.sql(
             "SELECT processed_at,error FROM zulip_incoming_events WHERE id=%s AND project_id=%s AND provider_uuid=%s",
@@ -660,24 +655,36 @@ class ZulipIncomingService:
             return
         payload = None
         if not previous or previous[0]["error"] is not None:
-            try:
-                latest = await self.http.request(
-                    account,
-                    "GET",
-                    f"/messages/{remote}",
-                    {"apply_markdown": False},
-                )
-            except outgoing_operations.ApiError as error:
-                if not outgoing_operations.Operations.absent(error):
-                    raise
-            else:
+            if incoming_registry.topic_rename(source):
                 payload = {
                     key: value
-                    for key, value in event["payload"].items()
+                    for key, value in source.items()
                     if key not in ("_shared_key", "_personal_only")
                 }
-                payload["type"] = "message"
-                payload["message"] = latest["message"]
+            else:
+                remote = (
+                    source["message"]["id"]
+                    if source["type"] == "message"
+                    else source["message_id"]
+                )
+                try:
+                    latest = await self.http.request(
+                        account,
+                        "GET",
+                        f"/messages/{remote}",
+                        {"apply_markdown": False},
+                    )
+                except outgoing_operations.ApiError as error:
+                    if not outgoing_operations.Operations.absent(error):
+                        raise
+                else:
+                    payload = {
+                        key: value
+                        for key, value in event["payload"].items()
+                        if key not in ("_shared_key", "_personal_only")
+                    }
+                    payload["type"] = "message"
+                    payload["message"] = latest["message"]
         async with self.db.transaction() as connection:
             if not await self.current(connection, account):
                 return
@@ -741,9 +748,11 @@ class ZulipIncomingService:
                     await connection.execute(
                         "SELECT pg_notify('workspace_zulip_incoming','')"
                     )
-                else:
+                elif not prepared.get("more"):
                     await connection.execute(COMPLETE_EVENT_SQL, (event["id"],))
-            await self.finish_registry(event, True)
+            if not prepared.get("more"):
+                await self.finish_registry(event, True)
+            self.ready.set()
         except incoming_operations.MissingSharedMessage:
             try:
                 await self.recover_shared_message(event, typing.cast(dict, account))

@@ -33,6 +33,7 @@ cleanup; the generated public API describes the current supported contract.
 - [Topic summary refresh and stale statistics](topic_summary_refresh.md)
 - [Physical deletion and prepared unread facts](messenger_physical_deletion.md)
 - [Unread and deletion validation](messenger_physical_deletion_testing.md)
+- [Zulip topic renames and completion](zulip_topic_renames.md)
 
 ## Translation contract
 

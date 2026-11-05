@@ -197,3 +197,45 @@ def test_account_observation_bookkeeping_is_also_bounded():
     for identifier in range(10):
         registry.admit(account(str(identifier)), message(), identifier + 1)
     assert len(registry.seen) <= 2
+
+
+def topic_rename(subject="Renamed", **changes):
+    return {
+        "type": "update_message",
+        "message_id": 101,
+        "message_ids": [101, 102],
+        "stream_id": 42,
+        "orig_subject": "General",
+        "subject": subject,
+        "propagate_mode": "change_all",
+        "edit_timestamp": 100,
+        **changes,
+    }
+
+
+def test_same_topic_rename_coalesces_across_accounts_but_keeps_new_occurrences():
+    registry = incoming_registry.Registry()
+    first, duplicate = registry.admit(account(), topic_rename(), 1)
+    assert first is not None and not duplicate
+    copied, duplicate = registry.admit(
+        account("second"), topic_rename(flags=["starred"], message_ids=[102, 101]), 2
+    )
+    assert duplicate and copied is first
+    registry.complete(first.key)
+    reverse, duplicate = registry.admit(
+        account(),
+        topic_rename("General", orig_subject="Renamed", edit_timestamp=101),
+        3,
+    )
+    assert not duplicate and reverse is not first
+    again, duplicate = registry.admit(account(), topic_rename(edit_timestamp=102), 4)
+    assert not duplicate and again is not first
+
+
+def test_partial_topic_moves_and_content_edits_are_not_metadata_renames():
+    for changes in (
+        {"propagate_mode": "change_later"},
+        {"new_stream_id": 43},
+        {"content": "Edited"},
+    ):
+        assert incoming_registry.change(account(), topic_rename(**changes)) is None
