@@ -578,6 +578,10 @@ def origin(account: dict, identity: str) -> dict:
     }
 
 
+def topic_name(stream: dict, subject: str) -> str:
+    return subject.removeprefix("✔ ") or ("zulip" if stream["private"] else "General")
+
+
 async def rows(
     connection: typing.Any, query: str, parameters: tuple = ()
 ) -> list[dict]:
@@ -1209,7 +1213,7 @@ class Operations:
                         account["project_id"],
                         stream["uuid"],
                         remote,
-                        spec["subject"].removeprefix("✔ ") or "zulip",
+                        topic_name(stream, spec["subject"]),
                         spec["subject"].startswith("✔ "),
                     ),
                 )
@@ -2023,7 +2027,7 @@ class Operations:
                 account["project_id"],
                 stream["uuid"],
                 identity,
-                name.removeprefix("✔ ") or "zulip",
+                topic_name(stream, name),
                 name.startswith("✔ "),
             ),
         )
@@ -2035,7 +2039,7 @@ class Operations:
                 "uuid": identifier,
                 "project_id": account["project_id"],
                 "stream_uuid": stream["uuid"],
-                "name": name.removeprefix("✔ ") or "zulip",
+                "name": topic_name(stream, name),
                 "is_done": name.startswith("✔ "),
                 **origin(account, identity),
             },
@@ -3179,7 +3183,7 @@ class Operations:
                 "uuid": source["uuid"],
                 "project_id": account["project_id"],
                 "provider_identity": identity,
-                "name": subject.removeprefix("✔ ") or "zulip",
+                "name": topic_name(stream, subject),
                 "is_done": subject.startswith("✔ "),
             },
         )
@@ -3511,7 +3515,7 @@ class Operations:
                     {
                         "uuid": topic["uuid"],
                         "project_id": account["project_id"],
-                        "name": event["subject"].removeprefix("✔ ") or "zulip",
+                        "name": event["subject"].removeprefix("✔ ") or "General",
                         "is_done": event["subject"].startswith("✔ "),
                         "provider_identity": identity,
                     },

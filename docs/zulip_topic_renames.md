@@ -79,15 +79,24 @@ the newly imported history.
 
 ## Unnamed provider topics
 
-An empty Zulip subject is displayed as `zulip`, including the default container
-and direct-message conversations. The empty provider subject and its identity
-remain unchanged; an explicit provider topic named `zulip` is a separate topic.
-A checkmarked empty subject is displayed as `zulip` with `is_done=true`.
+An empty Zulip subject is displayed as `zulip` only in private one-to-one or
+self conversations (`private=true`). Group conversations and channels retain
+the pre-3.0.21 fallback `General`, including invite-only channels. `invite_only`
+does not make a channel a private direct conversation. Explicit provider topic
+names, including `General` and `zulip`, remain separate and unchanged.
+The empty provider subject and its identity remain unchanged. A checkmarked
+empty subject uses the same fallback with `is_done=true`.
 Realtime and historical import use the same naming rule. Historical name-based
 reconciliation only adopts a topic without an existing provider identity.
-Migration 0296 changes existing imported empty/default labels, preserving topic
-UUIDs, provider identities, placements and completion state, without generating
-outgoing provider renames.
+Migration 0296 originally changed imported empty/default labels to `zulip`.
+Migration 0298 restores `General` for existing nonprivate empty/default topics
+that received that generated label. Private conversations, native topics,
+explicit provider names and custom labels are preserved. Both migrations keep
+topic UUIDs, provider identities, placements and completion state, without
+generating outgoing provider renames.
+Migration 0298 records only the rows it changes. Rollback restores those labels
+only while their update timestamps still match, preserving both pre-existing
+`General` labels and later edits; rollback also removes the repair receipt table.
 
 The related incoming integration suite covers content edits, deletion, moves,
 files, quotes, flags, membership and client events. Unit tests cover registry

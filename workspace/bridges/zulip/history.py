@@ -421,7 +421,7 @@ class Operations(incoming_operations.Operations):
                 topic = named_topics.get(
                     (
                         stream["uuid"],
-                        subject.removeprefix("✔ ") or "zulip",
+                        incoming_operations.topic_name(stream, subject),
                         subject.startswith("✔ "),
                     )
                 )
@@ -432,7 +432,7 @@ class Operations(incoming_operations.Operations):
                         "uuid": uuid.uuid5(stream["uuid"], subject.lower()),
                         "project_id": account["project_id"],
                         "stream_uuid": stream["uuid"],
-                        "name": subject.removeprefix("✔ ") or "zulip",
+                        "name": incoming_operations.topic_name(stream, subject),
                         "is_done": subject.startswith("✔ "),
                         **incoming_operations.origin(account, topic_identity),
                     },
