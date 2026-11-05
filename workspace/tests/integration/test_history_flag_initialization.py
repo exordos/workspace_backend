@@ -48,11 +48,15 @@ def test_history_imports_final_flags_without_enqueuing_provider_repairs(incoming
         "SELECT count(*) FROM bridge_zulip_v5_flag_changes WHERE project_id=%s",
         (account["project_id"],),
     ).fetchone() == (0,)
+    # The empty-subject container and an explicit General topic are distinct.
+    # Both counter scopes must stay silent during historical initialization.
     assert db.execute(
-        "SELECT count(*),bool_or(publish_updates) FROM messenger_counter_updates "
-        "WHERE project_id=%s",
+        "SELECT topic.provider_identity,topic.name,pending.publish_updates "
+        "FROM messenger_counter_updates pending JOIN messenger_topics topic "
+        "ON topic.project_id=pending.project_id AND topic.uuid=pending.topic_uuid "
+        "WHERE pending.project_id=%s ORDER BY topic.provider_identity",
         (account["project_id"],),
-    ).fetchone() == (1, False)
+    ).fetchall() == [("42:", "zulip", False), ("42:General", "General", False)]
 
     # The transaction-local history path must not suppress realtime defaults.
     test_zulip_history.incoming_tests.apply(

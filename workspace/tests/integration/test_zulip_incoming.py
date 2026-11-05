@@ -1878,6 +1878,7 @@ def test_topic_edit_skips_already_deleted_messages_in_the_event(incoming, messag
             "stream_id": 42,
             "orig_subject": "General",
             "subject": updated["subject"],
+            "content": updated["content"],
             "propagate_mode": "change_all",
             "edit_timestamp": updated["last_edit_timestamp"],
         },
@@ -2792,8 +2793,7 @@ def test_incoming_message_does_not_lock_the_legacy_counter_scope(incoming, subje
     assert {message["provider_identity"] for message in messages} == {"100", "101"}
     topic_uuids = {message["topic_uuid"] for message in messages}
     assert len(topic_uuids) == 1
-    # The empty Zulip topic and the literal General topic share a display name.
-    # Their UUID order must not decide which counter this regression checks.
+    # Select the actual message topic rather than the stream default container.
     topic_uuid = topic_uuids.pop()
     response = api.get(f"/v1/messenger/stream_topics/{topic_uuid}")
     assert response.status_code == 200, response.text

@@ -21,6 +21,16 @@ class Intention:
     completed_at: float | None = None
 
 
+def topic_rename(event: dict) -> bool:
+    return (
+        event["type"] == "update_message"
+        and event.get("propagate_mode") == "change_all"
+        and all(key in event for key in ("stream_id", "orig_subject", "subject"))
+        and "content" not in event
+        and "new_stream_id" not in event
+    )
+
+
 def change(account: dict, event: dict) -> tuple[str, str, bool] | None:
     kind = event["type"]
     if kind == "message":
@@ -38,24 +48,35 @@ def change(account: dict, event: dict) -> tuple[str, str, bool] | None:
             )
         immutable = True
     elif kind == "update_message":
-        # Topic moves/renames deliberately keep their existing path.
-        if any(key in event for key in ("subject", "new_stream_id", "orig_subject")):
-            return None
-        if "content" not in event or "edit_timestamp" not in event:
-            return None
-        entity = ["message", event["message_id"]]
-        shared = {
-            key: event[key]
-            for key in (
-                "message_id",
-                "edit_timestamp",
-                "content",
-                "orig_content",
-                "rendering_only",
-            )
-            if key in event
-        }
-        immutable = False
+        if topic_rename(event) and "edit_timestamp" in event:
+            identifiers = sorted(event.get("message_ids", [event.get("message_id")]))
+            affected = hashlib.sha256(json.dumps(identifiers).encode()).hexdigest()
+            entity = ["topic_messages", event["stream_id"], affected]
+            shared = {
+                key: event[key]
+                for key in ("stream_id", "orig_subject", "subject", "edit_timestamp")
+            }
+            immutable = False
+        else:
+            if any(
+                key in event for key in ("subject", "new_stream_id", "orig_subject")
+            ):
+                return None
+            if "content" not in event or "edit_timestamp" not in event:
+                return None
+            entity = ["message", event["message_id"]]
+            shared = {
+                key: event[key]
+                for key in (
+                    "message_id",
+                    "edit_timestamp",
+                    "content",
+                    "orig_content",
+                    "rendering_only",
+                )
+                if key in event
+            }
+            immutable = False
     elif kind == "delete_message":
         identifiers = event.get("message_ids", [event.get("message_id")])
         entity = ["messages", sorted(identifiers)]
