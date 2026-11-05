@@ -13,15 +13,11 @@ from restalchemy.storage.sql import engines
 
 def connection_url_for_process(connection_url: str, name: str) -> str:
     """Use UTC for timestamp storage and identify the service connection."""
-    parts = urllib.parse.urlsplit(connection_url)
-    query = dict(urllib.parse.parse_qsl(parts.query, keep_blank_values=True))
+    base_url, _, query_string = connection_url.partition("?")
+    query = dict(urllib.parse.parse_qsl(query_string, keep_blank_values=True))
     query["application_name"] = name
     query["options"] = f"{query.get('options', '')} -c timezone=UTC".strip()
-    return urllib.parse.urlunsplit(
-        parts._replace(
-            query=urllib.parse.urlencode(query, quote_via=urllib.parse.quote),
-        )
-    )
+    return base_url + "?" + urllib.parse.urlencode(query, quote_via=urllib.parse.quote)
 
 
 def configure_postgresql(

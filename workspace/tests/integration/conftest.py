@@ -352,9 +352,8 @@ def _database():
 def isolated_migration_database(migration, *, current_models=False):
     """Own a disposable database for tests of a published schema revision."""
     database_name = "workspace_migration_" + sys_uuid.uuid4().hex
-    database_url = (
-        urllib.parse.urlsplit(TEST_DB_URL)._replace(path="/" + database_name).geturl()
-    )
+    parts = urllib.parse.urlsplit(TEST_DB_URL)
+    database_url = f"{parts.scheme}://{parts.netloc}/{database_name}?{parts.query}"
     with psycopg.connect(TEST_DB_URL, autocommit=True) as admin:
         admin.execute(
             sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database_name))
