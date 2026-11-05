@@ -35,7 +35,7 @@ def main() -> None:
         config["db"]["connection_url"],
         concurrency=int(options.get("concurrency", 128)),
         connections=int(options.get("connections", 128)),
-        dependency_delay=float(options.get("dependency_delay", 0.01)),
+        dependency_delay=float(options.get("dependency_delay", 1)),
         poll_interval=float(options.get("poll_interval", 1)),
     )
     asyncio.run(service.run())

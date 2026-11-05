@@ -219,6 +219,13 @@ class Server:
                     {"result": "success", "messages": list(self.messages.values())}
                 )
             if path == "/messages/flags":
+                for remote in json.loads(data["messages"]):
+                    if remote in self.messages:
+                        flags = self.messages[remote]["flags"]
+                        if data["op"] == "add" and data["flag"] not in flags:
+                            flags.append(data["flag"])
+                        elif data["op"] == "remove" and data["flag"] in flags:
+                            flags.remove(data["flag"])
                 return web.json_response({"result": "success"})
             if path == "/events":
                 return web.json_response({"result": "success", "events": self.events})
@@ -229,6 +236,14 @@ class Server:
                     "id": remote,
                     "sender_id": self.sender_id,
                     "content": data["content"],
+                    "type": "stream" if data["type"] == "channel" else "private",
+                    "stream_id": int(data["to"]) if data["type"] == "channel" else None,
+                    "display_recipient": "Channel" if data["type"] == "channel" else [],
+                    "subject": data.get("topic", ""),
+                    "sender_full_name": "Sender",
+                    "timestamp": int(
+                        datetime.datetime.now(datetime.timezone.utc).timestamp()
+                    ),
                     "flags": [],
                     "reactions": [],
                 }
@@ -666,7 +681,7 @@ def test_pending_file_upload_survives_api_deletion(
         )
 
 
-def test_restart_verifies_prepared_request_and_keeps_following_changes_blocked(
+def test_restart_schedules_an_ambiguous_send_before_following_edits(
     outgoing, db, _test_database_url
 ):
     api, account, *_ = outgoing
@@ -702,7 +717,14 @@ def test_restart_verifies_prepared_request_and_keeps_following_changes_blocked(
                 await service.db.sql(
                     "SELECT status FROM zulip_outgoing_intents ORDER BY id"
                 )
-            ) == [{"status": "checking"}, {"status": "new"}]
+            ) == [{"status": "new"}, {"status": "new"}]
+            await service.dispatch()
+            assert not service.tasks
+            await drain(service)
+            assert server.messages[101]["content"] == "later"
+            assert [
+                method for method, path, _ in server.calls if path == "/api/v1/messages"
+            ] == ["POST"]
 
     asyncio.run(run())
 
@@ -1789,8 +1811,8 @@ def test_retained_local_receipt_resolves_lost_response_after_queue_expiry(
                 "SELECT status,error FROM zulip_outgoing_intents WHERE entity_uuid=%s",
                 (canonical,),
             )
-            assert pending[0]["status"] == "checking"
-            assert "queue expiry" in pending[0]["error"]
+            assert pending[0]["status"] == "new"
+            assert "expired or was pruned" in pending[0]["error"]
             # The original receiver had durably stored this event before its queue expired.
             receipt = {**server.events[0], "local_message_id": str(canonical)}
             await service.db.sql(
@@ -1973,5 +1995,485 @@ def test_canonical_message_has_one_destination_and_copy_gets_new_uuid(
             assert len(sends) == 2
             assert {str(call[2]["to"]) for call in sends} == {"42", "43"}
             assert len(server.messages) == 2
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("receipt_error", [None, "expired", "pruned"])
+def test_ambiguous_send_retries_after_restart_and_releases_quote_chain(
+    outgoing, db, _test_database_url, receipt_error
+):
+    api, account, channel, *_ = outgoing
+    root = create(outgoing)
+    reply = api.post(
+        "/v1/messenger/messages/",
+        json={
+            "stream_uuid": str(channel.stream_uuid),
+            "payload": {
+                "kind": "markdown",
+                "content": f"[Original](urn:quote:{root['uuid']})\n\nReply marker",
+            },
+        },
+    ).json()
+    for message in (root, reply):
+        db.execute(
+            "INSERT INTO messenger_user_message_unreads(project_id,user_uuid,placement_uuid,stream_uuid,topic_uuid) "
+            "SELECT project_id,%s,uuid,stream_uuid,topic_uuid FROM messenger_message_placements WHERE uuid=%s "
+            "ON CONFLICT DO NOTHING",
+            (account.owner_user_uuid, uuid.UUID(message["uuid"])),
+        )
+        response = api.post(
+            f"/v1/messenger/messages/{message['uuid']}/actions/read/invoke", json={}
+        )
+        assert response.status_code == 200, response.text
+
+    async def run():
+        async with sender(account, _test_database_url) as (service, server):
+            server.lose_response = True
+            original = service.http.request
+
+            async def no_receipt(account, method, path, data=None, **kwargs):
+                if method == "GET" and path == "/events":
+                    if receipt_error:
+                        raise outgoing_operations.ApiError(
+                            400,
+                            {"code": "BAD_EVENT_QUEUE_ID", "msg": "Bad event queue id"}
+                            if receipt_error == "expired"
+                            else {
+                                "msg": "An event newer than 7 has already been pruned!"
+                            },
+                            "GET",
+                        )
+                    return {"events": []}
+                return await original(account, method, path, data, **kwargs)
+
+            service.http.request = no_receipt
+            await service.dispatch()
+            await asyncio.gather(*list(service.tasks.values()))
+            await asyncio.sleep(0)
+            await service.db.sql(
+                "UPDATE zulip_outgoing_intents SET next_attempt_at=now()"
+            )
+            await service.dispatch()
+            await asyncio.gather(*list(service.tasks.values()))
+            await asyncio.sleep(0)
+            retry = await service.db.sql(
+                "SELECT status,request,next_attempt_at>now()+interval '0.8 seconds' AS deferred "
+                "FROM zulip_outgoing_intents WHERE entity_type='message' AND id="
+                "(SELECT min(id) FROM zulip_outgoing_intents)"
+            )
+            assert retry[0] == {"status": "new", "request": None, "deferred": True}
+            await service.dispatch()
+            assert not service.tasks
+            assert len(server.messages) == 1
+            messages, events, next_id = server.messages, server.events, server.next_id
+
+        # The durable retry must survive replacement of the sender process.
+        async with sender(account, _test_database_url) as (service, server):
+            server.messages, server.events, server.next_id = messages, events, next_id
+            await drain(service)
+            assert (
+                len(server.messages) == 3
+            )  # original, accepted duplicate, quoted reply
+            assert server.messages[101]["content"] == server.messages[102]["content"]
+            assert "near/102" in server.messages[103]["content"]
+            assert "Reply marker" in server.messages[103]["content"]
+            flags = [
+                data
+                for method, path, data in server.calls
+                if path.endswith("/messages/flags")
+            ]
+            assert sorted(json.loads(data["messages"])[0] for data in flags) == [
+                102,
+                103,
+            ]
+            assert all(data["flag"] == "read" and data["op"] == "add" for data in flags)
+            assert server.messages[102]["flags"] == ["read"]
+            assert server.messages[103]["flags"] == ["read"]
+            actual = await service.db.sql(
+                "SELECT status,error FROM zulip_outgoing_intents ORDER BY id"
+            )
+            assert len(actual) == 4
+            assert all(row == {"status": "done", "error": None} for row in actual)
+            return [
+                data
+                for method, path, data in server.calls
+                if method == "POST" and path == "/api/v1/messages"
+            ]
+
+    sent = asyncio.run(run())
+    assert len(sent) == 2
+    assert sent[0]["content"] == "Raw **message**"
+    assert sent[0]["type"] == "channel" and sent[0]["to"] == "42"
+    assert db.execute(
+        "SELECT provider_identity FROM messenger_messages WHERE uuid=(SELECT message_uuid FROM messenger_message_placements WHERE uuid=%s)",
+        (uuid.UUID(root["uuid"]),),
+    ).fetchone() == ("102",)
+
+
+def test_dependency_wait_uses_durable_one_second_deadline(
+    outgoing, db, _test_database_url
+):
+    api, account, channel, *_ = outgoing
+    root = create(outgoing)
+    reply = api.post(
+        "/v1/messenger/messages/",
+        json={
+            "stream_uuid": str(channel.stream_uuid),
+            "payload": {
+                "kind": "markdown",
+                "content": f"[Original](urn:quote:{root['uuid']})",
+            },
+        },
+    )
+    assert reply.status_code == 201, reply.text
+    db.execute(
+        "UPDATE zulip_outgoing_intents SET next_attempt_at=now()+interval '1 day' WHERE id=(SELECT min(id) FROM zulip_outgoing_intents)"
+    )
+
+    async def run():
+        async with sender(account, _test_database_url, dependency_delay=0.001) as (
+            service,
+            server,
+        ):
+            await service.dispatch()
+            await asyncio.gather(*list(service.tasks.values()))
+            await asyncio.sleep(0)
+            waiting = await service.db.sql(
+                "SELECT attempts,next_attempt_at>now()+interval '0.8 seconds' AS deferred FROM zulip_outgoing_intents ORDER BY id DESC LIMIT 1"
+            )
+            assert waiting[0] == {"attempts": 1, "deferred": True}
+            for _ in range(10):
+                await service.dispatch()
+                assert not service.tasks
+            assert not server.calls
+
+    asyncio.run(run())
+
+
+def test_terminal_parent_errors_fail_dependencies_without_blocking_other_work(
+    outgoing, db, _test_database_url
+):
+    api, account, channel, *_ = outgoing
+    root = create(outgoing)
+    reply = api.post(
+        "/v1/messenger/messages/",
+        json={
+            "stream_uuid": str(channel.stream_uuid),
+            "payload": {
+                "kind": "markdown",
+                "content": f"[Original](urn:quote:{root['uuid']})",
+            },
+        },
+    )
+    assert reply.status_code == 201, reply.text
+    response = api.post(
+        f"/v1/messenger/messages/{reply.json()['uuid']}/actions/star/invoke", json={}
+    )
+    assert response.status_code == 200, response.text
+    root_id = db.execute("SELECT min(id) FROM zulip_outgoing_intents").fetchone()[0]
+    db.execute(
+        "UPDATE zulip_outgoing_intents SET status='error',error='Zulip HTTP 403: Forbidden' WHERE id=%s",
+        (root_id,),
+    )
+    independent = create(outgoing)
+    # Exercise the selector itself even when an earlier failed operation shares its key.
+    db.execute(
+        "UPDATE zulip_outgoing_intents SET ordering_key=(SELECT ordering_key FROM zulip_outgoing_intents WHERE id=%s) WHERE entity_uuid=(SELECT message_uuid FROM messenger_message_placements WHERE uuid=%s)",
+        (root_id, uuid.UUID(independent["uuid"])),
+    )
+
+    async def run():
+        async with sender(account, _test_database_url) as (service, server):
+            for _ in range(4):
+                await service.dispatch()
+                await asyncio.gather(*list(service.tasks.values()))
+                await asyncio.sleep(0)
+                await service.db.sql(
+                    "UPDATE zulip_outgoing_intents SET next_attempt_at=now()"
+                )
+            states = await service.db.sql(
+                "SELECT status,error FROM zulip_outgoing_intents ORDER BY id"
+            )
+            assert [r["status"] for r in states] == ["error", "error", "error", "done"]
+            assert "Cannot resolve message" in states[1]["error"]
+            assert "Forbidden" in states[1]["error"]
+            assert "Cannot resolve message" in states[2]["error"]
+            assert len(server.messages) == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.isolated_schema
+def test_receipt_queue_migration_retries_only_recognized_send_errors(
+    outgoing, db, _test_database_url
+):
+    _api, account, *_ = outgoing
+    errors = [
+        "Zulip HTTP 400: An event newer than 7 has already been pruned!",
+        "Zulip HTTP 400: Bad event queue id",
+        "Zulip HTTP 403: Forbidden",
+    ]
+    for _ in errors:
+        create(outgoing)
+
+    async def seed():
+        async with sender(account, _test_database_url) as (service, server):
+            account_data = (
+                await service.db.sql(
+                    zulip_outgoing.SELECT_ACCOUNT_SQL,
+                    (account.uuid, account.project_id),
+                )
+            )[0]
+            rows = await service.db.sql(
+                "SELECT * FROM zulip_outgoing_intents ORDER BY id"
+            )
+            for item, error in zip(rows, errors):
+                prepared = await service.operations.prepare(item, account_data)
+                await service.db.sql(
+                    "UPDATE zulip_outgoing_intents SET request=%s,status='error',attempts=5,error=%s WHERE id=%s",
+                    (pg_json.Jsonb(prepared), error, item["id"]),
+                )
+            assert not server.calls
+
+    asyncio.run(seed())
+    db.execute(
+        "UPDATE messenger_messages SET status='error' WHERE project_id=%s",
+        (account.project_id,),
+    )
+    before = db.execute(
+        "SELECT id,data FROM zulip_outgoing_intents ORDER BY id"
+    ).fetchall()
+    path = next(conftest.MIGRATIONS_DIR.glob("0295-*.py"))
+    spec = importlib.util.spec_from_file_location("receipt_queue_recovery", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    with contexts.Context().session_manager() as session:
+        module.migration_step.downgrade(session)
+        module.migration_step.upgrade(session)
+    after = db.execute(
+        "SELECT status,request IS NULL,attempts,error,next_attempt_at>now(),data FROM zulip_outgoing_intents ORDER BY id"
+    ).fetchall()
+    assert [(r[0], r[1], r[2], r[3], r[4]) for r in after] == [
+        ("new", True, 5, errors[0], True),
+        ("new", True, 5, errors[1], True),
+        ("error", False, 5, errors[2], False),
+    ]
+    assert [row[1] for row in before] == [row[5] for row in after]
+    assert db.execute(
+        "SELECT status FROM messenger_messages WHERE project_id=%s ORDER BY created_at",
+        (account.project_id,),
+    ).fetchall() == [("new",), ("new",), ("error",)]
+    assert db.execute("SELECT to_regclass('zulip_incoming_local_receipt')").fetchone()[
+        0
+    ]
+
+
+def test_send_response_preserves_an_already_observed_receipt(
+    outgoing, db, _test_database_url
+):
+    _api, account, *_ = outgoing
+    root = create(outgoing)
+
+    async def run():
+        async with sender(account, _test_database_url) as (service, server):
+            original = service.http.request
+
+            async def observed_before_response(
+                account_data, method, path, data=None, **kwargs
+            ):
+                result = await original(account_data, method, path, data, **kwargs)
+                if method == "POST" and path == "/messages":
+                    # Another accepted copy's echo wins while the POST response is in flight.
+                    server.messages[100] = {**server.messages[result["id"]], "id": 100}
+                    await service.db.sql(
+                        "UPDATE bridge_zulip_v5_deliveries SET zulip_message_id=100,sending=false"
+                    )
+                    await service.db.sql(
+                        "UPDATE messenger_messages SET provider_identity='100' WHERE uuid=%s",
+                        (uuid.UUID(data["local_id"]),),
+                    )
+                return result
+
+            service.http.request = observed_before_response
+            await drain(service)
+            assert len(server.messages) == 2
+            assert (
+                len([c for c in server.calls if c[:2] == ("POST", "/api/v1/messages")])
+                == 1
+            )
+
+    asyncio.run(run())
+    assert db.execute(
+        "SELECT provider_identity FROM messenger_messages WHERE uuid=(SELECT message_uuid FROM messenger_message_placements WHERE uuid=%s)",
+        (uuid.UUID(root["uuid"]),),
+    ).fetchone() == ("100",)
+    assert db.execute(
+        "SELECT zulip_message_id FROM bridge_zulip_v5_deliveries WHERE project_id=%s",
+        (account.project_id,),
+    ).fetchone() == (100,)
+
+
+@pytest.mark.parametrize("cycle", [False, True])
+def test_unresolvable_quote_keeps_a_visible_bounded_wait_and_independent_progress(
+    outgoing, db, _test_database_url, cycle
+):
+    api, account, channel, *_ = outgoing
+    root = create(outgoing)
+    reply = api.post(
+        "/v1/messenger/messages/",
+        json={
+            "stream_uuid": str(channel.stream_uuid),
+            "payload": {
+                "kind": "markdown",
+                "content": f"[Original](urn:quote:{root['uuid']})",
+            },
+        },
+    )
+    assert reply.status_code == 201, reply.text
+    first = db.execute("SELECT min(id) FROM zulip_outgoing_intents").fetchone()[0]
+    if cycle:
+        db.execute(
+            "UPDATE zulip_outgoing_intents SET data=jsonb_set(data,'{payload,content}',%s) WHERE id=%s",
+            (pg_json.Jsonb(f"[Reply](urn:quote:{reply.json()['uuid']})"), first),
+        )
+    else:
+        db.execute("DELETE FROM zulip_outgoing_intents WHERE id=%s", (first,))
+    create(outgoing)
+
+    async def run():
+        async with sender(account, _test_database_url) as (service, server):
+            await service.dispatch()
+            await asyncio.gather(*list(service.tasks.values()))
+            await asyncio.sleep(0)
+            pending = await service.db.sql(
+                "SELECT status,error,attempts,next_attempt_at>now()+interval '0.8 seconds' AS deferred FROM zulip_outgoing_intents WHERE status<>'done'"
+            )
+            assert len(pending) == (2 if cycle else 1)
+            assert all(
+                row["status"] == "new"
+                and "Waiting for message" in row["error"]
+                and row["attempts"] == 1
+                and row["deferred"]
+                for row in pending
+            )
+            for _ in range(5):
+                await service.dispatch()
+                assert not service.tasks
+            assert len(server.messages) == 1
+
+    asyncio.run(run())
+
+
+def test_known_canonical_identity_repairs_an_incomplete_delivery_without_resending(
+    outgoing, db, _test_database_url
+):
+    _api, account, *_ = outgoing
+    create(outgoing)
+
+    async def run():
+        async with sender(account, _test_database_url) as (service, server):
+            original_finish = service.operations.finish
+            original_http = service.http.request
+
+            async def interrupted_finish(intent, account_data, prepared, result):
+                await service.db.sql(
+                    "UPDATE messenger_messages SET provider_identity=%s WHERE uuid=%s",
+                    (result["identity"], intent["entity_uuid"]),
+                )
+                raise psycopg.OperationalError("Interrupted legacy receipt persistence")
+
+            async def missing_events(account_data, method, path, data=None, **kwargs):
+                if method == "GET" and path == "/events":
+                    return {"events": []}
+                return await original_http(account_data, method, path, data, **kwargs)
+
+            service.operations.finish = interrupted_finish
+            service.http.request = missing_events
+            await service.dispatch()
+            await asyncio.gather(*list(service.tasks.values()))
+            await asyncio.sleep(0)
+            service.operations.finish = original_finish
+            await drain(service)
+            assert (
+                len([c for c in server.calls if c[:2] == ("POST", "/api/v1/messages")])
+                == 1
+            )
+            receipt = await service.db.sql(
+                "SELECT zulip_message_id,sending FROM bridge_zulip_v5_deliveries WHERE project_id=%s",
+                (account.project_id,),
+            )
+            assert receipt == [{"zulip_message_id": 101, "sending": False}]
+
+    asyncio.run(run())
+
+
+def test_receipt_uses_the_identity_committed_while_it_waited_for_the_message_lock(
+    outgoing, db, _test_database_url
+):
+    _api, account, *_ = outgoing
+    create(outgoing)
+
+    async def run():
+        async with sender(account, _test_database_url) as (service, _server):
+            item = (
+                await service.db.sql("SELECT * FROM zulip_outgoing_intents ORDER BY id")
+            )[0]
+            account_data = (
+                await service.db.sql(
+                    zulip_outgoing.SELECT_ACCOUNT_SQL,
+                    (account.uuid, account.project_id),
+                )
+            )[0]
+            prepared = await service.operations.prepare(item, account_data)
+            with psycopg.connect(_test_database_url) as receipt:
+                receipt.execute(
+                    "SELECT messenger_lock_message(%s,%s)",
+                    (account.project_id, item["entity_uuid"]),
+                )
+                finishing = asyncio.create_task(
+                    service.operations.finish(
+                        item, account_data, prepared, {"identity": "101"}
+                    )
+                )
+                try:
+                    for _ in range(100):
+                        blocked = await service.db.sql(
+                            "SELECT 1 FROM pg_stat_activity WHERE %s=ANY(pg_blocking_pids(pid))",
+                            (receipt.info.backend_pid,),
+                        )
+                        if blocked:
+                            break
+                        await asyncio.sleep(0.01)
+                    else:
+                        pytest.fail(
+                            "Sender receipt did not reach the canonical message lock"
+                        )
+                    receipt.execute(
+                        "UPDATE messenger_messages SET provider_identity='100' WHERE uuid=%s",
+                        (item["entity_uuid"],),
+                    )
+                    receipt.execute(
+                        "UPDATE bridge_zulip_v5_deliveries SET zulip_message_id=100,sending=false WHERE uuid=%s",
+                        (prepared["delivery_uuid"],),
+                    )
+                    receipt.commit()
+                    await asyncio.wait_for(finishing, 5)
+                finally:
+                    receipt.rollback()
+                    finishing.cancel()
+                    await asyncio.gather(finishing, return_exceptions=True)
+            assert (
+                await service.db.sql(
+                    "SELECT provider_identity FROM messenger_messages WHERE uuid=%s",
+                    (item["entity_uuid"],),
+                )
+            ) == [{"provider_identity": "100"}]
+            assert (
+                await service.db.sql(
+                    "SELECT zulip_message_id FROM bridge_zulip_v5_deliveries WHERE uuid=%s",
+                    (prepared["delivery_uuid"],),
+                )
+            ) == [{"zulip_message_id": 100}]
 
     asyncio.run(run())

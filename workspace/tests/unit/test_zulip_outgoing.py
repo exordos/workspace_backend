@@ -25,7 +25,7 @@ def test_delete_only_accepts_absent_entities(status, absent):
             asyncio.run(operations.execute({}, {}, prepared, False))
 
 
-def test_ambiguous_send_without_a_receipt_is_never_reposted():
+def test_ambiguous_send_without_a_receipt_requests_a_scheduled_resend():
     db = mock.Mock(sql=mock.AsyncMock(side_effect=[[{"zulip_message_id": None}], []]))
     http = mock.Mock(request=mock.AsyncMock(return_value={"events": []}))
     operations = outgoing_operations.Operations(db, http)
@@ -37,9 +37,35 @@ def test_ambiguous_send_without_a_receipt_is_never_reposted():
         delivery_uuid="receipt",
         last_event_id=0,
     )
-    with pytest.raises(outgoing_operations.Pending):
-        asyncio.run(operations.execute({}, {"uuid": "account"}, prepared, True))
+    with pytest.raises(outgoing_operations.RetrySend):
+        asyncio.run(
+            operations.execute(
+                {"entity_uuid": "workspace-message"},
+                {"uuid": "account"},
+                prepared,
+                True,
+            )
+        )
     assert http.request.call_args.args[1:3] == ("GET", "/events")
+
+
+@pytest.mark.parametrize(
+    "status,data,expected",
+    [
+        (400, {"code": "BAD_EVENT_QUEUE_ID"}, True),
+        (400, {"msg": "An event newer than 7 has already been pruned!"}, True),
+        (400, {"msg": "Invalid message content"}, False),
+        (403, {"msg": "Forbidden"}, False),
+        (500, {}, False),
+    ],
+)
+def test_receipt_queue_errors_are_distinct_from_permanent_send_errors(
+    status, data, expected
+):
+    assert (
+        outgoing_operations.lost_queue(outgoing_operations.ApiError(status, data))
+        is expected
+    )
 
 
 def test_retry_verifies_edit_before_repeating_the_write():
