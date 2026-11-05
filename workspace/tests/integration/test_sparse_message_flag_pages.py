@@ -151,12 +151,12 @@ def test_sparse_mention_pages_preserve_access_and_deletion_checks(
         }[case]
         if value is None:
             db.execute(
-                "UPDATE messenger_messages SET deleted_at=now() WHERE project_id=%s",
+                "DELETE FROM messenger_messages WHERE project_id=%s",
                 (api.project_id,),
             )
         else:
             db.execute(
-                f"UPDATE {table} SET deleted_at=now() WHERE project_id=%s AND {column}=%s",
+                f"DELETE FROM {table} WHERE project_id=%s AND {column}=%s",
                 (api.project_id, value),
             )
     elif case == "inactive_membership":

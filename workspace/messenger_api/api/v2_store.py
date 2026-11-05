@@ -901,6 +901,17 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             raise ra_exceptions.ValidationErrorException()
         base.WorkspaceProviderBase.validate_native_creation(values)
         canonical_uuid = sys_uuid.UUID(str(values.get("uuid") or sys_uuid.uuid4()))
+        session.execute(
+            "SELECT messenger_lock_message(%s,%s)", (self.project_uuid, canonical_uuid)
+        )
+        if (
+            session.execute(
+                "SELECT 1 FROM messenger_message_delete_tombstones WHERE project_id=%s AND canonical_message_uuid=%s LIMIT 1",
+                (self.project_uuid, canonical_uuid),
+            ).fetchone()
+            is not None
+        ):
+            raise ra_exceptions.ValidationErrorException()
         placement_uuid = sys_uuid.uuid5(topic.uuid, str(canonical_uuid))
         existing_placement = session.execute(
             """
@@ -1125,37 +1136,8 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         if message.author_uuid != self.user_uuid:
             raise ra_exceptions.ValidationErrorException()
         session = contexts.Context().get_session()
-        placements = session.execute(
-            """
-            SELECT placement.uuid, placement.stream_uuid, placement.topic_uuid
-            FROM messenger_message_placements AS placement
-            WHERE placement.project_id = %s AND placement.message_uuid = %s
-            ORDER BY placement.uuid
-            """,
-            (self.project_uuid, message.canonical_message_uuid),
-        ).fetchall()
-        for placement in placements:
-            self._enqueue(
-                "delivery_snapshot_event",
-                "message",
-                f"{self.project_uuid}:{message.canonical_message_uuid}",
-                {
-                    "source_kind": "message.deleted",
-                    "placement": dict(placement),
-                    "canonical_message_uuid": message.canonical_message_uuid,
-                    "message_created_at": message.created_at,
-                    "author_uuid": message.author_uuid,
-                    "source_name": message.source_name,
-                    "provider_uuid": message.provider_uuid,
-                    "provider_identity": message.provider_identity,
-                },
-            )
         session.execute(
-            """
-            UPDATE messenger_messages
-            SET deleted_at = NOW()
-            WHERE project_id = %s AND uuid = %s
-            """,
+            "SELECT messenger_delete_message(%s,%s)",
             (self.project_uuid, message.canonical_message_uuid),
         )
         return None
@@ -1532,19 +1514,6 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             return None
         if resource == "stream_topics":
             topic = self._topic(resource_uuid)
-            self._enqueue(
-                "delivery_snapshot_event",
-                "topic",
-                f"{self.project_uuid}:{topic.uuid}",
-                {
-                    "source_kind": "topic.deleted",
-                    "topic_uuid": topic.uuid,
-                    "stream_uuid": topic.stream_uuid,
-                    "source_name": topic.source_name,
-                    "provider_uuid": topic.provider_uuid,
-                    "provider_identity": topic.provider_identity,
-                },
-            )
             cleared_default = session.execute(
                 """
                 UPDATE messenger_streams
@@ -1561,8 +1530,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                     source_kind="stream.updated",
                 )
             session.execute(
-                "UPDATE messenger_topics SET deleted_at = NOW() "
-                "WHERE project_id = %s AND uuid = %s",
+                "DELETE FROM messenger_topics WHERE project_id = %s AND uuid = %s",
                 (self.project_uuid, topic.uuid),
             )
             return None
@@ -1570,23 +1538,8 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             stream = self._stream(resource_uuid)
             if stream.direct_user_uuid is not None:
                 raise ra_exceptions.ValidationErrorException()
-            self._enqueue(
-                "delivery_snapshot_event",
-                "resource",
-                f"{self.project_uuid}:stream:{stream.uuid}",
-                {
-                    "source_kind": "stream.deleted",
-                    "stream_uuid": stream.uuid,
-                    "source_name": stream.source_name,
-                    "provider_uuid": stream.provider_uuid,
-                    "provider_identity": stream.provider_identity,
-                    "all_recipients": True,
-                    "private": stream.private,
-                },
-            )
             session.execute(
-                "UPDATE messenger_streams SET deleted_at = NOW() "
-                "WHERE project_id = %s AND uuid = %s",
+                "DELETE FROM messenger_streams WHERE project_id = %s AND uuid = %s",
                 (self.project_uuid, stream.uuid),
             )
             return None

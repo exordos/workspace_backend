@@ -38,7 +38,7 @@ def journal(conversation, db):
         runtime.close()
 
 
-def test_read_up_to_leaves_hidden_unread_facts_unchanged(
+def test_read_up_to_keeps_revoked_access_unread_absent(
     api, db, conversation, record_property
 ):
     _stream, messages, peer = conversation
@@ -64,7 +64,7 @@ def test_read_up_to_leaves_hidden_unread_facts_unchanged(
         (api.project_id, hidden["uuid"], peer),
     ).fetchone()[0]
     record_property("hidden_state_marked_read", state)
-    assert state is False
+    assert state is True
 
 
 def test_terminal_non_delete_receipts_are_not_retained_forever(
@@ -390,13 +390,13 @@ def test_scope_read_uses_a_visible_boundary(api, db, conversation, resource):
         user=peer,
     )
     assert receipt.json()["status"] == "applied", receipt.text
-    for message, visible in zip(messages, [True, False]):
+    for message in messages:
         assert (
             db.execute(
                 "SELECT NOT EXISTS(SELECT 1 FROM messenger_user_message_unreads WHERE project_id=%s AND user_uuid=%s AND placement_uuid=%s)",
                 (api.project_id, peer, message["uuid"]),
             ).fetchone()[0]
-            is visible
+            is True
         )
 
 

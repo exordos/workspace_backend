@@ -889,26 +889,25 @@ def test_bounded_topic_counts_sum_and_publish_without_capping_parent_totals(
     ) == (1004, 3, 1001)
 
 
-def test_stream_read_preserves_unreads_in_a_deleted_topic(api, db, conversation):
+def test_stream_read_does_not_recreate_deleted_topic_unreads(api, db, conversation):
     stream, messages, peer = conversation
     cfg.CONF.set_override("enabled", False, group=mutation_journal_opts.DOMAIN)
     db.execute(
-        "UPDATE messenger_topics SET deleted_at=NOW() WHERE project_id=%s AND uuid=%s",
+        "DELETE FROM messenger_topics WHERE project_id=%s AND uuid=%s",
         (api.project_id, stream["default_topic_uuid"]),
     )
     response = api.post(
         f"{native.STREAMS}{stream['uuid']}/actions/read/invoke", user=peer
     )
     assert response.status_code == 200, response.text
-    db.execute(
-        "UPDATE messenger_topics SET deleted_at=NULL WHERE project_id=%s AND uuid=%s",
-        (api.project_id, stream["default_topic_uuid"]),
-    )
     for message in messages:
         assert (
-            api.get(f"{native.MESSAGES}{message['uuid']}", user=peer).json()["read"]
-            is False
+            api.get(f"{native.MESSAGES}{message['uuid']}", user=peer).status_code == 404
         )
+    assert db.execute(
+        "SELECT count(*) FROM messenger_user_message_unreads WHERE project_id=%s",
+        (api.project_id,),
+    ).fetchone() == (0,)
 
 
 def test_physical_topic_deletion_zeros_stream_folder_and_project_counts(

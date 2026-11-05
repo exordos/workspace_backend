@@ -120,9 +120,7 @@ def test_local_file_uses_workspace_membership_without_running_either_sync_worker
             (api.project_id, stream, peer),
         )
         readable(api, file, peer)
-        db.execute(
-            "UPDATE messenger_streams SET deleted_at=NOW() WHERE uuid=%s", (stream,)
-        )
+        db.execute("DELETE FROM messenger_streams WHERE uuid=%s", (stream,))
         hidden(api, file, peer)
     finally:
         linked.delete()

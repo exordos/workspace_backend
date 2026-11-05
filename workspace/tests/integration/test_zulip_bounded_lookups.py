@@ -148,14 +148,11 @@ def test_unread_count_preserves_visibility_mentions_and_membership(incoming):
         "INSERT INTO messenger_user_message_bindings(uuid,project_id,user_uuid,placement_uuid) VALUES(gen_random_uuid(),%s,%s,%s)",
         fact[:3],
     )
+    count((0, 0))
+    db.execute(
+        "INSERT INTO messenger_user_message_unreads VALUES(%s,%s,%s,%s,%s)", fact
+    )
     count((1, 1))
-    for deleted, expected in ((True, (0, 0)), (False, (1, 1))):
-        db.execute(
-            "UPDATE messenger_messages SET deleted_at=CASE WHEN %s THEN now() ELSE NULL END "
-            "WHERE project_id=%s AND uuid=%s",
-            (deleted, account["project_id"], message),
-        )
-        count(expected)
     for active, expected in ((False, (0, 0)), (True, (0, 0))):
         db.execute(
             "UPDATE messenger_stream_bindings SET active=%s "
@@ -181,6 +178,11 @@ def test_unread_count_preserves_visibility_mentions_and_membership(incoming):
         "UPDATE messenger_stream_bindings SET membership_generation=membership_generation+1 "
         "WHERE project_id=%s AND user_uuid=%s AND stream_uuid=%s",
         (account["project_id"], account["owner_user_uuid"], stream),
+    )
+    count((0, 0))
+    db.execute(
+        "DELETE FROM messenger_messages WHERE project_id=%s AND uuid=%s",
+        (account["project_id"], message),
     )
     count((0, 0))
 

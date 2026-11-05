@@ -146,7 +146,7 @@ SELECT_STREAMS_SQL = """
     JOIN messenger_stream_bindings member
       ON member.project_id = stream.project_id AND member.stream_uuid = stream.uuid
     WHERE stream.project_id = %s AND stream.provider_uuid = %s
-      AND member.user_uuid = %s AND member.active AND stream.deleted_at IS NULL
+      AND member.user_uuid = %s AND member.active
 """
 SELECT_TOPIC_REFERENCES_SQL = """
     SELECT topic.uuid, topic.name, topic.provider_identity, stream.name AS stream_name
@@ -159,7 +159,7 @@ SELECT_TOPIC_REFERENCES_SQL = """
       ON member.project_id = stream.project_id AND member.stream_uuid = stream.uuid
      AND member.user_uuid = personal.user_uuid AND member.active
     WHERE topic.project_id = %s AND stream.provider_uuid = %s AND personal.user_uuid = %s
-      AND topic.deleted_at IS NULL AND stream.deleted_at IS NULL
+
       AND (topic.provider_identity=ANY(%s::text[])
            OR stream.name || '>' || topic.name=ANY(%s::text[]))
 """
@@ -509,14 +509,14 @@ SELECT_EMPTY_TOPIC_SQL = """
     SELECT topic.* FROM messenger_topics topic
     JOIN messenger_streams stream
       ON stream.project_id = topic.project_id AND stream.uuid = topic.stream_uuid
-    WHERE topic.project_id = %s AND topic.uuid = %s AND topic.deleted_at IS NULL
+    WHERE topic.project_id = %s AND topic.uuid = %s
       AND topic.uuid IS DISTINCT FROM stream.default_topic_uuid
       AND NOT EXISTS (
           SELECT 1 FROM messenger_message_placements placement
           JOIN messenger_messages message
             ON message.project_id = placement.project_id AND message.uuid = placement.message_uuid
           WHERE placement.project_id = topic.project_id AND placement.topic_uuid = topic.uuid
-            AND message.deleted_at IS NULL
+
       )
 """
 SELECT_PROVIDER_BINDINGS_SQL = """
@@ -1183,7 +1183,7 @@ class Operations:
             )
         elif kind == "stream":
             found = await query(
-                "SELECT * FROM messenger_streams WHERE project_id=%s AND provider_uuid=%s AND source_name='zulip' AND provider_identity=%s AND deleted_at IS NULL",
+                "SELECT * FROM messenger_streams WHERE project_id=%s AND provider_uuid=%s AND source_name='zulip' AND provider_identity=%s",
                 (account["project_id"], account["provider_uuid"], remote),
             )
         else:
@@ -1211,7 +1211,6 @@ class Operations:
                         spec["subject"].startswith("✔ "),
                     ),
                 )
-                found = [row for row in found if row["deleted_at"] is None]
             else:
                 user = await self.dependency(
                     account, {"kind": "user", "identity": spec["user"]}, connection
@@ -1457,18 +1456,17 @@ class Operations:
         if kind == "message":
             if "_shared_key" in event:
                 known = await self.db.sql(
-                    "SELECT payload,deleted_at FROM messenger_messages_with_content_v1 WHERE project_id=%s AND provider_uuid=%s AND source_name='zulip' AND provider_identity=%s",
+                    "SELECT payload FROM messenger_messages_with_content_v1 WHERE project_id=%s AND provider_uuid=%s AND source_name='zulip' AND provider_identity=%s",
                     (
                         account["project_id"],
                         account["provider_uuid"],
                         str(event["message"]["id"]),
                     ),
                 )
-                if known and (
-                    known[0]["deleted_at"] is not None
-                    or known[0]["payload"]
-                    == {"kind": "markdown", "content": event["message"]["content"]}
-                ):
+                if known and known[0]["payload"] == {
+                    "kind": "markdown",
+                    "content": event["message"]["content"],
+                }:
                     return {"event": event, "personal": True}
             prepared["messages"] = [dict(event["message"])]
             if "flags" in event:
@@ -2035,7 +2033,6 @@ class Operations:
                 "stream_uuid": stream["uuid"],
                 "name": name.removeprefix("✔ ") or "General",
                 "is_done": name.startswith("✔ "),
-                "deleted_at": None,
                 **origin(account, identity),
             },
         )
@@ -2190,44 +2187,20 @@ class Operations:
         identifier = await self.identity(
             account, "message", remote, connection=connection
         )
-        old = await rows(
-            connection,
-            SELECT_ROW_SQL.format(table=TABLES["message"]),
-            (
-                account["project_id"],
-                identifier,
-            ),
+        await connection.execute(
+            "SELECT messenger_lock_message(%s,%s)", (account["project_id"], identifier)
         )
-        if not old or old[0]["deleted_at"] is not None:
-            return
+        await connection.execute(
+            "INSERT INTO messenger_message_delete_tombstones(project_id,canonical_message_uuid,ingest_sequence) "
+            "VALUES(%s,%s,0) ON CONFLICT DO NOTHING",
+            (account["project_id"], identifier),
+        )
         placements = await rows(
             connection, SELECT_PLACEMENTS_SQL, (account["project_id"], identifier)
         )
-        for placement in placements:
-            snapshots = await rows(
-                connection,
-                SELECT_SNAPSHOT_SQL.format(view=VIEWS["message"]),
-                (
-                    account["project_id"],
-                    placement["uuid"],
-                ),
-            )
-            await self.publish(
-                connection,
-                account,
-                "message.deleted",
-                placement["uuid"],
-                snapshots,
-                placement["stream_uuid"],
-            )
-        await self.save(
-            connection,
-            TABLES["message"],
-            {
-                "uuid": identifier,
-                "project_id": account["project_id"],
-                "deleted_at": datetime.datetime.now(datetime.timezone.utc),
-            },
+        await connection.execute(
+            "SELECT messenger_delete_message(%s,%s)",
+            (account["project_id"], identifier),
         )
         for placement in placements:
             await self.counters(connection, account, placement)
@@ -2240,31 +2213,9 @@ class Operations:
             connection, SELECT_EMPTY_TOPIC_SQL, (account["project_id"], identifier)
         )
         if topics:
-            topic = topics[0]
-            snapshots = await rows(
-                connection,
-                SELECT_SNAPSHOT_SQL.format(view=VIEWS["topic"]),
-                (
-                    account["project_id"],
-                    identifier,
-                ),
-            )
-            await self.publish(
-                connection,
-                account,
-                "topic.deleted",
-                identifier,
-                snapshots,
-                topic["stream_uuid"],
-            )
-            await self.save(
-                connection,
-                TABLES["topic"],
-                {
-                    "uuid": identifier,
-                    "project_id": account["project_id"],
-                    "deleted_at": datetime.datetime.now(datetime.timezone.utc),
-                },
+            await connection.execute(
+                "DELETE FROM messenger_topics WHERE project_id=%s AND uuid=%s",
+                (account["project_id"], identifier),
             )
 
     async def message(
@@ -2292,6 +2243,9 @@ class Operations:
                 account, "message", data["id"], connection=connection
             )
         )
+        await connection.execute(
+            "SELECT messenger_lock_message(%s,%s)", (account["project_id"], identifier)
+        )
         old = await rows(
             connection,
             SELECT_ROW_SQL.format(table="messenger_messages_with_content_v1"),
@@ -2308,7 +2262,11 @@ class Operations:
                 ),
             )
             return
-        if old and old[0]["deleted_at"] is not None:
+        if await rows(
+            connection,
+            "SELECT 1 FROM messenger_message_delete_tombstones WHERE project_id=%s AND canonical_message_uuid=%s LIMIT 1",
+            (account["project_id"], identifier),
+        ):
             return
         if not old and not deliveries:
             pending = await rows(
@@ -2851,7 +2809,7 @@ class Operations:
                 identifier,
             ),
         )
-        if not roots or roots[0]["deleted_at"] is not None:
+        if not roots:
             return
         pending = await rows(
             connection,
@@ -2998,8 +2956,6 @@ class Operations:
         if not canonical:
             raise MissingSharedMessage()
         message = canonical[0]
-        if message["deleted_at"] is not None:
-            return
         placements = await rows(
             connection, SELECT_PLACEMENTS_SQL, (account["project_id"], message["uuid"])
         )
@@ -3432,29 +3388,9 @@ class Operations:
     async def delete_stream(
         self, connection: typing.Any, account: dict, stream: dict
     ) -> None:
-        if stream["deleted_at"] is not None:
-            return
-        members = await rows(
-            connection, SELECT_MEMBERS_SQL, (account["project_id"], stream["uuid"])
-        )
-        await self.save(
-            connection,
-            TABLES["stream"],
-            {
-                "uuid": stream["uuid"],
-                "project_id": account["project_id"],
-                "deleted_at": datetime.datetime.now(datetime.timezone.utc),
-            },
-        )
-        await self.publish(
-            connection,
-            account,
-            "stream.deleted",
-            stream["uuid"],
-            [stream] * len(members),
-            stream["uuid"],
-            recipients=[row["user_uuid"] for row in members],
-            control_effect=True,
+        await connection.execute(
+            "DELETE FROM messenger_streams WHERE project_id=%s AND uuid=%s",
+            (account["project_id"], stream["uuid"]),
         )
 
     async def attachment(

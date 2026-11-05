@@ -1185,7 +1185,7 @@ def _message_namespace(
          AND message.uuid = placement.message_uuid
         JOIN messenger_message_contents contents ON contents.uuid=message.content_uuid
         WHERE placement.project_id = %s AND placement.uuid = %s
-          AND message.deleted_at IS NULL
+
         """,
         (project_id, placement_uuid),
     ).fetchone()
@@ -1999,7 +1999,7 @@ def _process_folder_projection(
                     AND membership.user_uuid = item.user_uuid
                     AND membership.stream_uuid = item.stream_uuid
                     AND membership.active AND NOT stream.is_archived
-                    AND stream.deleted_at IS NULL
+
                     AND (
                         %s = 'all_chats'
                         OR (%s = 'personal' AND stream.private)
@@ -2028,7 +2028,7 @@ def _process_folder_projection(
              AND stream.uuid = membership.stream_uuid
             WHERE membership.project_id = %s AND membership.user_uuid = %s
               AND membership.active AND NOT stream.is_archived
-              AND stream.deleted_at IS NULL
+
               AND (
                   %s = 'all_chats'
                   OR (%s = 'personal' AND stream.private)
@@ -2100,7 +2100,7 @@ def _process_folder_projection(
               ON visible_stream.project_id = item.project_id
              AND visible_stream.uuid = item.stream_uuid
              AND NOT visible_stream.is_archived
-             AND visible_stream.deleted_at IS NULL
+
             WHERE target.project_id = %s AND target.user_uuid = %s
               AND target.folder_uuid = %s
         )
@@ -2365,11 +2365,19 @@ def _deliver_snapshot_batch(
 ) -> None:
     payload = task["payload"]
     source_kind = payload["source_kind"]
+    if source_kind in {"message.deleted", "topic.deleted"}:
+        stream = payload.get("stream_uuid") or payload["placement"]["stream_uuid"]
+        if (
+            session.execute(
+                "SELECT 1 FROM messenger_streams WHERE project_id=%s AND uuid=%s",
+                (task["project_id"], stream),
+            ).fetchone()
+            is None
+        ):
+            # A stream deletion supersedes its pending child notifications.
+            return
     if len(payload.get("recipients") or []) > MAX_FANOUT_BATCH_SIZE:
         raise ValueError("delivery recipient batch exceeds the hard maximum")
-    for placement_payload in payload.get("placements") or []:
-        if len(placement_payload.get("recipients") or []) > MAX_FANOUT_BATCH_SIZE:
-            raise ValueError("delivery recipient batch exceeds the hard maximum")
     expected_generations = payload.get("membership_generations") or {}
     if source_kind in {
         "stream_bindings.created",
@@ -2520,36 +2528,27 @@ def _deliver_snapshot_batch(
     if source_kind == "message.deleted":
         if not payload.get("emit_public_event", True):
             return
-        placements = payload.get("placements")
-        if placements is None:
-            placements = [
-                {
-                    **payload["placement"],
-                    "recipients": payload["recipients"],
-                    "membership_generations": expected_generations,
-                }
-            ]
-        for placement in placements:
-            emitted = messenger_events.create_message_deleted_events(
-                task["project_id"],
-                [_uuid(value) for value in placement["recipients"]],
-                _uuid(placement["uuid"]),
-                _uuid(placement["stream_uuid"]),
-                _uuid(placement["topic_uuid"]),
-                _uuid(payload["author_uuid"]),
-                payload["source_name"],
-                payload["provider_uuid"],
-                payload["provider_identity"],
-                session=session,
-                compact=True,
-            )
-            _guard_emitted_events(
-                session,
-                emitted,
-                project_id=task["project_id"],
-                stream_uuid=placement["stream_uuid"],
-                membership_generations=placement.get("membership_generations") or {},
-            )
+        placement = payload["placement"]
+        emitted = messenger_events.create_message_deleted_events(
+            task["project_id"],
+            [_uuid(value) for value in payload["recipients"]],
+            _uuid(placement["uuid"]),
+            _uuid(placement["stream_uuid"]),
+            _uuid(placement["topic_uuid"]),
+            _uuid(payload["author_uuid"]),
+            payload["source_name"],
+            payload["provider_uuid"],
+            payload["provider_identity"],
+            session=session,
+            compact=True,
+        )
+        _guard_emitted_events(
+            session,
+            emitted,
+            project_id=task["project_id"],
+            stream_uuid=placement["stream_uuid"],
+            membership_generations=expected_generations,
+        )
         return
     if source_kind == "message.updated":
         if payload.get("canonical_message_uuid"):
@@ -2620,17 +2619,30 @@ def _process_delivery_snapshot(
     """Resolve delivery audiences in bounded worker-owned keyset batches."""
     original_payload = task["payload"]
     if "recipients" in original_payload:
-        _deliver_snapshot_batch(session, task)
-        return True
+        recipients = original_payload["recipients"]
+        offset = task["processed_count"]
+        limit = min(max(batch_size, 1), MAX_FANOUT_BATCH_SIZE)
+        batch = recipients[offset : offset + limit]
+        payload = {**original_payload, "recipients": batch}
+        generations = original_payload.get("membership_generations") or {}
+        payload["membership_generations"] = {
+            str(user): generations[str(user)]
+            for user in batch
+            if str(user) in generations
+        }
+        _deliver_snapshot_batch(session, {**task, "payload": payload})
+        session.execute(
+            "UPDATE messenger_projection_tasks SET processed_count=processed_count+%s "
+            "WHERE project_id=%s AND uuid=%s",
+            (len(batch), task["project_id"], task["uuid"]),
+        )
+        return offset + len(batch) >= len(recipients)
     source_kind = original_payload["source_kind"]
     batched_kinds = {
         "stream.updated",
         "stream_binding.updated",
         "stream_bindings.created",
         "stream_binding.deleted",
-        "stream.deleted",
-        "topic.deleted",
-        "message.deleted",
     }
     if source_kind not in batched_kinds:
         _deliver_snapshot_batch(session, task)
@@ -2646,70 +2658,33 @@ def _process_delivery_snapshot(
             membership_generation=int(binding["membership_generation"]),
         )
     limit = min(max(batch_size, 1), MAX_FANOUT_BATCH_SIZE)
-    if source_kind == "message.deleted":
-        placement = original_payload["placement"]
-        # Match soft deletion: shared last-message rows precede dirty counters.
-        # The later physical purge repairs these pointers in this transaction.
-        session.execute(
-            "SELECT messenger_repair_last_message(%s,%s,%s,%s)",
-            (
-                task["project_id"],
-                _uuid(placement["stream_uuid"]),
-                _uuid(placement["topic_uuid"]),
-                _uuid(placement["uuid"]),
-            ),
-        )
-        rows = session.execute(
-            """
-            SELECT access.user_uuid,membership.membership_generation
-            FROM messenger_user_message_bindings access
-            JOIN messenger_message_placements placement
-              ON placement.project_id=access.project_id AND placement.uuid=access.placement_uuid
-            JOIN messenger_stream_bindings membership
-              ON membership.project_id=access.project_id AND membership.user_uuid=access.user_uuid
-             AND membership.stream_uuid=placement.stream_uuid AND membership.active
-            WHERE access.project_id = %s AND access.placement_uuid = %s
-              AND (%s::uuid IS NULL OR access.user_uuid > %s::uuid)
-            ORDER BY access.user_uuid
-            LIMIT %s
-            """,
-            (
-                task["project_id"],
-                _uuid(placement["uuid"]),
-                cursor,
-                cursor,
-                limit + 1,
-            ),
-        ).fetchall()
-    else:
-        stream_uuid = _uuid(original_payload["stream_uuid"])
-        excluded_user = original_payload.get("exclude_user_uuid")
-        excluded_bindings = [
-            _uuid(value)
-            for value in original_payload.get("exclude_binding_uuids") or []
-        ]
-        rows = session.execute(
-            """
-            SELECT uuid, user_uuid, membership_generation
-            FROM messenger_stream_bindings
-            WHERE project_id = %s AND stream_uuid = %s AND active
-              AND (%s::uuid IS NULL OR user_uuid <> %s::uuid)
-              AND NOT (uuid = ANY(%s::uuid[]))
-              AND (%s::uuid IS NULL OR user_uuid > %s::uuid)
-            ORDER BY user_uuid
-            LIMIT %s
-            """,
-            (
-                task["project_id"],
-                stream_uuid,
-                excluded_user,
-                excluded_user,
-                excluded_bindings,
-                cursor,
-                cursor,
-                limit + 1,
-            ),
-        ).fetchall()
+    stream_uuid = _uuid(original_payload["stream_uuid"])
+    excluded_user = original_payload.get("exclude_user_uuid")
+    excluded_bindings = [
+        _uuid(value) for value in original_payload.get("exclude_binding_uuids") or []
+    ]
+    rows = session.execute(
+        """
+        SELECT uuid, user_uuid, membership_generation
+        FROM messenger_stream_bindings
+        WHERE project_id = %s AND stream_uuid = %s AND active
+          AND (%s::uuid IS NULL OR user_uuid <> %s::uuid)
+          AND NOT (uuid = ANY(%s::uuid[]))
+          AND (%s::uuid IS NULL OR user_uuid > %s::uuid)
+        ORDER BY user_uuid
+        LIMIT %s
+        """,
+        (
+            task["project_id"],
+            stream_uuid,
+            excluded_user,
+            excluded_user,
+            excluded_bindings,
+            cursor,
+            cursor,
+            limit + 1,
+        ),
+    ).fetchall()
     has_more = len(rows) > limit
     rows = rows[:limit]
     if not rows:
@@ -2722,41 +2697,6 @@ def _process_delivery_snapshot(
     batch_task = dict(task)
     batch_task["payload"] = payload
     _deliver_snapshot_batch(session, batch_task)
-    if source_kind == "message.deleted":
-        placement = original_payload["placement"]
-        for row in rows:
-            _enqueue_counter_outbox_events(
-                session,
-                source_event_uuid=task["outbox_event_uuid"],
-                project_id=task["project_id"],
-                source_kind=source_kind,
-                user_uuid=row["user_uuid"],
-                stream_uuid=placement["stream_uuid"],
-                topic_uuid=placement["topic_uuid"],
-                placement_uuid=placement["uuid"],
-            )
-    if source_kind == "topic.deleted":
-        for row in rows:
-            _enqueue_counter_outbox_events(
-                session,
-                source_event_uuid=task["outbox_event_uuid"],
-                project_id=task["project_id"],
-                source_kind=source_kind,
-                user_uuid=row["user_uuid"],
-                stream_uuid=original_payload["stream_uuid"],
-                topic_uuid=original_payload["topic_uuid"],
-                include_topic=False,
-            )
-    if source_kind == "stream.deleted" and original_payload.get("all_recipients"):
-        for row in rows:
-            _enqueue_folder_outbox_events(
-                session,
-                source_event_uuid=task["outbox_event_uuid"],
-                project_id=task["project_id"],
-                source_kind=source_kind,
-                user_uuid=row["user_uuid"],
-                stream_uuid=original_payload["stream_uuid"],
-            )
     session.execute(
         """
         UPDATE messenger_projection_tasks
@@ -2808,104 +2748,6 @@ def _process_task(
         raise ValueError(f"Unsupported Messenger v2 task kind {task['task_kind']}")
     handler(session, task)
     return True
-
-
-def _purge_completed_tombstone(
-    session: typing.Any,
-    task: typing.Mapping[str, typing.Any],
-) -> None:
-    """Physically remove a hidden root after all root-scoped work is durable."""
-    payload = task["payload"]
-    source_kind = payload.get("source_kind")
-    project_id = task["project_id"]
-    canonical_value = payload.get("canonical_message_uuid")
-    if canonical_value is not None:
-        canonical_uuid = _uuid(canonical_value)
-        deleted = session.execute(
-            """
-            SELECT 1 FROM messenger_messages
-            WHERE project_id = %s AND uuid = %s AND deleted_at IS NOT NULL
-            """,
-            (project_id, canonical_uuid),
-        ).fetchone()
-        if deleted is not None:
-            unfinished = session.execute(
-                """
-                SELECT 1
-                FROM messenger_domain_outbox_events AS event
-                LEFT JOIN messenger_projection_tasks AS projection
-                  ON projection.project_id = event.project_id
-                 AND projection.outbox_event_uuid = event.uuid
-                WHERE event.project_id = %s AND event.uuid <> %s
-                  AND (
-                      event.payload->>'canonical_message_uuid' = %s
-                      OR (
-                          event.scope_kind = 'message'
-                          AND event.scope_key = %s
-                      )
-                  )
-                  AND (
-                      projection.uuid IS NULL
-                      OR projection.status NOT IN ('completed', 'dead_letter')
-                  )
-                LIMIT 1
-                """,
-                (
-                    project_id,
-                    task["outbox_event_uuid"],
-                    str(canonical_uuid),
-                    f"{project_id}:{canonical_uuid}",
-                ),
-            ).fetchone()
-            if unfinished is None:
-                session.execute(
-                    """
-                    DELETE FROM messenger_messages
-                    WHERE project_id = %s AND uuid = %s
-                      AND deleted_at IS NOT NULL
-                    """,
-                    (project_id, canonical_uuid),
-                )
-    if source_kind == "topic.deleted" and payload.get("topic_uuid") is not None:
-        session.execute(
-            """
-            DELETE FROM messenger_topics
-            WHERE project_id = %s AND uuid = %s AND deleted_at IS NOT NULL
-            """,
-            (project_id, _uuid(payload["topic_uuid"])),
-        )
-        session.execute(
-            """
-            DELETE FROM messenger_messages AS message
-            WHERE message.project_id = %s
-              AND NOT EXISTS (
-                  SELECT 1 FROM messenger_message_placements AS placement
-                  WHERE placement.project_id = message.project_id
-                    AND placement.message_uuid = message.uuid
-              )
-            """,
-            (project_id,),
-        )
-    if source_kind == "stream.deleted":
-        session.execute(
-            """
-            DELETE FROM messenger_streams
-            WHERE project_id = %s AND uuid = %s AND deleted_at IS NOT NULL
-            """,
-            (project_id, _uuid(payload["stream_uuid"])),
-        )
-        session.execute(
-            """
-            DELETE FROM messenger_messages AS message
-            WHERE message.project_id = %s
-              AND NOT EXISTS (
-                  SELECT 1 FROM messenger_message_placements AS placement
-                  WHERE placement.project_id = message.project_id
-                    AND placement.message_uuid = message.uuid
-              )
-            """,
-            (project_id,),
-        )
 
 
 def process_one_projection_task(
@@ -3072,8 +2914,6 @@ def process_one_projection_task(
             metrics[outcome_key] = metrics.get(outcome_key, 0.0) + 1
     else:
         session.execute("RELEASE SAVEPOINT messenger_v2_projection_task", ())
-        if completed:
-            _purge_completed_tombstone(session, task)
         outcome = "completed" if completed else "requeued"
         duration = time.monotonic() - started_at
         execution_stats = _finish_execution_stats(

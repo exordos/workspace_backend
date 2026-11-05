@@ -14,32 +14,42 @@ LOG = logging.getLogger(__name__)
 
 
 COUNT_TOPIC_SQL = """
-    SELECT count(*) AS unread_count,
-           count(*) FILTER (WHERE is_active) AS active_unread_count
-    FROM (
+    WITH scope(project_id,user_uuid,topic_uuid) AS NOT MATERIALIZED (
+        VALUES (%s::uuid,%s::uuid,%s::uuid)
+    ), policy AS MATERIALIZED (
         SELECT CASE
-               WHEN personal.notification_mode='mute' THEN stream.source_name='zulip' AND mention.placement_uuid IS NOT NULL
-               WHEN personal.notification_mode='follow' THEN true
-               WHEN personal.notification_mode='unmute' THEN stream.source_name='zulip' OR mention.placement_uuid IS NOT NULL
-               WHEN membership.notification_mode='all_messages' THEN true
-               WHEN membership.notification_mode='mentions_only' THEN mention.placement_uuid IS NOT NULL
-               ELSE false END AS is_active
-        FROM messenger_user_message_unreads unread
-        JOIN messenger_user_message_bindings access ON
-            (access.project_id,access.user_uuid,access.placement_uuid)=(unread.project_id,unread.user_uuid,unread.placement_uuid)
-        JOIN messenger_message_placements placement ON placement.project_id=unread.project_id AND placement.uuid=unread.placement_uuid
-        JOIN messenger_messages message ON message.project_id=placement.project_id AND message.uuid=placement.message_uuid AND message.deleted_at IS NULL
-        JOIN messenger_topics topic ON topic.project_id=unread.project_id AND topic.uuid=unread.topic_uuid AND topic.deleted_at IS NULL
-        JOIN messenger_streams stream ON stream.project_id=unread.project_id AND stream.uuid=unread.stream_uuid AND stream.deleted_at IS NULL
-        JOIN messenger_stream_bindings membership ON membership.project_id=unread.project_id AND membership.user_uuid=unread.user_uuid
-            AND membership.stream_uuid=unread.stream_uuid AND membership.active
-        LEFT JOIN messenger_user_topic_bindings personal ON personal.project_id=unread.project_id
-            AND personal.user_uuid=unread.user_uuid AND personal.topic_uuid=unread.topic_uuid
-        LEFT JOIN messenger_user_message_mentions mention ON
-            (mention.project_id,mention.user_uuid,mention.placement_uuid)=(unread.project_id,unread.user_uuid,unread.placement_uuid)
-        WHERE unread.project_id=%s AND unread.user_uuid=%s AND unread.topic_uuid=%s
+            WHEN personal.notification_mode='mute' THEN
+                CASE WHEN stream.source_name='zulip' THEN 'mentions' ELSE 'none' END
+            WHEN personal.notification_mode='follow' THEN 'all'
+            WHEN personal.notification_mode='unmute' THEN
+                CASE WHEN stream.source_name='zulip' THEN 'all' ELSE 'mentions' END
+            WHEN membership.notification_mode='all_messages' THEN 'all'
+            WHEN membership.notification_mode='mentions_only' THEN 'mentions'
+            ELSE 'none' END AS mode
+        FROM scope
+        JOIN messenger_topics topic ON topic.project_id=scope.project_id AND topic.uuid=scope.topic_uuid
+        JOIN messenger_streams stream ON stream.project_id=topic.project_id AND stream.uuid=topic.stream_uuid
+        JOIN messenger_stream_bindings membership ON membership.project_id=scope.project_id
+            AND membership.user_uuid=scope.user_uuid AND membership.stream_uuid=stream.uuid AND membership.active
+        LEFT JOIN messenger_user_topic_bindings personal ON personal.project_id=scope.project_id
+            AND personal.user_uuid=scope.user_uuid AND personal.topic_uuid=scope.topic_uuid
+    ), bounded AS MATERIALIZED (
+        SELECT unread.project_id,unread.user_uuid,unread.placement_uuid
+        FROM messenger_user_message_unreads unread,scope
+        WHERE unread.project_id=scope.project_id AND unread.user_uuid=scope.user_uuid
+            AND unread.topic_uuid=scope.topic_uuid
+        ORDER BY unread.placement_uuid
         LIMIT 1001
-    ) bounded
+    )
+    SELECT count(*) AS unread_count,
+           count(*) FILTER (WHERE CASE policy.mode
+               WHEN 'all' THEN true
+               WHEN 'mentions' THEN EXISTS (
+                   SELECT 1 FROM messenger_user_message_mentions mention
+                   WHERE (mention.project_id,mention.user_uuid,mention.placement_uuid)=
+                         (bounded.project_id,bounded.user_uuid,bounded.placement_uuid)
+               ) ELSE false END) AS active_unread_count
+    FROM bounded CROSS JOIN policy
 """
 
 
@@ -142,7 +152,7 @@ def _recount_scope(
              SELECT COALESCE(sum(personal.unread_count),0) AS unread,
                     COALESCE(sum(personal.active_unread_count),0) AS active
              FROM messenger_user_topic_bindings personal
-             JOIN messenger_topics topic ON topic.project_id=personal.project_id AND topic.uuid=personal.topic_uuid AND topic.deleted_at IS NULL
+             JOIN messenger_topics topic ON topic.project_id=personal.project_id AND topic.uuid=personal.topic_uuid
              WHERE personal.project_id=%s AND personal.user_uuid=%s AND topic.stream_uuid=%s
            ) UPDATE messenger_stream_bindings binding SET unread_count=totals.unread,
                 active_unread_count=totals.active,passive_unread_count=totals.unread-totals.active
@@ -175,7 +185,7 @@ def _recount_scope(
                     COALESCE(sum(binding.active_unread_count),0) AS active
              FROM messenger_stream_bindings binding JOIN messenger_streams stream
                ON stream.project_id=binding.project_id AND stream.uuid=binding.stream_uuid
-              AND stream.deleted_at IS NULL AND NOT stream.is_archived
+              AND NOT stream.is_archived
              WHERE binding.project_id=%s AND binding.user_uuid=%s AND binding.active
            ) UPDATE messenger_project_users SET unread_count=totals.unread,
              active_unread_count=totals.active,passive_unread_count=totals.unread-totals.active

@@ -3483,6 +3483,7 @@ def test_shared_admission_rolls_back_registry_and_cursor_on_commit_failure(incom
 
 def test_duplicate_shared_event_does_not_rollback_useful_batch_events(incoming):
     api, db, account, http, url = incoming
+    shared_message = event(identifier=201)
     linked, peer = peer_account(incoming)
     peer_data = peer[2]
     db.execute(
@@ -3511,7 +3512,7 @@ def test_duplicate_shared_event_does_not_rollback_useful_batch_events(incoming):
                         connection,
                         account,
                         {"queue_id": "original-copy"},
-                        [{"id": 1, **event(identifier=201)}],
+                        [{"id": 1, **shared_message}],
                         stage,
                     )
                 async with service.admission() as (connection, stage):
@@ -3520,7 +3521,7 @@ def test_duplicate_shared_event_does_not_rollback_useful_batch_events(incoming):
                         peer_data,
                         {"queue_id": "mixed-batch"},
                         [
-                            {"id": 4, **event(identifier=201)},
+                            {"id": 4, **shared_message},
                             {"id": 5, **event("Useful next message", 202)},
                         ],
                         stage,

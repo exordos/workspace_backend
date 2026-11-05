@@ -691,7 +691,7 @@ def claim_summary_work(
         FROM messenger_topics AS topic
         JOIN messenger_streams AS stream
           ON stream.project_id=topic.project_id AND stream.uuid=topic.stream_uuid
-         AND stream.deleted_at IS NULL
+
         JOIN m_workspace_topic_summary_project_settings AS project_settings
           ON project_settings.project_id = topic.project_id
          AND project_settings.enabled = TRUE
@@ -699,7 +699,7 @@ def claim_summary_work(
           ON global_settings.singleton = TRUE
          AND global_settings.enabled = TRUE
          AND topic.summary_enabled = TRUE
-         AND topic.deleted_at IS NULL
+
         JOIN LATERAL (
             SELECT bounded.uuid
             FROM (
@@ -1086,7 +1086,7 @@ def complete_summary_work(
     current = session.execute(
         """
         SELECT job.claim_token,
-               topic.summary_enabled AND topic.deleted_at IS NULL AND stream.deleted_at IS NULL AS summary_enabled
+               topic.summary_enabled AS summary_enabled
         FROM m_workspace_topic_summary_jobs AS job
         JOIN messenger_topics AS topic
           ON topic.project_id=job.project_id AND topic.uuid = job.topic_uuid
