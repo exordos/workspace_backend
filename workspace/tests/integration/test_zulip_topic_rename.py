@@ -689,9 +689,9 @@ def test_rename_into_default_topic_never_removes_its_identity(incoming):
 
     asyncio.run(run())
     assert db.execute(
-        "SELECT uuid FROM messenger_topics WHERE project_id=%s AND provider_identity='42:'",
+        "SELECT uuid,name FROM messenger_topics WHERE project_id=%s AND provider_identity='42:'",
         (account["project_id"],),
-    ).fetchone() == (default,)
+    ).fetchone() == (default, "General")
     assert db.execute(
         "SELECT topic_uuid FROM messenger_message_placements WHERE project_id=%s",
         (account["project_id"],),

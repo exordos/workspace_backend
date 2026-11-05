@@ -56,7 +56,7 @@ def test_history_imports_final_flags_without_enqueuing_provider_repairs(incoming
         "ON topic.project_id=pending.project_id AND topic.uuid=pending.topic_uuid "
         "WHERE pending.project_id=%s ORDER BY topic.provider_identity",
         (account["project_id"],),
-    ).fetchall() == [("42:", "zulip", False), ("42:General", "General", False)]
+    ).fetchall() == [("42:", "General", False), ("42:General", "General", False)]
 
     # The transaction-local history path must not suppress realtime defaults.
     test_zulip_history.incoming_tests.apply(
