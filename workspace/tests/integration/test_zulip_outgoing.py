@@ -342,6 +342,134 @@ def intents(db, account):
     ).fetchall()
 
 
+def set_send_creation_time(db, public, created):
+    message_uuid = db.execute(
+        "UPDATE messenger_messages message SET created_at=%s "
+        "FROM messenger_message_placements placement "
+        "WHERE placement.uuid=%s AND message.uuid=placement.message_uuid "
+        "RETURNING message.uuid",
+        (created, uuid.UUID(public["uuid"])),
+    ).fetchone()[0]
+    db.execute(
+        "UPDATE zulip_outgoing_intents SET data=jsonb_set(data,'{created_at}',%s) "
+        "WHERE entity_type='message' AND entity_uuid=%s AND operation='insert'",
+        (pg_json.Jsonb(created.isoformat()), message_uuid),
+    )
+    return message_uuid
+
+
+def test_expired_message_does_not_send_or_block_a_fresh_message(
+    outgoing, db, _test_database_url
+):
+    api, account, *_ = outgoing
+    expired = create(outgoing)
+    expired_uuid = set_send_creation_time(
+        db,
+        expired,
+        datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=61),
+    )
+    fresh = create(outgoing)
+
+    async def run():
+        async with sender(account, _test_database_url) as (service, server):
+            await service.dispatch()
+            await asyncio.gather(*list(service.tasks.values()))
+            await asyncio.sleep(0)
+            actual = await service.db.sql(
+                "SELECT entity_uuid,status,error,attempts FROM zulip_outgoing_intents ORDER BY id"
+            )
+            assert actual[0]["entity_uuid"] == expired_uuid
+            assert actual[0]["status"] == "error"
+            assert "one-hour message sending window has expired" in actual[0]["error"]
+            assert actual[0]["attempts"] == 1
+            assert actual[1]["status"] == "done" and actual[1]["error"] is None
+            posts = [
+                data
+                for method, path, data in server.calls
+                if method == "POST" and path == "/api/v1/messages"
+            ]
+            assert len(posts) == 1
+            assert posts[0]["local_id"] == str(actual[1]["entity_uuid"])
+            await service.dispatch()
+            assert not service.tasks
+
+    asyncio.run(run())
+    assert api.get(f"/v1/messenger/messages/{expired['uuid']}").status_code == 200
+    assert api.get(f"/v1/messenger/messages/{fresh['uuid']}").status_code == 200
+
+
+def test_message_expires_between_preparation_and_provider_post(
+    outgoing, db, _test_database_url
+):
+    _api, account, *_ = outgoing
+    public = create(outgoing)
+    current = datetime.datetime.now(datetime.timezone.utc)
+    set_send_creation_time(db, public, current - datetime.timedelta(minutes=59))
+
+    class Clock(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return current
+
+    async def run():
+        nonlocal current
+        async with sender(account, _test_database_url) as (service, server):
+            original = service.operations.prepare
+
+            async def prepare(intent, linked_account):
+                nonlocal current
+                prepared = await original(intent, linked_account)
+                current += datetime.timedelta(minutes=2)
+                return prepared
+
+            service.operations.prepare = prepare
+            with mock.patch.object(outgoing_operations.datetime, "datetime", Clock):
+                await service.dispatch()
+                await asyncio.gather(*list(service.tasks.values()))
+                await asyncio.sleep(0)
+            rows = await service.db.sql(
+                "SELECT status,error FROM zulip_outgoing_intents"
+            )
+            assert rows[0]["status"] == "error"
+            assert "one-hour message sending window has expired" in rows[0]["error"]
+            assert not server.messages
+            assert not any(method == "POST" for method, _, _ in server.calls)
+
+    asyncio.run(run())
+
+
+def test_delivered_message_can_be_edited_after_its_send_window(
+    outgoing, db, _test_database_url
+):
+    api, account, *_ = outgoing
+    public = create(outgoing)
+
+    async def run():
+        async with sender(account, _test_database_url) as (service, server):
+            await drain(service)
+            set_send_creation_time(
+                db,
+                public,
+                datetime.datetime.now(datetime.timezone.utc)
+                - datetime.timedelta(minutes=61),
+            )
+            response = api.put(
+                f"/v1/messenger/messages/{public['uuid']}",
+                json={"payload": {"kind": "markdown", "content": "Later edit"}},
+            )
+            assert response.status_code == 200, response.text
+            await drain(service)
+            assert len(server.messages) == 1
+            assert server.messages[101]["content"] == "Later edit"
+            assert [
+                method
+                for method, path, _ in server.calls
+                if path in ("/api/v1/messages", "/api/v1/messages/101")
+            ] == ["POST", "PATCH"]
+
+    asyncio.run(run())
+
+
 def test_api_intent_is_atomic_and_receipt_updates_canonical_identity(
     outgoing, db, _test_database_url
 ):
@@ -1775,8 +1903,9 @@ def test_group_send_never_falls_back_to_sender_only(
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("message_age_minutes", [0, 61])
 def test_retained_local_receipt_resolves_lost_response_after_queue_expiry(
-    outgoing, db, _test_database_url
+    outgoing, db, _test_database_url, message_age_minutes
 ):
     _api, account, *_ = outgoing
     public = create(outgoing)
@@ -1826,6 +1955,12 @@ def test_retained_local_receipt_resolves_lost_response_after_queue_expiry(
                     pg_json.Jsonb(receipt),
                 ),
             )
+            set_send_creation_time(
+                db,
+                public,
+                datetime.datetime.now(datetime.timezone.utc)
+                - datetime.timedelta(minutes=message_age_minutes),
+            )
             await drain(service)
             sent = [
                 data
@@ -1839,6 +1974,75 @@ def test_retained_local_receipt_resolves_lost_response_after_queue_expiry(
     assert db.execute(
         "SELECT provider_identity FROM messenger_messages WHERE uuid=%s", (canonical,)
     ).fetchone() == ("101",)
+
+
+@pytest.mark.parametrize("receipt", ["available", "empty", "expired", "pruned"])
+def test_restart_never_resends_an_expired_message(
+    outgoing, db, _test_database_url, receipt
+):
+    _api, account, *_ = outgoing
+    public = create(outgoing)
+
+    async def run():
+        async with sender(account, _test_database_url) as (service, server):
+            server.lose_response = True
+            await service.dispatch()
+            await asyncio.gather(*list(service.tasks.values()))
+            await asyncio.sleep(0)
+            rows = await service.db.sql(
+                "SELECT status,request FROM zulip_outgoing_intents"
+            )
+            assert rows[0]["status"] == "checking"
+            assert rows[0]["request"]["kind"] == "send"
+            messages, events, next_id = server.messages, server.events, server.next_id
+
+        set_send_creation_time(
+            db,
+            public,
+            datetime.datetime.now(datetime.timezone.utc)
+            - datetime.timedelta(minutes=61),
+        )
+        async with sender(account, _test_database_url) as (service, server):
+            server.messages, server.events, server.next_id = messages, events, next_id
+            original = service.http.request
+
+            async def restored(linked_account, method, path, data=None, **kwargs):
+                if method == "GET" and path == "/events" and receipt != "available":
+                    if receipt == "empty":
+                        return {"events": []}
+                    raise outgoing_operations.ApiError(
+                        400,
+                        {"code": "BAD_EVENT_QUEUE_ID"}
+                        if receipt == "expired"
+                        else {"msg": "An event newer than 7 has already been pruned!"},
+                        "GET",
+                    )
+                return await original(linked_account, method, path, data, **kwargs)
+
+            service.http.request = restored
+            for _ in range(3):
+                await service.db.sql(
+                    "UPDATE zulip_outgoing_intents SET next_attempt_at=now()"
+                )
+                await service.dispatch()
+                await asyncio.gather(*list(service.tasks.values()))
+                await asyncio.sleep(0)
+                rows = await service.db.sql(
+                    "SELECT status,error FROM zulip_outgoing_intents"
+                )
+                if rows[0]["status"] in ("done", "error"):
+                    break
+            assert len(server.messages) == 1
+            assert not any(method == "POST" for method, _, _ in server.calls)
+            if receipt == "available":
+                assert rows[0] == {"status": "done", "error": None}
+            else:
+                assert rows[0]["status"] == "error"
+                assert "one-hour message sending window has expired" in rows[0]["error"]
+            await service.dispatch()
+            assert not service.tasks
+
+    asyncio.run(run())
 
 
 @pytest.mark.isolated_schema
