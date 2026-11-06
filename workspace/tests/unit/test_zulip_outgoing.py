@@ -10,6 +10,44 @@ import pytest
 from workspace.bridges.zulip import outgoing_operations
 
 
+@pytest.mark.parametrize("age", [3599, 3600, 3601])
+@pytest.mark.parametrize("offset", [None, 0, 3])
+def test_message_send_window_uses_message_creation_time(age, offset):
+    now = datetime.datetime(2026, 11, 6, 12, tzinfo=datetime.timezone.utc)
+    created = now - datetime.timedelta(seconds=age)
+    created = (
+        created.replace(tzinfo=None)
+        if offset is None
+        else created.astimezone(datetime.timezone(datetime.timedelta(hours=offset)))
+    )
+
+    class Clock(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now
+
+    http = mock.Mock(request=mock.AsyncMock(return_value={"id": 123}))
+    operations = outgoing_operations.Operations(mock.Mock(), http)
+    prepared = outgoing_operations.request(
+        "send", "POST", "/messages", {"content": "marker"}
+    )
+    # Recreating the intention must not renew the message's send window.
+    intent = {
+        "created_at": now,
+        "data": {"created_at": created.isoformat()},
+    }
+    with mock.patch.object(outgoing_operations.datetime, "datetime", Clock):
+        if age > 3600:
+            with pytest.raises(ValueError, match="one-hour.*expired"):
+                asyncio.run(operations.execute(intent, {}, prepared, False))
+            http.request.assert_not_called()
+        else:
+            assert asyncio.run(operations.execute(intent, {}, prepared, False)) == {
+                "identity": "123"
+            }
+            http.request.assert_awaited_once()
+
+
 @pytest.mark.parametrize("status,absent", [(404, True), (403, False), (500, False)])
 def test_delete_only_accepts_absent_entities(status, absent):
     db = mock.Mock(sql=mock.AsyncMock())

@@ -826,6 +826,7 @@ class Operations:
                 return request(
                     "noop", "", "", identity=str(remote), delivery_uuid=str(delivery_id)
                 )
+        self.check_send_window(intent)
         route = await self.route(intent, account)
         data = intent["data"]
         if route["channel_type"] == "channel":
@@ -1286,6 +1287,8 @@ class Operations:
             done, result = await self.verify(intent, account, prepared)
             if done:
                 return result
+        if kind == "send":
+            self.check_send_window(intent)
         if kind == "flags":
             for flag, value in prepared["flags"].items():
                 result = await self.http.request(
@@ -1344,6 +1347,16 @@ class Operations:
         if kind == "topic_delete" and not result["complete"]:
             raise Pending("Topic deletion has more batches")
         return {"identity": prepared.get("identity")}
+
+    @staticmethod
+    def check_send_window(intent: dict) -> None:
+        created = datetime.datetime.fromisoformat(intent["data"]["created_at"])
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=datetime.timezone.utc)
+        if datetime.datetime.now(datetime.timezone.utc) - created > datetime.timedelta(
+            hours=1
+        ):
+            raise ValueError("The one-hour message sending window has expired")
 
     async def finish(
         self, intent: dict, account: dict, prepared: dict, result: dict
