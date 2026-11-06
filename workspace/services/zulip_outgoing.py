@@ -8,6 +8,7 @@ import contextlib
 import json
 import logging
 import signal
+import socket
 import typing
 
 import aiohttp
@@ -20,6 +21,9 @@ from workspace.common import database
 
 
 LOG = logging.getLogger(__name__)
+TCP_KEEPALIVE_IDLE = 10
+TCP_KEEPALIVE_INTERVAL = 5
+TCP_KEEPALIVE_COUNT = 3
 
 SELECT_READY_INTENTS_SQL = """
     SELECT intent.*
@@ -168,8 +172,24 @@ class Http:
             limit=connections,
             limit_per_host=connections,
             keepalive_timeout=keepalive,
+            socket_factory=self.create_socket,
         )
         self.sessions: dict[str, tuple[dict, aiohttp.ClientSession]] = {}
+
+    @staticmethod
+    def create_socket(address: tuple) -> socket.socket:
+        connection = socket.socket(*address[:3])
+        connection.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        connection.setsockopt(
+            socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, TCP_KEEPALIVE_IDLE
+        )
+        connection.setsockopt(
+            socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, TCP_KEEPALIVE_INTERVAL
+        )
+        connection.setsockopt(
+            socket.IPPROTO_TCP, socket.TCP_KEEPCNT, TCP_KEEPALIVE_COUNT
+        )
+        return connection
 
     async def close(self) -> None:
         for _, session in self.sessions.values():
