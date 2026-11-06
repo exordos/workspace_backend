@@ -495,6 +495,7 @@ class ZulipIncomingService:
             event = dict(source)
             event.pop("_shared_key", None)
             event.pop("_personal_only", None)
+            event.pop("_topic_rename_progress", None)
             parameters = (
                 account["project_id"],
                 account["uuid"],
@@ -644,7 +645,7 @@ class ZulipIncomingService:
         source = event["payload"]
         metadata = source["_shared_key"]
         previous = await self.db.sql(
-            "SELECT processed_at,error FROM zulip_incoming_events WHERE id=%s AND project_id=%s AND provider_uuid=%s",
+            "SELECT processed_at,error,payload FROM zulip_incoming_events WHERE id=%s AND project_id=%s AND provider_uuid=%s",
             (metadata["identifier"], account["project_id"], account["provider_uuid"]),
         )
         if previous and previous[0]["processed_at"] is None:
@@ -661,6 +662,10 @@ class ZulipIncomingService:
                     for key, value in source.items()
                     if key not in ("_shared_key", "_personal_only")
                 }
+                if previous and "_topic_rename_progress" in previous[0]["payload"]:
+                    payload["_topic_rename_progress"] = previous[0]["payload"][
+                        "_topic_rename_progress"
+                    ]
             else:
                 remote = (
                     source["message"]["id"]
@@ -750,6 +755,13 @@ class ZulipIncomingService:
                     )
                 elif not prepared.get("more"):
                     await connection.execute(COMPLETE_EVENT_SQL, (event["id"],))
+                elif "_topic_rename_progress" in event["payload"]:
+                    # Commit the batch cursor atomically with placement moves,
+                    # including recovery through another linked account.
+                    await connection.execute(
+                        "UPDATE zulip_incoming_events SET payload=%s WHERE id=%s",
+                        (pg_json.Jsonb(event["payload"]), event["id"]),
+                    )
             if not prepared.get("more"):
                 await self.finish_registry(event, True)
             self.ready.set()
@@ -767,7 +779,7 @@ class ZulipIncomingService:
                     await self.finish_registry(event, False)
             except Exception as failure:
                 await self.failure(event, account, failure)
-        except outgoing_operations.Pending as error:
+        except (outgoing_operations.Pending, psycopg.errors.LockNotAvailable) as error:
             await self.db.sql(
                 RETRY_EVENT_SQL, (str(error), self.dependency_delay, event["id"])
             )

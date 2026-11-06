@@ -6,6 +6,7 @@ import datetime
 import json
 import socket
 import time
+import uuid
 from unittest import mock
 
 import pytest
@@ -17,6 +18,160 @@ from workspace.services import zulip_incoming
 from workspace.tests.integration import test_zulip_incoming as incoming_tests
 
 incoming = incoming_tests.incoming
+
+
+def seed_notification_bot(incoming):
+    incoming_tests.apply(
+        incoming,
+        {
+            "type": "realm_user",
+            "op": "add",
+            "person": {
+                "user_id": 6,
+                "full_name": "Notification Bot",
+                "email": "notification-bot@zulip.com",
+                "is_bot": True,
+            },
+        },
+    )
+
+
+@pytest.mark.parametrize("precreate", ["before_admission", "after_admission"])
+@pytest.mark.parametrize("subjects", [("B", "C", "D"), ("✔ A", "A", "✔ A", "A")])
+def test_repeated_rename_keeps_history_with_delayed_personal_events_and_notices(
+    incoming, precreate, subjects
+):
+    api, db, account, http, url = incoming
+    seed_notification_bot(incoming)
+    for identifier in (101, 102, 103):
+        message = incoming_tests.event(f"Original {identifier}", identifier)
+        message["message"].update(subject="A", timestamp=1000)
+        incoming_tests.apply(incoming, message)
+    source = db.execute(
+        "SELECT uuid FROM messenger_topics WHERE project_id=%s AND provider_identity='42:A'",
+        (account["project_id"],),
+    ).fetchone()[0]
+    original = db.execute(
+        "SELECT uuid,message_uuid FROM messenger_message_placements WHERE project_id=%s ORDER BY uuid",
+        (account["project_id"],),
+    ).fetchall()
+
+    async def run():
+        previous = "A"
+        for index, subject in enumerate(subjects, 1):
+            # Recreate the worker/registry between transitions, as on an upgrade.
+            service = zulip_incoming.ZulipIncomingService(url)
+            await service.db.open()
+            service.http = http
+            service.operations = incoming_operations.Operations(service.db, http)
+            personal = {
+                "type": "user_topic",
+                "stream_id": 42,
+                "topic_name": subject,
+                "visibility_policy": 3,
+            }
+            try:
+                if precreate == "before_admission":
+                    await asyncio.to_thread(incoming_tests.apply, incoming, personal)
+                async with service.admission() as (connection, stage):
+                    await service.append(
+                        connection,
+                        account,
+                        {"queue_id": "repeated"},
+                        [
+                            {
+                                "id": index,
+                                **rename(
+                                    subject,
+                                    orig_subject=previous,
+                                    message_ids=[101, 102, 103],
+                                    edit_timestamp=2000 + index,
+                                ),
+                            }
+                        ],
+                        stage,
+                    )
+                if precreate == "after_admission":
+                    await asyncio.to_thread(incoming_tests.apply, incoming, personal)
+                # Zulip also sends a fresh automatic topic move notification.
+                notice = incoming_tests.event("Topic moved", 200 + index)
+                notice["message"].update(
+                    subject=subject, timestamp=2000 + index, sender_id=6
+                )
+                await asyncio.to_thread(incoming_tests.apply, incoming, notice)
+                await incoming_tests.drain_incoming(service)
+                await asyncio.to_thread(incoming_tests.publish)
+                current = api.get(f"/v1/messenger/stream_topics/{source}")
+                assert current.status_code == 200, current.text
+                assert (current.json()["name"], current.json()["is_done"]) == (
+                    subject.removeprefix("✔ "),
+                    subject.startswith("✔ "),
+                )
+                assert db.execute(
+                    "SELECT notification_mode FROM messenger_user_topic_bindings "
+                    "WHERE project_id=%s AND topic_uuid=%s AND user_uuid=%s",
+                    (account["project_id"], source, account["owner_user_uuid"]),
+                ).fetchone() == ("follow",)
+                assert (
+                    db.execute(
+                        "SELECT uuid,message_uuid FROM messenger_message_placements WHERE project_id=%s AND topic_uuid=%s "
+                        "AND message_uuid=ANY(%s) ORDER BY uuid",
+                        (account["project_id"], source, [row[1] for row in original]),
+                    ).fetchall()
+                    == original
+                )
+                # An old personal preference can arrive after the rename. It
+                # must not change the identity/name of the topic with history.
+                await asyncio.to_thread(
+                    incoming_tests.apply,
+                    incoming,
+                    {
+                        **personal,
+                        "topic_name": previous,
+                        "visibility_policy": 0,
+                    },
+                )
+                current = api.get(f"/v1/messenger/stream_topics/{source}").json()
+                assert (current["name"], current["is_done"]) == (
+                    subject.removeprefix("✔ "),
+                    subject.startswith("✔ "),
+                )
+                assert not db.execute(
+                    "SELECT provider_identity FROM messenger_topics WHERE project_id=%s "
+                    "GROUP BY provider_uuid,stream_uuid,provider_identity HAVING count(*)>1",
+                    (account["project_id"],),
+                ).fetchall()
+                previous = subject
+            finally:
+                await service.db.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("duplicate", ["source", "destination"])
+def test_rename_selects_history_instead_of_empty_duplicate_identity(
+    incoming, duplicate
+):
+    api, db, account, _http, _url = incoming
+    source = seed_messages(incoming, size=3)
+    # The old implementation can leave two rows with the same provider name.
+    db.execute(
+        "INSERT INTO messenger_topics SELECT (jsonb_populate_record(NULL::messenger_topics, "
+        "to_jsonb(topic)||jsonb_build_object('uuid',%s::text,'provider_identity',%s::text))).* "
+        "FROM messenger_topics topic WHERE project_id=%s AND uuid=%s",
+        (
+            str(uuid.UUID(int=1)),
+            "42:General" if duplicate == "source" else "42:Renamed",
+            account["project_id"],
+            source,
+        ),
+    )
+    incoming_tests.apply(incoming, rename(message_ids=[101, 102, 103]))
+    assert api.get(f"/v1/messenger/stream_topics/{source}").json()["name"] == "Renamed"
+    assert db.execute(
+        "SELECT uuid FROM messenger_topics WHERE project_id=%s AND provider_identity='42:Renamed'",
+        (account["project_id"],),
+    ).fetchall() == [(source,)]
 
 
 @pytest.fixture
@@ -36,6 +191,85 @@ def stale_statistics(incoming):
     finally:
         for table in tables:
             db.execute(f"ALTER TABLE {table} RESET (autovacuum_enabled)")
+
+
+def test_delayed_rename_batches_reconcile_precreated_aliases(incoming):
+    api, db, account, http, url = incoming
+    seed_notification_bot(incoming)
+    initial = incoming_tests.event()
+    initial["message"].update(subject="A", timestamp=1000)
+    incoming_tests.apply(incoming, initial)
+    source = db.execute(
+        "SELECT uuid FROM messenger_topics WHERE project_id=%s AND provider_identity='42:A'",
+        (account["project_id"],),
+    ).fetchone()[0]
+
+    async def run():
+        service = zulip_incoming.ZulipIncomingService(url)
+        await service.db.open()
+        service.http = http
+        service.operations = incoming_operations.Operations(service.db, http)
+        try:
+            previous = "A"
+            for index, subject in enumerate(("B", "C", "D"), 1):
+                await asyncio.to_thread(
+                    incoming_tests.apply,
+                    incoming,
+                    {
+                        "type": "user_topic",
+                        "stream_id": 42,
+                        "topic_name": subject,
+                        "visibility_policy": 3,
+                    },
+                )
+                notice = incoming_tests.event("Move notice", 200 + index)
+                notice["message"].update(
+                    subject=subject, timestamp=2000 + index, sender_id=6
+                )
+                await asyncio.to_thread(incoming_tests.apply, incoming, notice)
+                async with service.admission() as (connection, stage):
+                    await service.append(
+                        connection,
+                        account,
+                        {"queue_id": "delayed"},
+                        [
+                            {
+                                "id": index,
+                                **rename(
+                                    subject,
+                                    orig_subject=previous,
+                                    message_ids=[101, *range(201, 200 + index)],
+                                    edit_timestamp=2000 + index,
+                                ),
+                            }
+                        ],
+                        stage,
+                    )
+                previous = subject
+            # All batches are admitted before processing, with the same worker
+            # ordering and publication path as live provider delivery.
+            for subject in ("B", "C", "D"):
+                ready = await service.db.sql(zulip_incoming.SELECT_EVENT_SQL, ([], 128))
+                assert len(ready) == 1
+                await service.process(ready[0])
+                await asyncio.to_thread(incoming_tests.publish)
+                assert (
+                    api.get(f"/v1/messenger/stream_topics/{source}").json()["name"]
+                    == subject
+                )
+                assert db.execute(
+                    "SELECT p.topic_uuid FROM messenger_message_placements p JOIN messenger_messages m "
+                    "ON m.project_id=p.project_id AND m.uuid=p.message_uuid "
+                    "WHERE m.project_id=%s AND m.provider_identity='101'",
+                    (account["project_id"],),
+                ).fetchone() == (source,)
+            assert not db.execute(
+                "SELECT 1 FROM zulip_incoming_events WHERE processed_at IS NULL"
+            ).fetchall()
+        finally:
+            await service.db.close()
+
+    asyncio.run(run())
 
 
 def rename(subject="Renamed", **changes):

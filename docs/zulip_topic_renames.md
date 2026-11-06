@@ -26,13 +26,50 @@ bodies. Restarting restores pending shared intentions from the inbox.
 
 ## A fresh message under the new name
 
-A fresh message can arrive before the rename finishes and create a second local
-topic under the new name. When that container was created after receipt of the
-rename and contains at most 100 messages created at or after the provider edit,
-the handler joins those fresh placements into the original topic and renames
-its metadata atomically. The original history keeps its topic UUID. Topic rows
+A fresh message or a personal `user_topic` event can arrive before admission of
+the rename and create a second local topic under the new name. When that
+container is empty or contains at most 100 fresh messages or Notification Bot
+move notices, the handler joins those placements into the original topic and
+renames its metadata atomically. A destination containing only move notices can
+be larger: each transaction folds at most 100 placements into the original
+history. The durable inbox payload records both topic UUIDs and the notices
+already folded, in the same transaction as the moves. Restart and recovery
+through another linked account resume that progress. Each batch checks for newly
+arrived destination history and switches to a real merge when appropriate; new old-name notices stay
+separate and late old-name human history retains real-merge semantics. Provider
+events cannot supply this internal progress metadata.
+
+The original history keeps its topic UUID. Topic rows
 and fresh placements are locked before this decision; contention retries rather
 than waiting inside a large transaction.
+
+Source selection prefers the topic containing the affected placements over an
+empty duplicate provider identity. Empty duplicate aliases contribute their
+latest personal preferences and are removed without moving the history.
+Provisional destinations also transfer newer preferences to the preserved topic;
+a real destination keeps its existing preferences.
+
+A late event for an old name must not overwrite a topic that retained the
+name's deterministic UUID through a rename. Topic creation checks that UUID and,
+when occupied by another identity, derives another deterministic UUID instead.
+Repeated old-name events therefore reuse their alias without changing the
+history's name or completion state.
+
+Zulip leaves old Notification Bot move notices out of the next `change_all`
+message list. Those notices remain under the old provider name. Before an
+in-place rename, the handler relocates at most 100 such placements to an old-name
+alias per transaction and keeps the rename pending if another batch remains.
+Only these notices move; the affected human history retains its topic and
+placement UUIDs. The reserved Notification Bot identity comes from the actual
+provider user catalog, rather than a fixed user ID. Older ordinary destination
+messages, including those created in the same provider second, remain a real merge.
+
+Message transactions pin their resolved topic with `FOR KEY SHARE NOWAIT` in
+the existing lookup. Rename cleanup therefore retries instead of deleting an
+alias that an incoming message is still using. Expected `NOWAIT` contention
+uses the short durable retry path without an application-error log. Topic creation
+and personal-topic resolution lock the selected row before saving it, preventing
+an old-name personal event from overwriting a concurrent rename.
 
 The stream's default topic is a permanent empty-subject container. It cannot be
 renamed in place or retained as the history container for a provisional target.
@@ -53,6 +90,9 @@ when neither its source nor its destination has been imported.
 
 ## Verification
 
+See the [repeated-rename acceptance and timing report](zulip_topic_rename_acceptance.md)
+for the measured provider scenario, regression result and before/after operation timings.
+
 `workspace/tests/integration/test_zulip_topic_rename.py` exercises real PostgreSQL,
 the incoming service, HTTP API, publication and a WebSocket client. It covers:
 
@@ -65,6 +105,13 @@ the incoming service, HTTP API, publication and a WebSocket client. It covers:
 - bounded merge commits, fresh unrelated message visibility before merge
   completion, resume after restart and message-update publication;
 - recovery when the primary account is disabled;
+- A→B→C→D and close/reopen across worker restarts, with old/new personal events
+  before and after rename admission, fresh move notices and duplicate empty aliases;
+- old move notices excluded from `change_all`, bounded notice relocation while
+  unrelated realtime progresses, and a concurrent notice/alias-deletion race;
+- 151 destination notices across restart and disabled-primary recovery, late
+  human/notice arrivals at either name, and real destination history beyond the first batch;
+- a paused old-name personal save racing a rename in the supported incoming worker;
 - renames from the default topic through direct and durable service paths,
   including done and subsequent empty-subject messages;
 - realtime/history naming for empty subjects, completion and direct messages,
