@@ -9,8 +9,8 @@ import datetime
 import hashlib
 import json
 import re
-import typing
 import types
+import typing
 import urllib.parse
 import uuid
 
@@ -1208,7 +1208,8 @@ class Operations:
             )
             if kind == "topic":
                 found = await query(
-                    SELECT_TOPIC_SQL,
+                    SELECT_TOPIC_SQL
+                    + (" FOR KEY SHARE NOWAIT" if connection is not None else ""),
                     (
                         account["project_id"],
                         stream["uuid"],
@@ -2022,7 +2023,7 @@ class Operations:
         identity = f"{stream_identity}:{name}"
         old = await rows(
             connection,
-            SELECT_TOPIC_SQL,
+            SELECT_TOPIC_SQL + " FOR UPDATE NOWAIT",
             (
                 account["project_id"],
                 stream["uuid"],
@@ -2032,6 +2033,22 @@ class Operations:
             ),
         )
         identifier = old[0]["uuid"] if old else uuid.uuid5(stream["uuid"], name.lower())
+        if not old:
+            occupied = await rows(
+                connection,
+                SELECT_ROW_SQL.format(table=TABLES["topic"]) + " FOR UPDATE NOWAIT",
+                (account["project_id"], identifier),
+            )
+            # A rename keeps its UUID. Reusing that name must not overwrite
+            # the renamed topic, including on delayed user_topic events.
+            while occupied and occupied[0]["provider_identity"] != identity:
+                identifier = uuid.uuid5(identifier, name.lower())
+                occupied = await rows(
+                    connection,
+                    SELECT_ROW_SQL.format(table=TABLES["topic"]) + " FOR UPDATE NOWAIT",
+                    (account["project_id"], identifier),
+                )
+            old = occupied
         changed = await self.save(
             connection,
             TABLES["topic"],
@@ -3221,7 +3238,7 @@ class Operations:
         event: dict,
         received_at: datetime.datetime | None = None,
     ) -> bool:
-        """Rename metadata; only a real merge needs bounded placement writes."""
+        """Keep history in place; bound real merges and notice relocation."""
         stream = await self.dependency(
             account,
             {
@@ -3233,11 +3250,31 @@ class Operations:
         )
         old_identity = f"{event['stream_id']}:{event['orig_subject']}"
         identity = f"{event['stream_id']}:{event['subject']}"
+        if old_identity == identity:
+            return False
+        identifiers = list(
+            map(str, event.get("message_ids", [event.get("message_id")]))
+        )
+        progress = event.get("_topic_rename_progress")
+        if progress:
+            identifiers.extend(progress["moved_ids"])
         topics = await rows(
             connection,
-            "SELECT * FROM messenger_topics WHERE project_id=%s AND stream_uuid=%s "
-            "AND provider_uuid=%s AND provider_identity=ANY(%s) ORDER BY uuid FOR UPDATE NOWAIT",
+            "SELECT topic.*,EXISTS(SELECT 1 FROM messenger_message_placements placement "
+            "WHERE placement.project_id=topic.project_id AND placement.topic_uuid=topic.uuid) AS occupied,"
+            "EXISTS(SELECT 1 FROM messenger_message_placements placement "
+            "CROSS JOIN LATERAL (SELECT source_name,provider_uuid,provider_identity "
+            "FROM messenger_messages WHERE project_id=placement.project_id "
+            "AND uuid=placement.message_uuid LIMIT 1) message "
+            "WHERE placement.project_id=topic.project_id AND placement.topic_uuid=topic.uuid "
+            "AND message.source_name='zulip' AND message.provider_uuid=%s "
+            "AND message.provider_identity=ANY(%s)) AS affected "
+            "FROM messenger_topics topic WHERE topic.project_id=%s AND topic.stream_uuid=%s "
+            "AND topic.provider_uuid=%s AND topic.provider_identity=ANY(%s) "
+            "ORDER BY uuid FOR UPDATE OF topic NOWAIT",
             (
+                account["provider_uuid"],
+                identifiers,
                 account["project_id"],
                 stream["uuid"],
                 account["provider_uuid"],
@@ -3245,31 +3282,99 @@ class Operations:
             ),
         )
         source = next(
-            (topic for topic in topics if topic["provider_identity"] == old_identity),
+            (
+                topic
+                for topic in topics
+                if topic["provider_identity"] == old_identity and topic["affected"]
+            ),
             None,
         )
+        if source is None:
+            source = next(
+                (
+                    topic
+                    for topic in topics
+                    if topic["provider_identity"] == old_identity
+                ),
+                None,
+            )
         target = next(
-            (topic for topic in topics if topic["provider_identity"] == identity), None
+            (
+                topic
+                for topic in sorted(topics, key=lambda topic: not topic["occupied"])
+                if topic["provider_identity"] == identity
+            ),
+            None,
         )
-        identifiers = list(
-            map(str, event.get("message_ids", [event.get("message_id")]))
-        )
+        if progress:
+            source = next(
+                (
+                    topic
+                    for topic in topics
+                    if str(topic["uuid"]) == progress["history_uuid"]
+                ),
+                None,
+            )
+            target = next(
+                (
+                    topic
+                    for topic in topics
+                    if str(topic["uuid"]) == progress["alias_uuid"]
+                ),
+                None,
+            )
+        for alias in topics:
+            canonical = source if alias["provider_identity"] == old_identity else target
+            if (
+                canonical
+                and alias["uuid"] != canonical["uuid"]
+                and not alias["occupied"]
+                and alias["uuid"] != stream["default_topic_uuid"]
+            ):
+                await self.merge_topic_bindings(
+                    connection, account, alias, canonical, True
+                )
+                await self.empty_topic(connection, account, alias["uuid"])
+        if (
+            not progress
+            and source
+            and not source["affected"]
+            and target
+            and target["affected"]
+        ):
+            # This change is already reflected in the placements. A delayed
+            # old-name alias must not become their new history container.
+            if (
+                not source["occupied"]
+                and source["uuid"] != stream["default_topic_uuid"]
+            ):
+                await self.merge_topic_bindings(
+                    connection, account, source, target, True
+                )
+                await self.empty_topic(connection, account, source["uuid"])
+            return False
         # A late message may have reused the old topic name. Only rename the
         # whole row when every local placement belongs to this provider change.
         retained = source and await rows(
             connection,
             "SELECT 1 FROM messenger_message_placements placement "
-            "CROSS JOIN LATERAL (SELECT source_name,provider_uuid,provider_identity "
+            "CROSS JOIN LATERAL (SELECT source_name,provider_uuid,provider_identity,author_uuid "
             "FROM messenger_messages WHERE project_id=placement.project_id "
             "AND uuid=placement.message_uuid LIMIT 1) message "
             "WHERE placement.project_id=%s AND placement.topic_uuid=%s "
             "AND NOT COALESCE((message.source_name='zulip' AND message.provider_uuid=%s "
-            "AND message.provider_identity=ANY(%s)),false) LIMIT 1",
+            "AND message.provider_identity=ANY(%s)),false) "
+            "AND NOT EXISTS(SELECT 1 FROM m_external_accounts_v2 sender "
+            "WHERE sender.project_id=placement.project_id AND sender.provider_uuid=message.provider_uuid "
+            "AND sender.provider_uuid=%s AND message.source_name='zulip' "
+            "AND sender.owner_user_uuid=message.author_uuid "
+            "AND sender.settings->>'email'='notification-bot@zulip.com') LIMIT 1",
             (
                 account["project_id"],
                 source["uuid"],
                 account["provider_uuid"],
                 identifiers,
+                account["provider_uuid"],
             ),
         )
         if (
@@ -3278,6 +3383,10 @@ class Operations:
             and (target is None or target["uuid"] == source["uuid"])
             and not retained
         ):
+            if await self.split_topic_notices(
+                connection, account, stream, source, topics, identifiers
+            ):
+                return True
             await self.rename_topic_metadata(
                 connection, account, stream, source, event["subject"]
             )
@@ -3291,21 +3400,28 @@ class Operations:
         if source["uuid"] == target["uuid"]:
             return False
         provisional = False
+        fresh = []
+        if progress and retained:
+            # A late human message under the old name turns this into a real
+            # merge. Include notices already folded in previous transactions.
+            progress["mode"] = "merge"
         if (
             not retained
+            and (not progress or progress["mode"] == "provisional")
             and source["uuid"] != stream["default_topic_uuid"]
-            and received_at is not None
             and "edit_timestamp" in event
             and target["uuid"] != stream["default_topic_uuid"]
-            and target["created_at"].replace(tzinfo=None)
-            >= received_at.replace(tzinfo=None)
         ):
             # A fresh message or user_topic event can create the new name before
             # the rename is applied. Preserve the existing history's topic UUID
             # instead of moving that history to this provisional container.
             fresh = await rows(
                 connection,
-                "SELECT message.provider_identity,message.provider_uuid,message.source_name,message.created_at "
+                "SELECT placement.uuid AS placement_uuid,message.provider_identity,message.provider_uuid,message.source_name,message.created_at,"
+                "EXISTS(SELECT 1 FROM m_external_accounts_v2 sender "
+                "WHERE sender.project_id=message.project_id AND sender.provider_uuid=message.provider_uuid "
+                "AND sender.owner_user_uuid=message.author_uuid "
+                "AND sender.settings->>'email'='notification-bot@zulip.com') AS move_notice "
                 "FROM messenger_message_placements placement JOIN messenger_messages message "
                 "ON message.project_id=placement.project_id AND message.uuid=placement.message_uuid "
                 "WHERE placement.project_id=%s AND placement.topic_uuid=%s "
@@ -3315,32 +3431,75 @@ class Operations:
             edited = datetime.datetime.fromtimestamp(
                 event["edit_timestamp"], datetime.timezone.utc
             ).replace(tzinfo=None)
-            if len(fresh) <= 100 and all(
+            foldable = len(fresh) > 100 and all(
                 row["source_name"] == "zulip"
                 and row["provider_uuid"] == account["provider_uuid"]
-                and row["created_at"].replace(tzinfo=None) >= edited
+                and row["move_notice"]
                 for row in fresh
+            )
+            if foldable or progress:
+                # Inspect only for a disqualifying row; never load the whole
+                # destination or move more than 100 placements per transaction.
+                foldable = not await rows(
+                    connection,
+                    "SELECT 1 FROM messenger_message_placements placement "
+                    "JOIN messenger_messages message ON message.project_id=placement.project_id "
+                    "AND message.uuid=placement.message_uuid "
+                    "WHERE placement.project_id=%s AND placement.topic_uuid=%s "
+                    "AND NOT COALESCE((message.source_name='zulip' AND message.provider_uuid=%s "
+                    "AND (EXISTS(SELECT 1 FROM m_external_accounts_v2 sender "
+                    "WHERE sender.project_id=message.project_id AND sender.provider_uuid=message.provider_uuid "
+                    "AND sender.owner_user_uuid=message.author_uuid "
+                    "AND sender.settings->>'email'='notification-bot@zulip.com') "
+                    "OR message.created_at>%s OR (message.created_at=%s AND %s))),false) LIMIT 1",
+                    (
+                        account["project_id"],
+                        target["uuid"],
+                        account["provider_uuid"],
+                        edited,
+                        edited,
+                        received_at is not None
+                        and target["created_at"].replace(tzinfo=None)
+                        >= received_at.replace(tzinfo=None),
+                    ),
+                )
+            if foldable or (
+                len(fresh) <= 100
+                and all(
+                    row["source_name"] == "zulip"
+                    and row["provider_uuid"] == account["provider_uuid"]
+                    and (
+                        row["move_notice"]
+                        or row["created_at"].replace(tzinfo=None) > edited
+                        or (
+                            row["created_at"].replace(tzinfo=None) == edited
+                            and received_at is not None
+                            and target["created_at"].replace(tzinfo=None)
+                            >= received_at.replace(tzinfo=None)
+                        )
+                    )
+                    for row in fresh
+                )
             ):
+                if await self.split_topic_notices(
+                    connection, account, stream, source, topics, identifiers
+                ):
+                    return True
+                if foldable and not progress:
+                    progress = {
+                        "history_uuid": str(source["uuid"]),
+                        "alias_uuid": str(target["uuid"]),
+                        "mode": "provisional",
+                        "moved_ids": [],
+                    }
+                    event["_topic_rename_progress"] = progress
                 provisional = True
                 source, target = target, source
                 identifiers = [row["provider_identity"] for row in fresh]
-        # Destination preferences win for existing bindings; new recipients
-        # retain their source-topic notification preference.
-        await connection.execute(
-            "INSERT INTO messenger_user_topic_bindings "
-            "(uuid,project_id,user_uuid,topic_uuid,notification_mode,source_name,provider_uuid,provider_identity,status) "
-            "SELECT messenger_uuid_v5(%s,user_uuid::text),project_id,user_uuid,%s,notification_mode,"
-            "source_name,provider_uuid,CASE WHEN provider_identity IS NOT NULL THEN %s || ':' || "
-            "split_part(provider_identity,':',-1) END,status "
-            "FROM messenger_user_topic_bindings WHERE project_id=%s AND topic_uuid=%s "
-            "ON CONFLICT (project_id,user_uuid,topic_uuid) DO NOTHING",
-            (
-                target["uuid"],
-                target["uuid"],
-                target["provider_identity"],
-                account["project_id"],
-                source["uuid"],
-            ),
+        if progress and not provisional:
+            progress["mode"] = "merge"
+        await self.merge_topic_bindings(
+            connection, account, source, target, provisional
         )
         moved = await rows(
             connection,
@@ -3363,6 +3522,18 @@ class Operations:
                 account["project_id"],
             ),
         )
+        if provisional and progress:
+            moved_placements = {row["uuid"] for row in moved}
+            progress["moved_ids"] = list(
+                dict.fromkeys(
+                    progress["moved_ids"]
+                    + [
+                        row["provider_identity"]
+                        for row in fresh
+                        if row["placement_uuid"] in moved_placements
+                    ]
+                )
+            )
         more = bool(
             await rows(
                 connection,
@@ -3412,6 +3583,131 @@ class Operations:
                     stream["uuid"],
                 )
         return more
+
+    async def split_topic_notices(
+        self,
+        connection: typing.Any,
+        account: dict,
+        stream: dict,
+        source: dict,
+        topics: list[dict],
+        identifiers: list[str],
+    ) -> bool:
+        # Zulip leaves old move notices behind instead of including them in
+        # change_all. Keep those under the old name, preserving the human
+        # history's UUID, with the same bounded batches as ordinary merges.
+        notices = await rows(
+            connection,
+            "SELECT placement.uuid FROM messenger_message_placements placement "
+            "CROSS JOIN LATERAL (SELECT source_name,provider_uuid,provider_identity,author_uuid "
+            "FROM messenger_messages WHERE project_id=placement.project_id "
+            "AND uuid=placement.message_uuid LIMIT 1) message "
+            "WHERE placement.project_id=%s AND placement.topic_uuid=%s "
+            "AND message.source_name='zulip' AND message.provider_uuid=%s "
+            "AND NOT(message.provider_identity=ANY(%s)) "
+            "AND EXISTS(SELECT 1 FROM m_external_accounts_v2 sender "
+            "WHERE sender.project_id=placement.project_id AND sender.provider_uuid=message.provider_uuid "
+            "AND sender.owner_user_uuid=message.author_uuid "
+            "AND sender.settings->>'email'='notification-bot@zulip.com') "
+            "ORDER BY placement.uuid LIMIT 101 FOR UPDATE OF placement NOWAIT",
+            (
+                account["project_id"],
+                source["uuid"],
+                account["provider_uuid"],
+                identifiers,
+            ),
+        )
+        if not notices:
+            return False
+        alias = next(
+            (
+                topic
+                for topic in topics
+                if topic["uuid"] != source["uuid"]
+                and topic["provider_identity"] == source["provider_identity"]
+                and topic["occupied"]
+            ),
+            None,
+        )
+        created = alias is None
+        if alias is None:
+            alias = await self.save(
+                connection,
+                TABLES["topic"],
+                {
+                    "uuid": uuid.uuid4(),
+                    "project_id": account["project_id"],
+                    "stream_uuid": stream["uuid"],
+                    "name": source["name"],
+                    "is_done": source["is_done"],
+                    **origin(account, source["provider_identity"]),
+                },
+            )
+        alias = typing.cast(dict, alias)
+        await self.merge_topic_bindings(connection, account, source, alias, False)
+        await connection.execute(
+            "UPDATE messenger_message_placements SET topic_uuid=%s,updated_at=now() "
+            "WHERE project_id=%s AND uuid=ANY(%s)",
+            (
+                alias["uuid"],
+                account["project_id"],
+                [notice["uuid"] for notice in notices[:100]],
+            ),
+        )
+        for notice in notices[:100]:
+            await self.snapshot(
+                connection,
+                account,
+                "message",
+                notice["uuid"],
+                "updated",
+                stream["uuid"],
+            )
+        await self.snapshot(
+            connection,
+            account,
+            "topic",
+            alias["uuid"],
+            "created" if created else "updated",
+            stream["uuid"],
+        )
+        for topic in (source, alias):
+            await self.counters(
+                connection,
+                account,
+                {"stream_uuid": stream["uuid"], "topic_uuid": topic["uuid"]},
+            )
+        return len(notices) > 100
+
+    async def merge_topic_bindings(
+        self,
+        connection: typing.Any,
+        account: dict,
+        source: dict,
+        target: dict,
+        prefer_latest: bool,
+    ) -> None:
+        # Real destinations keep their preferences. Provisional aliases only
+        # contribute preferences newer than those on the preserved topic.
+        await connection.execute(
+            "INSERT INTO messenger_user_topic_bindings "
+            "(uuid,project_id,user_uuid,topic_uuid,notification_mode,source_name,provider_uuid,provider_identity,status,updated_at) "
+            "SELECT messenger_uuid_v5(%s,user_uuid::text),project_id,user_uuid,%s,notification_mode,"
+            "source_name,provider_uuid,CASE WHEN provider_identity IS NOT NULL THEN %s || ':' || "
+            "split_part(provider_identity,':',-1) END,status,updated_at "
+            "FROM messenger_user_topic_bindings WHERE project_id=%s AND topic_uuid=%s "
+            "ON CONFLICT (project_id,user_uuid,topic_uuid) DO UPDATE SET "
+            "notification_mode=EXCLUDED.notification_mode,updated_at=EXCLUDED.updated_at "
+            "WHERE %s AND messenger_user_topic_bindings.updated_at<EXCLUDED.updated_at",
+            (
+                target["uuid"],
+                target["uuid"],
+                target["provider_identity"],
+                account["project_id"],
+                source["uuid"],
+                prefer_latest,
+            ),
+        )
 
     async def apply(
         self, connection: typing.Any, account: dict, prepared: dict
