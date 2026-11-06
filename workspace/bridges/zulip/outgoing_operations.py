@@ -1287,8 +1287,9 @@ class Operations:
             done, result = await self.verify(intent, account, prepared)
             if done:
                 return result
+        timeout = 30.0
         if kind == "send":
-            self.check_send_window(intent)
+            timeout = min(timeout, self.check_send_window(intent))
         if kind == "flags":
             for flag, value in prepared["flags"].items():
                 result = await self.http.request(
@@ -1321,6 +1322,7 @@ class Operations:
                 prepared["path"],
                 prepared["data"],
                 file=file,
+                timeout=timeout,
             )
         except ApiError as error:
             if kind in ("delete", "topic_delete", "archive") and self.absent(error):
@@ -1349,14 +1351,19 @@ class Operations:
         return {"identity": prepared.get("identity")}
 
     @staticmethod
-    def check_send_window(intent: dict) -> None:
+    def check_send_window(intent: dict) -> float:
         created = datetime.datetime.fromisoformat(intent["data"]["created_at"])
         if created.tzinfo is None:
             created = created.replace(tzinfo=datetime.timezone.utc)
-        if datetime.datetime.now(datetime.timezone.utc) - created > datetime.timedelta(
-            hours=1
-        ):
+        remaining = (
+            created
+            + datetime.timedelta(hours=1)
+            - datetime.datetime.now(datetime.timezone.utc)
+        ).total_seconds()
+        if remaining < 0:
             raise ValueError("The one-hour message sending window has expired")
+        # A zero aiohttp timeout disables the deadline rather than expiring it.
+        return max(remaining, 0.000001)
 
     async def finish(
         self, intent: dict, account: dict, prepared: dict, result: dict

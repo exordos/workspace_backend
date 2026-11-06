@@ -15,6 +15,8 @@ the intention's creation or retry time. An intention captured or requeued later
 does not extend this window. The sender checks the age before preparing a new
 send and again immediately before its POST, so waiting for recipients, files,
 rate limits, or a sender restart cannot renew permission to send.
+The request's total HTTP timeout is also capped by the remaining window, so
+waiting for a pooled connection or connection setup cannot extend it.
 
 An expired send becomes a terminal `error` with an explicit expiry reason. The
 Workspace message remains stored, and independent work continues. Existing
@@ -73,7 +75,8 @@ the retry prevents a duplicate POST.
 
 Send-window coverage includes the exact one-hour boundary, UTC and offset or
 naive timestamps, an expired message beside independent fresh work, expiry
-between preparation and POST, and restart recovery with an available, empty,
+between preparation and POST, a connection pool occupied beyond the deadline,
+and restart recovery with an available, empty,
 expired or pruned receipt queue. A retained local receipt must still complete
 an expired send without repeating the POST.
 
