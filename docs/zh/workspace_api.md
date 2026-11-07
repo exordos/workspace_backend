@@ -765,7 +765,7 @@ Provider instances are stored once with their UUID and hostname. Public origins 
 | 场地 | 类型 | 创建时需要 | 仅供读取 | 描述 |
 | --- | --- | --- | --- | --- |
 | `uuid` | UUID | 不需要 | 是的 | 流量识别器 |
-| `name` | 连接器,最大 255 | 是的 | 不需要 | 流的名称. |
+| `name` | 连接器,最大 2048 | 是的 | 不需要 | 流的名称. |
 | `description` | 连接器,最大 255 | 不需要 | 不需要 | 流描述;默认为空字符串. |
 | `project_id` | UUID | 不需要 | 是的 | IAM 项目范围 |
 | `owner` | UUID | 不需要 | 是的 | 从用户流视图中看到所有者. |

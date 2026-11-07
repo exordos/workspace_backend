@@ -765,7 +765,7 @@ Provider instances are stored once with their UUID and hostname. Public origins 
 | Field | Type | Required on create | Read-only | Description |
 | --- | --- | --- | --- | --- |
 | `uuid` | UUID | no | yes | Stream identifier. |
-| `name` | string, max 255 | yes | no | Stream name. |
+| `name` | string, max 2048 | yes | no | Stream name. |
 | `description` | string, max 255 | no | no | Stream description; defaults to an empty string. |
 | `project_id` | UUID | no | yes | IAM project scope. |
 | `owner` | UUID | no | yes | Owner from the user stream view. |

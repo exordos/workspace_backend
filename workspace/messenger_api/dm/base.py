@@ -315,6 +315,7 @@ class WorkspaceStreamBase(
     common_models.ModelWithRequiredNameDesc,
     models.ModelWithTimestamp,
 ):
+    name = properties.property(types.String(max_length=2048), required=True)
     user_uuid = properties.property(
         types.UUID(),
         required=True,
@@ -397,6 +398,7 @@ class WorkspaceUserStreamBase(
     models.ModelWithProject,
     models.ModelWithTimestamp,
 ):
+    name = properties.property(types.String(max_length=2048), required=True)
     owner = properties.property(
         types.UUID(),
         required=True,

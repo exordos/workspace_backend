@@ -277,6 +277,34 @@ def _assert_all_local_references_resolve(specification):
             pending.extend(value)
 
 
+def test_stream_name_limit_is_2048_in_requests_responses_and_filters():
+    specification = _build_openapi(workspace_app)
+    for name in (
+        "WorkspaceUserStream_Get",
+        "WorkspaceUserStream_Create",
+        "WorkspaceUserStream_Update",
+    ):
+        assert (
+            _component_schema(specification, name)["properties"]["name"]["maxLength"]
+            == 2048
+        )
+    paths = specification["paths"]
+    for path, method in (
+        ("/v1/messenger/streams/", "post"),
+        ("/v1/messenger/streams/{WorkspaceUserStreamUuid}", "put"),
+    ):
+        schema = paths[path][method]["requestBody"]["content"]["application/json"][
+            "schema"
+        ]
+        assert schema["properties"]["name"]["maxLength"] == 2048
+    assert (
+        specification["components"]["parameters"]["WorkspaceUserStream_name"]["schema"][
+            "maxLength"
+        ]
+        == 2048
+    )
+
+
 def test_file_upload_identity_is_not_limited_to_255_characters():
     specification = _build_openapi(workspace_app)
     identity = _component_schema(specification, "WorkspaceFile_Get")["properties"][

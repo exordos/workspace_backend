@@ -765,7 +765,7 @@ Provider instances are stored once with their UUID and hostname. Public origins 
 | Feld | Typ | Erforderlich bei der Erstellung | Nur für Lesen | Beschreibung |
 | --- | --- | --- | --- | --- |
 | `uuid` | UUID | - Nein. | - Ja, das ist es. | Streaming-Identifikator. |
-| `name` | String, max. 255 | - Ja, das ist es. | - Nein. | - Der Name des Stroms. |
+| `name` | String, max. 2048 | - Ja, das ist es. | - Nein. | - Der Name des Stroms. |
 | `description` | String, max. 255 | - Nein. | - Nein. | Strömungsbeschreibung; Standard für eine leere Zeichenfolge. |
 | `project_id` | UUID | - Nein. | - Ja, das ist es. | IAM Projektumfang. |
 | `owner` | UUID | - Nein. | - Ja, das ist es. | Eigentümer aus der Benutzer-Stream-Ansicht. |
