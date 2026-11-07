@@ -19,6 +19,61 @@ from workspace.tests.integration import test_zulip_incoming as incoming_tests
 incoming = incoming_tests.incoming
 
 
+@pytest.mark.parametrize("participant_count", [3, 40])
+def test_group_history_with_long_stream_name_is_complete_and_idempotent(
+    incoming, participant_count
+):
+    api, db, account, _, _ = incoming
+    recipients = [
+        {"id": value, "full_name": f"User{value:04d}"}
+        for value in range(7, 7 + participant_count)
+    ]
+    name = ", ".join(person["full_name"] for person in recipients)
+    remote = message(
+        type="private",
+        recipient_id=1,
+        display_recipient=recipients,
+        flags=["read", "starred"],
+    )
+    remote.pop("stream_id")
+    remote.pop("subject")
+
+    async def run():
+        async with worker(incoming, {101: remote}) as (service, _):
+            await drain(service, account)
+            assert not await service.db.sql("SELECT 1 FROM zulip_history_batches")
+
+    def snapshot():
+        streams = api.get("/v1/messenger/streams/").json()
+        assert len(streams) == 1
+        stream = streams[0]
+        assert stream["name"] == name
+        assert not stream["private"]
+        assert db.execute(
+            "SELECT direct_user_uuid FROM messenger_streams WHERE uuid=%s",
+            (stream["uuid"],),
+        ).fetchone() == (None,)
+        visible = api.get("/v1/messenger/messages/").json()
+        assert len(visible) == 1
+        assert visible[0]["read"] and visible[0]["starred"]
+        people = db.execute(
+            "SELECT external_account_id FROM m_external_accounts_v2 "
+            "WHERE project_id=%s AND provider_uuid=%s",
+            (account["project_id"], account["provider_uuid"]),
+        ).fetchall()
+        assert {row[0] for row in people} == {
+            str(person["id"]) for person in recipients
+        }
+        return stream["uuid"], visible[0]["topic_uuid"], visible[0]["uuid"]
+
+    request(db, account)
+    asyncio.run(run())
+    before = snapshot()
+    request(db, account)
+    asyncio.run(run())
+    assert snapshot() == before
+
+
 def message(identifier=101, content="Hello", **changes):
     return {
         **incoming_tests.event(content, identifier)["message"],

@@ -1354,7 +1354,7 @@ components:
         name:
           type: string
           example: any_string
-          maxLength: 255
+          maxLength: 2048
         description:
           type: string
           example: any_string
@@ -3881,7 +3881,7 @@ components:
       schema:
         type: string
         example: any_string
-        maxLength: 255
+        maxLength: 2048
     WorkspaceUserStream_description:
       name: description
       in: query
@@ -7558,7 +7558,7 @@ paths:
                 name:
                   type: string
                   example: any_string
-                  maxLength: 255
+                  maxLength: 2048
                 description:
                   type: string
                   example: any_string
@@ -7683,7 +7683,7 @@ paths:
                 name:
                   type: string
                   example: any_string
-                  maxLength: 255
+                  maxLength: 2048
                 description:
                   type: string
                   example: any_string

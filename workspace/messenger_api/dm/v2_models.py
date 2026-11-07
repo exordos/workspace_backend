@@ -329,6 +329,7 @@ class WorkspaceStream(
 ):
     __tablename__ = "messenger_streams"
 
+    name = properties.property(types.String(max_length=2048), required=True)
     owner_uuid = properties.property(types.UUID(), required=True, read_only=True)
     encryption = properties.property(types.Boolean(), default=False)
     current_encryption_key_uuid = properties.property(
