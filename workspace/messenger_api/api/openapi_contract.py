@@ -443,6 +443,7 @@ def add_message_encryption_contract(
             variant["required"] = [
                 "kind",
                 "questions",
+                "multiple_answers",
                 "is_anonymous",
                 "allow_revote",
                 "results_visibility",

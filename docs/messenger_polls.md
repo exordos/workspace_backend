@@ -10,19 +10,19 @@ Send a poll through the ordinary message endpoint. UUIDs are stable within the q
   "questions": [{
     "uuid": "00000000-0000-4000-8000-000000000001",
     "text": "Where should we meet?",
-    "multiple_answers": false,
     "options": [
       {"uuid": "00000000-0000-4000-8000-000000000002", "text": "Office"},
       {"uuid": "00000000-0000-4000-8000-000000000003", "text": "Online"}
     ]
   }],
+  "multiple_answers": false,
   "is_anonymous": true,
   "allow_revote": false,
   "results_visibility": "after_vote"
 }
 ```
 
-A poll needs at least one question and two options per question. The default maxima are 20 questions and 20 options per question (`poll_max_questions` and `poll_max_options_per_question`); changing these limits does not invalidate published polls. A question may include `correct_option_uuids` drawn from its options. Readers always receive these IDs. Optional creation fields are `closes_at` (a future timestamp with a time zone, default null) and `allow_adding_options` (default false). The server supplies `closed_at`.
+A poll needs at least one question and two options per question. The default maxima are 20 questions and 20 options per question (`poll_max_questions` and `poll_max_options_per_question`); changing these limits does not invalidate published polls. The required poll-level `multiple_answers` applies to every question, while selections remain independent per question. A question may include `correct_option_uuids` drawn from its options. Readers always receive these IDs. Optional creation fields are `closes_at` (a future timestamp with a time zone, default null) and `allow_adding_options` (default false). The server supplies `closed_at`.
 
 Use the public message UUID for the following endpoints. All four POST actions return the current message, including the caller's poll state.
 
@@ -34,7 +34,7 @@ Use the public message UUID for the following endpoints. All four POST actions r
 | `POST actions/add_poll_option/invoke` | `{question_uuid, option: {uuid, text}}`. Append without voting. Retrying the same UUID and text succeeds even after closing. |
 | `GET poll_voters/` | `question_uuid`, `option_uuid`; optional `page_limit` (default 50, maximum 100) and `page_marker`. Returns objects containing only `uuid`; use `X-Pagination-Marker` for the next page. Anonymous polls forbid this lookup for everyone. |
 
-Only a current participant can vote or append. The author and current stream owners, administrators and moderators can manage the poll. Without revoting, a single choice cannot be replaced and existing selections cannot be removed; a multiple-choice question still accepts additional selections. Questions are independent. Once the deadline passes or a manager closes the poll, no further changes are accepted. Ordinary message edits cannot change polls or convert another message into a poll. Forwarded results are Markdown snapshots.
+Only a current participant can vote or append. The author and current stream owners, administrators and moderators can manage the poll. Without revoting, a single choice cannot be replaced and existing selections cannot be removed; a question in a multiple-choice poll still accepts additional selections. Questions are independent. Once the deadline passes or a manager closes the poll, no further changes are accepted. Ordinary message edits cannot change polls or convert another message into a poll. Forwarded results are Markdown snapshots.
 
 Message reads include `poll_state` (null for other kinds). It contains `revision`, `is_closed`, distinct `voter_count`, ordered `questions` with per-question `voter_count` and `option_counts` keyed by option UUID, and the reader's `my_votes` as `{question_uuid, option_uuids}` entries. Missing votes produce zero counts and an empty own-answer list. Counts are available to the API regardless of `results_visibility` (`always` or `after_vote`); the latter is a presentation rule.
 
