@@ -218,3 +218,5 @@ Der Inhalt der Nachricht V1 verwendet die Form der Markierung der Nutzlast:
 Anwesenheit wird über die REST aktualisiert
 `users/{uuid}/actions/presence/invoke` Aktion. Der Arbeiter markiert veraltete Benutzer
 Offline und sendet `user.updated` mit dem vollständigen öffentlichen Nutzer-Snapshot.
+
+Poll updates carry each reader’s own selections. See [poll revisions and deadline ordering](../messenger_polls.md#realtime-ordering).

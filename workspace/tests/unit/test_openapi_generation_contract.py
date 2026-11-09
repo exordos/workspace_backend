@@ -384,6 +384,16 @@ def test_generated_openapi_describes_encryption_requests_and_fixed_payloads(
             "recipient_device_id",
         },
         "key_announced": {"kind", "key_uuid"},
+        "poll": {
+            "kind",
+            "questions",
+            "is_anonymous",
+            "allow_revote",
+            "results_visibility",
+            "allow_adding_options",
+            "closes_at",
+            "closed_at",
+        },
     }
     for name in (
         "WorkspaceUserMessage_Filter",
@@ -451,7 +461,7 @@ def test_generated_openapi_describes_encryption_requests_and_fixed_payloads(
     assert {
         variant["properties"]["kind"]["enum"][0]
         for variant in update_message["properties"]["payload"]["oneOf"]
-    } == set(expected_fields) - {"key_announced"}
+    } == set(expected_fields) - {"key_announced", "poll"}
     _assert_draft_contract(paths, f"{root}drafts/")
 
 
@@ -729,3 +739,43 @@ def test_external_account_status_contract():
     )
     for method in ("get", "put"):
         assert "ETag" not in resource[method]["responses"][200].get("headers", {})
+
+
+def test_poll_openapi_matches_the_create_actions_and_voter_page():
+    spec = _build_openapi(workspace_app)
+    paths = spec["paths"]
+    root = "/v1/messenger/messages/{WorkspaceUserMessageUuid}"
+    create = paths["/v1/messenger/messages/"]["post"]["requestBody"]["content"][
+        "application/json"
+    ]["schema"]
+    variant = next(
+        v
+        for v in create["properties"]["payload"]["oneOf"]
+        if v["properties"]["kind"]["enum"] == ["poll"]
+    )
+    assert "closed_at" not in variant["properties"]
+    assert {"closes_at", "allow_adding_options"}.isdisjoint(variant["required"])
+    assert variant["properties"]["questions"]["items"]["additionalProperties"] is False
+    vote = paths[f"{root}/actions/vote/invoke"]["post"]
+    body = vote["requestBody"]["content"]["application/json"]["schema"]
+    assert set(body["required"]) == {"question_uuid", "option_uuid", "selected"}
+    assert vote["responses"][200]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/WorkspaceUserMessage_Get"
+    }
+    state = _component_schema(spec, "WorkspaceUserMessage_Get")["properties"][
+        "poll_state"
+    ]
+    assert state["nullable"] and state["readOnly"]
+    assert set(state["required"]) == {
+        "revision",
+        "is_closed",
+        "voter_count",
+        "questions",
+        "my_votes",
+    }
+    voters = paths[f"{root}/poll_voters/"]["get"]
+    assert {p["name"] for p in voters["parameters"] if p.get("required")} == {
+        "question_uuid",
+        "option_uuid",
+    }
+    assert "X-Pagination-Marker" in voters["responses"][200]["headers"]

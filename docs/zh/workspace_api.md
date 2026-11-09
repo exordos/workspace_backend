@@ -1268,7 +1268,9 @@ Authorization: Bearer <access_token>
 
 ### 消息格式 {#message-payloads}
 
-无论频道加密标志如何，均允许全部六种 `kind`，但 Zulip 频道禁止 `e2ee`。示例中的所有 payload 字段都必填，未知字段会被拒绝。`key_uuid` 和 `request_message_uuid` 必须为 UUID。设备标识和名称是不透明字符串，长度最多 255 个字符。
+See [Native Messenger polls](../messenger_polls.md) for the `poll` payload, `poll_state`, voting actions, visibility and pagination.
+
+Polls require a native stream without encryption. The other six `kind` values are independent of the stream encryption flag, except that Zulip streams reject `e2ee`. Unknown payload fields are rejected. `key_uuid` 和 `request_message_uuid` 必须为 UUID。设备标识和名称是不透明字符串，长度最多 255 个字符。
 
 Markdown 的 `content` 为非空字符串，最多 40,000 个字符。`e2ee.content` 最多允许 213,336 个字符，可容纳 40,000 个 UTF-8 字符（每个最多四字节）经过不改变字节长度的加密再转为 Base64 后的内容。`key_grant.content` 非空且最多 40,000 个字符。`key_request.public_key` 是请求设备的公钥，而非频道对称密钥；它非空且最多 2048 个字符。内容和公钥原样传递；后端不裁剪空格、不检查 Base64、不加密或解密，也不保存明文秘密密钥。
 

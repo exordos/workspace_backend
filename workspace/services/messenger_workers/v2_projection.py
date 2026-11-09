@@ -1145,10 +1145,12 @@ def _emit_message_updated_rows(
     session: typing.Any,
     project_id: object,
     rows: typing.Iterable[typing.Any],
+    *,
+    poll_changed: bool = False,
 ) -> None:
     grouped: dict[object, list[typing.Any]] = {}
     for row in rows:
-        if messenger_events.is_recent_message(row.created_at):
+        if poll_changed or messenger_events.is_recent_message(row.created_at):
             grouped.setdefault(row.uuid, []).append(row)
     for placement_uuid in sorted(grouped, key=str):
         placement_rows = grouped[placement_uuid]
@@ -1163,6 +1165,11 @@ def _emit_message_updated_rows(
             emitted,
             project_id=project_id,
             stream_uuid=placement_rows[0].stream_uuid,
+            membership_generations={
+                row.user_uuid: row.membership_generation for row in placement_rows
+            }
+            if poll_changed
+            else None,
         )
 
 
@@ -2551,7 +2558,14 @@ def _deliver_snapshot_batch(
         )
         return
     if source_kind == "message.updated":
-        if payload.get("canonical_message_uuid"):
+        poll_changed = bool(payload.get("poll_changed"))
+        if poll_changed:
+            filters = {
+                "uuid": dm_filters.EQ(_uuid(payload["placement_uuid"])),
+                "user_uuid": dm_filters.In(payload["recipients"]),
+                "visible": dm_filters.EQ(True),
+            }
+        elif payload.get("canonical_message_uuid"):
             filters = _canonical_message_filters(
                 session, task["project_id"], _uuid(payload["canonical_message_uuid"])
             )
@@ -2565,7 +2579,9 @@ def _deliver_snapshot_batch(
             filters,
             order_by={"uuid": "asc", "user_uuid": "asc"},
         )
-        _emit_message_updated_rows(session, task["project_id"], rows)
+        _emit_message_updated_rows(
+            session, task["project_id"], rows, poll_changed=poll_changed
+        )
 
 
 def _revoke_broadcast_membership_events(
@@ -2644,7 +2660,7 @@ def _process_delivery_snapshot(
         "stream_bindings.created",
         "stream_binding.deleted",
     }
-    if source_kind not in batched_kinds:
+    if source_kind not in batched_kinds and not original_payload.get("poll_changed"):
         _deliver_snapshot_batch(session, task)
         return True
     cursor = task["progress_uuid"]

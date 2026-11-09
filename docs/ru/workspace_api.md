@@ -1270,7 +1270,9 @@ Authorization: Bearer <access_token>
 
 ### Форматы сообщений {#message-payloads}
 
-Все шесть значений `kind` разрешены независимо от флага шифрования, кроме `e2ee` в стриме Zulip. Все поля в примерах payload обязательны; неизвестные поля отклоняются. `key_uuid` и `request_message_uuid` должны быть UUID. Идентификаторы и названия устройств — непрозрачные строки длиной до 255 символов.
+See [Native Messenger polls](../messenger_polls.md) for the `poll` payload, `poll_state`, voting actions, visibility and pagination.
+
+Polls require a native stream without encryption. The other six `kind` values are independent of the stream encryption flag, except that Zulip streams reject `e2ee`. Unknown payload fields are rejected. `key_uuid` и `request_message_uuid` должны быть UUID. Идентификаторы и названия устройств — непрозрачные строки длиной до 255 символов.
 
 `content` в Markdown — непустая строка до 40 000 символов. `e2ee.content` допускает до 213 336 символов: этого достаточно для Base64 после шифрования без изменения длины байтов для 40 000 символов UTF-8 размером до четырёх байтов каждый. Непустой `key_grant.content` ограничен 40 000 символов. `key_request.public_key` — публичный ключ запрашивающего устройства, а не симметричный ключ стрима; это непустая строка до 2048 символов. Контент и публичные ключи передаются без изменений: backend не удаляет пробелы, не проверяет Base64, не шифрует, не расшифровывает и не хранит секретные ключи в открытом виде.
 

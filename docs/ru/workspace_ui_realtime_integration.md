@@ -218,3 +218,5 @@ GET /api/workspace/v1/events/?epoch_version%3E=<last_epoch_version>&epoch_genera
 Присутствие обновляется через REST
 `users/{uuid}/actions/presence/invoke` действие. Работник отмечает устаревших пользователей
 Онлайн и передает `user.updated` с полным публичным снимком пользователя.
+
+Poll updates carry each reader’s own selections. See [poll revisions and deadline ordering](../messenger_polls.md#realtime-ordering).
