@@ -10,13 +10,11 @@ import json
 import typing
 import uuid as sys_uuid
 
-from oslo_config import cfg
 from restalchemy.common import contexts
 from restalchemy.common import exceptions as ra_exceptions
 from restalchemy.dm import filters as dm_filters
 from restalchemy.storage.sql import filters as sql_filters
 
-from workspace.messenger_api import exceptions as messenger_exc
 from workspace.messenger_api import message_flags
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api.api import outgoing
@@ -25,7 +23,6 @@ from workspace.messenger_api.api import poll_store
 from workspace.messenger_api.api import resource_projection
 from workspace.messenger_api.api import sql_canonical_store
 from workspace.messenger_api.api import store as api_store
-from workspace.common import messenger_poll_opts
 from workspace.common import emoji
 from workspace.common import mutation_journal_opts
 from workspace.messenger_api.dm import base
@@ -984,8 +981,6 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             raise ra_exceptions.ValidationErrorException()
         now = session.execute("SELECT NOW() AS value", ()).fetchone()["value"]
         if existing_canonical is None:
-            if poll and not cfg.CONF[messenger_poll_opts.DOMAIN].creation_enabled:
-                raise messenger_exc.PollCreationDisabledError()
             inserted = session.execute(
                 """
                 INSERT INTO messenger_messages (

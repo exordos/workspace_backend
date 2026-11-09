@@ -175,7 +175,3 @@ class PollClosedError(PollConflictError):
 
 class PollRevoteForbiddenError(PollConflictError):
     message = "The poll does not allow changing this vote"
-
-
-class PollCreationDisabledError(PollConflictError):
-    message = "Poll creation is not enabled"
