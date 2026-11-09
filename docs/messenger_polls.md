@@ -22,7 +22,7 @@ Send a poll through the ordinary message endpoint. UUIDs are stable within the q
 }
 ```
 
-A poll needs at least one question and two options per question. The default maxima are 20 questions and 20 options per question (`poll_max_questions` and `poll_max_options_per_question`); changing these limits does not invalidate published polls. The required poll-level `multiple_answers` applies to every question, while selections remain independent per question. A question may include `correct_option_uuids` drawn from its options. Readers always receive these IDs. Optional creation fields are `closes_at` (a future timestamp with a time zone, default null) and `allow_adding_options` (default false). The server supplies `closed_at`.
+A poll needs at least one question and two options per question. The maxima are 20 questions and 20 options per question; changing these constants does not invalidate published polls. The required poll-level `multiple_answers` applies to every question, while selections remain independent per question. A question may include `correct_option_uuids` drawn from its options. Readers always receive these IDs. Optional creation fields are `closes_at` (a future timestamp with a time zone, default null) and `allow_adding_options` (default false). The server supplies `closed_at`.
 
 Use the public message UUID for the following endpoints. All four POST actions return the current message, including the caller's poll state.
 
