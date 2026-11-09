@@ -386,6 +386,7 @@ def test_generated_openapi_describes_encryption_requests_and_fixed_payloads(
         "key_announced": {"kind", "key_uuid"},
         "poll": {
             "kind",
+            "multiple_answers",
             "questions",
             "is_anonymous",
             "allow_revote",
@@ -755,7 +756,12 @@ def test_poll_openapi_matches_the_create_actions_and_voter_page():
     )
     assert "closed_at" not in variant["properties"]
     assert {"closes_at", "allow_adding_options"}.isdisjoint(variant["required"])
-    assert variant["properties"]["questions"]["items"]["additionalProperties"] is False
+    assert "multiple_answers" in variant["required"]
+    assert variant["properties"]["multiple_answers"]["type"] == "boolean"
+    question = variant["properties"]["questions"]["items"]
+    assert question["additionalProperties"] is False
+    assert "multiple_answers" not in question["properties"]
+    assert "multiple_answers" not in question["required"]
     vote = paths[f"{root}/actions/vote/invoke"]["post"]
     body = vote["requestBody"]["content"]["application/json"]["schema"]
     assert set(body["required"]) == {"question_uuid", "option_uuid", "selected"}

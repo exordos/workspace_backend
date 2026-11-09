@@ -924,9 +924,6 @@ components:
                         - uuid
                         - text
                       minItems: 2
-                    multiple_answers:
-                      type: boolean
-                      example: true
                     correct_option_uuids:
                       type: array
                       items:
@@ -938,8 +935,10 @@ components:
                   - uuid
                   - text
                   - options
-                  - multiple_answers
                 minItems: 1
+              multiple_answers:
+                type: boolean
+                example: true
               is_anonymous:
                 type: boolean
                 example: true
@@ -971,6 +970,7 @@ components:
             required:
             - kind
             - questions
+            - multiple_answers
             - is_anonymous
             - allow_revote
             - results_visibility
@@ -3365,9 +3365,6 @@ components:
                       - uuid
                       - text
                     minItems: 2
-                  multiple_answers:
-                    type: boolean
-                    example: true
                   correct_option_uuids:
                     type: array
                     items:
@@ -3379,8 +3376,10 @@ components:
                 - uuid
                 - text
                 - options
-                - multiple_answers
               minItems: 1
+            multiple_answers:
+              type: boolean
+              example: true
             is_anonymous:
               type: boolean
               example: true
@@ -6649,9 +6648,6 @@ paths:
                                 - uuid
                                 - text
                               minItems: 2
-                            multiple_answers:
-                              type: boolean
-                              example: true
                             correct_option_uuids:
                               type: array
                               items:
@@ -6663,8 +6659,10 @@ paths:
                           - uuid
                           - text
                           - options
-                          - multiple_answers
                         minItems: 1
+                      multiple_answers:
+                        type: boolean
+                        example: true
                       is_anonymous:
                         type: boolean
                         example: true
@@ -6690,6 +6688,7 @@ paths:
                     required:
                     - kind
                     - questions
+                    - multiple_answers
                     - is_anonymous
                     - allow_revote
                     - results_visibility

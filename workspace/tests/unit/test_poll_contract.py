@@ -20,7 +20,6 @@ def question():
     return {
         "uuid": str(uuid.uuid4()),
         "text": "Question",
-        "multiple_answers": False,
         "options": [option(), option()],
     }
 
@@ -30,6 +29,7 @@ def payload():
     messenger_poll_opts.register_opts()
     return {
         "kind": "poll",
+        "multiple_answers": False,
         "questions": [question()],
         "is_anonymous": True,
         "allow_revote": False,
@@ -63,6 +63,11 @@ def test_poll_limits_apply_to_new_writes_and_preserve_existing_reads(payload):
     "change",
     [
         lambda p, q: p.update(questions=[]),
+        lambda p, q: p.pop("multiple_answers"),
+        lambda p, q: p.update(multiple_answers="false"),
+        lambda p, q: p.update(multiple_answers=0),
+        lambda p, q: p.update(multiple_answers=None),
+        lambda p, q: q.update(multiple_answers=False),
         lambda p, q: p["questions"].append(q),
         lambda p, q: q.update(options=q["options"][:1]),
         lambda p, q: q["options"].append(q["options"][0]),
@@ -129,3 +134,37 @@ def test_poll_timestamps_are_normalized_and_preserve_precision(payload):
 def test_poll_action_bodies_reject_partial_or_extra_data(action, values):
     with pytest.raises(ra_exc.ValidationErrorException):
         polls.action_body(action, values)
+
+
+@pytest.mark.parametrize("multiple_answers", [False, True])
+def test_poll_global_multiple_answers_round_trip(payload, multiple_answers):
+    payload["multiple_answers"] = multiple_answers
+    payload["questions"].append(question())
+    saved = polls.normalize_create(payload)
+    assert saved["multiple_answers"] is multiple_answers
+    assert all("multiple_answers" not in q for q in saved["questions"])
+    restored = message_payloads.WORKSPACE_MESSAGE_PAYLOAD_TYPE.from_simple_type(saved)
+    assert polls.POLL_TYPE.to_simple_type(restored) == saved
+
+
+def test_poll_rejects_legacy_question_selection_mode(payload):
+    payload.pop("multiple_answers")
+    for q in payload["questions"]:
+        q["multiple_answers"] = False
+    with pytest.raises(ra_exc.RestAlchemyException):
+        polls.normalize_create(payload)
+
+
+@pytest.mark.parametrize("multiple_answers", [False, True])
+@pytest.mark.parametrize("correct_count", [0, 1, 2])
+def test_poll_correct_answers_are_independent_of_global_selection_mode(
+    payload, multiple_answers, correct_count
+):
+    payload["multiple_answers"] = multiple_answers
+    payload["questions"].append(question())
+    for q in payload["questions"]:
+        q["correct_option_uuids"] = [o["uuid"] for o in q["options"][:correct_count]]
+    saved = polls.normalize_create(payload)
+    assert [q["correct_option_uuids"] for q in saved["questions"]] == [
+        q["correct_option_uuids"] for q in payload["questions"]
+    ]

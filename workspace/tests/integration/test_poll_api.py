@@ -21,11 +21,10 @@ from workspace.tests.integration import conftest
 from workspace.tests.integration import test_messenger_v2 as native
 
 
-def question(multiple):
+def question():
     return {
         "uuid": str(uuid.uuid4()),
         "text": "Pick a time",
-        "multiple_answers": multiple,
         "options": [
             {"uuid": str(uuid.uuid4()), "text": label} for label in ("12:00", "15:00")
         ],
@@ -50,7 +49,8 @@ def room(api, db, poll_creation):
 def create(api, room, **settings):
     payload = {
         "kind": "poll",
-        "questions": [question(False), question(True)],
+        "questions": [question(), question()],
+        "multiple_answers": False,
         "is_anonymous": False,
         "results_visibility": "after_vote",
         "allow_revote": False,
@@ -113,9 +113,8 @@ def test_poll_clicks_noop_and_personal_snapshots(api, db, room):
     invoke(api, path, "vote", selection(first, 1), user=peer, status=409)
     invoke(api, path, "vote", selection(first, selected=False), user=peer, status=409)
     invoke(api, path, "vote", selection(second), user=peer)
-    peer_state = invoke(api, path, "vote", selection(second, 1), user=peer)[
-        "poll_state"
-    ]
+    invoke(api, path, "vote", selection(second, 1), user=peer, status=409)
+    peer_state = api.get(path, user=peer).json()["poll_state"]
     assert (
         peer_state["voter_count"] == 1
         and peer_state["questions"][1]["voter_count"] == 1
@@ -409,3 +408,42 @@ def test_poll_deletion_does_not_hide_next_history_page(api, db, room, monkeypatc
     assert following.status_code == 200, following.text
     assert [m["uuid"] for m in following.json()] == [last]
     assert "X-Pagination-Marker" not in following.headers
+
+
+@pytest.mark.parametrize("multiple_answers", [False, True])
+@pytest.mark.parametrize("allow_revote", [False, True])
+def test_poll_global_selection_mode_keeps_questions_independent(
+    api, room, multiple_answers, allow_revote
+):
+    message = create(
+        api, room, multiple_answers=multiple_answers, allow_revote=allow_revote
+    )
+    path = native.MESSAGES + message["uuid"]
+    questions = message["payload"]["questions"]
+    for q in questions:
+        invoke(api, path, "vote", selection(q))
+    for q in questions:
+        invoke(
+            api,
+            path,
+            "vote",
+            selection(q, 1),
+            status=200 if multiple_answers or allow_revote else 409,
+        )
+    state = api.get(path).json()["poll_state"]
+    assert state["voter_count"] == 1
+    assert state["my_votes"] == [
+        {
+            "question_uuid": q["uuid"],
+            "option_uuids": [
+                o["uuid"]
+                for o in (
+                    q["options"]
+                    if multiple_answers
+                    else [q["options"][1 if allow_revote else 0]]
+                )
+            ],
+        }
+        for q in questions
+    ]
+    assert all(q["voter_count"] == 1 for q in state["questions"])
