@@ -1270,7 +1270,9 @@ Nebenwirkungen in Echtzeit:
 
 ### Nachrichtenformate {#message-payloads}
 
-Alle sechs `kind`-Werte sind unabhängig vom Verschlüsselungsflag erlaubt, außer `e2ee` in einem Zulip-Stream. Alle in den Beispielen gezeigten Payload-Felder sind erforderlich; unbekannte Felder werden abgelehnt. `key_uuid` und `request_message_uuid` müssen UUIDs sein. Gerätekennungen und Namen sind undurchsichtige Zeichenfolgen mit höchstens 255 Zeichen.
+See [Native Messenger polls](../messenger_polls.md) for the `poll` payload, `poll_state`, voting actions, visibility and pagination.
+
+Polls require a native stream without encryption. The other six `kind` values are independent of the stream encryption flag, except that Zulip streams reject `e2ee`. Unknown payload fields are rejected. `key_uuid` und `request_message_uuid` müssen UUIDs sein. Gerätekennungen und Namen sind undurchsichtige Zeichenfolgen mit höchstens 255 Zeichen.
 
 Markdown-`content` ist eine nicht leere Zeichenfolge mit höchstens 40.000 Zeichen. `e2ee.content` erlaubt bis zu 213.336 Zeichen: ausreichend für Base64 nach einer längenerhaltenden Verschlüsselung von 40.000 UTF-8-Zeichen mit jeweils bis zu vier Bytes. `key_grant.content` ist nicht leer und auf 40.000 Zeichen begrenzt. `key_request.public_key` ist der öffentliche Schlüssel des anfragenden Geräts, nicht der symmetrische Stream-Schlüssel; er ist nicht leer und auf 2048 Zeichen begrenzt. Inhalte und öffentliche Schlüssel werden unverändert übertragen; das Backend entfernt keine Leerzeichen, prüft kein Base64, ver- oder entschlüsselt nicht und speichert keine geheimen Schlüssel im Klartext.
 

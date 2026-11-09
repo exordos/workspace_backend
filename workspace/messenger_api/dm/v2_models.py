@@ -16,6 +16,7 @@ import typing
 import uuid as sys_uuid
 
 from restalchemy.common import contexts
+from restalchemy.common import exceptions as ra_exc
 from restalchemy.dm import filters as dm_filters
 from restalchemy.dm import models
 from restalchemy.dm import properties
@@ -27,6 +28,7 @@ from workspace.common import types as common_types
 from workspace.messenger_api import exceptions as messenger_exceptions
 from workspace.messenger_api.dm import base
 from workspace.messenger_api.dm import message_payloads
+from workspace.messenger_api.dm import polls
 
 
 TASK_KINDS = (
@@ -299,6 +301,10 @@ class WorkspaceUserMessage(
     def validate_payload_update(
         self, payload: typing.Mapping[str, typing.Any], session: typing.Any
     ) -> None:
+        if self.payload.KIND == polls.PollPayload.KIND:
+            raise messenger_exceptions.PollConflictError()
+        if payload["kind"] == polls.PollPayload.KIND:
+            raise ra_exc.ValidationErrorException()
         self.validate_key_announcement_update(payload["kind"])
         if payload["kind"] != message_payloads.E2EEPayload.KIND:
             return

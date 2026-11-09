@@ -157,3 +157,25 @@ class DraftPreconditionFailedError(ra_exc.RestAlchemyException):
 class ExternalResourceForbiddenError(ra_exc.RestAlchemyException):
     message = "External resource access is forbidden"
     code = 403
+
+
+class PollForbiddenError(ra_exc.RestAlchemyException):
+    message = "This poll operation is forbidden"
+    code = 403
+
+
+class PollConflictError(ra_exc.RestAlchemyException):
+    message = "The operation conflicts with the current poll configuration"
+    code = 409
+
+
+class PollClosedError(PollConflictError):
+    message = "The poll is closed"
+
+
+class PollRevoteForbiddenError(PollConflictError):
+    message = "The poll does not allow changing this vote"
+
+
+class PollCreationDisabledError(PollConflictError):
+    message = "Poll creation is not enabled"

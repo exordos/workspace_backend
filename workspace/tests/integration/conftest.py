@@ -57,6 +57,7 @@ from oslo_config import cfg
 
 from workspace.common import file_storage_opts
 from workspace.common import database
+from workspace.common import messenger_poll_opts
 from workspace.common import messenger_reaction_opts
 from workspace.common import topic_summary_opts
 from workspace.messenger_api.api import context as auth_context
@@ -212,6 +213,7 @@ class MockedIamAuthMiddleware(iam_mw.GenesisCoreAuthMiddleware):
 def build_test_wsgi_application():
     """Same WSGI app + middleware stack as production, mocked auth layer only."""
     file_storage_opts.register_opts()
+    messenger_poll_opts.register_opts()
     try:
         messenger_reaction_opts.register_opts()
     except cfg.DuplicateOptError:
@@ -428,6 +430,15 @@ def http_server(_database):
         server.shutdown()
         thread.join(timeout=5)
         server.server_close()
+
+
+@pytest.fixture
+def poll_creation(http_server):
+    cfg.CONF.set_override("creation_enabled", True, group=messenger_poll_opts.DOMAIN)
+    try:
+        yield
+    finally:
+        cfg.CONF.clear_override("creation_enabled", group=messenger_poll_opts.DOMAIN)
 
 
 @pytest.fixture
