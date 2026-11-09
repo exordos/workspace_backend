@@ -176,6 +176,9 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             poll_reads.apply_page_snapshot(message, snapshot)
         return messages
 
+    def resolve_message_uuid(self, message_uuid: sys_uuid.UUID) -> sys_uuid.UUID:
+        return self._message(message_uuid).uuid
+
     def get_resource(
         self,
         resource: str,
@@ -908,17 +911,14 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         values: dict[str, typing.Any],
     ) -> dict[str, typing.Any]:
         session = contexts.Context().get_session()
-        canonical_payload = resource_projection.simple(values["payload"])
-        poll = canonical_payload["kind"] == polls.PollPayload.KIND
-        if poll:
-            canonical_payload = polls.normalize_create(values["payload"])
-        announced = (
-            canonical_payload["kind"] == message_payloads.KeyAnnouncedPayload.KIND
-        )
+        payload = values["payload"]
+        kind = payload["kind"]
+        poll = kind == polls.PollPayload.KIND
+        announced = kind == message_payloads.KeyAnnouncedPayload.KIND
         if announced:
             self._lock_key_announcement(values["stream_uuid"], session)
         stream = self._stream(values["stream_uuid"])
-        stream.validate_message_creation(canonical_payload["kind"])
+        stream.validate_message_creation(kind)
         topic_uuid = values.get("topic_uuid") or stream.default_topic_uuid
         if topic_uuid is None:
             raise ra_exceptions.ValidationErrorException()
@@ -941,7 +941,14 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         placement_uuid = sys_uuid.uuid5(topic.uuid, str(canonical_uuid))
         existing_placement = session.execute(
             """
-            SELECT message.author_uuid, message.payload,
+            SELECT message.author_uuid,
+                   CASE WHEN %s THEN (
+                       SELECT contents.workspace_content
+                       FROM messenger_message_content_versions version
+                       JOIN messenger_message_contents contents ON contents.uuid=version.content_uuid
+                       WHERE version.project_id=message.project_id AND version.message_uuid=message.uuid
+                         AND version.revision=1
+                   ) ELSE message.payload END AS payload,
                    message.source_name, message.provider_uuid, message.provider_identity
             FROM messenger_message_placements AS placement
             JOIN messenger_messages_with_content_v1 AS message
@@ -949,8 +956,15 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
              AND message.uuid = placement.message_uuid
             WHERE placement.project_id = %s AND placement.uuid = %s
             """,
-            (self.project_uuid, placement_uuid),
+            (poll, self.project_uuid, placement_uuid),
         ).fetchone()
+        # An identical resend still identifies the original poll after its
+        # options, settings, deadline, or creation limits change.
+        canonical_payload = (
+            polls.normalize_create(payload, retry=existing_placement is not None)
+            if poll
+            else resource_projection.simple(payload)
+        )
         if existing_placement is not None and (
             existing_placement["author_uuid"] != self.user_uuid
             or existing_placement["payload"] != canonical_payload

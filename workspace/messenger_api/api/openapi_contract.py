@@ -438,16 +438,18 @@ def add_message_encryption_contract(
         }
     )
     for variant in message_create_schema["properties"]["payload"]["oneOf"]:
-        if variant["properties"]["kind"]["enum"] == ["poll"]:
-            del variant["properties"]["closed_at"]
-            variant["required"] = [
-                "kind",
-                "questions",
-                "multiple_answers",
-                "is_anonymous",
-                "allow_revote",
-                "results_visibility",
-            ]
+        if variant["properties"]["kind"]["enum"] == [polls.PollCreatePayload.KIND]:
+            fields = polls.PollCreatePayload.properties.properties
+            variant.update(
+                _object_schema(
+                    polls.POLL_CREATE_TYPE.to_openapi_spec({})["properties"],
+                    [
+                        name
+                        for name, prop in fields.items()
+                        if prop.get_kwargs().get("required")
+                    ],
+                )
+            )
     message_create["requestBody"] = _request_body(message_create_schema)
     message_create["description"] = (
         "Send a message; an absent or null topic_uuid selects the stream's "

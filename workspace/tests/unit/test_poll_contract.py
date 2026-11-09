@@ -93,9 +93,40 @@ def test_poll_create_rejects_ambiguous_or_server_owned_values(payload, change):
         polls.normalize_create(payload)
 
 
+@pytest.mark.parametrize("direct", [False, True], ids=["wire", "model"])
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda questions: questions.clear(),
+        lambda questions: questions[0]["options"].pop(),
+        lambda questions: questions[0].pop("text"),
+        lambda questions: questions[0]["options"][0].pop("text"),
+    ],
+    ids=["no-questions", "one-option", "missing-question-text", "missing-option-text"],
+)
+def test_poll_structure_is_checked_for_wire_and_model_values(payload, direct, change):
+    if direct:
+        payload["questions"] = [
+            polls.POLL_QUESTION.from_simple_type(q) for q in payload["questions"]
+        ]
+    change(payload["questions"])
+    with pytest.raises(ra_exc.RestAlchemyException):
+        if direct:
+            polls.PollPayload(**payload)
+        else:
+            polls.POLL_TYPE.from_simple_type(payload)
+
+
 def test_poll_timestamps_are_normalized_and_preserve_precision(payload):
     payload["closes_at"] = "2099-04-01T01:02:03.123456+02:30"
     assert polls.normalize_create(payload)["closes_at"] == "2099-03-31T22:32:03.123456Z"
+
+
+def test_poll_creation_retry_preserves_expired_deadline(payload):
+    payload["closes_at"] = "2000-01-01T12:30:00Z"
+    assert (
+        polls.normalize_create(payload, retry=True)["closes_at"] == payload["closes_at"]
+    )
 
 
 @pytest.mark.parametrize(

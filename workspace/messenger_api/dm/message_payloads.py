@@ -100,12 +100,17 @@ class KeyAnnouncedPayload(types_dynamic.AbstractKindModel):
     key_uuid = properties.property(types.UUID(), required=True)
 
 
-WORKSPACE_MESSAGE_PAYLOAD_TYPE = types_dynamic.KindModelSelectorType(
+_NON_POLL_PAYLOAD_TYPES = (
     types_dynamic.KindModelType(MarkdownPayload),
     types_dynamic.KindModelType(E2EEPayload),
     types_dynamic.KindModelType(KeyRequestPayload),
     types_dynamic.KindModelType(KeyGrantPayload),
     types_dynamic.KindModelType(KeyRejectPayload),
     types_dynamic.KindModelType(KeyAnnouncedPayload),
-    polls.POLL_TYPE,
+)
+WORKSPACE_MESSAGE_PAYLOAD_TYPE = types_dynamic.KindModelSelectorType(
+    *_NON_POLL_PAYLOAD_TYPES, polls.POLL_TYPE
+)
+MESSAGE_WRITE_PAYLOAD_TYPE = types_dynamic.KindModelSelectorType(
+    *_NON_POLL_PAYLOAD_TYPES, polls.POLL_CREATE_TYPE
 )

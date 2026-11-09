@@ -54,8 +54,14 @@ class Array(types.TypedList):
         super().__init__(item)
         self.minimum = minimum
 
+    def _has_minimum_items(self, value: typing.Any) -> bool:
+        return isinstance(value, list) and len(value) >= self.minimum
+
+    def validate(self, value: typing.Any) -> bool:
+        return self._has_minimum_items(value) and super().validate(value)
+
     def from_simple_type(self, value: typing.Any) -> list:
-        if not isinstance(value, list) or len(value) < self.minimum:
+        if not self._has_minimum_items(value):
             raise ra_exc.ValidationErrorException()
         return super().from_simple_type(value)
 
@@ -74,12 +80,11 @@ class Fields(types.SoftSchemeDict):
         super().__init__(fields)
         self.required = [name for name in fields if name not in optional]
 
+    def validate(self, value: typing.Any) -> bool:
+        return super().validate(value) and all(name in value for name in self.required)
+
     def from_simple_type(self, value: typing.Any) -> dict:
-        if (
-            not isinstance(value, dict)
-            or value.keys() - self._scheme.keys()
-            or not value.keys() >= set(self.required)
-        ):
+        if not isinstance(value, dict) or value.keys() - self._scheme.keys():
             raise ra_exc.ValidationErrorException()
         result = super().from_simple_type(value)
         if not self.validate(result):
@@ -131,7 +136,7 @@ ACTION_BODIES = {
 }
 
 
-class PollPayload(types_dynamic.AbstractKindModel):
+class PollCreatePayload(types_dynamic.AbstractKindModel):
     KIND = "poll"
     questions = properties.property(Array(POLL_QUESTION, minimum=1), required=True)
     multiple_answers = properties.property(common_types.StrictBoolean(), required=True)
@@ -144,7 +149,6 @@ class PollPayload(types_dynamic.AbstractKindModel):
         common_types.StrictBoolean(), default=False
     )
     closes_at = properties.property(NULLABLE_TIME, default=None)
-    closed_at = properties.property(NULLABLE_TIME, default=None)
 
     def validate(self) -> None:
         if len({question["uuid"] for question in self.questions}) != len(
@@ -162,19 +166,24 @@ class PollPayload(types_dynamic.AbstractKindModel):
                 raise ra_exc.ValidationErrorException()
 
 
+class PollPayload(PollCreatePayload):
+    closed_at = properties.property(NULLABLE_TIME, default=None)
+
+
+POLL_CREATE_TYPE = types_dynamic.KindModelType(PollCreatePayload)
 POLL_TYPE = types_dynamic.KindModelType(PollPayload)
 
 
-def normalize_create(raw_payload: typing.Any) -> dict:
-    if isinstance(raw_payload, PollPayload):
-        payload = raw_payload
-    else:
-        if "closed_at" in raw_payload:
-            raise ra_exc.ValidationErrorException()
-        payload = POLL_TYPE.from_simple_type(raw_payload)
-    if (
-        payload.closed_at is not None
-        or (
+def normalize_create(raw_payload: typing.Any, *, retry: bool = False) -> dict:
+    if isinstance(raw_payload, PollPayload) and raw_payload.closed_at is not None:
+        raise ra_exc.ValidationErrorException()
+    payload = (
+        raw_payload
+        if isinstance(raw_payload, PollCreatePayload)
+        else POLL_CREATE_TYPE.from_simple_type(raw_payload)
+    )
+    if not retry and (
+        (
             payload.closes_at is not None
             and payload.closes_at <= datetime.datetime.now(datetime.timezone.utc)
         )
@@ -186,7 +195,7 @@ def normalize_create(raw_payload: typing.Any) -> dict:
         )
     ):
         raise ra_exc.ValidationErrorException()
-    return POLL_TYPE.to_simple_type(payload)
+    return {**POLL_CREATE_TYPE.to_simple_type(payload), "closed_at": None}
 
 
 def action_body(action: str, values: dict) -> dict:
