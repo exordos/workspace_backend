@@ -33,6 +33,7 @@ def _vote(
     values: dict,
     *,
     allow_revote: bool,
+    multiple_answers: bool,
     closed: bool,
 ) -> None:
     _item(question["options"], values["option_uuid"])
@@ -46,7 +47,7 @@ def _vote(
         return
     if closed:
         raise exceptions.PollClosedError()
-    replace = values["selected"] and current and not question["multiple_answers"]
+    replace = values["selected"] and current and not multiple_answers
     if not allow_revote and (replace or not values["selected"]):
         raise exceptions.PollRevoteForbiddenError()
     if replace:
@@ -200,6 +201,7 @@ def mutate(
             question,
             values,
             allow_revote=payload["allow_revote"],
+            multiple_answers=payload["multiple_answers"],
             closed=closed,
         )
         return

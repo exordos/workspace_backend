@@ -36,6 +36,7 @@ def poll(api, db, poll_creation):
     options = [str(uuid.uuid4()), str(uuid.uuid4())]
     payload = {
         "kind": "poll",
+        "multiple_answers": True,
         "is_anonymous": True,
         "results_visibility": "always",
         "allow_revote": True,
@@ -44,7 +45,6 @@ def poll(api, db, poll_creation):
             {
                 "uuid": question,
                 "text": "Choose",
-                "multiple_answers": True,
                 "options": [{"uuid": value, "text": value} for value in options],
             }
         ],

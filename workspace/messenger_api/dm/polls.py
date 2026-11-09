@@ -101,7 +101,6 @@ POLL_QUESTION = Fields(
         "uuid": PollUUID(),
         "text": PollText(min_length=1, max_length=1000),
         "options": Array(POLL_OPTION, minimum=2),
-        "multiple_answers": common_types.StrictBoolean(),
         "correct_option_uuids": Array(PollUUID()),
     },
     optional=("correct_option_uuids",),
@@ -133,6 +132,7 @@ ACTION_BODIES = {
 class PollPayload(types_dynamic.AbstractKindModel):
     KIND = "poll"
     questions = properties.property(Array(POLL_QUESTION, minimum=1), required=True)
+    multiple_answers = properties.property(common_types.StrictBoolean(), required=True)
     is_anonymous = properties.property(common_types.StrictBoolean(), required=True)
     allow_revote = properties.property(common_types.StrictBoolean(), required=True)
     results_visibility = properties.property(
