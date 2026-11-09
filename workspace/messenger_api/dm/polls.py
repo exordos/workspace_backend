@@ -6,15 +6,17 @@
 import datetime
 import typing
 
-from oslo_config import cfg
 from restalchemy.common import exceptions as ra_exc
 from restalchemy.dm import models
 from restalchemy.dm import properties
 from restalchemy.dm import types
 from restalchemy.dm import types_dynamic
 
-from workspace.common import messenger_poll_opts
 from workspace.common import types as common_types
+
+
+MAX_POLL_QUESTIONS = 20
+MAX_POLL_OPTIONS_PER_QUESTION = 20
 
 
 class PollUUID(types.UUID):
@@ -177,9 +179,9 @@ def normalize_create(raw_payload: typing.Any) -> dict:
             and payload.closes_at <= datetime.datetime.now(datetime.timezone.utc)
         )
         or len(payload.questions)
-        > cfg.CONF[messenger_poll_opts.DOMAIN].poll_max_questions
+        > MAX_POLL_QUESTIONS
         or any(
-            len(q["options"]) > messenger_poll_opts.max_options_per_question()
+            len(q["options"]) > MAX_POLL_OPTIONS_PER_QUESTION
             for q in payload.questions
         )
     ):

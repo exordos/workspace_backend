@@ -10,9 +10,9 @@ import typing
 from restalchemy.common import exceptions as ra_exc
 from restalchemy.storage.sql import sessions
 
-from workspace.common import messenger_poll_opts
 from workspace.messenger_api import exceptions
 from workspace.messenger_api.dm import base
+from workspace.messenger_api.dm import polls
 
 
 def _instant(value: str) -> datetime.datetime:
@@ -81,7 +81,7 @@ def _append_option(
         raise exceptions.PollClosedError()
     if not allowed:
         raise exceptions.PollConflictError()
-    if len(question["options"]) >= messenger_poll_opts.max_options_per_question():
+    if len(question["options"]) >= polls.MAX_POLL_OPTIONS_PER_QUESTION:
         raise ra_exc.ValidationErrorException()
     question["options"].append(option)
     return True

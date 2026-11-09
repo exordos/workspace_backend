@@ -4,10 +4,8 @@
 import uuid
 
 import pytest
-from oslo_config import cfg
 from restalchemy.common import exceptions as ra_exc
 
-from workspace.common import messenger_poll_opts
 from workspace.messenger_api.dm import message_payloads
 from workspace.messenger_api.dm import polls
 
@@ -26,7 +24,6 @@ def question():
 
 @pytest.fixture
 def payload():
-    messenger_poll_opts.register_opts()
     return {
         "kind": "poll",
         "multiple_answers": False,
@@ -37,26 +34,32 @@ def payload():
     }
 
 
-def test_poll_limits_apply_to_new_writes_and_preserve_existing_reads(payload):
-    group = messenger_poll_opts.DOMAIN
+def test_poll_limits_apply_to_new_writes_and_preserve_existing_reads(payload, monkeypatch):
     payload["questions"] += [question() for _ in range(19)]
     payload["questions"][0]["options"] += [option() for _ in range(18)]
     saved = polls.normalize_create(payload)
     assert saved["allow_adding_options"] is False
     assert saved["closes_at"] is None and saved["closed_at"] is None
-    try:
-        for setting in ("poll_max_questions", "poll_max_options_per_question"):
-            cfg.CONF.set_override(setting, 2, group=group)
+
+    for constant in ("MAX_POLL_QUESTIONS", "MAX_POLL_OPTIONS_PER_QUESTION"):
+        with monkeypatch.context() as patch:
+            patch.setattr(polls, constant, 2)
             with pytest.raises(ra_exc.ValidationErrorException):
                 polls.normalize_create(payload)
             restored = message_payloads.WORKSPACE_MESSAGE_PAYLOAD_TYPE.from_simple_type(
                 saved
             )
             assert polls.POLL_TYPE.to_simple_type(restored) == saved
-            cfg.CONF.clear_override(setting, group=group)
-    finally:
-        cfg.CONF.clear_override("poll_max_questions", group=group)
-        cfg.CONF.clear_override("poll_max_options_per_question", group=group)
+
+
+def test_poll_limits_reject_twenty_one_questions_or_options(payload):
+    payload["questions"] = [question() for _ in range(21)]
+    with pytest.raises(ra_exc.ValidationErrorException):
+        polls.normalize_create(payload)
+    payload["questions"] = [question()]
+    payload["questions"][0]["options"] = [option() for _ in range(21)]
+    with pytest.raises(ra_exc.ValidationErrorException):
+        polls.normalize_create(payload)
 
 
 @pytest.mark.parametrize(
