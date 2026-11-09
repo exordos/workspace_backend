@@ -1,6 +1,6 @@
 # Native Messenger polls
 
-Apply the database migration and deploy poll readers and workers before enabling sends. Set `creation_enabled = true` in `[messenger_polls]` once supported clients can render the new kind. Migration 0300 refuses downgrade while published polls exist, to avoid losing their votes. The default for creation is false: new polls return HTTP 409; reads and actions on published polls continue to work.
+Apply the database migration and deploy poll readers and workers. Migration 0300 refuses downgrade while published polls exist, to avoid losing their votes.
 
 Send a poll through the ordinary message endpoint. UUIDs are stable within the question or option list; array order is the display order.
 

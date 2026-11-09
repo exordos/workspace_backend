@@ -30,7 +30,7 @@ def _wait_for_blocked_session(db, session):
 
 
 @pytest.fixture
-def poll(api, db, poll_creation):
+def poll(api, db):
     stream = api.post(native.STREAMS, json={"name": "Poll transactions"}).json()
     question = str(uuid.uuid4())
     options = [str(uuid.uuid4()), str(uuid.uuid4())]

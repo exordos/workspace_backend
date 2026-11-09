@@ -7,9 +7,7 @@ import datetime
 import uuid
 
 import pytest
-from oslo_config import cfg
 
-from workspace.common import messenger_poll_opts
 from workspace.common import mutation_journal_opts
 from restalchemy.common import contexts
 from restalchemy.storage.sql import sessions
@@ -32,7 +30,7 @@ def question():
 
 
 @pytest.fixture
-def room(api, db, poll_creation):
+def room(api, db):
     stream = api.post(native.STREAMS, json={"name": "Polls"}).json()
     peer = uuid.uuid4()
     conftest.seed_workspace_user(db, peer, f"poll-{peer}")
@@ -341,24 +339,6 @@ def test_poll_deferred_delivery_and_replay_respect_revoked_membership(api, db, r
     assert added.status_code == 200, added.text
     native._drain()
     assert not has_update(peer)
-
-
-def test_poll_rollout_can_pause_creation_without_disabling_votes(api, room):
-    message = create(api, room)
-    cfg.CONF.clear_override("creation_enabled", group=messenger_poll_opts.DOMAIN)
-    payload = message["payload"].copy()
-    payload.pop("closed_at")
-    res = api.post(
-        native.MESSAGES, json={"stream_uuid": room[0]["uuid"], "payload": payload}
-    )
-    assert res.status_code == 409, res.text
-    vote = invoke(
-        api,
-        native.MESSAGES + message["uuid"],
-        "vote",
-        selection(payload["questions"][0]),
-    )
-    assert vote["poll_state"]["voter_count"] == 1
 
 
 def test_poll_deletion_does_not_hide_next_history_page(api, db, room, monkeypatch):
