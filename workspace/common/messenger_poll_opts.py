@@ -6,11 +6,6 @@ from oslo_config import cfg
 
 DOMAIN = "messenger_polls"
 OPTIONS = [
-    cfg.BoolOpt(
-        "creation_enabled",
-        default=False,
-        help="Allow new polls after clients support the poll message kind.",
-    ),
     cfg.IntOpt("poll_max_questions", default=20, min=1),
     cfg.IntOpt("poll_max_options_per_question", default=20, min=2),
 ]

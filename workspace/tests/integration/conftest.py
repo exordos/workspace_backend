@@ -433,15 +433,6 @@ def http_server(_database):
 
 
 @pytest.fixture
-def poll_creation(http_server):
-    cfg.CONF.set_override("creation_enabled", True, group=messenger_poll_opts.DOMAIN)
-    try:
-        yield
-    finally:
-        cfg.CONF.clear_override("creation_enabled", group=messenger_poll_opts.DOMAIN)
-
-
-@pytest.fixture
 def api(http_server, db):
     """API client scoped to a fresh, unique (user, project) pair per test."""
     user_uuid = sys_uuid.uuid4()
