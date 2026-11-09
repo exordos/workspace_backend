@@ -28,7 +28,6 @@ from workspace.common import mutation_journal_opts
 from workspace.common import file_storage_opts
 from workspace.common import log as infra_log
 from workspace.common import messenger_worker_opts
-from workspace.common import messenger_poll_opts
 from workspace.common import messenger_reaction_opts
 from workspace.common import topic_summary_opts
 from workspace.messenger_api.api import store as api_store
@@ -44,7 +43,6 @@ ra_config_opts.register_posgresql_db_opts(CONF)
 mutation_journal_opts.register_opts(CONF)
 file_storage_opts.register_opts(CONF)
 messenger_worker_opts.register_opts(CONF)
-messenger_poll_opts.register_opts(CONF)
 messenger_reaction_opts.register_opts(CONF)
 topic_summary_opts.register_opts(CONF)
 
