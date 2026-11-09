@@ -1,5 +1,7 @@
 # 项目规范 RestAlchemy API Messenger
 
+The [native poll contract](../messenger_polls.md#storage-and-sizing) specifies two exceptions to this proposal for the first release. Message reads aggregate poll votes on demand, and the voter list uses a default page size of 50 and a maximum of 100.
+
 状态: ** 实施的项目规范; 实施前的文件**.
 
 这份文件显示了如何操作Workspace/Messengerv1 API

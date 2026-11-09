@@ -605,6 +605,9 @@ class SQLCanonicalReadStore:
             for draft_uuid in draft_uuids
         ]
 
+    def resolve_message_uuid(self, message_uuid: sys_uuid.UUID) -> sys_uuid.UUID:
+        return sys_uuid.UUID(str(self.get_resource("messages", message_uuid)["uuid"]))
+
     def get_resource(
         self,
         resource: str,

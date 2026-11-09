@@ -810,24 +810,30 @@ class WorkspaceStreamBindingController(StoreResourceController):
 
 
 class MessageJSONPacker(ContractJSONPacker):
+    _write_resource = ra_resources.ResourceByRAModel(
+        model_class=message_responses.WorkspaceUserMessageWrite,
+        convert_underscore=False,
+    )
+
     def unpack(self, value: typing.Any) -> typing.Any:
-        try:
-            body = json.loads(value)
-        except (ValueError, UnicodeError) as exc:
-            raise ra_exc.ParseBodyError() from exc
+        body = ra_packers.JSONPacker(None, self._req).unpack(value)
         if (
             not isinstance(body, dict)
             or {"resource", "self", "controller"} & body.keys()
         ):
             raise ra_exc.ValidationErrorException()
-        payload = body.get("payload")
-        if "poll_state" in body or (
-            isinstance(payload, dict)
-            and payload.get("kind") == "poll"
-            and "closed_at" in payload
-        ):
-            raise ra_exc.ValidationErrorException()
-        return ra_packers.BaseResourcePacker.unpack(self, body)
+        write_packer = ra_packers.BaseResourcePacker(self._write_resource, self._req)
+        if self._rt is not None:
+            return write_packer.unpack(body)
+        # Actions receive raw arguments. Any message fields still follow the
+        # write contract, including on actions that ignore extra arguments.
+        fields = (
+            body.keys()
+            & message_responses.WorkspaceUserMessage.properties.properties.keys()
+        )
+        if fields:
+            write_packer.unpack({name: body[name] for name in fields})
+        return body
 
 
 class PollVoterController(StoreResourceController):
@@ -880,6 +886,19 @@ class WorkspaceMessageController(StoreResourceController):
         process_filters=True,
     )
 
+    def get_resource_by_uuid(
+        self, uuid: str, parent_resource: typing.Any = None
+    ) -> typing.Any:
+        # Actions and child collections need only the accessible placement ID.
+        # A resource lookup for a relationship still returns the full message.
+        if self.request.path_info_peek() not in {"actions", "poll_voters"}:
+            return super().get_resource_by_uuid(uuid, parent_resource)
+        identifier = self._parse_resource_uuid(
+            "uuid", uuid, self.get_resource().get_id_type()
+        )
+        with api_store.open_store(self._get_project_id(), self._get_user_uuid()) as db:
+            return {"uuid": db.resolve_message_uuid(identifier)}
+
     def _is_queryable_field(self, model_field_name: str) -> bool:
         # poll_state is personalized after the SQL page has been selected.
         return model_field_name != "poll_state" and super()._is_queryable_field(
@@ -889,7 +908,7 @@ class WorkspaceMessageController(StoreResourceController):
     def get_packer(
         self, content_type: typing.Any, resource_type: typing.Any = None
     ) -> typing.Any:
-        if "json" in content_type:
+        if "multipart/form-data" not in content_type:
             return MessageJSONPacker(
                 resource_type or self.get_resource(), request=self.request
             )

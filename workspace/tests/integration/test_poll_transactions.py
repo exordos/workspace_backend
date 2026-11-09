@@ -12,9 +12,11 @@ import uuid
 import psycopg
 import pytest
 from restalchemy.common import exceptions as ra_exc
+from restalchemy.storage.sql import sessions
 
+from workspace.common import mutation_journal_opts
 from workspace.messenger_api import exceptions
-from workspace.messenger_api.api import poll_store
+from workspace.messenger_api.api import poll_reads, poll_store
 from workspace.tests.integration import conftest
 from workspace.tests.integration import test_messenger_v2 as native
 
@@ -59,6 +61,40 @@ def poll(api, db):
         (api.project_id, placement),
     ).fetchone()[0]
     return placement, root, question, options
+
+
+@pytest.mark.parametrize("journal", [False, True], ids=["sync", "journal"])
+def test_vote_loads_only_the_response_snapshot(api, poll, monkeypatch, journal):
+    placement, _, question, options = poll
+    path = native.MESSAGES + placement
+    monkeypatch.setattr(mutation_journal_opts, "enabled", lambda: journal)
+    execute = sessions.PgSQLSession.execute
+    snapshot_reads = 0
+
+    def count_snapshots(session, query, *args, **kwargs):
+        nonlocal snapshot_reads
+        if query == poll_reads.SNAPSHOTS_SQL:
+            snapshot_reads += 1
+        return execute(session, query, *args, **kwargs)
+
+    monkeypatch.setattr(sessions.PgSQLSession, "execute", count_snapshots)
+    choice = {"question_uuid": question, "option_uuid": options[0]}
+    response = api.post(
+        path + "/actions/vote/invoke", json={**choice, "selected": True}
+    )
+    assert response.status_code == 200, response.text
+    state = response.json()["poll_state"]
+    assert state["voter_count"] == 1
+    assert state["my_votes"] == [
+        {"question_uuid": question, "option_uuids": [options[0]]}
+    ]
+    assert snapshot_reads == 1
+
+    # A nested collection resolves the parent, but never returns its snapshot.
+    assert api.get(path + "/poll_voters/", params=choice).status_code == 403
+    assert snapshot_reads == 1
+    assert api.get(path).json()["poll_state"] == state
+    assert snapshot_reads == 2
 
 
 def test_concurrent_poll_selections_preserve_content_and_queue_each_change_once(

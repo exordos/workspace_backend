@@ -13,6 +13,7 @@ from restalchemy.common import contexts
 from restalchemy.storage.sql import sessions
 
 from workspace.messenger_api import publication
+from workspace.messenger_api.dm import polls
 from workspace.services.messenger_workers import v2_projection
 
 from workspace.tests.integration import conftest
@@ -190,6 +191,7 @@ def test_poll_append_settings_close_and_access(api, db, room):
     )
     closed = invoke(api, path, "close_poll", {})["poll_state"]
     assert closed["is_closed"]
+    assert api.get(path).json()["payload"]["closed_at"] is not None
     assert invoke(api, path, "close_poll", {})["poll_state"] == closed
     assert (
         invoke(api, path, "add_poll_option", extra, user=peer)["poll_state"] == closed
@@ -224,12 +226,23 @@ def test_poll_voters_cursor_survives_withdrawal_and_replacement(api, room):
     users = sorted([str(room[1]), str(api.user_uuid)])
     for user in users:
         invoke(api, path, "vote", selection(first), user=user)
-    query = {
+    voters_path = path + "/poll_voters/"
+    voter_filters = {
         "question_uuid": first["uuid"],
         "option_uuid": first["options"][0]["uuid"],
-        "page_limit": 1,
     }
-    response = api.get(path + "/poll_voters/", params=query)
+    for limit in (None, 100, 0, 101):
+        params = (
+            voter_filters if limit is None else {**voter_filters, "page_limit": limit}
+        )
+        page = api.get(voters_path, params=params)
+        if limit in (0, 101):
+            assert page.status_code == 400
+        else:
+            assert page.status_code == 200, page.text
+            assert page.headers["X-Pagination-Limit"] == str(limit or 50)
+    query = {**voter_filters, "page_limit": 1}
+    response = api.get(voters_path, params=query)
     assert response.status_code == 200, response.text
     assert response.json() == [{"uuid": users[0]}]
     marker = response.headers["X-Pagination-Marker"]
@@ -262,9 +275,13 @@ def test_poll_write_boundary_and_immutable_kind(
     envelope = {"stream_uuid": room[0]["uuid"], "payload": payload}
     for other in (
         {**envelope, "payload": {**payload, "closed_at": None}},
+        {**envelope, "payload": {**payload, "closed_at": "2026-01-01T12:00:00Z"}},
         {**envelope, "poll_state": message["poll_state"]},
+        {**envelope, "poll_state": None},
     ):
         assert api.post(native.MESSAGES, json=other).status_code == 400
+    invoke(api, path, "star", {"poll_state": None}, status=400)
+    invoke(api, path, "star", {"payload": {**payload, "closed_at": None}}, status=400)
     markdown = {"kind": "markdown", "content": "plain"}
     ordinary = api.post(native.MESSAGES, json={**envelope, "payload": markdown}).json()
     assert ordinary["poll_state"] is None
@@ -339,6 +356,37 @@ def test_poll_deferred_delivery_and_replay_respect_revoked_membership(api, db, r
     assert added.status_code == 200, added.text
     native._drain()
     assert not has_update(peer)
+
+
+def test_poll_creation_retry_compares_original_payload_and_returns_current_state(
+    api, room, monkeypatch
+):
+    stream, peer = room
+    body = {
+        "uuid": str(uuid.uuid4()),
+        "stream_uuid": stream["uuid"],
+        "payload": {
+            "kind": "poll",
+            "questions": [question(), question()],
+            "multiple_answers": False,
+            "is_anonymous": True,
+            "allow_revote": False,
+            "results_visibility": "always",
+        },
+    }
+    created = api.post(native.MESSAGES, json=body)
+    assert created.status_code == 201, created.text
+    path = native.MESSAGES + created.json()["uuid"]
+    closed = invoke(api, path, "close_poll", {})
+    monkeypatch.setattr(polls, "MAX_POLL_QUESTIONS", 1)
+    retry = api.post(native.MESSAGES, json=body)
+    assert retry.status_code == 201, retry.text
+    assert retry.json() == closed
+    fresh = {**body, "uuid": str(uuid.uuid4())}
+    assert api.post(native.MESSAGES, json=fresh).status_code == 400
+    assert api.post(native.MESSAGES, json=body, user=peer).status_code == 400
+    changed = {**body, "payload": {**body["payload"], "is_anonymous": False}}
+    assert api.post(native.MESSAGES, json=changed).status_code == 400
 
 
 def test_poll_deletion_does_not_hide_next_history_page(api, db, room, monkeypatch):
