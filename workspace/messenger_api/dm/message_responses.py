@@ -1,11 +1,11 @@
 # Copyright 2026 Genesis Corporation.
 # Licensed under the Apache License, Version 2.0 (the "License").
 
-"""Public Message resource, enriched after reading the access-scoped view."""
+"""Message input and access-scoped response models."""
 
 from restalchemy.dm import properties, types
 
-from workspace.messenger_api.dm import base, polls
+from workspace.messenger_api.dm import base, message_payloads, polls
 
 
 COUNT = types.Integer(min_value=0)
@@ -35,6 +35,12 @@ POLL_STATE = types.AllowNone(
         }
     )
 )
+
+
+class WorkspaceUserMessageWrite(base.WorkspaceUserMessageBase):
+    payload = properties.property(
+        message_payloads.MESSAGE_WRITE_PAYLOAD_TYPE, required=True
+    )
 
 
 class WorkspaceUserMessage(base.WorkspaceUserMessageBase):

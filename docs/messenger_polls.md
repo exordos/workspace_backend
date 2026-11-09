@@ -24,6 +24,8 @@ Send a poll through the ordinary message endpoint. UUIDs are stable within the q
 
 A poll needs at least one question and two options per question. The maxima are 20 questions and 20 options per question; changing these constants does not invalidate published polls. The required poll-level `multiple_answers` applies to every question, while selections remain independent per question. A question may include `correct_option_uuids` drawn from its options. Readers always receive these IDs. Optional creation fields are `closes_at` (a future timestamp with a time zone, default null) and `allow_adding_options` (default false). The server supplies `closed_at`.
 
+To retry a send after a lost response, submit the same message UUID and creation payload to the original stream and topic. The server compares the request with the first content revision and returns the current message. This also works if the poll has since closed or the creation limits have changed.
+
 Use the public message UUID for the following endpoints. All four POST actions return the current message, including the caller's poll state.
 
 | Endpoint relative to `messages/{uuid}/` | Body or query |
@@ -32,7 +34,7 @@ Use the public message UUID for the following endpoints. All four POST actions r
 | `POST actions/close_poll/invoke` | `{}`. Close permanently. |
 | `POST actions/update_settings/invoke` | `{settings: {closes_at, allow_adding_options}}`. Save both fields together; null removes a future deadline. |
 | `POST actions/add_poll_option/invoke` | `{question_uuid, option: {uuid, text}}`. Append without voting. Retrying the same UUID and text succeeds even after closing. |
-| `GET poll_voters/` | `question_uuid`, `option_uuid`; optional `page_limit` (default 50, maximum 100) and `page_marker`. Returns objects containing only `uuid`; use `X-Pagination-Marker` for the next page. Anonymous polls forbid this lookup for everyone. |
+| `GET poll_voters/` | `question_uuid`, `option_uuid`; optional `page_limit` (default 50, range 1–100) and `page_marker`. Returns objects containing only `uuid`; use `X-Pagination-Marker` for the next page. Anonymous polls forbid this lookup for everyone. |
 
 Only a current participant can vote or append. The author and current stream owners, administrators and moderators can manage the poll. Without revoting, a single choice cannot be replaced and existing selections cannot be removed; a question in a multiple-choice poll still accepts additional selections. Questions are independent. Once the deadline passes or a manager closes the poll, no further changes are accepted. Ordinary message edits cannot change polls or convert another message into a poll. Forwarded results are Markdown snapshots.
 
@@ -43,6 +45,10 @@ Message reads include `poll_state` (null for other kinds). It contains `revision
 A vote, manual close, settings change or appended option updates the existing message through `message.updated`. A vote does not create unread activity. Each reader receives their own `my_votes`; the voter is not identified in the update. Apply the poll payload and state together: a lower `poll_state.revision` is stale for both, but does not determine the ordering of read flags or reactions. Crossing `closes_at` does not change the revision or require a worker. At the same revision, an older snapshot must not reopen an expired poll.
 
 ## Storage and sizing
+
+The first release computes poll totals from the vote rows. The history query selects the page keys first and aggregates only its polls. A poll action reads the totals for its response after applying the action. Reading the content, revision, counts and personal choices in one SQL statement keeps them consistent during concurrent votes or account deletion. A materialized total would have to track both paths in the same transaction.
+
+The voter list has its own page-size contract. Omitting `page_limit` returns up to 50 UUIDs. Values from 1 through 100 are accepted, and zero or values above 100 return HTTP 400. A withdrawn vote can still serve as the exclusive UUID boundary for the next page.
 
 Votes belong to the canonical message and the project user. Deleting either cascades to its votes; leaving a stream alone preserves votes. A real vote advances the poll revision without changing the message content, timestamp or unread state. Poll metadata edits use immutable content pages. No cron job is required for deadlines.
 
