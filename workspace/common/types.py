@@ -4,6 +4,7 @@
 # you may not use this file except in compliance with the License.
 
 import datetime
+import typing
 
 from restalchemy.dm import types
 
@@ -13,3 +14,10 @@ class UTCDateTimeWithOffset(types.UTCDateTimeZ):
 
     def to_simple_type(self, value: datetime.datetime) -> str:
         return value.isoformat()
+
+
+class StrictBoolean(types.Boolean):
+    def from_simple_type(self, value: typing.Any) -> bool:
+        if not self.validate(value):
+            raise ValueError("Expected a JSON boolean")
+        return value

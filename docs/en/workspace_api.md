@@ -1275,7 +1275,9 @@ Realtime side effects:
 
 ### Message payloads {#message-payloads}
 
-All six `kind` values are allowed regardless of the stream encryption flag, except `e2ee` is forbidden in a Zulip stream. Every field shown in a payload example is required; unknown fields are rejected. `key_uuid` and `request_message_uuid` must be UUIDs. Device identifiers and names are opaque strings of at most 255 characters.
+See [Native Messenger polls](../messenger_polls.md) for the `poll` payload, `poll_state`, voting actions, visibility and pagination.
+
+Polls require a native stream without encryption. The other six `kind` values are independent of the stream encryption flag, except that Zulip streams reject `e2ee`. Unknown payload fields are rejected. `key_uuid` and `request_message_uuid` must be UUIDs. Device identifiers and names are opaque strings of at most 255 characters.
 
 Markdown `content` is a non-empty string of at most 40,000 characters. `e2ee.content` allows up to 213,336 characters: enough for Base64 of a length-preserving cipher applied to 40,000 characters encoded with up to four UTF-8 bytes each. `key_grant.content` is non-empty and limited to 40,000 characters. `key_request.public_key` is the requesting device public key, not the symmetric stream key; it is non-empty and limited to 2048 characters. Content and public keys pass through unchanged; the backend does not trim, validate Base64, encrypt, decrypt or store plaintext secret keys.
 

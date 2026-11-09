@@ -10,37 +10,43 @@ import json
 import typing
 import uuid as sys_uuid
 
+from oslo_config import cfg
 from restalchemy.common import contexts
 from restalchemy.common import exceptions as ra_exceptions
 from restalchemy.dm import filters as dm_filters
 from restalchemy.storage.sql import filters as sql_filters
 
+from workspace.messenger_api import exceptions as messenger_exc
 from workspace.messenger_api import message_flags
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api.api import outgoing
+from workspace.messenger_api.api import poll_reads
+from workspace.messenger_api.api import poll_store
 from workspace.messenger_api.api import resource_projection
 from workspace.messenger_api.api import sql_canonical_store
 from workspace.messenger_api.api import store as api_store
+from workspace.common import messenger_poll_opts
 from workspace.common import emoji
 from workspace.common import mutation_journal_opts
 from workspace.messenger_api.dm import base
 from workspace.messenger_api.dm import helpers
 from workspace.messenger_api.dm import message_payloads
+from workspace.messenger_api.dm import polls
 from workspace.messenger_api.dm import v2_models
 
 
-SELECT_MESSAGE_PAGE_SQL = """
+SELECT_MESSAGE_PAGE_SQL = f"""
 WITH page AS MATERIALIZED (
     SELECT uuid,created_at FROM messenger_api_message_page_candidates_v1
-    WHERE {predicate}
-    ORDER BY created_at {direction},uuid {direction} LIMIT %s
+    WHERE {{predicate}}
+    ORDER BY created_at {{direction}},uuid {{direction}} LIMIT %s
 )
-SELECT message.* FROM page
+SELECT message.*, {poll_reads.PAGE_SNAPSHOT_SQL} FROM page
 CROSS JOIN LATERAL (
     SELECT * FROM messenger_api_user_messages_v1
-    WHERE uuid=page.uuid AND {predicate} LIMIT 1
+    WHERE uuid=page.uuid AND {{predicate}} LIMIT 1
 ) message
-ORDER BY page.created_at {direction},page.uuid {direction}
+ORDER BY page.created_at {{direction}},page.uuid {{direction}}
 """
 
 
@@ -65,13 +71,29 @@ _INTERNAL_FIELDS = {
 }
 
 
-def _public(row: typing.Any, resource: str) -> dict[str, typing.Any]:
+def _public_fields(row: typing.Any, resource: str) -> dict[str, typing.Any]:
     result = resource_projection.as_dict(row, resource)
     for name in _INTERNAL_FIELDS:
         result.pop(name, None)
     if resource == "streams":
         result.setdefault("current_encryption_key_uuid", None)
     return result
+
+
+def _public_rows(
+    rows: typing.Iterable[typing.Any], resource: str
+) -> list[dict[str, typing.Any]]:
+    values = [_public_fields(row, resource) for row in rows]
+    if resource == "messages":
+        return poll_reads.hydrate(None, values)
+    return values
+
+
+def _public(row: typing.Any, resource: str) -> dict[str, typing.Any]:
+    values = _public_rows([row], resource)
+    if not values:
+        raise ra_exceptions.ResourceNotFoundError(resource=resource, path=str(row.uuid))
+    return values[0]
 
 
 class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
@@ -109,7 +131,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             order_by=order_by,
             limit=limit,
         )
-        return [_public(row, resource) for row in rows]
+        return _public_rows(rows, resource)
 
     def filter_message_page(
         self,
@@ -137,7 +159,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 filters=scoped_filters,
                 order_by={"created_at": sort_direction, "uuid": sort_direction},
             )
-            return [_public(row, "messages") for row in rows]
+            return _public_rows(rows, "messages")
         session = contexts.Context().get_session()
         predicate = sql_filters.convert_filters(
             v2_models.WorkspaceUserMessage, scoped_filters, session=session
@@ -148,10 +170,14 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         )
         values = [*predicate.value, limit, *predicate.value]
         result = session.execute(statement, values).fetchall()
+        snapshots = [row.pop("poll_snapshot") for row in result]
         rows = v2_models.WorkspaceUserMessage.restore_many_from_storage(
             result, session=session
         )
-        return [_public(row, "messages") for row in rows]
+        messages = [_public_fields(row, "messages") for row in rows]
+        for message, snapshot in zip(messages, snapshots):
+            poll_reads.apply_page_snapshot(message, snapshot)
+        return messages
 
     def get_resource(
         self,
@@ -886,6 +912,9 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
     ) -> dict[str, typing.Any]:
         session = contexts.Context().get_session()
         canonical_payload = resource_projection.simple(values["payload"])
+        poll = canonical_payload["kind"] == polls.PollPayload.KIND
+        if poll:
+            canonical_payload = polls.normalize_create(values["payload"])
         announced = (
             canonical_payload["kind"] == message_payloads.KeyAnnouncedPayload.KIND
         )
@@ -955,12 +984,14 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             raise ra_exceptions.ValidationErrorException()
         now = session.execute("SELECT NOW() AS value", ()).fetchone()["value"]
         if existing_canonical is None:
+            if poll and not cfg.CONF[messenger_poll_opts.DOMAIN].creation_enabled:
+                raise messenger_exc.PollCreationDisabledError()
             inserted = session.execute(
                 """
                 INSERT INTO messenger_messages (
-                    uuid, project_id, author_uuid, content_uuid,
+                    uuid, project_id, author_uuid, content_uuid, poll_state_revision,
                     source_name, provider_uuid, provider_identity, status, created_at, updated_at
-                ) VALUES (%s, %s, %s, messenger_resolve_message_content(%s::jsonb,NULL),
+                ) VALUES (%s, %s, %s, messenger_resolve_message_content(%s::jsonb,NULL), %s,
                           %s, %s, NULL, %s, %s, %s)
                 ON CONFLICT (project_id, uuid) DO NOTHING
                 RETURNING uuid
@@ -970,6 +1001,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                     self.project_uuid,
                     self.user_uuid,
                     json.dumps(canonical_payload),
+                    int(poll),
                     stream.source_name,
                     stream.provider_uuid,
                     "active" if stream.source_name == "native" else "new",
@@ -1563,6 +1595,23 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             )
         return _public(self._message(message.uuid), "messages")
 
+    def poll_voters(
+        self,
+        message_uuid: sys_uuid.UUID,
+        question_uuid: sys_uuid.UUID,
+        option_uuid: sys_uuid.UUID,
+        marker: sys_uuid.UUID | None,
+        limit: int,
+    ) -> list[dict[str, typing.Any]]:
+        return poll_reads.voters(
+            contexts.Context().get_session(),
+            self._message(message_uuid),
+            question_uuid,
+            option_uuid,
+            marker,
+            limit,
+        )
+
     @outgoing.api_change
     def perform_action(
         self,
@@ -1573,6 +1622,18 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
     ) -> dict[str, typing.Any] | list[dict[str, typing.Any]]:
         resource_uuid = sys_uuid.UUID(str(resource_uuid))
         session = contexts.Context().get_session()
+        if resource == "messages" and action in polls.ACTION_BODIES:
+            message = self._message(resource_uuid)
+            poll_store.mutate(
+                session,
+                self.project_uuid,
+                self.user_uuid,
+                message.uuid,
+                message.canonical_message_uuid,
+                action,
+                values,
+            )
+            return self.get_resource("messages", message.uuid)
         if resource == "folder_items" and action in {"pin", "unpin"}:
             item = self._folder_item(resource_uuid)
             session.execute(

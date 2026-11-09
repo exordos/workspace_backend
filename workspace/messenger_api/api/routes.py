@@ -18,6 +18,7 @@ import typing
 
 from restalchemy.api import constants
 from restalchemy.api import routes
+from restalchemy.common import exceptions as ra_exc
 
 from workspace.messenger_api.api import controllers
 
@@ -154,6 +155,26 @@ class WorkspaceStreamBindingRoute(routes.Route):
     ]
 
 
+class PollVoterRoute(routes.Route):
+    __controller__ = controllers.PollVoterController
+    __allow_methods__ = [routes.FILTER]
+
+
+class PollAction(routes.Action):
+    __controller__ = controllers.WorkspaceMessageController
+
+    def do(self, resource: typing.Any, **kwargs: typing.Any) -> typing.Any:
+        if self._req.method == "POST":
+            if (
+                self._req.content_type != constants.DEFAULT_CONTENT_TYPE
+                or not self._req.body
+            ):
+                raise ra_exc.ValidationErrorException()
+            # RESTAlchemy selects JSON action arguments by exact media type.
+            self._req.headers["Content-Type"] = constants.DEFAULT_CONTENT_TYPE
+        return super().do(resource, **kwargs)
+
+
 class WorkspaceMessageRoute(routes.Route):
     __controller__ = controllers.WorkspaceMessageController
     __allow_methods__ = [
@@ -164,6 +185,11 @@ class WorkspaceMessageRoute(routes.Route):
         routes.DELETE,
     ]
 
+    poll_voters = routes.route(PollVoterRoute, resource_route=True)
+    vote = routes.action(PollAction, invoke=True)
+    close_poll = routes.action(PollAction, invoke=True)
+    update_settings = routes.action(PollAction, invoke=True)
+    add_poll_option = routes.action(PollAction, invoke=True)
     read = routes.action(WorkspaceMessageReadAction, invoke=True)
     read_up_to = routes.action(WorkspaceMessageReadUpToAction, invoke=True)
     star = routes.action(WorkspaceMessageStarAction, invoke=True)

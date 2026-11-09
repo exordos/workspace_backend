@@ -29,9 +29,11 @@ from restalchemy.common import contexts
 from restalchemy.dm import filters as dm_filters
 from workspace.common import mutation_journal_opts
 from workspace.messenger_api import publication
+from workspace.messenger_api.api import poll_reads
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.dm import event_payloads
 from workspace.messenger_api.dm import message_payloads
+from workspace.messenger_api.dm import message_responses
 from workspace.messenger_api.dm import models
 
 
@@ -143,7 +145,9 @@ WORKSPACE_EVENT_RESOURCE = ra_resources.ResourceByRAModel(
 )
 DEFAULT_EVENTS_LIMIT = 100
 MESSAGE_EVENT_MAX_AGE = datetime.timedelta(weeks=2)
-WORKSPACE_USER_MESSAGE_FIELDS = tuple(models.WorkspaceUserMessage.properties.properties)
+WORKSPACE_USER_MESSAGE_FIELDS = tuple(
+    message_responses.WorkspaceUserMessage.properties.properties
+)
 WORKSPACE_USER_STREAM_FIELDS = tuple(
     name
     for name in models.WorkspaceUserStream.properties.properties
@@ -423,6 +427,13 @@ def _create_workspace_event(
     session: typing.Any = None,
 ) -> typing.Any:
     if mutation_journal_opts.enabled() or publication.DEFERRED.get():
+        overrides = None
+        if (payload.get("poll_state") or {}).get("my_votes"):
+            overrides = {str(user_uuid): {"poll_state": payload["poll_state"]}}
+            payload = {
+                **payload,
+                "poll_state": {**payload["poll_state"], "my_votes": []},
+            }
         pending = publication.enqueue(
             session or contexts.Context().get_session(),
             project_id,
@@ -430,6 +441,7 @@ def _create_workspace_event(
             [user_uuid],
             kind,
             payload,
+            overrides,
         )
         return pending[0]
     object_type, action = _event_metadata_for_kind(kind)
@@ -443,6 +455,22 @@ def _create_workspace_event(
         payload=_payload_with_kind(kind, payload),
     )
     return event.insert(session=session)
+
+
+def _create_personal_message_events(
+    messages: typing.Iterable[typing.Any], kind: str, session: typing.Any
+) -> list[typing.Any]:
+    snapshots = [_message_from_event_payload(row) for row in messages]
+    return [
+        _create_workspace_event(
+            project_id=sys_uuid.UUID(row["project_id"]),
+            user_uuid=sys_uuid.UUID(row["user_uuid"]),
+            kind=kind,
+            payload=row,
+            session=session,
+        )
+        for row in poll_reads.hydrate(session, snapshots)
+    ]
 
 
 def create_message_events(
@@ -465,14 +493,9 @@ def create_message_events(
             session=session,
         )
         return sorted(
-            _create_workspace_event(
-                project_id=user_message.project_id,
-                user_uuid=user_message.user_uuid,
-                kind=MESSAGE_CREATED_EVENT,
-                payload=_message_from_event_payload(user_message, session=session),
-                session=session,
+            _create_personal_message_events(
+                user_messages, MESSAGE_CREATED_EVENT, session
             )
-            for user_message in user_messages
         )
     recipients = sorted({sys_uuid.UUID(str(value)) for value in recipients}, key=str)
     author_uuid = sys_uuid.UUID(str(message.user_uuid))
@@ -569,6 +592,10 @@ def _compress_recipient_payloads(
         # Use the modal value as the base payload. A typical message therefore
         # stores only the author's read/is_own exception, not 300 false flags.
         common[key] = max(variants.values(), key=lambda item: item[1])[0]
+    # The common body is shared storage. Personal choices belong only to the
+    # recipient override even when everyone in a small batch chose identically.
+    if common.get("poll_state"):
+        common["poll_state"] = {**common["poll_state"], "my_votes": []}
     overrides = {
         user_uuid: {
             key: value
@@ -615,6 +642,15 @@ def prepare_resource_broadcast_event(
     session = session or contexts.Context().get_session()
     if not resources:
         return None
+    if kind in (MESSAGE_CREATED_EVENT, MESSAGE_UPDATED_EVENT) and any(
+        _event_payload_get(_event_payload_get(item, "payload"), "kind") == "poll"
+        for item in resources
+    ):
+        resources = poll_reads.hydrate(
+            session, [_message_from_event_payload(item) for item in resources]
+        )
+        if not resources:
+            return None
     missing_cache = object()
     previous_cache = getattr(
         session,
@@ -825,10 +861,9 @@ def create_message_updated_events(
     compact: typing.Any = False,
 ) -> typing.Any:
     if not compact:
-        return [
-            create_message_updated_event(message, session=session)
-            for message in user_messages
-        ]
+        return _create_personal_message_events(
+            user_messages, MESSAGE_UPDATED_EVENT, session
+        )
     user_messages = list(user_messages)
     if not user_messages:
         return []
@@ -1005,25 +1040,15 @@ def create_message_deleted_events(
 def create_message_updated_event(
     message: typing.Any, session: typing.Any = None
 ) -> typing.Any:
-    return _create_workspace_event(
-        project_id=message.project_id,
-        user_uuid=message.user_uuid,
-        kind=MESSAGE_UPDATED_EVENT,
-        payload=_message_from_event_payload(message, session=session),
-        session=session,
-    )
+    events = _create_personal_message_events([message], MESSAGE_UPDATED_EVENT, session)
+    return events[0] if events else None
 
 
 def create_message_read_event(
     message: typing.Any, session: typing.Any = None
 ) -> typing.Any:
-    return _create_workspace_event(
-        project_id=message.project_id,
-        user_uuid=message.user_uuid,
-        kind=MESSAGE_READ_EVENT,
-        payload=_message_from_event_payload(message, session=session),
-        session=session,
-    )
+    events = _create_personal_message_events([message], MESSAGE_READ_EVENT, session)
+    return events[0] if events else None
 
 
 def create_message_deleted_event(

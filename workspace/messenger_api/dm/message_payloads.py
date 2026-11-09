@@ -21,6 +21,8 @@ from restalchemy.dm import properties
 from restalchemy.dm import types
 from restalchemy.dm import types_dynamic
 
+from workspace.messenger_api.dm import polls
+
 
 MARKDOWN_CONTENT_MAX_LENGTH = 40_000
 E2EE_CONTENT_MAX_LENGTH = 4 * ((4 * MARKDOWN_CONTENT_MAX_LENGTH + 2) // 3)
@@ -105,4 +107,5 @@ WORKSPACE_MESSAGE_PAYLOAD_TYPE = types_dynamic.KindModelSelectorType(
     types_dynamic.KindModelType(KeyGrantPayload),
     types_dynamic.KindModelType(KeyRejectPayload),
     types_dynamic.KindModelType(KeyAnnouncedPayload),
+    polls.POLL_TYPE,
 )

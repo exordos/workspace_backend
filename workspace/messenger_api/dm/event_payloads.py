@@ -23,7 +23,7 @@ from restalchemy.dm import types
 from restalchemy.dm import types_dynamic
 
 from workspace.common import models as common_models
-from workspace.messenger_api.dm import base
+from workspace.messenger_api.dm import base, message_responses
 from workspace.messenger_api.dm import models as messenger_models
 
 
@@ -55,6 +55,9 @@ class MessageEventPayloadBase(
     types_dynamic.AbstractKindModel,
     base.WorkspaceUserMessageBase,
 ):
+    poll_state = properties.property(
+        message_responses.POLL_STATE, default=None, read_only=True
+    )
     created_at = properties.property(
         MESSAGE_EVENT_TIMESTAMP_TYPE,
         read_only=True,

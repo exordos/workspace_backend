@@ -218,3 +218,5 @@ V1消息内容使用了下降有效载荷的形式:
 通过REST更新了存在
 `users/{uuid}/actions/presence/invoke` 操作. 工人标记了过时的用户
 在线并发出`user.updated` 带有全公开用户快照.
+
+Poll updates carry each reader’s own selections. See [poll revisions and deadline ordering](../messenger_polls.md#realtime-ordering).
