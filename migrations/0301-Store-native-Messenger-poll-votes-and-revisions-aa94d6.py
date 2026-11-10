@@ -104,7 +104,7 @@ ALTER TABLE messenger_messages DROP COLUMN poll_state_revision;
 
 class MigrationStep(migrations.AbstractMigrationStep):
     def __init__(self):
-        self._depends = ["0299-Expand-stream-names-to-2048-characters-400671.py"]
+        self._depends = ["0300-Preserve-Zulip-history-during-subscription-recovery-82877f.py"]
 
     @property
     def migration_id(self):
