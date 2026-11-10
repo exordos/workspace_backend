@@ -82,20 +82,24 @@ class PollServer(outbound.Server):
                 question, *options = (
                     message["content"].removeprefix("/poll ").splitlines()
                 )
+                sent = self.calls[-1][2]
+                initialization = (
+                    json.loads(sent["widget_content"])
+                    if "widget_content" in sent
+                    else {
+                        "widget_type": "poll",
+                        "extra_data": {
+                            "question": question,
+                            "options": [option.lstrip("-* ") for option in options],
+                        },
+                    }
+                )
                 message["submessages"] = [
                     {
                         "id": 1,
                         "sender_id": self.sender_id,
                         "msg_type": "widget",
-                        "content": json.dumps(
-                            {
-                                "widget_type": "poll",
-                                "extra_data": {
-                                    "question": question,
-                                    "options": options,
-                                },
-                            }
-                        ),
+                        "content": json.dumps(initialization),
                     }
                 ]
         return response
@@ -415,5 +419,30 @@ def test_unsupported_provider_shape_bypasses_the_original_outgoing_poll_snapshot
             current = api.get(MESSAGES + message["uuid"]).json()
             assert current["payload"]["kind"] == "markdown"
             assert "Extra 18" in current["payload"]["content"]
+
+    asyncio.run(run())
+
+
+def test_outgoing_poll_preserves_literal_option_prefixes(
+    outgoing, _test_database_url, monkeypatch
+):
+    api, account, channel, *_ = outgoing
+    monkeypatch.setattr(outbound, "Server", PollServer)
+    body = payload()
+    labels = ["-1", "*another option"]
+    for option, label in zip(body["questions"][0]["options"], labels):
+        option["text"] = label
+    created = api.post(
+        MESSAGES, json={"stream_uuid": str(channel.stream_uuid), "payload": body}
+    )
+    assert created.status_code == 201
+
+    async def run():
+        async with outbound.sender(account, _test_database_url) as (service, server):
+            await outbound.drain(service)
+            assert (
+                list(poll_conversion.read(server.messages[101]).options.values())
+                == labels
+            )
 
     asyncio.run(run())
