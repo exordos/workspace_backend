@@ -40,22 +40,41 @@ Only a current participant can vote or append. The author and current stream own
 
 Message reads include `poll_state` (null for other kinds). It contains `revision`, `is_closed`, distinct `voter_count`, ordered `questions` with per-question `voter_count` and `option_counts` keyed by option UUID, and the reader's `my_votes` as `{question_uuid, option_uuids}` entries. Missing votes produce zero counts and an empty own-answer list. Counts are available to the API regardless of `results_visibility` (`always` or `after_vote`); the latter is a presentation rule.
 
-## Zulip snapshots
+## Zulip interoperability
 
-The Zulip converter exports a native poll as a read-only Markdown snapshot of
-all questions and options. A caller with the message's `poll_state` can pass
-that state in the conversion context to include aggregate counts and closure.
-Without that state, results are marked unavailable. Personal selections and
-voter identities are never exported. Poll text is literal, so mentions cannot
-notify people. A snapshot exceeding the message limit is rejected.
+Unencrypted native and Zulip conversations accept poll payloads. A poll uses a
+native interactive Zulip widget when it has one question, distinct single-line
+options, public results, multiple answers, revoting and option additions enabled,
+no anonymous voting, no correct-answer keys, and no closing deadline. Leading or
+trailing whitespace and mention commands also select the preview path, so the
+bridge never silently changes the question or sends unexpected notifications.
 
-Imported Zulip `/poll` messages retain the question and options, replaying the
-available widget submessages for point-in-time counts. Without widget data,
-results are marked unavailable. The source link remains available. Snapshots
-are Markdown in both directions; importing one does not recreate an interactive
-poll or continuously synchronize subsequent votes. Native interactive polls
-remain limited to unencrypted Workspace conversations. To share one in a Zulip
-channel, send its converted Markdown snapshot through the ordinary message API.
+Compatible polls synchronize creation, selections, withdrawn votes, added
+options and question edits from Zulip. Workspace clicks use the connected
+account of the voter; a user without an active matching account cannot vote as
+someone else. Updates reuse the ordinary durable inbox and outgoing intent
+queue. Repeated submessages and retries do not duplicate votes. An incoming
+provider snapshot preserves local selections whose outgoing writes are pending.
+Provider widgets outside the native payload limits remain readable snapshots.
+
+Zulip widgets cannot close or enforce a different voting policy. Those settings
+are fixed for a compatible poll in a Zulip conversation; the API returns 409
+rather than accepting a change that the other client would ignore. Create an
+extended poll when a deadline, anonymity or another restriction is needed.
+
+Extended Workspace polls stay interactive in Workspace. Zulip receives a
+read-only preview with every question and option, an explicit partial-support
+notice and a **View and vote in Workspace** link to that exact placement. The
+preview does not export personal selections or voter identities. A provider
+echo cannot replace the authoritative poll with its Markdown preview. Text is
+literal, so a preview cannot notify mentioned people; an oversized preview is
+rejected instead of being silently truncated.
+
+Set `workspace_url` in the connected Zulip account's settings to the public
+Workspace origin, for example `https://workspace.example.test`. This deployment
+setting is required for extended polls: workers must not guess another server's
+URL. The link includes the project, stream, topic and public message UUID and
+continues to require normal Workspace authentication and access permissions.
 
 ## Realtime ordering
 

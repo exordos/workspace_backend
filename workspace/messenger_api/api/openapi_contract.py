@@ -6,9 +6,7 @@
 import copy
 import typing
 
-from workspace.messenger_api.dm import message_payloads
-from workspace.messenger_api.dm import polls
-
+from workspace.messenger_api.dm import message_payloads, polls
 
 PAGINATION_LIMIT_PARAMETER = {
     "name": "page_limit",
@@ -453,7 +451,7 @@ def add_message_encryption_contract(
     message_create["requestBody"] = _request_body(message_create_schema)
     message_create["description"] = (
         "Send a message; an absent or null topic_uuid selects the stream's "
-        "default topic. Creating a new poll requires an unencrypted native stream. "
+        "default topic. Creating a new poll requires an unencrypted native or Zulip stream. "
         "An e2ee payload is forbidden for a shared Zulip stream. "
         "Only the owner role may send key_announced; saving the message and "
         "updating current_encryption_key_uuid is atomic. Old e2ee key UUIDs "
