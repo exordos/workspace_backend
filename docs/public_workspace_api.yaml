@@ -6700,7 +6700,7 @@ paths:
       security:
       - bearerAuth: []
       description: Send a message; an absent or null topic_uuid selects the stream's
-        default topic. Creating a new poll requires an unencrypted native stream.
+        default topic. Creating a new poll requires an unencrypted native or Zulip stream.
         An e2ee payload is forbidden for a shared Zulip stream. Only the owner role may send key_announced;
         saving the message and updating current_encryption_key_uuid is atomic. Old
         e2ee key UUIDs are accepted. The backend does not validate Base64, encrypt,

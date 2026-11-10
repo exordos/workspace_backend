@@ -19,14 +19,13 @@ Unsupported content remains a notice with a link to the original message.
 
 import base64
 import collections.abc
-import json
 import re
 import urllib.parse
 import uuid
 
-from workspace.messenger_api.dm import message_payloads
+from workspace.bridges.zulip import poll_conversion
 from workspace.common import emoji
-
+from workspace.messenger_api.dm import message_payloads
 
 _INLINE = (
     r"(?P<escape>\\[^\n])"
@@ -77,9 +76,11 @@ def _escape_label(value: str) -> str:
     return re.sub(r"([\\`*_{()\[\]#+.!|>~-])", r"\\\1", value)
 
 
-def _poll_snapshot(questions: list, *, closed: bool = False) -> str:
+def _poll_snapshot(
+    questions: list[tuple[str, list[tuple[str, int | None]]]], *, closed: bool = False
+) -> str:
     """Keep user text literal: a snapshot must never notify mentioned users."""
-    lines = []
+    lines: list[str] = []
     for question, options in questions:
         lines.extend((question,))
         for text, count in options:
@@ -100,76 +101,27 @@ def _poll_snapshot(questions: list, *, closed: bool = False) -> str:
     return result
 
 
-def _zulip_poll_snapshot(message: dict, file_notices: dict) -> str:
-    """Replay Zulip poll submessages; export counts, never voter identities."""
-    source = message["content"].removeprefix("/poll").strip().splitlines()
-    question = source[0] if source else "Poll"
-    options = {f"canned,{i}": [text, set()] for i, text in enumerate(source[1:])}
-    initialized = False
-    for submessage in message.get("submessages", []):
-        if submessage.get("msg_type") != "widget":
-            continue
-        try:
-            data = json.loads(submessage["content"])
-        except (ValueError, TypeError):
-            continue
-        if not isinstance(data, dict):
-            continue
-        sender = submessage.get("sender_id")
-        if data.get("widget_type") == "poll" and not initialized:
-            extra = data.get("extra_data", {})
-            if not isinstance(extra, dict):
-                continue
-            labels = extra.get("options", [])
-            title = extra.get("question", "")
-            if (
-                not isinstance(title, str)
-                or not isinstance(labels, list)
-                or not all(isinstance(o, str) for o in labels)
-            ):
-                continue
-            question = title or question
-            options = {}
-            for index, text in enumerate(labels):
-                if text not in [o[0] for o in options.values()]:
-                    options[f"canned,{index}"] = [text, set()]
-            initialized = True
-        elif initialized and data.get("type") == "question":
-            if sender == message["sender_id"] and isinstance(data.get("question"), str):
-                question = data["question"]
-        elif initialized and data.get("type") == "new_option":
-            index, text = data.get("idx"), data.get("option")
-            if (
-                type(index) is int
-                and 0 <= index <= 1000
-                and isinstance(text, str)
-                and text not in [o[0] for o in options.values()]
-            ):
-                options[f"{sender},{index}"] = [text, set()]
-        elif initialized and data.get("type") == "vote":
-            key, vote = data.get("key"), data.get("vote")
-            if isinstance(key, str) and key in options and type(vote) is int:
-                if vote == 1:
-                    options[key][1].add(sender)
-                elif vote == -1:
-                    options[key][1].discard(sender)
+def _zulip_poll_snapshot(message: dict, file_notices: dict[str, str | None]) -> str:
+    """Export the point-in-time widget totals without voter identities."""
+    observed = poll_conversion.read(message)
+    if observed is None:
+        source = message["content"].removeprefix("/poll").strip().splitlines()
+        question = source[0] if source else "Poll"
+        options: list[tuple[str, int | None]] = [(text, None) for text in source[1:]]
+    else:
+        question = observed.question or "Poll"
+        options = [
+            (text, len(observed.votes[key])) for key, text in observed.options.items()
+        ]
 
-    def literal(text):
+    def literal(text: str) -> str:
         for url, notice in file_notices.items():
             if notice is not None:
                 text = text.replace(url, notice)
         return text
 
     return _poll_snapshot(
-        [
-            (
-                literal(question),
-                [
-                    (literal(text), len(voters) if initialized else None)
-                    for text, voters in options.values()
-                ],
-            )
-        ]
+        [(literal(question), [(literal(text), count) for text, count in options])]
     )
 
 
@@ -943,13 +895,18 @@ def workspace_to_zulip(payload: dict, context: dict) -> str:
     """
     model = message_payloads.WORKSPACE_MESSAGE_PAYLOAD_TYPE.from_simple_type(payload)
     if model.kind == "poll":
+        canonical = message_payloads.WORKSPACE_MESSAGE_PAYLOAD_TYPE.to_simple_type(
+            model
+        )
+        if poll_conversion.compatible(canonical):
+            return poll_conversion.command(canonical)
         state = context.get("poll_state")
         counts = (
             {q["question_uuid"]: q["option_counts"] for q in state["questions"]}
             if state
             else {}
         )
-        return _poll_snapshot(
+        snapshot = _poll_snapshot(
             [
                 (
                     q["text"],
@@ -964,6 +921,13 @@ def workspace_to_zulip(payload: dict, context: dict) -> str:
                 for q in model.questions
             ],
             closed=state["is_closed"] if state else model.closed_at is not None,
+        )
+        return (
+            "This poll is not fully supported in Zulip. "
+            "[View and vote in Workspace]("
+            + context["workspace_message_url"]
+            + ")\n\n"
+            + snapshot
         )
     if model.kind != "markdown":
         raise ValueError("Only Markdown messages can be converted to Zulip")

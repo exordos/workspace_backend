@@ -88,7 +88,7 @@ def event(content="Hello", identifier=101):
     }
 
 
-def test_poll_import_preserves_a_readable_snapshot_without_reusing_vote_state(incoming):
+def test_poll_import_is_interactive_without_reusing_another_messages_votes(incoming):
     api, *_ = incoming
     first = event("/poll Deployment?\nMonday\nTuesday", 721)
     first["message"]["submessages"] = [
@@ -119,18 +119,25 @@ def test_poll_import_preserves_a_readable_snapshot_without_reusing_vote_state(in
     ]
     second = event(first["message"]["content"], 722)
     second["message"]["submessages"] = first["message"]["submessages"][:1]
-    apply(incoming, first, second)
+    apply(
+        incoming,
+        {
+            "type": "realm_user",
+            "op": "add",
+            "person": {
+                "user_id": 8,
+                "full_name": "Voter",
+                "email": "voter@example.test",
+            },
+        },
+        first,
+        second,
+    )
     messages = api.get("/v1/messenger/messages/").json()
     assert len(messages) == 2
-    contents = [m["payload"]["content"] for m in messages]
-    assert all(
-        "Deployment?" in text and "- Monday — 0 votes" in text for text in contents
-    )
-    assert sum("- Tuesday — 1 votes" in text for text in contents) == 1
-    assert sum("- Tuesday — 0 votes" in text for text in contents) == 1
-    assert all(
-        m["payload"]["kind"] == "markdown" and m["poll_state"] is None for m in messages
-    )
+    assert all(m["payload"]["kind"] == "poll" for m in messages)
+    assert all(m["payload"]["questions"][0]["text"] == "Deployment?" for m in messages)
+    assert sorted(m["poll_state"]["voter_count"] for m in messages) == [0, 1]
 
 
 def test_repeated_incoming_content_reuses_conversion_and_page(incoming):

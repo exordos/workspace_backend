@@ -10,9 +10,9 @@ import typing
 from restalchemy.common import exceptions as ra_exc
 from restalchemy.storage.sql import sessions
 
+from workspace.bridges.zulip import poll_conversion
 from workspace.messenger_api import exceptions
-from workspace.messenger_api.dm import base
-from workspace.messenger_api.dm import polls
+from workspace.messenger_api.dm import base, polls
 
 
 def _instant(value: str) -> datetime.datetime:
@@ -35,7 +35,7 @@ def _vote(
     allow_revote: bool,
     multiple_answers: bool,
     closed: bool,
-) -> None:
+) -> bool:
     _item(question["options"], values["option_uuid"])
     where = "project_id=%s AND message_uuid=%s AND user_uuid=%s AND question_uuid=%s"
     rows = session.execute(
@@ -44,7 +44,7 @@ def _vote(
     current = {str(row["option_uuid"]) for row in rows}
     option = values["option_uuid"]
     if values["selected"] == (option in current):
-        return
+        return False
     if closed:
         raise exceptions.PollClosedError()
     replace = values["selected"] and current and not multiple_answers
@@ -67,6 +67,7 @@ def _vote(
             f"DELETE FROM messenger_poll_votes WHERE {where} AND option_uuid=%s",
             (*key, option),
         )
+    return True
 
 
 def _append_option(
@@ -154,7 +155,8 @@ def mutate(
     # committed payload and check the placement's current audience and role.
     row = session.execute(
         """SELECT c.workspace_content AS payload, m.author_uuid,
-                  m.source_name AS message_source, s.source_name, s.encryption, member.role
+                  m.source_name AS message_source, m.provider_identity, s.provider_uuid,
+                  s.source_name, s.encryption, member.role
            FROM messenger_messages m
            JOIN messenger_message_contents c ON c.uuid=m.content_uuid
            JOIN messenger_message_placements p ON (p.project_id,p.message_uuid)=(m.project_id,m.uuid)
@@ -171,11 +173,28 @@ def mutate(
     payload = row["payload"]
     if (
         payload["kind"] != "poll"
-        or row["message_source"] != "native"
-        or row["source_name"] != "native"
+        or row["source_name"] not in {"native", "zulip"}
+        or row["message_source"] != row["source_name"]
         or row["encryption"]
     ):
         raise ra_exc.ValidationErrorException()
+    synchronized = row["source_name"] == "zulip" and poll_conversion.compatible(payload)
+    account = None
+    if synchronized:
+        # Zulip cannot close a widget or restrict who adds options. Keep its
+        # policy stable rather than accepting a change that the other client
+        # would silently ignore.
+        if action in {"close_poll", "update_settings"}:
+            raise exceptions.PollConflictError()
+        account = session.execute(
+            """SELECT uuid,external_account_id FROM m_external_accounts_v2
+               WHERE project_id=%s AND owner_user_uuid=%s AND provider_uuid=%s
+                 AND provider='zulip' AND NOT disabled AND status<>'new'
+                 AND COALESCE(settings->>'api_key','')<>''""",
+            (project_uuid, user_uuid, row["provider_uuid"]),
+        ).fetchone()
+        if account is None:
+            raise exceptions.PollForbiddenError()
     if (
         action in {"close_poll", "update_settings"}
         and row["author_uuid"] != user_uuid
@@ -195,7 +214,7 @@ def mutate(
     )
     if action == "vote":
         question = _item(payload["questions"], values["question_uuid"])
-        _vote(
+        changed = _vote(
             session,
             (project_uuid, canonical_uuid, user_uuid, question["uuid"]),
             question,
@@ -204,6 +223,32 @@ def mutate(
             multiple_answers=payload["multiple_answers"],
             closed=closed,
         )
+        if synchronized and changed:
+            session.execute(
+                """INSERT INTO zulip_outgoing_intents
+                   (project_id,entity_type,entity_uuid,ordering_key,external_account_uuid,operation,data)
+                   VALUES (%s,'poll_vote',%s,%s,%s,'vote',%s::jsonb)""",
+                (
+                    project_uuid,
+                    canonical_uuid,
+                    f"message:{canonical_uuid}",
+                    account["uuid"],
+                    json.dumps(
+                        {
+                            "message_uuid": str(canonical_uuid),
+                            "actor_uuid": str(user_uuid),
+                            "account_identity": account["external_account_id"],
+                            "remote_identity": row["provider_identity"],
+                            "payload": payload,
+                            **values,
+                        }
+                    ),
+                ),
+            )
+            session.execute(
+                "UPDATE messenger_messages SET status='new' WHERE project_id=%s AND uuid=%s",
+                (project_uuid, canonical_uuid),
+            )
         return
     if action == "close_poll":
         if closed:
@@ -213,6 +258,17 @@ def mutate(
         )
     elif action == "add_poll_option":
         question = _item(payload["questions"], values["question_uuid"])
+        if synchronized:
+            prospective = {
+                **payload,
+                "questions": [
+                    {**question, "options": [*question["options"], values["option"]]}
+                ],
+            }
+            if not any(
+                o["uuid"] == values["option"]["uuid"] for o in question["options"]
+            ) and not poll_conversion.compatible(prospective):
+                raise exceptions.PollConflictError()
         if not _append_option(
             question,
             values["option"],

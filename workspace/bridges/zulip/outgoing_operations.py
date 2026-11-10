@@ -5,15 +5,17 @@
 
 import asyncio
 import datetime
+import json
 import typing
 import urllib.parse
 import uuid
 
 from psycopg.types import json as pg_json
 
-from workspace.bridges.zulip import content_cache, message_conversion
+from workspace.bridges.zulip import content_cache, message_conversion, poll_conversion
 from workspace.common import emoji
 from workspace.messenger_api import file_storage
+from workspace.messenger_api.dm import message_payloads
 
 TABLES = {
     "stream": "messenger_streams",
@@ -21,6 +23,7 @@ TABLES = {
     "topic": "messenger_topics",
     "topic_binding": "messenger_user_topic_bindings",
     "message": "messenger_messages",
+    "poll_vote": "messenger_messages",
     "reaction": "messenger_message_reaction_facts",
     "file": "m_workspace_files",
 }
@@ -30,7 +33,7 @@ UPDATE_ENTITY_STATUS_SQL = """
         SELECT CASE WHEN %s = 'active' AND EXISTS (
             SELECT 1
             FROM zulip_outgoing_intents
-            WHERE entity_type = %s
+            WHERE entity_type = ANY(%s)
               AND entity_uuid = %s
               AND id <> %s
               AND status IN ('new', 'checking')
@@ -386,7 +389,9 @@ class Operations:
             UPDATE_ENTITY_STATUS_SQL.format(table=table),
             (
                 status,
-                intent["entity_type"],
+                ["message", "poll_vote"]
+                if intent["entity_type"] in {"message", "poll_vote"}
+                else [intent["entity_type"]],
                 intent["entity_uuid"],
                 intent["id"],
                 status,
@@ -444,6 +449,43 @@ class Operations:
             intent["data"],
             intent["operation"],
         )
+        if kind == "poll_vote":
+            remote = data.get("remote_identity") or await self.identity(
+                intent, account, "message", intent["entity_uuid"]
+            )
+            observed = await self.poll(account, remote)
+            question = data["payload"]["questions"][0]
+            label = next(
+                o["text"]
+                for o in question["options"]
+                if o["uuid"] == data["option_uuid"]
+            )
+            key = next(
+                (key for key, text in observed.options.items() if text == label), None
+            )
+            if key is None:
+                raise ValueError("The poll option no longer exists in Zulip")
+            return request(
+                "poll_vote",
+                "POST",
+                "/submessage",
+                {
+                    "message_id": int(remote),
+                    "msg_type": "widget",
+                    "content": json.dumps(
+                        {
+                            "type": "vote",
+                            "key": key,
+                            "vote": 1 if data["selected"] else -1,
+                        }
+                    ),
+                },
+                message_id=int(remote),
+                option_key=key,
+                selected=data["selected"],
+                user_id=int(account["external_account_id"]),
+                after_revision=observed.revision,
+            )
         if kind == "message":
             if operation == "insert":
                 try:
@@ -467,6 +509,19 @@ class Operations:
                 return request("delete", "DELETE", f"/messages/{remote}")
             if await self.outdated_edit(intent, account):
                 return request("noop", "", "", identity=remote)
+            if data["payload"]["kind"] == "poll" and poll_conversion.compatible(
+                data["payload"]
+            ):
+                return request(
+                    "poll_options",
+                    "",
+                    "",
+                    message_id=int(remote),
+                    labels=[
+                        o["text"] for o in data["payload"]["questions"][0]["options"]
+                    ],
+                    identity=str(remote),
+                )
             content = await self.convert(intent, account)
             await self.content_snapshot(intent, account, content["uuid"], remote)
             return request(
@@ -937,15 +992,12 @@ class Operations:
 
     async def convert(self, intent: dict, account: dict) -> dict:
         payload = intent["data"]["payload"]
-        if payload["kind"] == "poll":
-            payload = {
-                "kind": "markdown",
-                "content": message_conversion.workspace_to_zulip(payload, {}),
-            }
         references = {
             (kind, identifier)
             for kind, identifier, query in message_conversion.workspace_references(
-                message_conversion.workspace_reference_text(payload["content"])
+                message_conversion.workspace_reference_text(
+                    message_payloads.markdown_content(payload)
+                )
             )
             if kind != "forward" or message_conversion.parse_snapshot(query) is not None
         }
@@ -960,6 +1012,15 @@ class Operations:
             "messages": {},
             "files": {},
         }
+        if payload["kind"] == "poll" and not poll_conversion.compatible(payload):
+            data = intent["data"]
+            context["workspace_message_url"] = poll_conversion.message_url(
+                account["settings"]["workspace_url"],
+                intent["project_id"],
+                data["stream_uuid"],
+                data["topic_uuid"],
+                data["placement_uuid"],
+            )
         for kind, identifier in set(references):
             if kind == "user":
                 users = await self.db.sql(
@@ -1071,6 +1132,17 @@ class Operations:
         await self.db.sql(content_cache.SAVE_SQL, (*cache_key, content["uuid"]))
         return {"uuid": content["uuid"], "provider_content": text}
 
+    async def poll(self, account: dict, remote: object) -> poll_conversion.Poll:
+        message = (
+            await self.http.request(
+                account, "GET", f"/messages/{remote}", {"apply_markdown": False}
+            )
+        )["message"]
+        observed = poll_conversion.read(message)
+        if observed is None:
+            raise Pending("Waiting for the Zulip poll widget")
+        return observed
+
     async def send_receipt_identity(
         self,
         intent: dict,
@@ -1100,6 +1172,27 @@ class Operations:
         kind = prepared["kind"]
         if kind == "noop":
             return True, {"identity": prepared.get("identity")}
+        if kind in {"poll_vote", "poll_options"}:
+            observed = await self.poll(account, prepared["message_id"])
+            observation = {
+                "poll_revision": observed.revision,
+                "poll_message_id": prepared["message_id"],
+            }
+            if kind == "poll_vote":
+                current = (
+                    prepared["user_id"] in observed.votes[prepared["option_key"]]
+                ) == prepared["selected"]
+                applied = any(
+                    revision > prepared["after_revision"]
+                    and sender == prepared["user_id"]
+                    and key == prepared["option_key"]
+                    and vote == (1 if prepared["selected"] else -1)
+                    for revision, sender, key, vote in observed.vote_events
+                )
+                return current or applied, observation
+            return all(
+                label in observed.options.values() for label in prepared["labels"]
+            ), {"identity": prepared["identity"], **observation}
         if kind == "send":
             delivery_uuid = prepared["delivery_uuid"]
             local_id = prepared["data"]["local_id"]
@@ -1286,6 +1379,42 @@ class Operations:
         self, intent: dict, account: dict, prepared: dict, checking: bool
     ) -> dict:
         kind = prepared["kind"]
+        if kind == "poll_options":
+            # Fetch before each write so a retry after a lost response does not
+            # add the option again. Reuse Zulip's per-sender index convention.
+            sender = str(account["external_account_id"])
+            for label in prepared["labels"]:
+                observed = await self.poll(account, prepared["message_id"])
+                if label in observed.options.values():
+                    continue
+                index = 1 + max(
+                    (
+                        int(key.split(",")[1])
+                        for key in observed.options
+                        if key.startswith(sender + ",")
+                    ),
+                    default=0,
+                )
+                if index > 1000:
+                    raise ValueError("Zulip poll option index limit reached")
+                await self.http.request(
+                    account,
+                    "POST",
+                    "/submessage",
+                    {
+                        "message_id": prepared["message_id"],
+                        "msg_type": "widget",
+                        "content": json.dumps(
+                            {"type": "new_option", "idx": index, "option": label}
+                        ),
+                    },
+                )
+            observed = await self.poll(account, prepared["message_id"])
+            return {
+                "identity": prepared["identity"],
+                "poll_revision": observed.revision,
+                "poll_message_id": prepared["message_id"],
+            }
         if kind == "edit" and await self.outdated_edit(intent, account):
             return {"identity": prepared["identity"]}
         if checking or kind in ("noop", "stream_create"):
@@ -1344,6 +1473,11 @@ class Operations:
             raise
         if kind == "send":
             return {"identity": str(result["id"])}
+        if kind == "poll_vote":
+            done, verified = await self.verify(intent, account, prepared)
+            if not done:
+                raise Pending("Waiting for the poll vote observation")
+            return verified
         if kind == "upload":
             return {"identity": urllib.parse.urlparse(result["uri"]).path}
         if kind == "stream_create":
@@ -1373,6 +1507,46 @@ class Operations:
     async def finish(
         self, intent: dict, account: dict, prepared: dict, result: dict
     ) -> None:
+        if "poll_revision" in result:
+            # Fence older prepared provider reads under the same root lock as
+            # the inbox. Enqueue reconciliation before marking the intent done;
+            # a crash leaves either a retryable write or a durable refresh.
+            async with self.db.transaction() as connection:
+                await connection.execute(
+                    "SELECT uuid FROM messenger_messages WHERE project_id=%s AND uuid=%s FOR NO KEY UPDATE",
+                    (intent["project_id"], intent["entity_uuid"]),
+                )
+                await connection.execute(
+                    poll_conversion.OBSERVE_SQL,
+                    (
+                        account["provider_uuid"],
+                        result["poll_revision"],
+                        intent["project_id"],
+                        intent["entity_uuid"],
+                    ),
+                )
+                await connection.execute(
+                    """INSERT INTO zulip_incoming_events
+                    (project_id,external_account_uuid,provider_uuid,owner_user_uuid,account_identity,queue_id,event_id,payload,ordering_keys)
+                    VALUES(%s,%s,%s,%s,%s,%s,0,%s,%s)
+                    ON CONFLICT(external_account_uuid,queue_id,event_id) DO NOTHING""",
+                    (
+                        intent["project_id"],
+                        account["uuid"],
+                        account["provider_uuid"],
+                        account["owner_user_uuid"],
+                        account["external_account_id"],
+                        f"poll:{intent['uuid']}",
+                        pg_json.Jsonb(
+                            {
+                                "type": "poll_refresh",
+                                "message_id": result["poll_message_id"],
+                                "outgoing_intent_uuid": str(intent["uuid"]),
+                            }
+                        ),
+                        [f"message:{result['poll_message_id']}"],
+                    ),
+                )
         identity = result.get("identity")
         if "delivery_uuid" in prepared:
             receipt = await self.db.sql(
