@@ -88,6 +88,51 @@ def event(content="Hello", identifier=101):
     }
 
 
+def test_poll_import_preserves_a_readable_snapshot_without_reusing_vote_state(incoming):
+    api, *_ = incoming
+    first = event("/poll Deployment?\nMonday\nTuesday", 721)
+    first["message"]["submessages"] = [
+        {
+            "sender_id": 7,
+            "msg_type": "widget",
+            "content": json.dumps(
+                {
+                    "widget_type": "poll",
+                    "extra_data": {
+                        "question": "Deployment?",
+                        "options": ["Monday", "Tuesday"],
+                    },
+                }
+            ),
+        },
+        {
+            "sender_id": 8,
+            "msg_type": "widget",
+            "content": json.dumps(
+                {
+                    "type": "vote",
+                    "key": "canned,1",
+                    "vote": 1,
+                }
+            ),
+        },
+    ]
+    second = event(first["message"]["content"], 722)
+    second["message"]["submessages"] = first["message"]["submessages"][:1]
+    apply(incoming, first, second)
+    messages = api.get("/v1/messenger/messages/").json()
+    assert len(messages) == 2
+    contents = [m["payload"]["content"] for m in messages]
+    assert all(
+        "Deployment?" in text and "- Monday — 0 votes" in text for text in contents
+    )
+    assert sum("- Tuesday — 1 votes" in text for text in contents) == 1
+    assert sum("- Tuesday — 0 votes" in text for text in contents) == 1
+    assert all(
+        m["payload"]["kind"] == "markdown" and m["poll_state"] is None for m in messages
+    )
+
+
 def test_repeated_incoming_content_reuses_conversion_and_page(incoming):
     api, db, *_ = incoming
     with mock.patch.object(
