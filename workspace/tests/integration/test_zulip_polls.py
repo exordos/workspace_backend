@@ -6,6 +6,8 @@ import copy
 import json
 import uuid
 
+import pytest
+
 from aiohttp import web
 
 from workspace.bridges.zulip import (
@@ -444,5 +446,47 @@ def test_outgoing_poll_preserves_literal_option_prefixes(
                 list(poll_conversion.read(server.messages[101]).options.values())
                 == labels
             )
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("extended", [False, True])
+def test_history_replay_preserves_exported_poll_payload(
+    outgoing, db, _test_database_url, extended
+):
+    from workspace.bridges.zulip import history
+
+    api, account, channel, *_ = outgoing
+    db.execute(
+        "UPDATE m_external_accounts_v2 SET settings=settings||%s::jsonb WHERE uuid=%s",
+        (json.dumps({"workspace_url": "https://workspace.example.test"}), account.uuid),
+    )
+    created = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": str(channel.stream_uuid),
+            "payload": payload(is_anonymous=extended),
+        },
+    ).json()
+
+    async def run():
+        async with outbound.sender(account, _test_database_url) as (service, server):
+            await outbound.drain(service)
+            source = (
+                await service.db.sql(
+                    zulip_outgoing.SELECT_ACCOUNT_SQL,
+                    (account.uuid, account.project_id),
+                )
+            )[0]
+            source["subscribed_streams"] = None
+            operations = history.Operations(service.db, service.http)
+            batch = await operations.prepare_batch(
+                source, [copy.deepcopy(server.messages[101])]
+            )
+            async with service.db.transaction() as connection:
+                await operations.merge_batch(connection, source, batch)
+            replay = api.get(MESSAGES + created["uuid"]).json()
+            assert replay["payload"] == created["payload"]
+            assert replay["poll_state"] == created["poll_state"]
 
     asyncio.run(run())
