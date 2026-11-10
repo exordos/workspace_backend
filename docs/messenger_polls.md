@@ -89,3 +89,19 @@ The voter list has its own page-size contract. Omitting `page_limit` returns up 
 Votes belong to the canonical message and the project user. Deleting either cascades to its votes; leaving a stream alone preserves votes. A real vote advances the poll revision without changing the message content, timestamp or unread state. Poll metadata edits use immutable content pages. No cron job is required for deadlines.
 
 For a local PostgreSQL 17 sizing check, 25 polls had 1,000 voters each, four questions and two selections per voter per question (200,000 rows). On warm data, the median aggregate snapshot query took 3.34 ms for one reader and 4.24 ms for a batch of 128; personalizing the latter in Python took 0.48 ms. A single uncontended mutation including its response snapshot held the poll lock for 4.06 ms median and 4.84 ms p95 (24 updates). These measurements describe this fixture, not production latency. The project-user index reduced a lookup for account cleanup from 2,724 shared blocks to six.
+
+## Upgrading a privately extended legacy schema
+
+A historical private schema can contain `messenger_topics_redirect_fkey`, whose
+composite `ON DELETE SET NULL` also clears the non-null `project_id`. Physical
+deletion during migration 0294 then fails if a surviving topic points to a
+soft-deleted target. This column and constraint are absent from the current
+standard schema.
+
+After taking a database backup, an operator can run
+[`tools/repair_legacy_topic_redirect.sql`](../tools/repair_legacy_topic_redirect.sql)
+against that selected database, then rerun the normal migration command. The
+opt-in repair preserves project IDs and clears only the nullable redirect when
+its target is deleted. It is idempotent, does nothing when the extension is
+absent, and refuses an unexpected constraint definition. It does not mark any
+migration applied or bypass normal migration execution.
