@@ -1,6 +1,7 @@
 # Copyright 2026 Genesis Corporation.
 # Licensed under the Apache License, Version 2.0 (the "License").
 
+import json
 import uuid
 
 import pytest
@@ -50,6 +51,20 @@ def test_poll_limits_apply_to_new_writes_and_preserve_existing_reads(payload, mo
                 saved
             )
             assert polls.POLL_TYPE.to_simple_type(restored) == saved
+
+
+def test_poll_api_payload_accepts_saved_url_and_preserves_serialization(payload):
+    saved = polls.normalize_create(payload)
+    saved["closed_at"] = "2026-01-01T12:00:00Z"
+    api_type = message_payloads.MESSAGE_WRITE_PAYLOAD_TYPE
+    restored = api_type.from_unicode(json.dumps(saved))
+    assert isinstance(restored, polls.PollPayload)
+    assert api_type.to_simple_type(restored) == (
+        message_payloads.WORKSPACE_MESSAGE_PAYLOAD_TYPE.to_simple_type(restored)
+    )
+    assert api_type.to_simple_type(restored)["closed_at"] is not None
+    with pytest.raises(ra_exc.ParseError):
+        api_type.from_simple_type(saved)
 
 
 def test_poll_limits_reject_twenty_one_questions_or_options(payload):

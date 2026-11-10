@@ -160,7 +160,9 @@ def hydrate(
 
 def voters(
     session: typing.Any,
-    message: typing.Any,
+    project_uuid: uuid.UUID,
+    user_uuid: uuid.UUID,
+    message_uuid: uuid.UUID,
     question_uuid: uuid.UUID,
     option_uuid: uuid.UUID,
     marker: uuid.UUID | None,
@@ -190,13 +192,13 @@ def voters(
             marker,
             marker,
             limit,
-            message.project_id,
-            message.uuid,
-            message.user_uuid,
+            project_uuid,
+            message_uuid,
+            user_uuid,
         ),
     ).fetchone()
     if row is None:
-        raise ra_exc.ResourceNotFoundError(resource="message", path=str(message.uuid))
+        raise ra_exc.ResourceNotFoundError(resource="message", path=str(message_uuid))
     payload = row["payload"]
     if payload["kind"] != "poll":
         raise ra_exc.ValidationErrorException()

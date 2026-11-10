@@ -106,6 +106,19 @@ class ContractJSONPacker(ra_packers.JSONPacker):
         return result
 
 
+class ObjectJSONPacker(ContractJSONPacker):
+    """Require an object without reserved controller argument names."""
+
+    def unpack(self, value: typing.Any) -> typing.Any:
+        body = ra_packers.JSONPacker(None, self._req).unpack(value)
+        if (
+            not isinstance(body, dict)
+            or {"resource", "self", "controller"} & body.keys()
+        ):
+            raise ra_exc.ValidationErrorException()
+        return ra_packers.BaseResourcePacker.unpack(self, body)
+
+
 class ContractMultipartPacker(ra_packers.MultipartPacker):
     pack_resource = ContractJSONPacker.pack_resource
 
@@ -149,7 +162,7 @@ class StoreResourceController(ra_controllers.BaseResourceControllerPaginated):
         packer = (
             ContractMultipartPacker
             if "multipart/form-data" in content_type
-            else ContractJSONPacker
+            else self.__packer__ or ContractJSONPacker
         )
         return packer(resource_type or self.get_resource(), request=self.request)
 
@@ -809,33 +822,6 @@ class WorkspaceStreamBindingController(StoreResourceController):
         return self._action(resource, "add_users", kwargs)
 
 
-class MessageJSONPacker(ContractJSONPacker):
-    _write_resource = ra_resources.ResourceByRAModel(
-        model_class=message_responses.WorkspaceUserMessageWrite,
-        convert_underscore=False,
-    )
-
-    def unpack(self, value: typing.Any) -> typing.Any:
-        body = ra_packers.JSONPacker(None, self._req).unpack(value)
-        if (
-            not isinstance(body, dict)
-            or {"resource", "self", "controller"} & body.keys()
-        ):
-            raise ra_exc.ValidationErrorException()
-        write_packer = ra_packers.BaseResourcePacker(self._write_resource, self._req)
-        if self._rt is not None:
-            return write_packer.unpack(body)
-        # Actions receive raw arguments. Any message fields still follow the
-        # write contract, including on actions that ignore extra arguments.
-        fields = (
-            body.keys()
-            & message_responses.WorkspaceUserMessage.properties.properties.keys()
-        )
-        if fields:
-            write_packer.unpack({name: body[name] for name in fields})
-        return body
-
-
 class PollVoterController(StoreResourceController):
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=polls.PollVoter,
@@ -877,12 +863,18 @@ class PollVoterController(StoreResourceController):
 
 
 class WorkspaceMessageController(StoreResourceController):
+    __packer__ = ObjectJSONPacker
     resource_name = "messages"
     __default_sort__ = {"created_at": "asc"}
     __sortable_fields__ = ("created_at",)
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=message_responses.WorkspaceUserMessage,
         convert_underscore=False,
+        fields_permissions=ra_field_permissions.FieldsPermissions(
+            fields={
+                "poll_state": {ra_constants.ALL: ra_field_permissions.Permissions.RO}
+            }
+        ),
         process_filters=True,
     )
 
@@ -904,15 +896,6 @@ class WorkspaceMessageController(StoreResourceController):
         return model_field_name != "poll_state" and super()._is_queryable_field(
             model_field_name
         )
-
-    def get_packer(
-        self, content_type: typing.Any, resource_type: typing.Any = None
-    ) -> typing.Any:
-        if "multipart/form-data" not in content_type:
-            return MessageJSONPacker(
-                resource_type or self.get_resource(), request=self.request
-            )
-        return super().get_packer(content_type, resource_type)
 
     @ra_actions.post
     def vote(self, resource: typing.Any, **kwargs: typing.Any) -> typing.Any:

@@ -557,24 +557,6 @@ def create_compact_message_events(
     )
 
 
-def _split_common_recipient_payloads(
-    resources: typing.Any, payload_factory: typing.Any, session: typing.Any = None
-) -> typing.Any:
-    """Deduplicate identical resource fields without changing event payloads."""
-    payloads = {
-        str(_event_payload_get(resource, "user_uuid")): payload_factory(
-            resource,
-            session=session,
-        )
-        for resource in resources
-    }
-    for payload in payloads.values():
-        # The visibility view injects the scoped recipient and must not retain
-        # one copy of the same UUID in every override.
-        payload.pop("user_uuid", None)
-    return _compress_recipient_payloads(payloads)
-
-
 def _compress_recipient_payloads(
     payloads: dict[str, dict[str, typing.Any]],
 ) -> tuple[dict[str, typing.Any], dict[str, dict[str, typing.Any]]]:
@@ -642,15 +624,6 @@ def prepare_resource_broadcast_event(
     session = session or contexts.Context().get_session()
     if not resources:
         return None
-    if kind in (MESSAGE_CREATED_EVENT, MESSAGE_UPDATED_EVENT) and any(
-        _event_payload_get(_event_payload_get(item, "payload"), "kind") == "poll"
-        for item in resources
-    ):
-        resources = poll_reads.hydrate(
-            session, [_message_from_event_payload(item) for item in resources]
-        )
-        if not resources:
-            return None
     missing_cache = object()
     previous_cache = getattr(
         session,
@@ -660,22 +633,28 @@ def prepare_resource_broadcast_event(
     if previous_cache is missing_cache:
         session._workspace_event_metadata_cache = {}
     try:
-        common, recipient_payloads = _split_common_recipient_payloads(
-            resources,
-            payload_factory,
-            session=session,
-        )
+        payloads = [payload_factory(item, session=session) for item in resources]
+        if kind in (MESSAGE_CREATED_EVENT, MESSAGE_UPDATED_EVENT) and any(
+            (payload.get("payload") or {}).get("kind") == "poll" for payload in payloads
+        ):
+            payloads = poll_reads.hydrate(session, payloads)
+            if not payloads:
+                return None
+            for payload in payloads:
+                if payload["poll_state"] is None:
+                    del payload["poll_state"]
     finally:
         if previous_cache is missing_cache:
             delattr(session, "_workspace_event_metadata_cache")
         else:
             session._workspace_event_metadata_cache = previous_cache
+    # The visibility view injects the scoped recipient.
+    payloads_by_recipient = {payload.pop("user_uuid"): payload for payload in payloads}
+    common, recipient_payloads = _compress_recipient_payloads(payloads_by_recipient)
     return {
         "project_id": project_id,
         "entity_uuid": entity_uuid,
-        "recipients": [
-            _event_payload_get(resource, "user_uuid") for resource in resources
-        ],
+        "recipients": list(payloads_by_recipient),
         "kind": kind,
         "payload": common,
         "recipient_payloads": recipient_payloads,
