@@ -10,6 +10,7 @@ import math
 import signal
 import time
 
+import psycopg
 from psycopg.types import json as pg_json
 
 from workspace.bridges.zulip import history, history_blocks, incoming_operations
@@ -89,10 +90,18 @@ class ZulipHistoryService:
         try:
             while not self.stopping.is_set():
                 self.ready.clear()
-                jobs = await self.db.sql(
-                    SELECT_JOBS_SQL,
-                    (list(self.tasks), self.concurrency - len(self.tasks)),
-                )
+                try:
+                    jobs = await self.db.sql(
+                        SELECT_JOBS_SQL,
+                        (list(self.tasks), self.concurrency - len(self.tasks)),
+                    )
+                except psycopg.errors.QueryCanceled:
+                    LOG.warning(
+                        "History job selection cancelled; retrying", exc_info=True
+                    )
+                    with contextlib.suppress(asyncio.TimeoutError):
+                        await asyncio.wait_for(self.stopping.wait(), self.poll_interval)
+                    continue
                 for job in jobs:
                     scope = f"{job['project_id']}:{job['provider_uuid']}"
                     self.tasks[scope] = asyncio.create_task(self.step(job))

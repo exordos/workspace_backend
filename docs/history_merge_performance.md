@@ -98,6 +98,9 @@ DDL earlier does not restore revoked access or resurrect deleted messages.
 pool, including replacement connections. Its default is 60 seconds and its
 value must be positive. A shorter timeout already configured on the connection
 is preserved. Other workers retain their own connection policy.
+If selecting the next jobs times out, the scheduler waits for its configured
+poll interval (one second by default) and retries without stopping the service
+or cancelling pages already in flight. Shutdown interrupts this wait.
 
 When PostgreSQL cancels an overdue statement, the page transaction rolls back:
 canonical changes, receipts and cursor advancement do not partially commit.

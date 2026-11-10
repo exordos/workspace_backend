@@ -12,10 +12,59 @@ import psycopg
 import pytest
 
 from workspace.bridges.zulip import incoming_operations, outgoing_operations
-from workspace.services import zulip_incoming, zulip_outgoing
+from workspace.services import zulip_history, zulip_incoming, zulip_outgoing
 from workspace.tests.integration import test_zulip_history as history_tests
 
 incoming = history_tests.incoming
+
+
+@pytest.mark.isolated_schema
+def test_timed_out_job_selection_retries_without_stopping_history(incoming):
+    _, db, account, _, url = incoming
+    history_tests.request(db, account)
+
+    async def run():
+        service = zulip_history.ZulipHistoryService(
+            url, concurrency=1, statement_timeout=0.2, poll_interval=0.05
+        )
+        query = service.db.sql
+        selections = []
+        cancellations = []
+        scheduled = []
+
+        async def select_jobs(sql, parameters=()):
+            if sql == zulip_history.SELECT_JOBS_SQL:
+                selections.append(asyncio.get_running_loop().time())
+                if len(selections) == 1:
+                    try:
+                        await query("SELECT pg_sleep(2)")
+                    except psycopg.errors.QueryCanceled:
+                        cancellations.append(asyncio.get_running_loop().time())
+                        raise
+            return await query(sql, parameters)
+
+        async def step(job):
+            scheduled.append(job["uuid"])
+            service.stopping.set()
+            service.ready.set()
+
+        with (
+            mock.patch.object(service.db, "sql", select_jobs),
+            mock.patch.object(service, "step", step),
+            mock.patch.object(
+                zulip_outgoing,
+                "Http",
+                return_value=mock.Mock(close=mock.AsyncMock()),
+            ),
+        ):
+            await asyncio.wait_for(service.run(), 3)
+        assert len(selections) == 2
+        assert len(cancellations) == 1
+        assert selections[1] - cancellations[0] >= service.poll_interval
+        assert scheduled == [account["uuid"]]
+        assert service.db.connections.empty()
+
+    asyncio.run(run())
 
 
 @contextlib.contextmanager
