@@ -1,6 +1,6 @@
 # Native Messenger polls
 
-Apply the database migration and deploy poll readers and workers. Migration 0300 refuses downgrade while published polls exist, to avoid losing their votes.
+Apply the database migration and deploy poll readers and workers. Migration 0301 refuses downgrade while published polls exist, to avoid losing their votes.
 
 Send a poll through the ordinary message endpoint. UUIDs are stable within the question or option list; array order is the display order.
 
