@@ -768,9 +768,15 @@ def test_poll_openapi_matches_the_create_actions_and_voter_page():
     assert vote["responses"][200]["content"]["application/json"]["schema"] == {
         "$ref": "#/components/schemas/WorkspaceUserMessage_Get"
     }
-    state = _component_schema(spec, "WorkspaceUserMessage_Get")["properties"][
-        "poll_state"
+    response = _component_schema(spec, "WorkspaceUserMessage_Get")["properties"]
+    parameter = spec["components"]["parameters"]["WorkspaceUserMessage_payload"][
+        "schema"
     ]
+    parameter_poll = next(
+        v for v in parameter["oneOf"] if v["properties"]["kind"]["enum"] == ["poll"]
+    )
+    assert "closed_at" in parameter_poll["properties"]
+    state = response["poll_state"]
     assert state["nullable"] and state["readOnly"]
     assert set(state["required"]) == {
         "revision",

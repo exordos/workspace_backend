@@ -111,6 +111,20 @@ _NON_POLL_PAYLOAD_TYPES = (
 WORKSPACE_MESSAGE_PAYLOAD_TYPE = types_dynamic.KindModelSelectorType(
     *_NON_POLL_PAYLOAD_TYPES, polls.POLL_TYPE
 )
-MESSAGE_WRITE_PAYLOAD_TYPE = types_dynamic.KindModelSelectorType(
+
+
+class MessageAPIPayloadType(types_dynamic.KindModelSelectorType):
+    # URL filters and responses use saved payloads; JSON writes use create fields.
+    def from_unicode(self, value: str) -> typing.Any:
+        return WORKSPACE_MESSAGE_PAYLOAD_TYPE.from_unicode(value)
+
+    def to_simple_type(self, value: typing.Any) -> typing.Any:
+        return WORKSPACE_MESSAGE_PAYLOAD_TYPE.to_simple_type(value)
+
+    def to_openapi_spec(self, prop_kwargs: dict) -> dict:
+        return WORKSPACE_MESSAGE_PAYLOAD_TYPE.to_openapi_spec(prop_kwargs)
+
+
+MESSAGE_WRITE_PAYLOAD_TYPE = MessageAPIPayloadType(
     *_NON_POLL_PAYLOAD_TYPES, polls.POLL_CREATE_TYPE
 )

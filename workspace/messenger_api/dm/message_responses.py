@@ -37,11 +37,9 @@ POLL_STATE = types.AllowNone(
 )
 
 
-class WorkspaceUserMessageWrite(base.WorkspaceUserMessageBase):
+class WorkspaceUserMessage(base.WorkspaceUserMessageBase):
     payload = properties.property(
         message_payloads.MESSAGE_WRITE_PAYLOAD_TYPE, required=True
     )
 
-
-class WorkspaceUserMessage(base.WorkspaceUserMessageBase):
     poll_state = properties.property(POLL_STATE, default=None, read_only=True)

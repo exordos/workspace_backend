@@ -5,10 +5,12 @@
 
 import contextlib
 import inspect
+import json
 import types
 import uuid as sys_uuid
 
 import pytest
+from restalchemy.common import exceptions as ra_exc
 
 from workspace.messenger_api.api import controllers
 from workspace.messenger_api.api import routes
@@ -143,6 +145,24 @@ def _controller(controller_class):
         headers={},
     )
     return controller_class(request)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        None,
+        [],
+        "text",
+        1,
+        True,
+        {"resource": None},
+        {"self": None},
+        {"controller": None},
+    ],
+)
+def test_message_json_rejects_non_objects_and_reserved_arguments(body):
+    with pytest.raises(ra_exc.ValidationErrorException):
+        controllers.ObjectJSONPacker(None, None).unpack(json.dumps(body))
 
 
 def test_message_mutations_use_dedicated_canonical_store_operations(fake_store):
