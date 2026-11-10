@@ -6436,8 +6436,6 @@ paths:
           $ref: '#/components/responses/Error'
         '400':
           description: Invalid payload, encryption metadata, kind, or stream role.
-        '409':
-          description: New poll creation is disabled.
       operationId: Create_v1_messenger_messages
       requestBody:
         required: true
