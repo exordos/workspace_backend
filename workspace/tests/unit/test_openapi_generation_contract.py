@@ -742,6 +742,13 @@ def test_external_account_status_contract():
         assert "ETag" not in resource[method]["responses"][200].get("headers", {})
 
 
+def test_poll_creation_does_not_advertise_removed_feature_switch():
+    spec = _build_openapi(workspace_app)
+    responses = spec["paths"]["/v1/messenger/messages/"]["post"]["responses"]
+    descriptions = [response.get("description", "") for response in responses.values()]
+    assert "New poll creation is disabled." not in descriptions
+
+
 def test_poll_openapi_matches_the_create_actions_and_voter_page():
     spec = _build_openapi(workspace_app)
     paths = spec["paths"]

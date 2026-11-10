@@ -460,10 +460,6 @@ def add_message_encryption_contract(
         "are accepted. The backend does not validate Base64, encrypt, or store "
         "plaintext private or symmetric keys."
     )
-    message_create["responses"] = {
-        **message_create["responses"],
-        409: {"description": "New poll creation is disabled."},
-    }
     editable_payload = copy.deepcopy(message_properties["payload"])
     editable_payload["oneOf"] = [
         variant
