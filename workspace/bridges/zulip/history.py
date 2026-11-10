@@ -260,38 +260,26 @@ class Operations(incoming_operations.Operations):
     emit_public_event = False
 
     async def current(self, connection: typing.Any, account: dict) -> bool:
-        # Root first, matching account deletion/FK checks. Taking the job first
-        # would let a root delete wait on us while our writes wait on its root.
-        if not await incoming_operations.rows(
-            connection,
-            """
-            SELECT 1 FROM m_external_accounts_v2
-            WHERE uuid=%s AND project_id=%s AND provider_uuid=%s
-              AND owner_user_uuid=%s AND external_account_id=%s
-              AND NOT disabled AND settings=%s FOR KEY SHARE
-            """,
-            (
-                account["uuid"],
-                account["project_id"],
-                account["provider_uuid"],
-                account["owner_user_uuid"],
-                account["external_account_id"],
-                pg_json.Jsonb(account["settings"]),
-            ),
-        ):
-            return False
-        # Fence the selected generation through commit, including renewal and
-        # full resync racing a prepared page or catalog item.
+        # A single history task owns each provider scope. Generation predicates
+        # fence durable progress; membership fences protect the materialization.
         return bool(
             await incoming_operations.rows(
                 connection,
                 f"""
-                SELECT 1 FROM {account_table(account)}
-                WHERE external_account_uuid=%s AND cutoff_at=%s
-                  AND registration IS NOT DISTINCT FROM %s::jsonb FOR UPDATE
+                SELECT 1 FROM m_external_accounts_v2 account
+                JOIN {account_table(account)} job ON job.external_account_uuid=account.uuid
+                WHERE account.uuid=%s AND account.project_id=%s AND account.provider_uuid=%s
+                  AND account.owner_user_uuid=%s AND account.external_account_id=%s
+                  AND NOT account.disabled AND account.settings=%s AND job.cutoff_at=%s
+                  AND job.registration IS NOT DISTINCT FROM %s::jsonb
                 """,
                 (
                     account["uuid"],
+                    account["project_id"],
+                    account["provider_uuid"],
+                    account["owner_user_uuid"],
+                    account["external_account_id"],
+                    pg_json.Jsonb(account["settings"]),
                     account["cutoff_at"],
                     pg_json.Jsonb(account["registration"])
                     if account.get("registration") is not None

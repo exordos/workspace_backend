@@ -23,9 +23,13 @@ initial and recovery work both get turns. The existing one-task
 limit per project/provider remains authoritative.
 
 A later renewal replaces the recovery snapshot and its fetched recovery page,
-while the initial import stays intact. Generation checks take the external-account key-share lock before locking
-the selected job through commit, matching deletion and foreign-key lock order. An old selected generation cannot recreate a deleted recovery
-page or advance a new frontier. A changed provider identity starts fresh coverage instead of inheriting another
+while the initial import stays intact. Generation predicates protect the selected frontier and cursor updates. The
+short batch-reservation transaction locks its frontier while creating the saved
+page; HTTP fetch, normalization and materialization do not retain that lock.
+The supported topology remains one history task per project/provider. Existing
+membership fences reject a prepared page after concurrent API unlink, and an
+old selected generation cannot recreate a deleted recovery page or advance a
+new frontier. A changed provider identity starts fresh coverage instead of inheriting another
 identity's saved frontier. The existing explicit `REQUEST_SQL` full-resync path can still deliberately replace the original boundary.
 
 Logs identify initial registration versus recovery without provider queue IDs,
@@ -37,7 +41,7 @@ have recovery work pending.
 `test_zulip_history_renewal.py` exercises the real invalid-queue/register/admission
 transaction, unfinished and completed coverage, saved pages, repeated renewal,
 process restart, historical and new messages, old read/starred state, channel
-access expansion, fair progress, stale generation fencing and explicit resync.
+access expansion, fair progress, stale generation fencing, concurrent API unlink and explicit resync.
 Production deployment and fresh bidirectional UI/provider acceptance remain a
 separate release step.
 

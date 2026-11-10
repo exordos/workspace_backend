@@ -152,7 +152,6 @@ CURRENT_ACCOUNT_SQL = """
     SELECT 1 FROM m_external_accounts_v2
     WHERE uuid = %s AND project_id = %s AND provider_uuid = %s
       AND owner_user_uuid = %s AND settings = %s AND NOT disabled
-    FOR KEY SHARE
 """
 INCOMING_TRANSACTION_SQL = "SELECT set_config('workspace.zulip_incoming', 'on', true)"
 
@@ -297,9 +296,11 @@ class ZulipIncomingService:
             account["settings"],
         )
 
-    async def current(self, connection: typing.Any, account: dict) -> bool:
+    async def current(
+        self, connection: typing.Any, account: dict, *, lock: bool = False
+    ) -> bool:
         cursor = await connection.execute(
-            CURRENT_ACCOUNT_SQL,
+            CURRENT_ACCOUNT_SQL + (" FOR KEY SHARE" if lock else ""),
             (
                 account["uuid"],
                 account["project_id"],
@@ -385,7 +386,7 @@ class ZulipIncomingService:
                         ),
                     }
                     async with self.admission() as (connection, stage):
-                        if not await self.current(connection, account):
+                        if not await self.current(connection, account, lock=True):
                             return
                         cursor = await connection.execute(
                             SELECT_SUBSCRIPTION_SQL, identity

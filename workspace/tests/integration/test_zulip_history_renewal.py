@@ -358,67 +358,6 @@ def test_failed_registration_commit_does_not_poll_an_uncommitted_queue(incoming)
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("receiver", [False, True])
-def test_history_generation_fence_does_not_invert_account_deletion_locks(
-    incoming, receiver
-):
-    _, _, account, _, url = incoming
-    history_tests.request(incoming[1], account, cutoff_id=500)
-    incoming[1].execute("UPDATE zulip_history_accounts SET registration=NULL")
-
-    async def run():
-        deleting = await psycopg.AsyncConnection.connect(url, autocommit=True)
-        cursor = await deleting.execute("SELECT pg_backend_pid()")
-        pid = (await cursor.fetchone())[0]
-        task = None
-        try:
-            async with history_tests.worker(incoming, {}) as (service, _):
-                current = await history_tests.job(service, account)
-                try:
-                    async with service.db.transaction() as connection:
-                        if receiver:
-                            incoming_service = zulip_incoming.ZulipIncomingService(url)
-                            assert await incoming_service.current(connection, current)
-                            await connection.execute(
-                                "SELECT 1 FROM zulip_history_accounts WHERE external_account_uuid=%s FOR UPDATE",
-                                (account["uuid"],),
-                            )
-                        else:
-                            assert await service.operations.current(connection, current)
-                        task = asyncio.create_task(
-                            deleting.execute(
-                                "DELETE FROM m_external_accounts_v2 WHERE uuid=%s",
-                                (account["uuid"],),
-                            )
-                        )
-                        for _ in range(100):
-                            state = await service.db.sql(
-                                "SELECT wait_event_type FROM pg_stat_activity WHERE pid=%s",
-                                (pid,),
-                            )
-                            if state and state[0]["wait_event_type"] == "Lock":
-                                break
-                            await asyncio.sleep(0.01)
-                        else:
-                            raise AssertionError(
-                                "Deletion did not reach the history fence"
-                            )
-                        await connection.execute("SET LOCAL lock_timeout='300ms'")
-                        # Normal history writes acquire FK key-share locks on
-                        # this root. The generation fence must take root first.
-                        await connection.execute(
-                            "SELECT 1 FROM m_external_accounts_v2 WHERE uuid=%s FOR KEY SHARE",
-                            (account["uuid"],),
-                        )
-                finally:
-                    if task:
-                        await asyncio.wait_for(task, 3)
-        finally:
-            await deleting.close()
-
-    asyncio.run(run())
-
-
 @pytest.mark.parametrize("deferred", [False, True])
 def test_unrelated_initial_job_cannot_starve_ready_recovery(incoming, deferred):
     _, db, account, *_ = incoming
@@ -456,3 +395,52 @@ def test_unrelated_initial_job_cannot_starve_ready_recovery(incoming, deferred):
         asyncio.run(run())
     finally:
         peer.delete()
+
+
+def test_api_unlink_can_finish_during_history_merge_without_restoring_access(incoming):
+    api, db, account, _, _ = incoming
+    history_tests.incoming_tests.apply(incoming, history_tests.incoming_tests.event())
+    history_tests.request(db, account, cutoff_id=500)
+    db.execute("UPDATE zulip_history_accounts SET registration=NULL")
+
+    async def run():
+        async with history_tests.worker(
+            incoming, {102: history_tests.message(102)}
+        ) as (service, _):
+            entered, release = asyncio.Event(), asyncio.Event()
+            merge = service.operations.merge_batch
+
+            async def pause(*args):
+                entered.set()
+                await release.wait()
+                return await merge(*args)
+
+            task = unlink = None
+            with mock.patch.object(service.operations, "merge_batch", pause):
+                try:
+                    task = asyncio.create_task(
+                        service.step(await history_tests.job(service, account))
+                    )
+                    await asyncio.wait_for(entered.wait(), 3)
+                    unlink = asyncio.create_task(
+                        asyncio.to_thread(
+                            api.delete,
+                            f"/v1/messenger/external_accounts/{account['uuid']}",
+                            permissions=("workspace.external_account.delete",),
+                        )
+                    )
+                    response = await asyncio.wait_for(asyncio.shield(unlink), 1)
+                    assert response.status_code in (200, 204), response.text
+                finally:
+                    release.set()
+                    if task:
+                        await asyncio.wait_for(task, 5)
+                    if unlink:
+                        await asyncio.wait_for(unlink, 5)
+
+    asyncio.run(run())
+    assert not api.get("/v1/messenger/messages/").json()
+    assert not db.execute(
+        "SELECT 1 FROM messenger_messages WHERE project_id=%s AND provider_identity='102'",
+        (account["project_id"],),
+    ).fetchall()

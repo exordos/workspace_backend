@@ -163,6 +163,12 @@ class ZulipHistoryService:
             async with self.db.transaction() as connection:
                 if not await self.operations.current(connection, account):
                     return
+                cursor = await connection.execute(
+                    f"SELECT 1 FROM {history.account_table(account)} WHERE external_account_uuid=%s AND cutoff_at=%s AND registration IS NULL FOR UPDATE",
+                    (account["uuid"], account["cutoff_at"]),
+                )
+                if await cursor.fetchone() is None:
+                    return
                 # A deliberate full resync can replace the historical boundary;
                 # an old selected generation must never recreate its batch.
                 await connection.execute(
