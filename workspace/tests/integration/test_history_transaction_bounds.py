@@ -80,17 +80,21 @@ def test_slow_staging_does_not_block_realtime_topic_update(incoming):
                     release.set()
                     await asyncio.wait_for(task, 5)
             assert not await service.db.sql(
-                "SELECT error FROM zulip_history_accounts WHERE error IS NOT NULL"
+                "SELECT error FROM zulip_history_accounts WHERE external_account_uuid=%s AND error IS NOT NULL",
+                (account["uuid"],),
             )
 
     asyncio.run(run())
     assert db.execute(
         "SELECT binding.notification_mode FROM messenger_user_topic_bindings binding "
         "JOIN messenger_topics topic ON topic.project_id=binding.project_id AND topic.uuid=binding.topic_uuid "
-        "WHERE binding.project_id=%s AND topic.name='General'",
-        (account["project_id"],),
+        "WHERE binding.project_id=%s AND binding.user_uuid=%s AND topic.provider_identity='42:General'",
+        (account["project_id"], account["owner_user_uuid"]),
     ).fetchone() == ("follow",)
-    assert db.execute("SELECT count(*) FROM messenger_messages").fetchone() == (2,)
+    assert db.execute(
+        "SELECT count(*) FROM messenger_messages WHERE project_id=%s",
+        (account["project_id"],),
+    ).fetchone() == (2,)
 
 
 @pytest.mark.parametrize("personal_only", [False, True])
@@ -100,14 +104,16 @@ def test_membership_can_change_during_staging_without_regranting_access(
     _, db, account, *_ = incoming
     history_tests.incoming_tests.apply(incoming, history_tests.incoming_tests.event())
     history_tests.incoming_tests.drain()
+    history_tests.request(db, account)
 
     async def run():
         async with history_tests.worker(incoming, {}) as (service, _):
             messages = [history_tests.message(flags=["starred"])]
+            current = await history_tests.job(service, account)
             batch = await (
                 service.operations.prepare_flags(account, messages)
                 if personal_only
-                else service.operations.prepare_batch(account, messages)
+                else service.operations.prepare_batch(current, messages)
             )
             table = (
                 "messenger_message_placements"
@@ -148,7 +154,8 @@ def test_membership_can_change_during_staging_without_regranting_access(
 
     asyncio.run(run())
     assert db.execute(
-        "SELECT count(*) FROM messenger_user_message_stars"
+        "SELECT count(*) FROM messenger_user_message_stars WHERE project_id=%s",
+        (account["project_id"],),
     ).fetchone() == (0,)
 
 
@@ -182,32 +189,41 @@ def test_statement_timeout_rolls_back_page_and_releases_topic_for_retry(incoming
             assert state[0] == 1000001
             assert "statement timeout" in state[1]
             assert db.execute(
-                "SELECT count(*) FROM zulip_history_batches"
+                "SELECT count(*) FROM zulip_history_batches WHERE external_account_uuid=%s",
+                (account["uuid"],),
             ).fetchone() == (1,)
-            assert db.execute("SELECT count(*) FROM messenger_messages").fetchone() == (
-                1,
-            )
+            assert db.execute(
+                "SELECT count(*) FROM messenger_messages WHERE project_id=%s",
+                (account["project_id"],),
+            ).fetchone() == (1,)
             assert not db.execute(
-                "SELECT 1 FROM zulip_history_block_receipts"
+                "SELECT 1 FROM zulip_history_block_receipts WHERE external_account_uuid=%s",
+                (account["uuid"],),
             ).fetchone()
             await realtime_topic(incoming)
             history_tests.incoming_tests.publish()
             db.execute("UPDATE zulip_history_accounts SET next_attempt_at=now()")
             await service.step(await history_tests.job(service, account))
-            assert not await service.db.sql("SELECT 1 FROM zulip_history_batches")
+            assert not await service.db.sql(
+                "SELECT 1 FROM zulip_history_batches WHERE external_account_uuid=%s",
+                (account["uuid"],),
+            )
             assert db.execute(
                 "SELECT before_id,finished,error FROM zulip_history_accounts WHERE external_account_uuid=%s",
                 (account["uuid"],),
             ).fetchone() == (0, True, None)
-            assert db.execute("SELECT count(*) FROM messenger_messages").fetchone() == (
-                2,
-            )
+            assert db.execute(
+                "SELECT count(*) FROM messenger_messages WHERE project_id=%s",
+                (account["project_id"],),
+            ).fetchone() == (2,)
             assert len([call for call in calls if call[1] == "/messages"]) == 1
 
     asyncio.run(run())
 
 
-def test_history_timeout_preserves_a_stricter_connection_limit(incoming):
+def test_history_timeout_preserves_a_stricter_connection_limit_after_reconnect(
+    incoming,
+):
     _, _, _, _, url = incoming
     parts = urllib.parse.urlsplit(url)
     query = dict(urllib.parse.parse_qsl(parts.query))
@@ -220,6 +236,12 @@ def test_history_timeout_preserves_a_stricter_connection_limit(incoming):
         database = zulip_outgoing.Database(limited, size=1, statement_timeout=1)
         await database.open()
         try:
+            assert await database.sql(
+                "SELECT setting FROM pg_settings WHERE name='statement_timeout'"
+            ) == [{"setting": "100"}]
+            connection = await database.connections.get()
+            await connection.close()
+            database.connections.put_nowait(connection)
             assert await database.sql(
                 "SELECT setting FROM pg_settings WHERE name='statement_timeout'"
             ) == [{"setting": "100"}]

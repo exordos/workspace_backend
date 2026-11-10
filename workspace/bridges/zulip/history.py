@@ -118,20 +118,31 @@ def catalog_events(registration: dict) -> list[dict]:
     )
 
 
+async def create_stages(connection: typing.Any, batch: dict) -> None:
+    """Prepare private relations before fencing any working rows."""
+    for table in batch:
+        if table == "_context":
+            continue
+        started = time.monotonic()
+        await connection.execute(
+            sql.SQL(
+                "CREATE TEMP TABLE {} (LIKE {} INCLUDING DEFAULTS INCLUDING GENERATED) ON COMMIT DROP"
+            ).format(sql.Identifier("history_" + table), sql.Identifier(table))
+        )
+        LOG.info(
+            "History stage create table=%s create_ms=%.1f",
+            table,
+            1000 * (time.monotonic() - started),
+        )
+
+
 async def stage(connection: typing.Any, table: str, values: list[dict]) -> None:
-    """A private relation with the same columns/defaults as the working table."""
+    """Fill a private relation after validating memberships and tombstones."""
     started = time.monotonic()
-    await connection.execute(
-        sql.SQL(
-            "CREATE TEMP TABLE {} (LIKE {} INCLUDING DEFAULTS INCLUDING GENERATED) ON COMMIT DROP"
-        ).format(sql.Identifier("history_" + table), sql.Identifier(table))
-    )
-    created = time.monotonic()
     if not values:
         LOG.info(
-            "History stage table=%s rows=0 create_ms=%.1f copy_ms=0",
+            "History stage table=%s rows=0 copy_ms=0",
             table,
-            1000 * (created - started),
         )
         return
     columns = list(values[0])
@@ -151,11 +162,10 @@ async def stage(connection: typing.Any, table: str, values: list[dict]) -> None:
             )
 
     LOG.info(
-        "History stage table=%s rows=%s create_ms=%.1f copy_ms=%.1f",
+        "History stage table=%s rows=%s copy_ms=%.1f",
         table,
         len(values),
-        1000 * (created - started),
-        1000 * (time.monotonic() - created),
+        1000 * (time.monotonic() - started),
     )
 
 
@@ -742,6 +752,7 @@ class Operations(incoming_operations.Operations):
         self, connection: typing.Any, account: dict, batch: dict
     ) -> None:
         await execute(connection, "setup", TRANSACTION_SQL)
+        await create_stages(connection, batch)
         streams = {row["stream_uuid"] for row in batch["messenger_message_placements"]}
         await lock_memberships(
             connection,
@@ -1098,6 +1109,7 @@ class Operations(incoming_operations.Operations):
         placements = batch["messenger_message_placements"]
         if not placements:
             return
+        await create_stages(connection, batch)
         project = placements[0]["project_id"]
         await lock_memberships(
             connection,

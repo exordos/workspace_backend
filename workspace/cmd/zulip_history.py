@@ -42,6 +42,7 @@ def main() -> None:
         publication_limit=int(options.get("publication_limit", 256)),
         realtime_delay=float(options.get("realtime_delay", 0.5)),
         poll_interval=float(options.get("poll_interval", 1)),
+        statement_timeout=float(options.get("statement_timeout", 60)),
     )
     asyncio.run(service.run())
 

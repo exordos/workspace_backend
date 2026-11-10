@@ -120,9 +120,11 @@ class Database:
         size: int = 4,
         *,
         application_name: str = "workspace-zulip-outgoing",
+        statement_timeout: float | None = None,
     ) -> None:
         self.url = database.connection_url_for_process(url, application_name)
         self.application_name = application_name
+        self.statement_timeout = statement_timeout
         self.size = size
         self.connections: asyncio.Queue = asyncio.Queue()
 
@@ -131,12 +133,24 @@ class Database:
             await self.connections.put(await self.connect())
 
     async def connect(self) -> psycopg.AsyncConnection[dict[str, typing.Any]]:
-        return await psycopg.AsyncConnection.connect(
+        connection = await psycopg.AsyncConnection.connect(
             self.url,
             autocommit=True,
             row_factory=rows.dict_row,
             application_name=self.application_name,
         )
+        if self.statement_timeout is not None:
+            try:
+                await connection.execute(
+                    "SELECT set_config('statement_timeout',"
+                    "LEAST(NULLIF(setting::bigint,0),%s)::text,false) "
+                    "FROM pg_settings WHERE name='statement_timeout'",
+                    (max(1, int(self.statement_timeout * 1000)),),
+                )
+            except BaseException:
+                await connection.close()
+                raise
+        return connection
 
     async def close(self) -> None:
         while not self.connections.empty():

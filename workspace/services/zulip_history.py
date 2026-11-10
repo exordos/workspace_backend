@@ -6,6 +6,7 @@
 import asyncio
 import contextlib
 import logging
+import math
 import signal
 import time
 
@@ -57,11 +58,17 @@ class ZulipHistoryService:
         publication_limit: int = 256,
         realtime_delay: float = 0.5,
         poll_interval: float = 1,
+        statement_timeout: float = 60,
     ) -> None:
         if not 1 <= batch_size <= 1000:
             raise ValueError("History pages must contain 1..1000 messages")
+        if not math.isfinite(statement_timeout) or statement_timeout <= 0:
+            raise ValueError("History statement timeout must be positive")
         self.db = zulip_outgoing.Database(
-            db_url, size=concurrency, application_name="workspace-zulip-history"
+            db_url,
+            size=concurrency,
+            application_name="workspace-zulip-history",
+            statement_timeout=statement_timeout,
         )
         self.connections, self.concurrency = connections, concurrency
         self.reaction_user_limit, self.batch_size = reaction_user_limit, batch_size

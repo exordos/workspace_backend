@@ -5,7 +5,17 @@ import asyncio
 import uuid
 from unittest import mock
 
+import pytest
+
 from workspace.services import zulip_history
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan")])
+def test_history_statement_timeout_must_be_positive_and_finite(timeout):
+    with pytest.raises(ValueError, match="timeout must be positive"):
+        zulip_history.ZulipHistoryService(
+            "postgresql:///unused", statement_timeout=timeout
+        )
 
 
 def test_same_provider_in_different_projects_keeps_both_running_tasks(monkeypatch):
