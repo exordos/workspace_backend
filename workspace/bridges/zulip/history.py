@@ -50,6 +50,36 @@ REQUEST_SQL = """
         cutoff_at=EXCLUDED.cutoff_at,cutoff_id=EXCLUDED.cutoff_id,
         before_id=EXCLUDED.before_id,finished=false,next_attempt_at=now(),error=NULL
 """
+# Renewal has its own durable frontier. Reuse committed block receipts for the
+# reconciliation pass, without rewinding or clearing the original import.
+RENEW_SQL = """
+    INSERT INTO zulip_history_recovery_accounts (
+        external_account_uuid,project_id,provider_uuid,cutoff_at,cutoff_id,
+        before_id,registration,subscribed_streams
+    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+    ON CONFLICT(external_account_uuid) DO UPDATE SET
+        registration=EXCLUDED.registration,subscribed_streams=EXCLUDED.subscribed_streams,catalog_position=0,
+        cutoff_at=EXCLUDED.cutoff_at,cutoff_id=EXCLUDED.cutoff_id,
+        before_id=EXCLUDED.before_id,finished=false,next_attempt_at=now(),error=NULL
+"""
+
+
+def account_table(account: dict) -> str:
+    return (
+        "zulip_history_recovery_accounts"
+        if account.get("_recovery")
+        else "zulip_history_accounts"
+    )
+
+
+def batch_table(account: dict) -> str:
+    return (
+        "zulip_history_recovery_batches"
+        if account.get("_recovery")
+        else "zulip_history_batches"
+    )
+
+
 TRANSACTION_SQL = """
     SELECT set_config('workspace.zulip_incoming','on',true),
            set_config('workspace.zulip_history','on',true),
@@ -230,18 +260,19 @@ class Operations(incoming_operations.Operations):
     emit_public_event = False
 
     async def current(self, connection: typing.Any, account: dict) -> bool:
-        # Reconnection replaces the job. An old in-flight page must not move
-        # the replacement job's cursor or restore a disconnected membership.
+        # A single history task owns each provider scope. Generation predicates
+        # fence durable progress; membership fences protect the materialization.
         return bool(
             await incoming_operations.rows(
                 connection,
-                """
-            SELECT 1 FROM m_external_accounts_v2 account
-            JOIN zulip_history_accounts job ON job.external_account_uuid=account.uuid
-            WHERE account.uuid=%s AND account.project_id=%s AND account.provider_uuid=%s
-              AND account.owner_user_uuid=%s AND account.external_account_id=%s
-              AND NOT account.disabled AND account.settings=%s AND job.cutoff_at=%s
-            """,
+                f"""
+                SELECT 1 FROM m_external_accounts_v2 account
+                JOIN {account_table(account)} job ON job.external_account_uuid=account.uuid
+                WHERE account.uuid=%s AND account.project_id=%s AND account.provider_uuid=%s
+                  AND account.owner_user_uuid=%s AND account.external_account_id=%s
+                  AND NOT account.disabled AND account.settings=%s AND job.cutoff_at=%s
+                  AND job.registration IS NOT DISTINCT FROM %s::jsonb
+                """,
                 (
                     account["uuid"],
                     account["project_id"],
@@ -250,6 +281,9 @@ class Operations(incoming_operations.Operations):
                     account["external_account_id"],
                     pg_json.Jsonb(account["settings"]),
                     account["cutoff_at"],
+                    pg_json.Jsonb(account["registration"])
+                    if account.get("registration") is not None
+                    else None,
                 ),
             )
         )

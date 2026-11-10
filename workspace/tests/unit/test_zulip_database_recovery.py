@@ -39,6 +39,8 @@ def test_dispatch_does_not_reclaim_work_immediately_when_retry_cannot_be_persist
         async def sql(query, parameters=()):
             if query == selected:
                 return [item]
+            if query == zulip_incoming.COMPLETE_TRANSIENTS_SQL:
+                return []
             writes.append(query)
             raise psycopg.errors.ReadOnlySqlTransaction("database is recovering")
 
@@ -96,5 +98,24 @@ def test_outgoing_read_only_database_is_transient_and_does_not_fail_the_intentio
         )
         assert not any(query == zulip_outgoing.FAIL_INTENT_SQL for query, _ in writes)
         service.operations.status.assert_not_awaited()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("nan"), float("inf")])
+def test_database_deadline_rejects_unbounded_values(timeout):
+    with pytest.raises(ValueError, match="positive and finite"):
+        zulip_outgoing.Database("postgresql:///unused", io_timeout=timeout)
+
+
+def test_transient_backlog_cleanup_does_not_scan_on_every_dispatch():
+    async def run():
+        service = zulip_incoming.ZulipIncomingService("postgresql:///unused")
+        service.db.sql = mock.AsyncMock(return_value=[])
+        for _ in range(5):
+            await service.dispatch()
+        queries = [call.args[0] for call in service.db.sql.call_args_list]
+        assert queries.count(zulip_incoming.COMPLETE_TRANSIENTS_SQL) == 1
+        assert queries.count(zulip_incoming.SELECT_EVENT_SQL) == 5
 
     asyncio.run(run())
