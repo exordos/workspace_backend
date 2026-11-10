@@ -285,6 +285,12 @@ def mutate(
             raise ra_exc.ValidationErrorException()
         if all(payload[key] == value for key, value in settings.items()):
             return
+        # Zulip initializes widgets only when creating a message. Editing a
+        # delivered preview cannot turn that existing message into a widget.
+        if row["source_name"] == "zulip" and poll_conversion.compatible(
+            {**payload, **settings}
+        ):
+            raise exceptions.PollConflictError()
         payload.update(settings)
     else:
         raise ra_exc.ValidationErrorException()

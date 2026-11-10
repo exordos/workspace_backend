@@ -107,3 +107,5 @@ absent, and refuses an unexpected constraint definition. It does not mark any
 migration applied or bypass normal migration execution.
 
 History restoration reconciles compatible Zulip poll widgets through the durable inbox after each imported page commits. Replaying a page preserves an existing interactive Workspace poll and its current votes until that refresh completes. Extended Workspace polls retain their original payload when the provider preview is read back.
+
+A Zulip-backed poll cannot switch from a text preview to an interactive widget by changing its settings: Zulip initializes widgets only when a message is created. Such a transition returns 409 without changing the poll; create a new compatible poll instead. Other settings changes that keep an extended poll in preview mode remain supported by the API.
