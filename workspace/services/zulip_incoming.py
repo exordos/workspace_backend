@@ -26,6 +26,7 @@ from workspace.services import zulip_outgoing
 LOG = logging.getLogger(__name__)
 # These provider liveness/presence events have no persistent Workspace state.
 LISTENER_PROBE_INTERVAL = 30
+TRANSIENT_CLEANUP_INTERVAL = 30
 TRANSIENT_EVENTS = frozenset({"heartbeat", "typing", "typing_edit_message"})
 COMPLETE_TRANSIENTS_SQL = """
     WITH batch AS (
@@ -191,6 +192,7 @@ class ZulipIncomingService:
         self.registry = incoming_registry.Registry()
         self.ready = asyncio.Event()
         self.stopping = asyncio.Event()
+        self.transient_cleanup_at = 0.0
         self.accounts: dict[object, tuple[tuple, asyncio.Task]] = {}
 
     async def run(self) -> None:
@@ -678,8 +680,11 @@ class ZulipIncomingService:
         return sorted(keys)
 
     async def dispatch(self) -> None:
-        # Retire old no-op rows gradually, independently of persistent ordering.
-        await self.db.sql(COMPLETE_TRANSIENTS_SQL)
+        # Old no-op cleanup must not repeatedly scan the inbox on every wakeup.
+        now = asyncio.get_running_loop().time()
+        if now >= self.transient_cleanup_at:
+            await self.db.sql(COMPLETE_TRANSIENTS_SQL)
+            self.transient_cleanup_at = now + TRANSIENT_CLEANUP_INTERVAL
         room = self.concurrency - len(self.tasks)
         if room <= 0:
             return

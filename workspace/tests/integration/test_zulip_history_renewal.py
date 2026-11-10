@@ -417,3 +417,42 @@ def test_history_generation_fence_does_not_invert_account_deletion_locks(
             await deleting.close()
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+def test_unrelated_initial_job_cannot_starve_ready_recovery(incoming, deferred):
+    _, db, account, *_ = incoming
+    peer, other_context = history_tests.incoming_tests.peer_account(incoming, 8)
+    other = other_context[2]
+    try:
+        history_tests.request(db, account, cutoff_id=500)
+        db.execute(
+            "UPDATE zulip_history_accounts SET finished=true,before_id=0,registration=NULL"
+        )
+        asyncio.run(renew(incoming, 750))
+        db.execute(
+            "UPDATE zulip_history_recovery_accounts SET registration=NULL,last_run_at=now()-interval '2 minutes'"
+        )
+        history_tests.request(db, other, cutoff_id=1000)
+        db.execute(
+            "UPDATE zulip_history_accounts SET registration=NULL,last_run_at=now()-interval '1 minute' WHERE external_account_uuid=%s",
+            (other["uuid"],),
+        )
+        if deferred:
+            db.execute(
+                "UPDATE zulip_history_accounts SET error='provider unavailable',next_attempt_at=now()+interval '5 seconds' WHERE external_account_uuid=%s",
+                (other["uuid"],),
+            )
+
+        async def run():
+            async with history_tests.worker(incoming, {}) as (service, _):
+                selected = await service.db.sql(
+                    history_tests.zulip_history.SELECT_JOBS_SQL, ([], 1)
+                )
+                assert [(item["uuid"], item["_recovery"]) for item in selected] == [
+                    (account["uuid"], True)
+                ]
+
+        asyncio.run(run())
+    finally:
+        peer.delete()

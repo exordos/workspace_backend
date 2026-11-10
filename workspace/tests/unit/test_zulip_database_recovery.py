@@ -106,3 +106,16 @@ def test_outgoing_read_only_database_is_transient_and_does_not_fail_the_intentio
 def test_database_deadline_rejects_unbounded_values(timeout):
     with pytest.raises(ValueError, match="positive and finite"):
         zulip_outgoing.Database("postgresql:///unused", io_timeout=timeout)
+
+
+def test_transient_backlog_cleanup_does_not_scan_on_every_dispatch():
+    async def run():
+        service = zulip_incoming.ZulipIncomingService("postgresql:///unused")
+        service.db.sql = mock.AsyncMock(return_value=[])
+        for _ in range(5):
+            await service.dispatch()
+        queries = [call.args[0] for call in service.db.sql.call_args_list]
+        assert queries.count(zulip_incoming.COMPLETE_TRANSIENTS_SQL) == 1
+        assert queries.count(zulip_incoming.SELECT_EVENT_SQL) == 5
+
+    asyncio.run(run())

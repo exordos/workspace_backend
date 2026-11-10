@@ -17,8 +17,9 @@ well as the recent message gap: old read/starred flags or newly accessible old
 channel messages can change during a disconnection. Existing block receipts
 skip unchanged merges; retaining a cursor alone would miss those changes.
 This provider scan is deliberate reconciliation, not a reset of completed
-initial coverage. The scheduler alternates initial and recovery work for an
-account, so neither frontier is displaced by the other. The existing one-task
+initial coverage. The scheduler ranks only ready jobs by their last run time,
+across accounts and both frontiers. Deferred retries cannot block ready work;
+initial and recovery work both get turns. The existing one-task
 limit per project/provider remains authoritative.
 
 A later renewal replaces the recovery snapshot and its fetched recovery page,

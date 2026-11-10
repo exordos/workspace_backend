@@ -27,22 +27,18 @@ SELECT_JOBS_SQL = """
                provider.hostname,account.uuid,
                row_number() OVER (
                    PARTITION BY job.project_id,job.provider_uuid
-                   ORDER BY (job.registration IS NOT NULL) DESC,
-                     CASE WHEN recovery.external_account_uuid IS NOT NULL
-                          THEN job.last_run_at ELSE 'epoch'::timestamptz END,
-                     (job._recovery AND job.before_id>original.cutoff_id) DESC,
-                     job.before_id DESC,job.last_run_at
+                   ORDER BY job.last_run_at,(job.registration IS NOT NULL) DESC,
+                            job.before_id DESC
                ) AS priority
         FROM work job
-        JOIN zulip_history_accounts original USING(external_account_uuid)
-        LEFT JOIN zulip_history_recovery_accounts recovery USING(external_account_uuid)
         JOIN m_external_accounts_v2 account ON account.uuid=job.external_account_uuid
         JOIN messenger_providers provider ON provider.uuid=job.provider_uuid
         WHERE NOT account.disabled AND account.status<>'new'
           AND COALESCE(account.settings->>'api_key','')<>''
           AND (NOT job.finished OR job.registration IS NOT NULL)
+          AND job.next_attempt_at<=now()
     )
-    SELECT * FROM candidates WHERE priority=1 AND next_attempt_at<=now()
+    SELECT * FROM candidates WHERE priority=1
       AND NOT((project_id::text||':'||provider_uuid::text)=ANY(%s::text[]))
     ORDER BY last_run_at LIMIT %s
 """

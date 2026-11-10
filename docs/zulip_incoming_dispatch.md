@@ -50,8 +50,8 @@ transaction advances neither the cursor nor durable events. Unknown types stay
 durable so a new state-bearing provider event is never discarded by default.
 
 The selector excludes those three transient types from both candidates and
-ordering barriers. Each dispatch retires at most 1,024 old transient rows using
-`FOR UPDATE SKIP LOCKED`; audit rows remain present. Persistent work need not
+ordering barriers. At most once every 30 seconds, dispatch retires up to 1,024 old transient rows
+using `FOR UPDATE SKIP LOCKED`; audit rows remain present. Persistent work need not
 wait for this cleanup to finish, and history admission ignores the same no-op
 backlog. Dependency, wildcard, retry, in-flight and tenant/provider rules remain
 in force for every persistent class. No message-only priority is introduced.
