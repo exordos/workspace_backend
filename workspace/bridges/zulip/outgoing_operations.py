@@ -937,6 +937,11 @@ class Operations:
 
     async def convert(self, intent: dict, account: dict) -> dict:
         payload = intent["data"]["payload"]
+        if payload["kind"] == "poll":
+            payload = {
+                "kind": "markdown",
+                "content": message_conversion.workspace_to_zulip(payload, {}),
+            }
         references = {
             (kind, identifier)
             for kind, identifier, query in message_conversion.workspace_references(

@@ -19,6 +19,7 @@ Unsupported content remains a notice with a link to the original message.
 
 import base64
 import collections.abc
+import json
 import re
 import urllib.parse
 import uuid
@@ -74,6 +75,102 @@ class _ConversionParts(list[str]):
 
 def _escape_label(value: str) -> str:
     return re.sub(r"([\\`*_{()\[\]#+.!|>~-])", r"\\\1", value)
+
+
+def _poll_snapshot(questions: list, *, closed: bool = False) -> str:
+    """Keep user text literal: a snapshot must never notify mentioned users."""
+    lines = []
+    for question, options in questions:
+        lines.extend((question,))
+        for text, count in options:
+            lines.append(
+                f"- {text}" + (f" — {count} votes" if count is not None else "")
+            )
+        if not options or any(count is None for _, count in options):
+            lines.append("Results unavailable")
+        lines.append("")
+    body = "\n".join(lines).rstrip()
+    fence = "`" * max(
+        3, 1 + max((len(m[0]) for m in re.finditer(r"`+", body)), default=0)
+    )
+    state = "closed; read-only" if closed else "read-only"
+    result = f"Poll snapshot ({state})\n\n{fence}text\n{body}\n{fence}"
+    if len(result) > message_payloads.MARKDOWN_CONTENT_MAX_LENGTH:
+        raise ValueError("Poll snapshot exceeds the message limit")
+    return result
+
+
+def _zulip_poll_snapshot(message: dict, file_notices: dict) -> str:
+    """Replay Zulip poll submessages; export counts, never voter identities."""
+    source = message["content"].removeprefix("/poll").strip().splitlines()
+    question = source[0] if source else "Poll"
+    options = {f"canned,{i}": [text, set()] for i, text in enumerate(source[1:])}
+    initialized = False
+    for submessage in message.get("submessages", []):
+        if submessage.get("msg_type") != "widget":
+            continue
+        try:
+            data = json.loads(submessage["content"])
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        sender = submessage.get("sender_id")
+        if data.get("widget_type") == "poll" and not initialized:
+            extra = data.get("extra_data", {})
+            if not isinstance(extra, dict):
+                continue
+            labels = extra.get("options", [])
+            title = extra.get("question", "")
+            if (
+                not isinstance(title, str)
+                or not isinstance(labels, list)
+                or not all(isinstance(o, str) for o in labels)
+            ):
+                continue
+            question = title or question
+            options = {}
+            for index, text in enumerate(labels):
+                if text not in [o[0] for o in options.values()]:
+                    options[f"canned,{index}"] = [text, set()]
+            initialized = True
+        elif initialized and data.get("type") == "question":
+            if sender == message["sender_id"] and isinstance(data.get("question"), str):
+                question = data["question"]
+        elif initialized and data.get("type") == "new_option":
+            index, text = data.get("idx"), data.get("option")
+            if (
+                type(index) is int
+                and 0 <= index <= 1000
+                and isinstance(text, str)
+                and text not in [o[0] for o in options.values()]
+            ):
+                options[f"{sender},{index}"] = [text, set()]
+        elif initialized and data.get("type") == "vote":
+            key, vote = data.get("key"), data.get("vote")
+            if isinstance(key, str) and key in options and type(vote) is int:
+                if vote == 1:
+                    options[key][1].add(sender)
+                elif vote == -1:
+                    options[key][1].discard(sender)
+
+    def literal(text):
+        for url, notice in file_notices.items():
+            if notice is not None:
+                text = text.replace(url, notice)
+        return text
+
+    return _poll_snapshot(
+        [
+            (
+                literal(question),
+                [
+                    (literal(text), len(voters) if initialized else None)
+                    for text, voters in options.values()
+                ],
+            )
+        ]
+    )
 
 
 def _unescape(value: str) -> str:
@@ -370,6 +467,11 @@ class _ZulipToWorkspace:
     def block_notice(self, description: str, source: str) -> str:
         parts = _ConversionParts()
         parts.append(self.notice(description, block=True))
+        parts.append(self.block_files(source))
+        return "".join(parts)
+
+    def block_files(self, source: str) -> str:
+        parts = _ConversionParts()
         for url in get_zulip_files({"content": source}, self.context):
             parts.append("\n\n")
             unavailable = self.unavailable_file(url)
@@ -654,6 +756,19 @@ class _ZulipToWorkspace:
             raise _ConversionLimitExceeded
         command = re.match(r"^/(me|poll|todo)(?:\s|$)", text)
         if command:
+            if command[1] == "poll" and not quoted:
+                self.uses_current_message = True
+                try:
+                    snapshot = _zulip_poll_snapshot(
+                        self.message,
+                        {
+                            url: self.unavailable_file(url)
+                            for url in get_zulip_files(self.message, self.context)
+                        },
+                    )
+                except ValueError:
+                    raise _ConversionLimitExceeded from None
+                return snapshot + self.block_files(text) + "\n\n" + self.original_link()
             return self.block_notice(
                 {
                     "me": "/me action",
@@ -827,6 +942,29 @@ def workspace_to_zulip(payload: dict, context: dict) -> str:
     require the referenced original messages; notices are not reversible.
     """
     model = message_payloads.WORKSPACE_MESSAGE_PAYLOAD_TYPE.from_simple_type(payload)
+    if model.kind == "poll":
+        state = context.get("poll_state")
+        counts = (
+            {q["question_uuid"]: q["option_counts"] for q in state["questions"]}
+            if state
+            else {}
+        )
+        return _poll_snapshot(
+            [
+                (
+                    q["text"],
+                    [
+                        (
+                            o["text"],
+                            counts[str(q["uuid"])][str(o["uuid"])] if state else None,
+                        )
+                        for o in q["options"]
+                    ],
+                )
+                for q in model.questions
+            ],
+            closed=state["is_closed"] if state else model.closed_at is not None,
+        )
     if model.kind != "markdown":
         raise ValueError("Only Markdown messages can be converted to Zulip")
 

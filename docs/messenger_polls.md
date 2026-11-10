@@ -40,6 +40,23 @@ Only a current participant can vote or append. The author and current stream own
 
 Message reads include `poll_state` (null for other kinds). It contains `revision`, `is_closed`, distinct `voter_count`, ordered `questions` with per-question `voter_count` and `option_counts` keyed by option UUID, and the reader's `my_votes` as `{question_uuid, option_uuids}` entries. Missing votes produce zero counts and an empty own-answer list. Counts are available to the API regardless of `results_visibility` (`always` or `after_vote`); the latter is a presentation rule.
 
+## Zulip snapshots
+
+The Zulip converter exports a native poll as a read-only Markdown snapshot of
+all questions and options. A caller with the message's `poll_state` can pass
+that state in the conversion context to include aggregate counts and closure.
+Without that state, results are marked unavailable. Personal selections and
+voter identities are never exported. Poll text is literal, so mentions cannot
+notify people. A snapshot exceeding the message limit is rejected.
+
+Imported Zulip `/poll` messages retain the question and options, replaying the
+available widget submessages for point-in-time counts. Without widget data,
+results are marked unavailable. The source link remains available. Snapshots
+are Markdown in both directions; importing one does not recreate an interactive
+poll or continuously synchronize subsequent votes. Native interactive polls
+remain limited to unencrypted Workspace conversations. To share one in a Zulip
+channel, send its converted Markdown snapshot through the ordinary message API.
+
 ## Realtime ordering
 
 A vote, manual close, settings change or appended option updates the existing message through `message.updated`. A vote does not create unread activity. Each reader receives their own `my_votes`; the voter is not identified in the update. Apply the poll payload and state together: a lower `poll_state.revision` is stale for both, but does not determine the ordering of read flags or reactions. Crossing `closes_at` does not change the revision or require a worker. At the same revision, an older snapshot must not reopen an expired poll.

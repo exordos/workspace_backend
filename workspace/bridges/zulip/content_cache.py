@@ -9,7 +9,7 @@ import typing
 import uuid
 
 
-CONVERTER_VERSION = 2
+CONVERTER_VERSION = 3
 
 LOOKUP_SQL = """
     SELECT contents.uuid,contents.workspace_content,contents.provider_content
