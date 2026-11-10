@@ -7,13 +7,15 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import signal
 import socket
 import typing
 
 import aiohttp
 import psycopg
-from psycopg import rows
+from psycopg import abc as pg_abc
+from psycopg import conninfo, rows
 from psycopg.types import json as pg_json
 
 from workspace.bridges.zulip import outgoing_operations
@@ -113,6 +115,31 @@ FAIL_DELIVERY_SQL = """
 """
 
 
+_Result = typing.TypeVar("_Result")
+
+
+class Connection(psycopg.AsyncConnection[dict[str, typing.Any]]):
+    """Bound client I/O even when a dead server cannot send a timeout reply."""
+
+    io_timeout: float = 300
+
+    async def wait(self, gen: pg_abc.PQGen[_Result], interval: float = 0.1) -> _Result:
+        pending = asyncio.create_task(super().wait(gen, interval=interval))
+        try:
+            done, _ = await asyncio.wait((pending,), timeout=self.io_timeout)
+            if done:
+                return pending.result()
+            # Close before cancellation: psycopg otherwise sends a cancel and
+            # waits for a reply on the same broken transport.
+            await self.close()
+            raise psycopg.OperationalError("Database client I/O deadline exceeded")
+        finally:
+            if not pending.done():
+                await self.close()
+                pending.cancel()
+                await asyncio.gather(pending, return_exceptions=True)
+
+
 class Database:
     def __init__(
         self,
@@ -120,23 +147,55 @@ class Database:
         size: int = 4,
         *,
         application_name: str = "workspace-zulip-outgoing",
+        statement_timeout: float | None = None,
+        io_timeout: float = 300,
     ) -> None:
+        if not math.isfinite(io_timeout) or io_timeout <= 0:
+            raise ValueError("Database I/O timeout must be positive and finite")
         self.url = database.connection_url_for_process(url, application_name)
         self.application_name = application_name
+        self.statement_timeout = statement_timeout
+        self.io_timeout = io_timeout
         self.size = size
         self.connections: asyncio.Queue = asyncio.Queue()
 
     async def open(self) -> None:
-        for _ in range(self.size):
-            await self.connections.put(await self.connect())
+        try:
+            for _ in range(self.size):
+                await self.connections.put(await self.connect())
+        except BaseException:
+            await self.close()
+            raise
 
     async def connect(self) -> psycopg.AsyncConnection[dict[str, typing.Any]]:
-        return await psycopg.AsyncConnection.connect(
-            self.url,
+        parameters = conninfo.conninfo_to_dict(self.url)
+        for name, value in {
+            "connect_timeout": 10,
+            "keepalives": 1,
+            "keepalives_idle": TCP_KEEPALIVE_IDLE,
+            "keepalives_interval": TCP_KEEPALIVE_INTERVAL,
+            "keepalives_count": TCP_KEEPALIVE_COUNT,
+            "tcp_user_timeout": 30000,
+        }.items():
+            parameters.setdefault(name, value)
+        connection = await Connection.connect(
+            conninfo.make_conninfo("", **parameters),
             autocommit=True,
             row_factory=rows.dict_row,
-            application_name=self.application_name,
         )
+        connection.io_timeout = self.io_timeout
+        if self.statement_timeout is not None:
+            try:
+                await connection.execute(
+                    "SELECT set_config('statement_timeout',"
+                    "LEAST(NULLIF(setting::bigint,0),%s)::text,false) "
+                    "FROM pg_settings WHERE name='statement_timeout'",
+                    (max(1, int(self.statement_timeout * 1000)),),
+                )
+            except BaseException:
+                await connection.close()
+                raise
+        return connection
 
     async def close(self) -> None:
         while not self.connections.empty():
@@ -271,12 +330,13 @@ class ZulipOutgoingService:
         self,
         db_url: str,
         *,
+        database_io_timeout: float = 300,
         concurrency: int = 128,
         connections: int = 128,
         dependency_delay: float = 1,
         poll_interval: float = 1,
     ) -> None:
-        self.db = Database(db_url)
+        self.db = Database(db_url, io_timeout=database_io_timeout)
         self.concurrency = concurrency
         self.connections = connections
         self.dependency_delay = max(1, dependency_delay)

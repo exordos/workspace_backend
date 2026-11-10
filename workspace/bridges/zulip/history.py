@@ -50,6 +50,36 @@ REQUEST_SQL = """
         cutoff_at=EXCLUDED.cutoff_at,cutoff_id=EXCLUDED.cutoff_id,
         before_id=EXCLUDED.before_id,finished=false,next_attempt_at=now(),error=NULL
 """
+# Renewal has its own durable frontier. Reuse committed block receipts for the
+# reconciliation pass, without rewinding or clearing the original import.
+RENEW_SQL = """
+    INSERT INTO zulip_history_recovery_accounts (
+        external_account_uuid,project_id,provider_uuid,cutoff_at,cutoff_id,
+        before_id,registration,subscribed_streams
+    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+    ON CONFLICT(external_account_uuid) DO UPDATE SET
+        registration=EXCLUDED.registration,subscribed_streams=EXCLUDED.subscribed_streams,catalog_position=0,
+        cutoff_at=EXCLUDED.cutoff_at,cutoff_id=EXCLUDED.cutoff_id,
+        before_id=EXCLUDED.before_id,finished=false,next_attempt_at=now(),error=NULL
+"""
+
+
+def account_table(account: dict) -> str:
+    return (
+        "zulip_history_recovery_accounts"
+        if account.get("_recovery")
+        else "zulip_history_accounts"
+    )
+
+
+def batch_table(account: dict) -> str:
+    return (
+        "zulip_history_recovery_batches"
+        if account.get("_recovery")
+        else "zulip_history_batches"
+    )
+
+
 TRANSACTION_SQL = """
     SELECT set_config('workspace.zulip_incoming','on',true),
            set_config('workspace.zulip_history','on',true),
@@ -118,20 +148,31 @@ def catalog_events(registration: dict) -> list[dict]:
     )
 
 
+async def create_stages(connection: typing.Any, batch: dict) -> None:
+    """Prepare private relations before fencing any working rows."""
+    for table in batch:
+        if table == "_context":
+            continue
+        started = time.monotonic()
+        await connection.execute(
+            sql.SQL(
+                "CREATE TEMP TABLE {} (LIKE {} INCLUDING DEFAULTS INCLUDING GENERATED) ON COMMIT DROP"
+            ).format(sql.Identifier("history_" + table), sql.Identifier(table))
+        )
+        LOG.info(
+            "History stage create table=%s create_ms=%.1f",
+            table,
+            1000 * (time.monotonic() - started),
+        )
+
+
 async def stage(connection: typing.Any, table: str, values: list[dict]) -> None:
-    """A private relation with the same columns/defaults as the working table."""
+    """Fill a private relation after validating memberships and tombstones."""
     started = time.monotonic()
-    await connection.execute(
-        sql.SQL(
-            "CREATE TEMP TABLE {} (LIKE {} INCLUDING DEFAULTS INCLUDING GENERATED) ON COMMIT DROP"
-        ).format(sql.Identifier("history_" + table), sql.Identifier(table))
-    )
-    created = time.monotonic()
     if not values:
         LOG.info(
-            "History stage table=%s rows=0 create_ms=%.1f copy_ms=0",
+            "History stage table=%s rows=0 copy_ms=0",
             table,
-            1000 * (created - started),
         )
         return
     columns = list(values[0])
@@ -151,11 +192,10 @@ async def stage(connection: typing.Any, table: str, values: list[dict]) -> None:
             )
 
     LOG.info(
-        "History stage table=%s rows=%s create_ms=%.1f copy_ms=%.1f",
+        "History stage table=%s rows=%s copy_ms=%.1f",
         table,
         len(values),
-        1000 * (created - started),
-        1000 * (time.monotonic() - created),
+        1000 * (time.monotonic() - started),
     )
 
 
@@ -220,18 +260,19 @@ class Operations(incoming_operations.Operations):
     emit_public_event = False
 
     async def current(self, connection: typing.Any, account: dict) -> bool:
-        # Reconnection replaces the job. An old in-flight page must not move
-        # the replacement job's cursor or restore a disconnected membership.
+        # A single history task owns each provider scope. Generation predicates
+        # fence durable progress; membership fences protect the materialization.
         return bool(
             await incoming_operations.rows(
                 connection,
-                """
-            SELECT 1 FROM m_external_accounts_v2 account
-            JOIN zulip_history_accounts job ON job.external_account_uuid=account.uuid
-            WHERE account.uuid=%s AND account.project_id=%s AND account.provider_uuid=%s
-              AND account.owner_user_uuid=%s AND account.external_account_id=%s
-              AND NOT account.disabled AND account.settings=%s AND job.cutoff_at=%s
-            """,
+                f"""
+                SELECT 1 FROM m_external_accounts_v2 account
+                JOIN {account_table(account)} job ON job.external_account_uuid=account.uuid
+                WHERE account.uuid=%s AND account.project_id=%s AND account.provider_uuid=%s
+                  AND account.owner_user_uuid=%s AND account.external_account_id=%s
+                  AND NOT account.disabled AND account.settings=%s AND job.cutoff_at=%s
+                  AND job.registration IS NOT DISTINCT FROM %s::jsonb
+                """,
                 (
                     account["uuid"],
                     account["project_id"],
@@ -240,6 +281,9 @@ class Operations(incoming_operations.Operations):
                     account["external_account_id"],
                     pg_json.Jsonb(account["settings"]),
                     account["cutoff_at"],
+                    pg_json.Jsonb(account["registration"])
+                    if account.get("registration") is not None
+                    else None,
                 ),
             )
         )
@@ -742,6 +786,7 @@ class Operations(incoming_operations.Operations):
         self, connection: typing.Any, account: dict, batch: dict
     ) -> None:
         await execute(connection, "setup", TRANSACTION_SQL)
+        await create_stages(connection, batch)
         streams = {row["stream_uuid"] for row in batch["messenger_message_placements"]}
         await lock_memberships(
             connection,
@@ -1098,6 +1143,7 @@ class Operations(incoming_operations.Operations):
         placements = batch["messenger_message_placements"]
         if not placements:
             return
+        await create_stages(connection, batch)
         project = placements[0]["project_id"]
         await lock_memberships(
             connection,

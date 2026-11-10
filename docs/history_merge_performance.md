@@ -84,3 +84,32 @@ transaction can still hold locks on counter scopes and last-message pointers;
 verify concurrent realtime inserts into the same stream as well as isolated
 history throughput. A synthetic database result does not establish provider or
 client delivery latency.
+
+## Working-row locks and SQL deadlines
+
+Full pages and personal-flag pages create every private staging relation before
+locking stream memberships, topics or canonical messages. Table creation can
+wait for PostgreSQL catalog I/O; it must not hold the working-row fences needed
+by realtime topic updates or membership changes. Copying the prepared values
+still follows the membership-generation and deletion-tombstone checks, so moving
+DDL earlier does not restore revoked access or resurrect deleted messages.
+
+`[zulip_history] statement_timeout` limits each SQL statement on the history
+pool, including replacement connections. Its default is 60 seconds and its
+value must be positive. A shorter timeout already configured on the connection
+is preserved. Other workers retain their own connection policy.
+If selecting the next jobs times out, the scheduler waits for its configured
+poll interval (one second by default) and retries without stopping the service
+or cancelling pages already in flight. Shutdown interrupts this wait.
+
+When PostgreSQL cancels an overdue statement, the page transaction rolls back:
+canonical changes, receipts and cursor advancement do not partially commit.
+The durable fetched page remains available for the existing delayed retry.
+Realtime can then acquire the released rows; retrying the page preserves its
+canonical identities and does not duplicate messages.
+
+This is application-side containment, not a PostgreSQL I/O repair. A database
+backend stuck in non-interruptible I/O may not respond promptly to cancellation.
+Investigate its wait event and storage separately, and do not kill sessions or
+reset import progress as an automatic recovery heuristic. These limits do not
+retroactively reconfigure an already-running history session.

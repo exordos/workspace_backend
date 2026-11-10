@@ -33,6 +33,7 @@ def main() -> None:
     )
     service = zulip_incoming.ZulipIncomingService(
         config["db"]["connection_url"],
+        database_io_timeout=float(options.get("database_io_timeout", 300)),
         connections=int(options.get("connections", 128)),
         concurrency=int(options.get("concurrency", 128)),
         reaction_user_limit=config.getint(

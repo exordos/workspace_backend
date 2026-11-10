@@ -448,6 +448,7 @@ resources:
 
 
           [zulip_outgoing]
+          database_io_timeout = 300
           concurrency = 128
           connections = 128
           dependency_delay = 0.01
@@ -455,15 +456,18 @@ resources:
 
 
           [zulip_history]
+          database_io_timeout = 300
           concurrency = 4
           connections = 4
           batch_size = 1000
           publication_limit = 256
           realtime_delay = 0.5
           poll_interval = 1
+          statement_timeout = 60
 
 
           [zulip_incoming]
+          database_io_timeout = 300
           concurrency = 128
           connections = 128
           poll_interval = 1

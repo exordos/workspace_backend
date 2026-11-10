@@ -40,3 +40,37 @@ The existing receiver integration test separately exercises HTTP, PostgreSQL,
 message processing, queue renewal and WebSocket delivery. Production acceptance
 requires a separate deployment and fresh delivery checks after the final
 restart, including a long poll that has already been idle for 40 seconds.
+
+## PostgreSQL transport recovery
+
+The independent incoming, outgoing and history SQL pools also need bounded
+failure detection. Their libpq defaults are a 10-second connect timeout,
+keepalive probes after 10 idle seconds with five-second intervals and three
+misses, and a 30-second TCP user timeout. Explicit DSN values are preserved.
+These transport bounds are separate from a PostgreSQL `statement_timeout`:
+a server that has disappeared cannot deliver its cancellation response.
+
+Each service section accepts `database_io_timeout` (seconds, default 300).
+The shared psycopg connection bounds each driver I/O wait, including BEGIN,
+COMMIT, COPY and ordinary SQL. It closes a stalled connection **before**
+cancelling the driver wait, avoiding a second wait for a lost cancellation
+reply. The closed slot returns to the pool and reconnects on its next use.
+This is a per-operation I/O allowance, not a cumulative history-transaction
+limit. Keep it above the healthy operation allowance; history retains its
+separate 60-second server statement deadline and any stricter DSN setting.
+
+An idle incoming LISTEN connection probes PostgreSQL after each 30-second
+notification window. The receiver still polls independently. Incoming and
+history supervision retry transient SQL failures with the existing poll delay;
+they do not rely on a process exit to recover. A partial pool open closes the
+connections it already created. Shutdown closes active driver I/O before
+cancelling its waiter.
+
+A lost COMMIT response is ambiguous. Application replay uses the existing
+source inbox uniqueness key and normal idempotent merge; the client does not
+assume that the server rolled back. The regressions in
+`test_zulip_database_recovery.py` use a controllable proxy in front of real
+PostgreSQL to blackhole established streams while new connections still work.
+They cover pool exhaustion, transaction entry, lost COMMIT acknowledgement,
+listener replacement, cancellation, kernel socket options, healthy queries,
+rollback and recipient API visibility after replay.
