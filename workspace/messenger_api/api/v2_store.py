@@ -1614,7 +1614,9 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
     ) -> list[dict[str, typing.Any]]:
         return poll_reads.voters(
             contexts.Context().get_session(),
-            self._message(message_uuid),
+            self.project_uuid,
+            self.user_uuid,
+            message_uuid,
             question_uuid,
             option_uuid,
             marker,

@@ -263,25 +263,34 @@ def test_poll_voters_cursor_survives_withdrawal_and_replacement(api, room):
     )
 
 
+def test_message_and_poll_request_validation(api, room):
+    message = create(api, room)
+    path = native.MESSAGES + message["uuid"]
+    payload = message["payload"].copy()
+    del payload["closed_at"]
+    envelope = {"stream_uuid": room[0]["uuid"], "payload": payload}
+    with_closed_at = {**envelope, "payload": {**payload, "closed_at": None}}
+    assert api.post(native.MESSAGES, json=with_closed_at).status_code == 400
+    assert (
+        api.post(native.MESSAGES, json={**envelope, "poll_state": None}).status_code
+        == 403
+    )
+    assert api.put(path, json={"poll_state": message["poll_state"]}).status_code == 403
+    assert api.post(native.MESSAGES, json=["invalid"]).status_code == 400
+    invoke(api, path, "star", {"resource": None}, status=400)
+    assert invoke(api, path, "star", {"poll_state": None})["starred"]
+    choice = selection(payload["questions"][0])
+    invoke(api, path, "vote", {**choice, "poll_state": None}, status=400)
+
+
 @pytest.mark.parametrize("journal_enabled", [False, True], ids=["sync", "journal"])
-def test_poll_write_boundary_and_immutable_kind(
-    api, room, journal_enabled, monkeypatch
-):
+def test_poll_kind_is_immutable(api, room, journal_enabled, monkeypatch):
     monkeypatch.setattr(mutation_journal_opts, "enabled", lambda: journal_enabled)
     message = create(api, room)
     payload = message["payload"].copy()
     payload.pop("closed_at")
     path = native.MESSAGES + message["uuid"]
     envelope = {"stream_uuid": room[0]["uuid"], "payload": payload}
-    for other in (
-        {**envelope, "payload": {**payload, "closed_at": None}},
-        {**envelope, "payload": {**payload, "closed_at": "2026-01-01T12:00:00Z"}},
-        {**envelope, "poll_state": message["poll_state"]},
-        {**envelope, "poll_state": None},
-    ):
-        assert api.post(native.MESSAGES, json=other).status_code == 400
-    invoke(api, path, "star", {"poll_state": None}, status=400)
-    invoke(api, path, "star", {"payload": {**payload, "closed_at": None}}, status=400)
     markdown = {"kind": "markdown", "content": "plain"}
     ordinary = api.post(native.MESSAGES, json={**envelope, "payload": markdown}).json()
     assert ordinary["poll_state"] is None
