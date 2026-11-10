@@ -956,6 +956,19 @@ class Operations:
         }
         if topic is not None:
             values["topic"] = topic
+        if data["payload"]["kind"] == "poll" and poll_conversion.compatible(
+            data["payload"]
+        ):
+            question = data["payload"]["questions"][0]
+            # Explicit widget data bypasses Zulip's /poll list syntax, which
+            # strips leading '-' and '*' characters from option labels.
+            values["widget_content"] = {
+                "widget_type": "poll",
+                "extra_data": {
+                    "question": question["text"],
+                    "options": [option["text"] for option in question["options"]],
+                },
+            }
         return request(
             "send",
             "POST",
