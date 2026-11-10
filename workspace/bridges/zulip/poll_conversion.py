@@ -82,7 +82,10 @@ def command(payload: dict) -> str:
         "/poll "
         + question["text"]
         + "\n"
-        + "\n".join(o["text"] for o in question["options"])
+        + "\n".join(
+            ("- " if o["text"].startswith(("-", "*")) else "") + o["text"]
+            for o in question["options"]
+        )
     )
 
 

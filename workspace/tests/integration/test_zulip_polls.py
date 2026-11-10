@@ -4,6 +4,7 @@
 import asyncio
 import copy
 import json
+import re
 import uuid
 
 import pytest
@@ -51,6 +52,16 @@ class PollServer(outbound.Server):
     deny_submessages = False
 
     async def handle(self, http):
+        if http.path == "/api/v1/messages" and http.method == "POST":
+            form = await http.post()
+            if (
+                "widget_content" in form
+                and json.loads(form["widget_content"])["widget_type"] == "poll"
+            ):
+                return web.json_response(
+                    {"result": "error", "msg": "Widgets: unknown widget type: poll"},
+                    status=400,
+                )
         if http.path == "/api/v1/submessage":
             assert http.headers["Authorization"] == self.auth
             if self.deny_submessages:
@@ -92,7 +103,10 @@ class PollServer(outbound.Server):
                         "widget_type": "poll",
                         "extra_data": {
                             "question": question,
-                            "options": [option.lstrip("-* ") for option in options],
+                            "options": [
+                                re.sub(r"(\s*[-*]?\s*)", "", option.strip(), count=1)
+                                for option in options
+                            ],
                         },
                     }
                 )
