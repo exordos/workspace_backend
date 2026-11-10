@@ -6,9 +6,11 @@
 import asyncio
 import contextlib
 import logging
+import math
 import signal
 import time
 
+import psycopg
 from psycopg.types import json as pg_json
 
 from workspace.bridges.zulip import history, history_blocks, incoming_operations
@@ -57,11 +59,17 @@ class ZulipHistoryService:
         publication_limit: int = 256,
         realtime_delay: float = 0.5,
         poll_interval: float = 1,
+        statement_timeout: float = 60,
     ) -> None:
         if not 1 <= batch_size <= 1000:
             raise ValueError("History pages must contain 1..1000 messages")
+        if not math.isfinite(statement_timeout) or statement_timeout <= 0:
+            raise ValueError("History statement timeout must be positive")
         self.db = zulip_outgoing.Database(
-            db_url, size=concurrency, application_name="workspace-zulip-history"
+            db_url,
+            size=concurrency,
+            application_name="workspace-zulip-history",
+            statement_timeout=statement_timeout,
         )
         self.connections, self.concurrency = connections, concurrency
         self.reaction_user_limit, self.batch_size = reaction_user_limit, batch_size
@@ -82,10 +90,18 @@ class ZulipHistoryService:
         try:
             while not self.stopping.is_set():
                 self.ready.clear()
-                jobs = await self.db.sql(
-                    SELECT_JOBS_SQL,
-                    (list(self.tasks), self.concurrency - len(self.tasks)),
-                )
+                try:
+                    jobs = await self.db.sql(
+                        SELECT_JOBS_SQL,
+                        (list(self.tasks), self.concurrency - len(self.tasks)),
+                    )
+                except psycopg.errors.QueryCanceled:
+                    LOG.warning(
+                        "History job selection cancelled; retrying", exc_info=True
+                    )
+                    with contextlib.suppress(asyncio.TimeoutError):
+                        await asyncio.wait_for(self.stopping.wait(), self.poll_interval)
+                    continue
                 for job in jobs:
                     scope = f"{job['project_id']}:{job['provider_uuid']}"
                     self.tasks[scope] = asyncio.create_task(self.step(job))
