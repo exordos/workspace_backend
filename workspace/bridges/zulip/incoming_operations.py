@@ -1458,7 +1458,7 @@ class Operations:
             "files": {},
         }
         kind = event["type"]
-        if kind == "poll_refresh":
+        if kind == "poll_refresh" and event.get("outgoing_intent_uuid") is not None:
             pending = await self.db.sql(
                 "SELECT 1 FROM zulip_outgoing_intents WHERE uuid=%s AND project_id=%s AND external_account_uuid=%s AND status IN ('new','checking')",
                 (event["outgoing_intent_uuid"], account["project_id"], account["uuid"]),

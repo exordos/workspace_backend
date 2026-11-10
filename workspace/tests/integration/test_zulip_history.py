@@ -129,6 +129,8 @@ async def worker(incoming, messages, **options):
                     "email": "user@example.com",
                 }
             }
+        if path.startswith("/messages/"):
+            return {"message": copy.deepcopy(messages[int(path.rsplit("/", 1)[1])])}
         assert path == "/messages", path
         ordered = sorted(messages)
         selected = [value for value in ordered if value < query["anchor"]][
@@ -2251,3 +2253,76 @@ def test_new_topic_reference_in_same_block_is_reconverted_before_skipping(incomi
     ).replace(tzinfo=None)
     request(db, account, cutoff_id=102)
     asyncio.run(repeated(0))
+
+
+def test_history_poll_is_durably_reconciled_and_replay_keeps_it_interactive(incoming):
+    import json
+
+    from workspace.services import zulip_incoming
+
+    api, db, account, *_ = incoming
+    remote = message(
+        content="/poll Deployment?\nMonday\nTuesday",
+        submessages=[
+            {
+                "id": 1,
+                "sender_id": 7,
+                "msg_type": "widget",
+                "content": json.dumps(
+                    {
+                        "widget_type": "poll",
+                        "extra_data": {
+                            "question": "Deployment?",
+                            "options": ["Monday", "Tuesday"],
+                        },
+                    }
+                ),
+            },
+            {
+                "id": 2,
+                "sender_id": 7,
+                "msg_type": "widget",
+                "content": json.dumps({"type": "vote", "key": "canned,1", "vote": 1}),
+            },
+        ],
+    )
+    request(db, account)
+
+    async def run():
+        async with worker(incoming, {101: remote}) as (service, _):
+            await drain(service, account)
+            events = await service.db.sql(
+                "SELECT id,payload FROM zulip_incoming_events WHERE payload->>'type'='poll_refresh'"
+            )
+            assert len(events) == 1
+            operations = incoming_operations.Operations(service.db, service.http)
+            prepared = await incoming_tests.prepare_dependencies(
+                operations, service.db, account, events[0]["payload"]
+            )
+            async with service.db.transaction() as connection:
+                await connection.execute(zulip_incoming.INCOMING_TRANSACTION_SQL)
+                await operations.apply(connection, account, prepared)
+                await connection.execute(
+                    "UPDATE zulip_incoming_events SET processed_at=now() WHERE id=%s",
+                    (events[0]["id"],),
+                )
+        current = api.get("/v1/messenger/messages/").json()[0]
+        assert current["payload"]["kind"] == "poll"
+        assert current["poll_state"]["voter_count"] == 1
+        assert current["poll_state"]["my_votes"]
+        request(db, account)
+        async with worker(incoming, {101: remote}) as (service, _):
+            await drain(service, account)
+            assert (
+                len(
+                    await service.db.sql(
+                        "SELECT id FROM zulip_incoming_events WHERE payload->>'type'='poll_refresh'"
+                    )
+                )
+                == 1
+            )
+        replay = api.get("/v1/messenger/messages/").json()[0]
+        assert replay["payload"] == current["payload"]
+        assert replay["poll_state"] == current["poll_state"]
+
+    asyncio.run(run())
