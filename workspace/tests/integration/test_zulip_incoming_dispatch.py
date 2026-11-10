@@ -176,7 +176,7 @@ def test_fresh_message_reaches_api_while_unrelated_backlog_remains(incoming):
         """INSERT INTO zulip_incoming_events
         (project_id,external_account_uuid,provider_uuid,owner_user_uuid,account_identity,
          queue_id,event_id,payload,ordering_keys,next_retry_at)
-        SELECT %s,%s,%s,%s,%s,'deferred-backlog',n,'{"type":"heartbeat"}'::jsonb,
+        SELECT %s,%s,%s,%s,%s,'deferred-backlog',n,'{"type":"realm_user"}'::jsonb,
                ARRAY['account:deferred'],now()+interval '1 day'
         FROM generate_series(1,2000) AS source(n)""",
         (

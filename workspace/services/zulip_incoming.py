@@ -24,6 +24,19 @@ from workspace.services import zulip_outgoing
 
 
 LOG = logging.getLogger(__name__)
+# These provider liveness/presence events have no persistent Workspace state.
+LISTENER_PROBE_INTERVAL = 30
+TRANSIENT_EVENTS = frozenset({"heartbeat", "typing", "typing_edit_message"})
+COMPLETE_TRANSIENTS_SQL = """
+    WITH batch AS (
+        SELECT id FROM zulip_incoming_events
+        WHERE processed_at IS NULL
+          AND payload->>'type' IN ('heartbeat','typing','typing_edit_message')
+        ORDER BY id LIMIT 1024 FOR UPDATE SKIP LOCKED
+    )
+    UPDATE zulip_incoming_events event SET processed_at=now(),error=NULL
+    FROM batch WHERE event.id=batch.id
+"""
 SELECT_ACCOUNTS_SQL = """
     SELECT account.*, provider.hostname
     FROM m_external_accounts_v2 account
@@ -74,6 +87,7 @@ WITH pending AS MATERIALIZED (
  SELECT id, project_id, provider_uuid, ordering_keys, next_retry_at,
         payload->>'type' AS kind
  FROM zulip_incoming_events WHERE processed_at IS NULL
+   AND COALESCE(payload->>'type','') NOT IN ('heartbeat','typing','typing_edit_message')
 ), keyed AS (
  SELECT id, min(id) FILTER (WHERE kind<>'ensure_dependency')
   OVER (PARTITION BY project_id,provider_uuid,k.key) AS first_id
@@ -137,6 +151,7 @@ CURRENT_ACCOUNT_SQL = """
     SELECT 1 FROM m_external_accounts_v2
     WHERE uuid = %s AND project_id = %s AND provider_uuid = %s
       AND owner_user_uuid = %s AND settings = %s AND NOT disabled
+    FOR KEY SHARE
 """
 INCOMING_TRANSACTION_SQL = "SELECT set_config('workspace.zulip_incoming', 'on', true)"
 
@@ -155,6 +170,7 @@ class ZulipIncomingService:
         self,
         db_url: str,
         *,
+        database_io_timeout: float = 300,
         connections: int = 128,
         concurrency: int = 128,
         reaction_user_limit: int = 5,
@@ -162,7 +178,9 @@ class ZulipIncomingService:
         dependency_delay: float = 0.01,
     ) -> None:
         self.db = zulip_outgoing.Database(
-            db_url, application_name="workspace-zulip-incoming"
+            db_url,
+            application_name="workspace-zulip-incoming",
+            io_timeout=database_io_timeout,
         )
         self.connections = connections
         self.concurrency = concurrency
@@ -203,7 +221,11 @@ class ZulipIncomingService:
                     await self.dispatch()
                 except Exception:
                     LOG.exception("Cannot supervise Zulip incoming accounts")
-                await self.wait()
+                try:
+                    await self.wait()
+                except psycopg.Error:
+                    LOG.exception("Incoming wakeup query unavailable; retrying")
+                    await asyncio.sleep(self.poll_interval)
         finally:
             tasks = [
                 listener,
@@ -238,8 +260,13 @@ class ZulipIncomingService:
             try:
                 async with await self.db.connect() as connection:
                     await connection.execute("LISTEN workspace_zulip_incoming")
-                    async for _ in connection.notifies():
-                        self.ready.set()
+                    while True:
+                        async for _ in connection.notifies(
+                            timeout=LISTENER_PROBE_INTERVAL
+                        ):
+                            self.ready.set()
+                        # An idle LISTEN socket also needs an acknowledged probe.
+                        await connection.execute("SELECT 1")
             except psycopg.Error:
                 LOG.exception("Incoming notifications unavailable; polling continues")
                 await asyncio.sleep(self.poll_interval)
@@ -306,16 +333,14 @@ class ZulipIncomingService:
             self.ready.set()
 
     async def receive(self, account: dict) -> None:
-        subscriptions = await self.db.sql(
-            SELECT_SUBSCRIPTION_SQL,
-            (
-                account["uuid"],
-                account["provider_uuid"],
-                account["owner_user_uuid"],
-                account["external_account_id"],
-                account["settings"]["server_url"],
-            ),
+        identity = (
+            account["uuid"],
+            account["provider_uuid"],
+            account["owner_user_uuid"],
+            account["external_account_id"],
+            account["settings"]["server_url"],
         )
+        subscriptions = await self.db.sql(SELECT_SUBSCRIPTION_SQL, identity)
         subscription = subscriptions[0] if subscriptions else None
         delay = 1
         while True:
@@ -350,7 +375,7 @@ class ZulipIncomingService:
                     registered_at = (
                         await self.db.sql("SELECT clock_timestamp() AS value")
                     )[0]["value"]
-                    subscription = {
+                    registered_subscription = {
                         "queue_id": registration["queue_id"],
                         "last_event_id": registration["last_event_id"],
                         "longpoll_timeout": registration.get(
@@ -360,6 +385,10 @@ class ZulipIncomingService:
                     async with self.admission() as (connection, stage):
                         if not await self.current(connection, account):
                             return
+                        cursor = await connection.execute(
+                            SELECT_SUBSCRIPTION_SQL, identity
+                        )
+                        same_identity = await cursor.fetchone() is not None
                         await connection.execute(
                             SAVE_SUBSCRIPTION_SQL,
                             (
@@ -369,17 +398,42 @@ class ZulipIncomingService:
                                 account["owner_user_uuid"],
                                 account["external_account_id"],
                                 account["settings"]["server_url"],
-                                subscription["queue_id"],
-                                subscription["last_event_id"],
-                                subscription["longpoll_timeout"],
+                                registered_subscription["queue_id"],
+                                registered_subscription["last_event_id"],
+                                registered_subscription["longpoll_timeout"],
                             ),
                         )
-                        await connection.execute(
-                            "DELETE FROM zulip_history_batches WHERE external_account_uuid=%s",
+                        cursor = await connection.execute(
+                            "SELECT project_id,provider_uuid FROM zulip_history_accounts WHERE external_account_uuid=%s FOR UPDATE",
                             (account["uuid"],),
                         )
+                        previous = await cursor.fetchone()
+                        renewing = bool(
+                            previous
+                            and same_identity
+                            and previous["project_id"] == account["project_id"]
+                            and previous["provider_uuid"] == account["provider_uuid"]
+                        )
+                        if previous and not renewing:
+                            # A changed provider identity cannot inherit another
+                            # identity's historical frontier or saved pages.
+                            await connection.execute(
+                                "DELETE FROM zulip_history_accounts WHERE external_account_uuid=%s",
+                                (account["uuid"],),
+                            )
+                        if renewing:
+                            # The new catalog supersedes unfinished catalog work;
+                            # historical pages and their frontier stay reusable.
+                            await connection.execute(
+                                "UPDATE zulip_history_accounts SET registration=NULL WHERE external_account_uuid=%s",
+                                (account["uuid"],),
+                            )
+                            await connection.execute(
+                                "DELETE FROM zulip_history_recovery_batches WHERE external_account_uuid=%s",
+                                (account["uuid"],),
+                            )
                         await connection.execute(
-                            history.REQUEST_SQL,
+                            history.RENEW_SQL if renewing else history.REQUEST_SQL,
                             (
                                 account["uuid"],
                                 account["project_id"],
@@ -410,13 +464,19 @@ class ZulipIncomingService:
                         await self.append(
                             connection,
                             account,
-                            subscription,
+                            registered_subscription,
                             [
                                 {"id": index - len(initial), **item}
                                 for index, item in enumerate(initial)
                             ],
                             stage,
                         )
+                    subscription = registered_subscription
+                    LOG.info(
+                        "Zulip subscription registered account=%s history_mode=%s",
+                        account["uuid"],
+                        "recovery" if renewing else "initial",
+                    )
                     self.ready.set()
                 data = await self.poll_http.request(
                     account,
@@ -444,6 +504,7 @@ class ZulipIncomingService:
                 delay = 1
             except outgoing_operations.ApiError as error:
                 if error.data.get("code") == "BAD_EVENT_QUEUE_ID":
+                    LOG.info("Zulip subscription expired account=%s", account["uuid"])
                     subscription = None
                     continue
                 if error.status in (401, 403):
@@ -492,6 +553,8 @@ class ZulipIncomingService:
         stage: Admission | None = None,
     ) -> None:
         for source in sorted(events, key=lambda item: item["id"]):
+            if source["type"] in TRANSIENT_EVENTS:
+                continue
             event = dict(source)
             event.pop("_shared_key", None)
             event.pop("_personal_only", None)
@@ -615,6 +678,8 @@ class ZulipIncomingService:
         return sorted(keys)
 
     async def dispatch(self) -> None:
+        # Retire old no-op rows gradually, independently of persistent ordering.
+        await self.db.sql(COMPLETE_TRANSIENTS_SQL)
         room = self.concurrency - len(self.tasks)
         if room <= 0:
             return

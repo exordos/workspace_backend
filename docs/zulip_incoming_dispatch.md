@@ -15,8 +15,7 @@ Deferred retries and in-flight events remain blockers. Completed events and
 `ensure_dependency` intentions do not block other events. Dependencies retain
 priority, followed by `next_retry_at` and ID. Empty arrays, duplicate keys and
 NULL array elements keep the existing overlap behavior. Full payloads are read
-only for the selected batch. No schema, API, queue state or concurrency setting
-changes are required.
+only for the selected batch. The persistent ordering and concurrency settings are unchanged.
 
 ## Verification
 
@@ -41,3 +40,22 @@ A later read-only sample of the final SQL, with about 96,600 pending events,
 selected full 128-event batches in 0.553, 0.502 and 0.486 seconds. The existing
 dispatcher query was observed at 378 seconds in that snapshot. Pending events
 were retained; the candidate was not installed by these measurements.
+
+## Transient provider events
+
+`heartbeat`, `typing` and `typing_edit_message` have no materialized Workspace
+state. Admission skips their inbox insert while committing the maximum source
+event ID in the same subscription transaction as persistent events. A failed
+transaction advances neither the cursor nor durable events. Unknown types stay
+durable so a new state-bearing provider event is never discarded by default.
+
+The selector excludes those three transient types from both candidates and
+ordering barriers. Each dispatch retires at most 1,024 old transient rows using
+`FOR UPDATE SKIP LOCKED`; audit rows remain present. Persistent work need not
+wait for this cleanup to finish, and history admission ignores the same no-op
+backlog. Dependency, wildcard, retry, in-flight and tenant/provider rules remain
+in force for every persistent class. No message-only priority is introduced.
+
+`test_zulip_transient_events.py` covers atomic cursor rollback, duplicate source
+delivery, unknown types and fresh-message API visibility beside 3,000 **ready**
+transients, with bounded cleanup still leaving old audit work behind.
