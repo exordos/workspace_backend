@@ -20,15 +20,11 @@ import typing
 import uuid as sys_uuid
 
 from restalchemy.common import exceptions as ra_exc
-from restalchemy.dm import models
-from restalchemy.dm import properties
-from restalchemy.dm import types
+from restalchemy.dm import models, properties, types
 
 from workspace.common import models as common_models
 from workspace.common import types as common_types
-from workspace.messenger_api.dm import message_payloads
-from workspace.messenger_api.dm import polls
-
+from workspace.messenger_api.dm import message_payloads, polls
 
 FOLDER_SYSTEM_TYPE_ALL = "all"
 FOLDER_SYSTEM_TYPE_CREATED = "created"
@@ -483,7 +479,7 @@ class WorkspaceUserStreamBase(
     def validate_message_creation(self, kind: str) -> None:
         self.validate_message_kind(self.source_name, kind)
         if kind == polls.PollPayload.KIND and (
-            self.source_name != "native" or self.encryption
+            self.source_name not in {"native", "zulip"} or self.encryption
         ):
             raise ra_exc.ValidationErrorException()
         if (

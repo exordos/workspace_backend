@@ -8,8 +8,9 @@ import uuid
 
 import pytest
 
-from workspace.bridges.zulip import message_conversion
-from workspace.bridges.zulip import outgoing_operations
+from workspace.bridges.zulip import message_conversion, outgoing_operations
+
+WORKSPACE_URL = "https://workspace.example.test/message"
 
 
 def poll():
@@ -47,23 +48,31 @@ def test_native_poll_exports_every_question_without_personal_votes():
         ],
     }
     before = copy.deepcopy((payload, state))
-    text = message_conversion.workspace_to_zulip(payload, {"poll_state": state})
+    text = message_conversion.workspace_to_zulip(
+        payload, {"poll_state": state, "workspace_message_url": WORKSPACE_URL}
+    )
     assert "Poll snapshot (closed; read-only)" in text
     assert "When?" in text and "Where?" in text
     assert text.count("First — 0 votes") == 2
     assert text.count("Second — 1 votes") == 2
     assert "secret-voter" not in text and "my_votes" not in text
     assert (payload, state) == before
-    assert message_conversion.zulip_to_workspace({"id": 1, "content": text}, {}) == {
+    assert message_conversion.zulip_to_workspace(
+        {"id": 1, "content": text}, {"server_url": "https://zulip.example.test"}
+    ) == {
         "kind": "markdown",
-        "content": text,
+        "content": text.replace(
+            "(" + WORKSPACE_URL + ")", "(urn:url:" + WORKSPACE_URL + ")"
+        ),
     }
 
 
 def test_snapshot_text_cannot_turn_into_mentions_or_fences():
     payload = poll()
     payload["questions"][0]["text"] = "```\n@**Everyone|1** [link](urn:user:x)"
-    text = message_conversion.workspace_to_zulip(payload, {})
+    text = message_conversion.workspace_to_zulip(
+        payload, {"workspace_message_url": WORKSPACE_URL}
+    )
     assert "````text\n" in text
     assert "Results unavailable" in text
     assert text.endswith("````")
@@ -149,7 +158,7 @@ def test_oversized_poll_snapshot_is_rejected_before_sending():
         message_conversion.workspace_to_zulip(payload, {})
 
 
-def test_outgoing_operation_persists_poll_as_markdown_snapshot():
+def test_outgoing_operation_keeps_the_original_poll_for_its_provider_echo():
     class Database:
         saved = None
 
@@ -161,15 +170,32 @@ def test_outgoing_operation_persists_poll_as_markdown_snapshot():
 
     db = Database()
     operations = outgoing_operations.Operations(db, None)
+    payload = poll()
     result = asyncio.run(
         operations.convert(
-            {"data": {"payload": poll()}},
+            {
+                "project_id": uuid.uuid4(),
+                "data": {
+                    "payload": payload,
+                    "stream_uuid": uuid.uuid4(),
+                    "topic_uuid": uuid.uuid4(),
+                    "placement_uuid": uuid.uuid4(),
+                },
+            },
             {
                 "provider_uuid": uuid.uuid4(),
-                "settings": {"server_url": "https://zulip.example.test"},
+                "settings": {
+                    "server_url": "https://zulip.example.test",
+                    "workspace_url": "https://workspace.example.test",
+                },
             },
         )
     )
-    assert db.saved == {"kind": "markdown", "content": result["provider_content"]}
+    assert db.saved == payload
     assert "When?" in result["provider_content"]
     assert "Where?" in result["provider_content"]
+    assert "not fully supported in Zulip" in result["provider_content"]
+    assert (
+        "https://workspace.example.test/org/workspace.example.test/project/"
+        in result["provider_content"]
+    )

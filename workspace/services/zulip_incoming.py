@@ -6,8 +6,8 @@
 import asyncio
 import contextlib
 import dataclasses
-import logging
 import json
+import logging
 import signal
 import typing
 import uuid
@@ -16,12 +16,13 @@ import aiohttp
 import psycopg
 from psycopg.types import json as pg_json
 
-from workspace.bridges.zulip import incoming_registry
-from workspace.bridges.zulip import incoming_operations
-from workspace.bridges.zulip import outgoing_operations
-from workspace.bridges.zulip import history
+from workspace.bridges.zulip import (
+    history,
+    incoming_operations,
+    incoming_registry,
+    outgoing_operations,
+)
 from workspace.services import zulip_outgoing
-
 
 LOG = logging.getLogger(__name__)
 # These provider liveness/presence events have no persistent Workspace state.
@@ -646,6 +647,8 @@ class ZulipIncomingService:
             "update_message",
             "delete_message",
             "reaction",
+            "submessage",
+            "poll_refresh",
             "update_message_flags",
         }
         if event["type"] == "update_message_flags" and event.get("all"):
