@@ -504,3 +504,41 @@ def test_history_replay_preserves_exported_poll_payload(
             assert replay["poll_state"] == created["poll_state"]
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("reason", ["options", "deadline"])
+def test_preview_cannot_switch_to_a_zulip_widget_after_delivery(
+    outgoing, db, _test_database_url, reason
+):
+    api, account, channel, *_ = outgoing
+    db.execute(
+        "UPDATE m_external_accounts_v2 SET settings=settings||%s::jsonb WHERE uuid=%s",
+        (json.dumps({"workspace_url": "https://workspace.example.test"}), account.uuid),
+    )
+    body = payload(
+        **(
+            {"allow_adding_options": False}
+            if reason == "options"
+            else {"closes_at": "2099-01-01T00:00:00Z"}
+        )
+    )
+    created = api.post(
+        MESSAGES, json={"stream_uuid": str(channel.stream_uuid), "payload": body}
+    ).json()
+
+    async def run():
+        async with outbound.sender(account, _test_database_url) as (service, server):
+            await outbound.drain(service)
+            assert "not fully supported in Zulip" in server.messages[101]["content"]
+            result = api.post(
+                MESSAGES + created["uuid"] + "/actions/update_settings/invoke",
+                json={"settings": {"closes_at": None, "allow_adding_options": True}},
+            )
+            assert result.status_code == 409, result.text
+            current = api.get(MESSAGES + created["uuid"]).json()
+            assert current["payload"] == created["payload"]
+            assert not await service.db.sql(
+                "SELECT 1 FROM zulip_outgoing_intents WHERE status<>'done'"
+            )
+
+    asyncio.run(run())
