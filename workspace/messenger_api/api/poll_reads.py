@@ -15,30 +15,11 @@ from workspace.messenger_api.dm import polls
 
 # Separate totals from personal selections. A delivery batch reads the question
 # counts once for each poll regardless of the number of recipients.
+# Rank votes only when at least one reader can see previews. Keep the branches
+# outside the aggregates so ranking can share its sort with the grouping sets.
 _SNAPSHOT_SELECT = f"""
 SELECT readers.uuid, readers.users, c.workspace_content AS payload, root.poll_state_revision,
-       status.is_closed, counts.items AS counts, choices.items AS choices,
-       CASE WHEN (c.workspace_content->>'is_anonymous')::boolean IS FALSE THEN (
-           SELECT jsonb_agg(jsonb_build_array(option.question_uuid, option.option_uuid, sample.users))
-           FROM (
-               SELECT (entry->>0)::uuid AS question_uuid, (entry->>1)::uuid AS option_uuid
-               FROM jsonb_array_elements(counts.items) AS groups(entry)
-               WHERE entry->>1 IS NOT NULL AND (
-                   c.workspace_content->>'results_visibility'='always' OR status.is_closed OR EXISTS (
-                       SELECT 1 FROM jsonb_array_elements(choices.items) AS choices_for_readers(choice)
-                       WHERE choice->>1=entry->>0
-                   )
-               )
-           ) option
-           CROSS JOIN LATERAL (
-               SELECT array_agg(user_uuid ORDER BY user_uuid) AS users FROM (
-                   SELECT user_uuid FROM messenger_poll_votes
-                   WHERE project_id=root.project_id AND message_uuid=root.uuid
-                     AND question_uuid=option.question_uuid AND option_uuid=option.option_uuid
-                   ORDER BY user_uuid LIMIT {polls.VOTER_PREVIEW_LIMIT}
-               ) selected
-           ) sample
-       ) END AS voter_previews
+       status.is_closed, counts.items AS counts, choices.items AS choices, counts.voter_previews
 FROM readers
 JOIN messenger_messages root ON root.project_id=readers.project_id AND root.uuid=readers.message_uuid
 JOIN messenger_message_contents c ON c.uuid=root.content_uuid
@@ -48,19 +29,57 @@ CROSS JOIN LATERAL (
     )) AS is_closed
 ) status
 CROSS JOIN LATERAL (
-    SELECT jsonb_agg(jsonb_build_array(question_uuid, option_uuid, n)) AS items
-    FROM (
-        SELECT question_uuid, option_uuid, COUNT(DISTINCT user_uuid) AS n
-        FROM messenger_poll_votes
-        WHERE project_id=root.project_id AND message_uuid=root.uuid
-        GROUP BY GROUPING SETS ((), (question_uuid), (question_uuid, option_uuid))
-    ) grouped
-) counts
-CROSS JOIN LATERAL (
     SELECT jsonb_agg(jsonb_build_array(user_uuid, question_uuid, option_uuid)) AS items
     FROM messenger_poll_votes
     WHERE project_id=root.project_id AND message_uuid=root.uuid AND user_uuid=ANY(readers.users)
 ) choices
+CROSS JOIN LATERAL (
+    SELECT (c.workspace_content->>'results_visibility'='always' OR status.is_closed) IS TRUE
+        AS public_results
+) visibility
+CROSS JOIN LATERAL (
+    SELECT (c.workspace_content->>'is_anonymous')::boolean IS FALSE
+        AND (visibility.public_results OR choices.items IS NOT NULL) AS enabled
+) previews
+CROSS JOIN LATERAL (
+    SELECT sampled.* FROM (
+        SELECT jsonb_agg(jsonb_build_array(question_uuid, option_uuid, n)) AS items,
+               jsonb_agg(jsonb_build_array(question_uuid, option_uuid, sample)) FILTER (
+                   WHERE option_uuid IS NOT NULL AND (
+                       visibility.public_results OR EXISTS (
+                           SELECT 1 FROM jsonb_array_elements(choices.items) AS choices_for_readers(choice)
+                           WHERE choice->>1=question_uuid::text
+                       )
+                   )
+               ) AS voter_previews
+        FROM (
+            SELECT question_uuid, option_uuid, COUNT(DISTINCT user_uuid) AS n,
+                   array_agg(user_uuid ORDER BY user_uuid) FILTER (
+                       WHERE voter_rank <= {polls.VOTER_PREVIEW_LIMIT}
+                   ) AS sample
+            FROM (
+                SELECT question_uuid, option_uuid, user_uuid,
+                       row_number() OVER (
+                           PARTITION BY question_uuid, option_uuid ORDER BY user_uuid
+                       ) AS voter_rank
+                FROM messenger_poll_votes
+                WHERE project_id=root.project_id AND message_uuid=root.uuid
+            ) ranked
+            GROUP BY GROUPING SETS ((), (question_uuid), (question_uuid, option_uuid))
+        ) grouped
+    ) sampled WHERE previews.enabled
+    UNION ALL
+    SELECT counts_only.* FROM (
+        SELECT jsonb_agg(jsonb_build_array(question_uuid, option_uuid, n)) AS items,
+               NULL::jsonb AS voter_previews
+        FROM (
+            SELECT question_uuid, option_uuid, COUNT(DISTINCT user_uuid) AS n
+            FROM messenger_poll_votes
+            WHERE project_id=root.project_id AND message_uuid=root.uuid
+            GROUP BY GROUPING SETS ((), (question_uuid), (question_uuid, option_uuid))
+        ) grouped
+    ) counts_only WHERE NOT previews.enabled
+) counts
 WHERE c.workspace_content->>'kind'='poll'
 """
 
