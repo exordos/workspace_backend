@@ -21,7 +21,15 @@ POLL_STATE = types.AllowNone(
                         "question_uuid": types.UUID(),
                         "voter_count": COUNT,
                         "option_counts": types.TypedDict(COUNT),
-                    }
+                        "option_voter_previews": types.TypedDict(
+                            polls.Array(
+                                types.UUID(),
+                                minimum=1,
+                                maximum=polls.VOTER_PREVIEW_LIMIT,
+                            )
+                        ),
+                    },
+                    optional=("option_voter_previews",),
                 )
             ),
             "my_votes": polls.Array(

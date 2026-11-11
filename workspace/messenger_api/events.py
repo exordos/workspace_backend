@@ -419,6 +419,24 @@ def event_row_to_messenger_event(row: typing.Any) -> typing.Any:
     return pack_workspace_event(_workspace_event_from_row(row))
 
 
+def _shared_poll_state(message: dict) -> dict:
+    state = {**message["poll_state"], "my_votes": []}
+    # Open after-vote previews belong only to the eligible recipient overrides.
+    if (
+        not state["is_closed"]
+        and message["payload"]["results_visibility"] == "after_vote"
+    ):
+        state["questions"] = [
+            {
+                key: value
+                for key, value in question.items()
+                if key != "option_voter_previews"
+            }
+            for question in state["questions"]
+        ]
+    return state
+
+
 def _create_workspace_event(
     project_id: object,
     user_uuid: object,
@@ -432,7 +450,7 @@ def _create_workspace_event(
             overrides = {str(user_uuid): {"poll_state": payload["poll_state"]}}
             payload = {
                 **payload,
-                "poll_state": {**payload["poll_state"], "my_votes": []},
+                "poll_state": _shared_poll_state(payload),
             }
         pending = publication.enqueue(
             session or contexts.Context().get_session(),
@@ -574,10 +592,8 @@ def _compress_recipient_payloads(
         # Use the modal value as the base payload. A typical message therefore
         # stores only the author's read/is_own exception, not 300 false flags.
         common[key] = max(variants.values(), key=lambda item: item[1])[0]
-    # The common body is shared storage. Personal choices belong only to the
-    # recipient override even when everyone in a small batch chose identically.
     if common.get("poll_state"):
-        common["poll_state"] = {**common["poll_state"], "my_votes": []}
+        common["poll_state"] = _shared_poll_state(common)
     overrides = {
         user_uuid: {
             key: value

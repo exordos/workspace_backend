@@ -17,6 +17,7 @@ from workspace.common import types as common_types
 
 MAX_POLL_QUESTIONS = 20
 MAX_POLL_OPTIONS_PER_QUESTION = 20
+VOTER_PREVIEW_LIMIT = 20
 
 
 class PollUUID(types.UUID):
@@ -50,18 +51,25 @@ class PollTimestamp(types.UTCDateTimeZ):
 
 
 class Array(types.TypedList):
-    def __init__(self, item: types.BaseType, minimum: int = 0) -> None:
+    def __init__(
+        self, item: types.BaseType, minimum: int = 0, maximum: int | None = None
+    ) -> None:
         super().__init__(item)
         self.minimum = minimum
+        self.maximum = maximum
 
-    def _has_minimum_items(self, value: typing.Any) -> bool:
-        return isinstance(value, list) and len(value) >= self.minimum
+    def _has_allowed_item_count(self, value: typing.Any) -> bool:
+        return (
+            isinstance(value, list)
+            and len(value) >= self.minimum
+            and (self.maximum is None or len(value) <= self.maximum)
+        )
 
     def validate(self, value: typing.Any) -> bool:
-        return self._has_minimum_items(value) and super().validate(value)
+        return self._has_allowed_item_count(value) and super().validate(value)
 
     def from_simple_type(self, value: typing.Any) -> list:
-        if not self._has_minimum_items(value):
+        if not self._has_allowed_item_count(value):
             raise ra_exc.ValidationErrorException()
         return super().from_simple_type(value)
 
@@ -70,6 +78,8 @@ class Array(types.TypedList):
         result.pop("example", None)
         if self.minimum:
             result["minItems"] = self.minimum
+        if self.maximum is not None:
+            result["maxItems"] = self.maximum
         return result
 
 

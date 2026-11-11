@@ -792,6 +792,14 @@ def test_poll_openapi_matches_the_create_actions_and_voter_page():
         "questions",
         "my_votes",
     }
+    question_state = state["properties"]["questions"]["items"]
+    assert "option_voter_previews" not in question_state["required"]
+    preview = question_state["properties"]["option_voter_previews"]
+    assert preview["type"] == "object"
+    uuid_list = preview["additionalProperties"]
+    assert uuid_list["type"] == "array"
+    assert uuid_list["minItems"] == 1 and uuid_list["maxItems"] == 20
+    assert uuid_list["items"]["format"] == "uuid"
     voters = paths[f"{root}/poll_voters/"]["get"]
     assert {p["name"] for p in voters["parameters"] if p.get("required")} == {
         "question_uuid",
