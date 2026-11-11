@@ -397,7 +397,13 @@ def _get_packer_request() -> typing.Any:
     return _PACKER_REQUEST
 
 
-def pack_workspace_event(event: typing.Any, request: typing.Any = None) -> typing.Any:
+def pack_workspace_event(
+    event: typing.Any,
+    request: typing.Any = None,
+    *,
+    poll_previews: typing.Any = None,
+    poll_my_votes: typing.Any = None,
+) -> typing.Any:
     request = request or _get_packer_request()
     result = ra_packers.BaseResourcePacker(
         WORKSPACE_EVENT_RESOURCE,
@@ -412,11 +418,72 @@ def pack_workspace_event(event: typing.Any, request: typing.Any = None) -> typin
             for name, users in result["payload"]["reaction_users"].items()
             if users
         }
+    if poll_previews is not None or poll_my_votes is not None:
+        payload = result["payload"]
+        state = {**payload["poll_state"], "my_votes": poll_my_votes or []}
+        if poll_previews and not payload["payload"]["is_anonymous"]:
+            voted_questions = {vote["question_uuid"] for vote in state["my_votes"]}
+            questions = []
+            for question in state["questions"]:
+                q = question["question_uuid"]
+                if q in voted_questions and q in poll_previews:
+                    question = {**question, "option_voter_previews": poll_previews[q]}
+                questions.append(question)
+            state["questions"] = questions
+        result["payload"] = {**payload, "poll_state": state}
     return result
 
 
 def event_row_to_messenger_event(row: typing.Any) -> typing.Any:
-    return pack_workspace_event(_workspace_event_from_row(row))
+    return pack_workspace_event(
+        _workspace_event_from_row(row),
+        poll_previews=_event_row_get(row, "poll_previews"),
+        poll_my_votes=_event_row_get(row, "poll_my_votes"),
+    )
+
+
+def _split_poll_event_state(
+    common: dict, overrides: dict[str, dict], payloads: dict[str, dict]
+) -> None:
+    state = next(iter(payloads.values()))["poll_state"]
+    common["poll_state"] = {**state, "my_votes": []}
+    restricted = (
+        not state["is_closed"]
+        and common["payload"]["results_visibility"] == "after_vote"
+    )
+    missing_previews = {
+        question["question_uuid"]
+        for question in state["questions"]
+        if restricted
+        and not common["payload"]["is_anonymous"]
+        and question["voter_count"]
+    }
+    previews = {}
+    for user_uuid, payload in payloads.items():
+        personal = payload["poll_state"]
+        if personal["my_votes"]:
+            # Both old broadcast readers overwrite user_uuid with the actual
+            # recipient. Keep storage metadata in this slot off the public wire.
+            overrides[user_uuid]["user_uuid"] = {
+                "poll_my_votes_v1": personal["my_votes"]
+            }
+            if missing_previews:
+                for question in personal["questions"]:
+                    q = question["question_uuid"]
+                    if q in missing_previews and "option_voter_previews" in question:
+                        previews[q] = question["option_voter_previews"]
+                        missing_previews.remove(q)
+    if restricted:
+        common["poll_state"]["questions"] = [
+            {
+                key: value
+                for key, value in question.items()
+                if key != "option_voter_previews"
+            }
+            for question in state["questions"]
+        ]
+        if previews:
+            common["user_uuid"] = {"poll_previews_v1": previews}
 
 
 def _create_workspace_event(
@@ -428,12 +495,16 @@ def _create_workspace_event(
 ) -> typing.Any:
     if mutation_journal_opts.enabled() or publication.DEFERRED.get():
         overrides = None
-        if (payload.get("poll_state") or {}).get("my_votes"):
-            overrides = {str(user_uuid): {"poll_state": payload["poll_state"]}}
-            payload = {
-                **payload,
-                "poll_state": {**payload["poll_state"], "my_votes": []},
-            }
+        if payload.get("poll_state"):
+            payload, overrides = _compress_recipient_payloads(
+                {
+                    str(user_uuid): {
+                        key: value
+                        for key, value in payload.items()
+                        if key != "user_uuid"
+                    }
+                }
+            )
         pending = publication.enqueue(
             session or contexts.Context().get_session(),
             project_id,
@@ -565,7 +636,10 @@ def _compress_recipient_payloads(
         return {}, {}
     values = list(payloads.values())
     common = {}
+    shared_poll = all(value.get("poll_state") for value in values)
     for key in set.intersection(*(set(value) for value in values)):
+        if key == "poll_state" and shared_poll:
+            continue
         variants: dict[str, list[typing.Any]] = {}
         for payload in values:
             value = payload[key]
@@ -574,18 +648,17 @@ def _compress_recipient_payloads(
         # Use the modal value as the base payload. A typical message therefore
         # stores only the author's read/is_own exception, not 300 false flags.
         common[key] = max(variants.values(), key=lambda item: item[1])[0]
-    # The common body is shared storage. Personal choices belong only to the
-    # recipient override even when everyone in a small batch chose identically.
-    if common.get("poll_state"):
-        common["poll_state"] = {**common["poll_state"], "my_votes": []}
     overrides = {
         user_uuid: {
             key: value
             for key, value in payload.items()
-            if key not in common or common[key] != value
+            if (key != "poll_state" or not shared_poll)
+            and (key not in common or common[key] != value)
         }
         for user_uuid, payload in payloads.items()
     }
+    if shared_poll:
+        _split_poll_event_state(common, overrides, payloads)
     return common, {key: value for key, value in overrides.items() if value}
 
 

@@ -547,7 +547,7 @@ def test_postgres_events_keep_model_path_for_additional_filters(monkeypatch):
             "pruned_through_epoch_version": 12,
         },
     )
-    events = [types.SimpleNamespace(epoch_version=21)]
+    events = [types.SimpleNamespace(epoch_version=21, payload={})]
     objects = FakeObjects(events)
     model = _fake_model(
         objects,
