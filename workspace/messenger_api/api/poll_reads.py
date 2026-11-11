@@ -10,33 +10,76 @@ from restalchemy.common import contexts
 from restalchemy.common import exceptions as ra_exc
 
 from workspace.messenger_api import exceptions
+from workspace.messenger_api.dm import polls
 
 
 # Separate totals from personal selections. A delivery batch reads the question
 # counts once for each poll regardless of the number of recipients.
-_SNAPSHOT_SELECT = """
+# Rank votes only when at least one reader can see previews. Keep the branches
+# outside the aggregates so ranking can share its sort with the grouping sets.
+_SNAPSHOT_SELECT = f"""
 SELECT readers.uuid, readers.users, c.workspace_content AS payload, root.poll_state_revision,
-       (c.workspace_content->>'closed_at' IS NOT NULL OR COALESCE(
-          (c.workspace_content->>'closes_at')::timestamptz <= statement_timestamp(), false
-       )) AS is_closed,
-       counts.items AS counts, choices.items AS choices
+       status.is_closed, counts.items AS counts, choices.items AS choices, counts.voter_previews
 FROM readers
 JOIN messenger_messages root ON root.project_id=readers.project_id AND root.uuid=readers.message_uuid
 JOIN messenger_message_contents c ON c.uuid=root.content_uuid
 CROSS JOIN LATERAL (
-    SELECT jsonb_agg(jsonb_build_array(question_uuid, option_uuid, n)) AS items
-    FROM (
-        SELECT question_uuid, option_uuid, COUNT(DISTINCT user_uuid) AS n
-        FROM messenger_poll_votes
-        WHERE project_id=root.project_id AND message_uuid=root.uuid
-        GROUP BY GROUPING SETS ((), (question_uuid), (question_uuid, option_uuid))
-    ) grouped
-) counts
+    SELECT (c.workspace_content->>'closed_at' IS NOT NULL OR COALESCE(
+        (c.workspace_content->>'closes_at')::timestamptz <= statement_timestamp(), false
+    )) AS is_closed
+) status
 CROSS JOIN LATERAL (
     SELECT jsonb_agg(jsonb_build_array(user_uuid, question_uuid, option_uuid)) AS items
     FROM messenger_poll_votes
     WHERE project_id=root.project_id AND message_uuid=root.uuid AND user_uuid=ANY(readers.users)
 ) choices
+CROSS JOIN LATERAL (
+    SELECT (c.workspace_content->>'results_visibility'='always' OR status.is_closed) IS TRUE
+        AS public_results
+) visibility
+CROSS JOIN LATERAL (
+    SELECT (c.workspace_content->>'is_anonymous')::boolean IS FALSE
+        AND (visibility.public_results OR choices.items IS NOT NULL) AS enabled
+) previews
+CROSS JOIN LATERAL (
+    SELECT sampled.* FROM (
+        SELECT jsonb_agg(jsonb_build_array(question_uuid, option_uuid, n)) AS items,
+               jsonb_agg(jsonb_build_array(question_uuid, option_uuid, sample)) FILTER (
+                   WHERE option_uuid IS NOT NULL AND (
+                       visibility.public_results OR EXISTS (
+                           SELECT 1 FROM jsonb_array_elements(choices.items) AS choices_for_readers(choice)
+                           WHERE choice->>1=question_uuid::text
+                       )
+                   )
+               ) AS voter_previews
+        FROM (
+            SELECT question_uuid, option_uuid, COUNT(DISTINCT user_uuid) AS n,
+                   array_agg(user_uuid ORDER BY user_uuid) FILTER (
+                       WHERE voter_rank <= {polls.VOTER_PREVIEW_LIMIT}
+                   ) AS sample
+            FROM (
+                SELECT question_uuid, option_uuid, user_uuid,
+                       row_number() OVER (
+                           PARTITION BY question_uuid, option_uuid ORDER BY user_uuid
+                       ) AS voter_rank
+                FROM messenger_poll_votes
+                WHERE project_id=root.project_id AND message_uuid=root.uuid
+            ) ranked
+            GROUP BY GROUPING SETS ((), (question_uuid), (question_uuid, option_uuid))
+        ) grouped
+    ) sampled WHERE previews.enabled
+    UNION ALL
+    SELECT counts_only.* FROM (
+        SELECT jsonb_agg(jsonb_build_array(question_uuid, option_uuid, n)) AS items,
+               NULL::jsonb AS voter_previews
+        FROM (
+            SELECT question_uuid, option_uuid, COUNT(DISTINCT user_uuid) AS n
+            FROM messenger_poll_votes
+            WHERE project_id=root.project_id AND message_uuid=root.uuid
+            GROUP BY GROUPING SETS ((), (question_uuid), (question_uuid, option_uuid))
+        ) grouped
+    ) counts_only WHERE NOT previews.enabled
+) counts
 WHERE c.workspace_content->>'kind'='poll'
 """
 
@@ -77,19 +120,33 @@ CASE WHEN message.payload->>'kind'='poll' THEN (
 def _personalize(snapshot: typing.Mapping[str, typing.Any]) -> dict[str, dict]:
     payload = snapshot["payload"]
     counts = {(q, o): n for q, o, n in snapshot["counts"]}
+    previews: dict[str, dict[str, list[str]]] = {}
+    for q, o, users in snapshot["voter_previews"] or []:
+        previews.setdefault(q, {})[o] = users
+
     questions = []
+    questions_with_previews = []
     order = {}
     for q_index, question in enumerate(payload["questions"]):
         q = question["uuid"]
-        questions.append(
-            {
-                "question_uuid": q,
-                "voter_count": counts.get((q, None), 0),
-                "option_counts": {
-                    o["uuid"]: counts.get((q, o["uuid"]), 0)
-                    for o in question["options"]
-                },
-            }
+        summary = {
+            "question_uuid": q,
+            "voter_count": counts.get((q, None), 0),
+            "option_counts": {
+                o["uuid"]: counts.get((q, o["uuid"]), 0) for o in question["options"]
+            },
+        }
+        questions.append(summary)
+        question_previews = previews.get(q, {})
+        option_previews = {
+            o["uuid"]: question_previews[o["uuid"]]
+            for o in question["options"]
+            if o["uuid"] in question_previews
+        }
+        questions_with_previews.append(
+            {**summary, "option_voter_previews": option_previews}
+            if option_previews
+            else summary
         )
         for o_index, option in enumerate(question["options"]):
             order[q, option["uuid"]] = (q_index, o_index)
@@ -99,22 +156,31 @@ def _personalize(snapshot: typing.Mapping[str, typing.Any]) -> dict[str, dict]:
         snapshot["choices"] or [], key=lambda v: order[v[1], v[2]]
     ):
         own.setdefault(user, {}).setdefault(q, []).append(o)
+    public_results = snapshot["is_closed"] or payload["results_visibility"] == "always"
     common = {
         "revision": snapshot["poll_state_revision"],
         "is_closed": snapshot["is_closed"],
         "voter_count": counts[None, None],
-        "questions": questions,
+        "questions": questions_with_previews if public_results else questions,
     }
-    return {
-        str(user): {
+    states = {}
+    for user in snapshot["users"]:
+        reader = str(user)
+        own_choices = own.get(reader, {})
+        state = {
             **common,
             "my_votes": [
                 {"question_uuid": q, "option_uuids": options}
-                for q, options in own.get(str(user), {}).items()
+                for q, options in own_choices.items()
             ],
         }
-        for user in snapshot["users"]
-    }
+        if previews and own_choices and not public_results:
+            state["questions"] = [
+                with_previews if question["question_uuid"] in own_choices else question
+                for question, with_previews in zip(questions, questions_with_previews)
+            ]
+        states[reader] = state
+    return states
 
 
 def apply_page_snapshot(message: dict, snapshot: dict | None) -> None:

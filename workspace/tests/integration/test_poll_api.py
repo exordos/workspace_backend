@@ -4,6 +4,7 @@
 """Public poll contract, including access, per-user state and delivery."""
 
 import datetime
+import json
 import uuid
 
 import pytest
@@ -12,7 +13,7 @@ from workspace.common import mutation_journal_opts
 from restalchemy.common import contexts
 from restalchemy.storage.sql import sessions
 
-from workspace.messenger_api import publication
+from workspace.messenger_api import events, publication
 from workspace.messenger_api.dm import polls
 from workspace.services.messenger_workers import v2_projection
 
@@ -108,6 +109,7 @@ def test_poll_clicks_noop_and_personal_snapshots(api, db, room):
     before = content_identity()
     one = invoke(api, path, "vote", selection(first), user=peer)["poll_state"]
     assert one["voter_count"] == 1 and one["revision"] > 1
+    assert "option_voter_previews" not in one["questions"][0]
     assert invoke(api, path, "vote", selection(first), user=peer)["poll_state"] == one
     invoke(api, path, "vote", selection(first, 1), user=peer, status=409)
     invoke(api, path, "vote", selection(first, selected=False), user=peer, status=409)
@@ -139,6 +141,10 @@ def test_poll_clicks_noop_and_personal_snapshots(api, db, room):
         ]
         assert updates and updates[-1]["poll_state"]["my_votes"] == expected
         assert updates[-1]["poll_state"]["revision"] == peer_state["revision"]
+        assert all(
+            "option_voter_previews" not in question
+            for question in updates[-1]["poll_state"]["questions"]
+        )
         page = api.get(
             native.MESSAGES,
             user=reader,
@@ -263,6 +269,295 @@ def test_poll_voters_cursor_survives_withdrawal_and_replacement(api, room):
     )
 
 
+def test_poll_voter_preview_bounds_and_pagination(api, db, room):
+    message = create(api, room, results_visibility="always")
+    path = native.MESSAGES + message["uuid"]
+    first = message["payload"]["questions"][0]
+    option = first["options"][0]["uuid"]
+    assert "option_voter_previews" not in message["poll_state"]["questions"][0]
+
+    users = sorted(uuid.uuid4() for _ in range(21))
+    for user in users:
+        conftest.seed_workspace_user(db, user, f"poll-{user}")
+        native._register_project_user(db, api.project_id, user)
+    response = api.post(
+        f"{native.STREAMS}{room[0]['uuid']}/actions/add_users/invoke",
+        json={"member": [str(user) for user in users]},
+    )
+    assert response.status_code == 200, response.text
+    native._drain()
+
+    def add_votes(voters):
+        db.execute(
+            """
+            INSERT INTO messenger_poll_votes
+                (project_id, message_uuid, user_uuid, question_uuid, option_uuid)
+            SELECT p.project_id, p.message_uuid, user_uuid, %s, %s
+            FROM messenger_message_placements p
+            CROSS JOIN unnest(%s::uuid[]) AS voters(user_uuid)
+            WHERE p.project_id=%s AND p.uuid=%s
+            """,
+            (first["uuid"], option, voters, api.project_id, message["uuid"]),
+        )
+
+    inserted = 0
+    for count in (19, 20, 21):
+        # Insert in reverse UUID order to check that selection has an explicit order.
+        add_votes(list(reversed(users[inserted:count])))
+        inserted = count
+        history = api.get(
+            native.MESSAGES,
+            params={"topic_uuid": room[0]["default_topic_uuid"], "page_limit": 10},
+        )
+        assert history.status_code == 200, history.text
+        assert len(history.json()) == 1
+        state = history.json()[0]["poll_state"]
+        assert api.get(path).json()["poll_state"] == state
+        assert state["questions"][0]["option_counts"][option] == count
+        assert state["questions"][0]["option_voter_previews"] == {
+            option: [str(user) for user in users[: min(count, 20)]]
+        }
+        assert "option_voter_previews" not in state["questions"][1]
+
+    preview = state["questions"][0]["option_voter_previews"][option]
+    voter_query = {
+        "question_uuid": first["uuid"],
+        "option_uuid": option,
+        "page_limit": 20,
+    }
+    page = api.get(path + "/poll_voters/", params=voter_query)
+    assert page.status_code == 200, page.text
+    assert page.json() == [{"uuid": user} for user in preview]
+    assert page.headers["X-Pagination-Marker"] == preview[-1]
+    rest = api.get(
+        path + "/poll_voters/", params={**voter_query, "page_marker": preview[-1]}
+    )
+    assert rest.status_code == 200, rest.text
+    assert rest.json() == [{"uuid": str(users[-1])}]
+    assert "X-Pagination-Marker" not in rest.headers
+
+
+def test_after_vote_previews_are_per_question_and_per_recipient(api, db, room):
+    message = create(api, room, allow_revote=True)
+    path = native.MESSAGES + message["uuid"]
+    peer = room[1]
+    first, second = message["payload"]["questions"]
+    first_preview = {first["options"][0]["uuid"]: [str(peer)]}
+    second_preview = {second["options"][0]["uuid"]: [str(api.user_uuid)]}
+
+    peer_state = invoke(api, path, "vote", selection(first), user=peer)["poll_state"]
+    assert peer_state["questions"][0]["option_voter_previews"] == first_preview
+    assert all(
+        "option_voter_previews" not in question
+        for question in api.get(path).json()["poll_state"]["questions"]
+    )
+    author_state = invoke(api, path, "vote", selection(second))["poll_state"]
+    assert "option_voter_previews" not in author_state["questions"][0]
+    assert author_state["questions"][1]["option_voter_previews"] == second_preview
+
+    with publication.defer(), contexts.Context().session_manager() as session:
+        v2_projection.drain_projection_queue(session, "poll-preview-delivery")
+    pending = db.execute(
+        "SELECT uuid,payload,recipient_payloads FROM messenger_publication_outbox "
+        "WHERE project_id=%s AND entity_uuid=%s AND kind='message.updated' "
+        "ORDER BY sequence DESC LIMIT 1",
+        (api.project_id, message["uuid"]),
+    ).fetchone()
+    assert pending is not None
+    event_uuid, common, overrides = pending
+    assert all(
+        "option_voter_previews" not in question
+        for question in common["poll_state"]["questions"]
+    )
+    assert common["user_uuid"] == {
+        "poll_previews_v1": {
+            first["uuid"]: first_preview,
+            second["uuid"]: second_preview,
+        }
+    }
+    expected = {str(peer): peer_state, str(api.user_uuid): author_state}
+    current = {user: api.get(path, user=user).json()["poll_state"] for user in expected}
+    for user, override in overrides.items():
+        assert "poll_state" not in override
+        assert override["user_uuid"] == {"poll_my_votes_v1": current[user]["my_votes"]}
+
+    # Change live votes before replay. Both compact and legacy payloads describe
+    # the event revision, so the former voter still sees their historical result.
+    invoke(api, path, "vote", {**selection(first), "selected": False}, user=peer)
+    with contexts.Context().session_manager() as session:
+        legacy_common = {
+            key: value for key, value in common.items() if key != "user_uuid"
+        }
+        legacy_overrides = {
+            user: {**override, "poll_state": current[user]}
+            for user, override in overrides.items()
+        }
+        for override in legacy_overrides.values():
+            del override["user_uuid"]
+        legacy_uuid = publication.enqueue(
+            session,
+            api.project_id,
+            message["uuid"],
+            current,
+            "message.updated",
+            legacy_common,
+            legacy_overrides,
+        )[0].uuid
+        publication.publish_pending(session)
+
+    for user, state in expected.items():
+        read = current[user]
+        for extra_filters in (
+            {"epoch_version>": 0},
+            {"epoch_version>": 0, "object_type": "message"},
+        ):
+            response = api.get(
+                native.EVENTS, user=user, params={"page_limit": 100, **extra_filters}
+            )
+            assert response.status_code == 200, response.text
+            updates = {event["uuid"]: event["payload"] for event in response.json()}
+            for stored_uuid in (event_uuid, legacy_uuid):
+                assert updates[str(stored_uuid)]["poll_state"] == read
+                assert updates[str(stored_uuid)]["user_uuid"] == user
+        legacy_read = db.execute(
+            "SELECT payload FROM m_workspace_visible_events WHERE uuid=%s AND user_uuid=%s",
+            (event_uuid, user),
+        ).fetchone()[0]
+        assert legacy_read["user_uuid"] == user
+        assert legacy_read["poll_state"] == common["poll_state"]
+        assert [
+            question.get("option_voter_previews") for question in read["questions"]
+        ] == [question.get("option_voter_previews") for question in state["questions"]]
+    closed = invoke(api, path, "close_poll", {})["poll_state"]
+    assert [
+        question.get("option_voter_previews") for question in closed["questions"]
+    ] == [
+        None,
+        second_preview,
+    ]
+    native._drain()
+    response = api.get(native.EVENTS, user=peer, params={"epoch_version>": 0})
+    assert response.status_code == 200, response.text
+    peer_updates = [
+        event["payload"]["poll_state"]
+        for event in response.json()
+        if event["payload"]["kind"] == "message.updated"
+        and event["payload"]["uuid"] == message["uuid"]
+    ]
+    assert peer_updates[-1] == {**closed, "my_votes": []}
+
+
+def test_poll_publication_stores_voter_previews_once_for_large_audience(api, db):
+    recipients = [str(uuid.UUID(int=index)) for index in range(1, 1001)]
+    question_uuid = str(uuid.uuid4())
+    option_uuid = str(uuid.uuid4())
+    placement_uuid = uuid.uuid4()
+    previews = {option_uuid: recipients[:20]}
+    state = {
+        "revision": 10,
+        "is_closed": False,
+        "voter_count": 1000,
+        "my_votes": [{"question_uuid": question_uuid, "option_uuids": [option_uuid]}],
+        "questions": [
+            {
+                "question_uuid": question_uuid,
+                "voter_count": 1000,
+                "option_counts": {option_uuid: 1000},
+                "option_voter_previews": previews,
+            }
+        ],
+    }
+    payload = {
+        "uuid": str(placement_uuid),
+        "payload": {
+            "kind": "poll",
+            "results_visibility": "after_vote",
+            "is_anonymous": False,
+        },
+        "poll_state": state,
+    }
+    common, overrides = events._compress_recipient_payloads(
+        dict.fromkeys(recipients, payload)
+    )
+    full_overrides = {user: {"poll_state": state} for user in recipients}
+    with contexts.Context().session_manager() as session:
+        event_uuid = publication.enqueue(
+            session,
+            api.project_id,
+            placement_uuid,
+            recipients,
+            "message.updated",
+            common,
+            overrides,
+        )[0].uuid
+    stored = db.execute(
+        "SELECT payload, recipient_payloads FROM messenger_publication_outbox WHERE uuid=%s",
+        (event_uuid,),
+    ).fetchone()
+    assert stored == (common, overrides)
+    assert len(json.dumps(overrides)) < len(json.dumps(full_overrides)) / 5
+
+    with contexts.Context().session_manager() as session:
+        publication.publish_pending(session)
+    stored = db.execute(
+        """
+        SELECT event.payload, jsonb_object_agg(override.user_uuid, override.payload)
+        FROM m_workspace_broadcast_message_events_v1 AS event
+        JOIN m_workspace_event_recipient_payloads_v1 AS override
+          ON override.event_uuid=event.uuid
+        WHERE event.uuid=%s
+        GROUP BY event.uuid, event.payload
+        """,
+        (event_uuid,),
+    ).fetchone()
+    published, overrides = stored
+    assert published["user_uuid"] == {"poll_previews_v1": {question_uuid: previews}}
+    assert "option_voter_previews" not in published["poll_state"]["questions"][0]
+    assert overrides == {
+        user: {"user_uuid": {"poll_my_votes_v1": state["my_votes"]}}
+        for user in recipients
+    }
+
+
+@pytest.mark.parametrize("visibility", ["always", "after_vote"])
+def test_personal_poll_event_keeps_state_in_direct_and_deferred_delivery(
+    api, db, room, monkeypatch, visibility
+):
+    message = create(api, room, results_visibility=visibility)
+    path = native.MESSAGES + message["uuid"]
+    message = invoke(api, path, "vote", selection(message["payload"]["questions"][0]))
+    project_uuid = uuid.UUID(str(api.project_id))
+    user_uuid = uuid.UUID(str(api.user_uuid))
+    monkeypatch.setattr(mutation_journal_opts, "enabled", lambda: False)
+    with contexts.Context().session_manager() as session:
+        direct_epoch = events._create_workspace_event(
+            project_uuid, user_uuid, "message.updated", message, session
+        )
+    with publication.defer(), contexts.Context().session_manager() as session:
+        deferred_uuid = events._create_workspace_event(
+            project_uuid, user_uuid, "message.updated", message, session
+        ).uuid
+    with contexts.Context().session_manager() as session:
+        publication.publish_pending(session)
+
+    old_reader_payload = db.execute(
+        "SELECT payload FROM m_workspace_visible_events WHERE uuid=%s AND user_uuid=%s",
+        (deferred_uuid, api.user_uuid),
+    ).fetchone()[0]
+    assert old_reader_payload["user_uuid"] == str(api.user_uuid)
+    assert old_reader_payload["poll_state"]["my_votes"] == []
+    question = old_reader_payload["poll_state"]["questions"][0]
+    assert ("option_voter_previews" in question) == (visibility == "always")
+    response = api.get(native.EVENTS, params={"epoch_version>": 0, "page_limit": 100})
+    assert response.status_code == 200, response.text
+    states = [
+        event["payload"]["poll_state"]
+        for event in response.json()
+        if event["epoch_version"] == direct_epoch or event["uuid"] == str(deferred_uuid)
+    ]
+    assert states == [message["poll_state"], message["poll_state"]]
+
+
 def test_message_and_poll_request_validation(api, room):
     message = create(api, room)
     path = native.MESSAGES + message["uuid"]
@@ -336,7 +631,8 @@ def test_poll_deferred_delivery_and_replay_respect_revoked_membership(api, db, r
     assert pending
     for common, overrides in pending:
         assert common["poll_state"]["my_votes"] == []
-        assert overrides[str(peer)]["poll_state"]["my_votes"]
+        assert overrides[str(peer)]["user_uuid"]["poll_my_votes_v1"]
+        assert "poll_state" not in overrides[str(peer)]
 
     binding = db.execute(
         "SELECT uuid FROM messenger_stream_bindings WHERE project_id=%s AND stream_uuid=%s AND user_uuid=%s",

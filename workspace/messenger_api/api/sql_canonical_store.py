@@ -46,13 +46,24 @@ class _IAMIdentityStore(typing.Protocol):
     ) -> dict[str, typing.Any]: ...
 
 
-BOUNDED_VISIBLE_EVENTS_SQL = """
+_RECIPIENT_POLL_PREVIEWS_SQL = """
+    CASE WHEN event.poll_previews IS NOT NULL AND event.poll_my_votes IS NOT NULL
+    THEN (
+        SELECT jsonb_object_agg(vote->>'question_uuid', event.poll_previews->(vote->>'question_uuid'))
+        FROM jsonb_array_elements(event.poll_my_votes) AS choices(vote)
+        WHERE event.poll_previews ? (vote->>'question_uuid')
+    )
+    END
+"""
+
+BOUNDED_VISIBLE_EVENTS_SQL = f"""
     WITH direct_events AS (
         SELECT
             event."epoch_version", event."uuid", event."project_id",
             event."user_uuid", event."payload", event."created_at",
             event."updated_at", event."schema_version",
-            event."object_type", event."action"
+            event."object_type", event."action",
+            NULL::jsonb AS poll_previews, NULL::jsonb AS poll_my_votes
         FROM "m_workspace_events" AS event
         WHERE event."project_id" = %s
           AND event."user_uuid" = %s
@@ -103,15 +114,17 @@ BOUNDED_VISIBLE_EVENTS_SQL = """
             event."epoch_version", event."uuid", event."project_id",
             recipient."user_uuid",
             event."payload"
-                || COALESCE(override."payload", '{}'::jsonb)
+                || COALESCE(override."payload", '{{}}'::jsonb)
                 || CASE
-                    WHEN event."object_type" = 'user' THEN '{}'::jsonb
+                    WHEN event."object_type" = 'user' THEN '{{}}'::jsonb
                     ELSE jsonb_build_object(
                         'user_uuid', recipient."user_uuid"
                     )
                 END AS "payload",
             event."created_at", event."updated_at",
-            event."schema_version", event."object_type", event."action"
+            event."schema_version", event."object_type", event."action",
+            event."payload"#>'{{user_uuid,poll_previews_v1}}' AS poll_previews,
+            override."payload"#>'{{user_uuid,poll_my_votes_v1}}' AS poll_my_votes
         FROM "m_workspace_broadcast_message_events_v1" AS event
         JOIN "m_workspace_event_audience_members_v1" AS recipient
           ON recipient."audience_snapshot_uuid" =
@@ -165,15 +178,35 @@ BOUNDED_VISIBLE_EVENTS_SQL = """
 
         ORDER BY event."epoch_version" ASC
         LIMIT %s
+    ),
+    page AS (
+        SELECT * FROM (
+            SELECT * FROM direct_events
+            UNION ALL
+            SELECT * FROM broadcast_events
+        ) AS visible
+        ORDER BY visible."epoch_version" ASC
+        LIMIT %s
     )
-    SELECT event.*
-    FROM (
-        SELECT * FROM direct_events
-        UNION ALL
-        SELECT * FROM broadcast_events
-    ) AS event
+    SELECT event."epoch_version", event."uuid", event."project_id",
+        event."user_uuid", event."payload", event."created_at", event."updated_at",
+        event."schema_version", event."object_type", event."action",
+        {_RECIPIENT_POLL_PREVIEWS_SQL} AS poll_previews, event.poll_my_votes
+    FROM page AS event
     ORDER BY event."epoch_version" ASC
-    LIMIT %s
+"""
+
+_VISIBLE_POLL_METADATA_SQL = f"""
+    SELECT event.uuid, {_RECIPIENT_POLL_PREVIEWS_SQL} AS poll_previews, event.poll_my_votes
+    FROM (
+        SELECT event.uuid,
+            event.payload#>'{{user_uuid,poll_previews_v1}}' AS poll_previews,
+            override.payload#>'{{user_uuid,poll_my_votes_v1}}' AS poll_my_votes
+        FROM m_workspace_broadcast_message_events_v1 AS event
+        LEFT JOIN m_workspace_event_recipient_payloads_v1 AS override
+          ON override.event_uuid = event.uuid AND override.user_uuid = %s
+        WHERE event.project_id = %s AND event.uuid = ANY(%s::uuid[])
+    ) AS event
 """
 
 
@@ -964,7 +997,7 @@ class PostgresEventStore:
                 order_by=order_by or {"epoch_version": "asc"},
                 limit=limit,
             )
-            result = [messenger_events.pack_workspace_event(event) for event in events]
+            result = self._pack_visible_events(events)
         for item in clauses:
             value = int(item.value)
             if isinstance(item, dm_filters.GT):
@@ -978,6 +1011,31 @@ class PostgresEventStore:
             else:
                 result = [event for event in result if event["epoch_version"] == value]
         return result
+
+    def _pack_visible_events(
+        self, events: list[models.WorkspaceVisibleEvent]
+    ) -> list[dict[str, typing.Any]]:
+        # The legacy visibility view exposes the actual user_uuid, so recover
+        # the shadowed poll metadata only for events already scoped by it.
+        poll_events = [
+            event.uuid for event in events if event.payload.get("poll_state")
+        ]
+        if not poll_events:
+            return [messenger_events.pack_workspace_event(event) for event in events]
+        session = contexts.Context().get_session()
+        rows = session.execute(
+            _VISIBLE_POLL_METADATA_SQL,
+            (self.user_uuid, self.project_uuid, poll_events),
+        ).fetchall()
+        metadata = {row["uuid"]: row for row in rows}
+        return [
+            messenger_events.pack_workspace_event(
+                event,
+                poll_previews=metadata.get(event.uuid, {}).get("poll_previews"),
+                poll_my_votes=metadata.get(event.uuid, {}).get("poll_my_votes"),
+            )
+            for event in events
+        ]
 
     def current_epoch(self) -> int:
         return self.event_cursor()["current_epoch_version"]

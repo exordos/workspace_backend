@@ -38,7 +38,9 @@ Use the public message UUID for the following endpoints. All four POST actions r
 
 Only a current participant can vote or append. The author and current stream owners, administrators and moderators can manage the poll. Without revoting, a single choice cannot be replaced and existing selections cannot be removed; a question in a multiple-choice poll still accepts additional selections. Questions are independent. Once the deadline passes or a manager closes the poll, no further changes are accepted. Ordinary message edits cannot change polls or convert another message into a poll. Forwarded results are Markdown snapshots.
 
-Message reads include `poll_state` (null for other kinds). It contains `revision`, `is_closed`, distinct `voter_count`, ordered `questions` with per-question `voter_count` and `option_counts` keyed by option UUID, and the reader's `my_votes` as `{question_uuid, option_uuids}` entries. Missing votes produce zero counts and an empty own-answer list. Counts are available to the API regardless of `results_visibility` (`always` or `after_vote`); the latter is a presentation rule.
+Message reads include `poll_state` (null for other kinds). It contains `revision`, `is_closed`, distinct `voter_count`, ordered `questions` with per-question `voter_count` and `option_counts` keyed by option UUID, and the reader's `my_votes` as `{question_uuid, option_uuids}` entries. Missing votes produce zero counts and an empty own-answer list. Counts are available to the API regardless of `results_visibility` (`always` or `after_vote`); clients control when they display those counts.
+
+Each question can also include `option_voter_previews`, a map from option UUID to up to 20 voter UUIDs in ascending UUID order. Empty options have no entry. Non-anonymous polls include previews for visible results: when results are always visible, the poll is closed, or the reader has voted on that question. Anonymous polls and questions with no eligible preview omit this field. A preview whose length matches `option_counts` for that option is complete. Otherwise use its last UUID as the exclusive `page_marker` for `poll_voters/` to continue the list.
 
 ## Zulip interoperability
 
@@ -78,11 +80,13 @@ continues to require normal Workspace authentication and access permissions.
 
 ## Realtime ordering
 
-A vote, manual close, settings change or appended option updates the existing message through `message.updated`. A vote does not create unread activity. Each reader receives their own `my_votes`; the voter is not identified in the update. Apply the poll payload and state together: a lower `poll_state.revision` is stale for both, but does not determine the ordering of read flags or reactions. Crossing `closes_at` does not change the revision or require a worker. At the same revision, an older snapshot must not reopen an expired poll.
+A vote, manual close, settings change or appended option updates the existing message through `message.updated`. A vote does not create unread activity. Each reader receives their own `my_votes` and eligible previews; the event does not identify the actor separately. Apply the poll payload and state together: a lower `poll_state.revision` is stale for both, but does not determine the ordering of read flags or reactions. Crossing `closes_at` does not change the revision or require a worker. At the same revision, an older snapshot must not reopen an expired poll.
+
+Broadcast events store previews once and record only each recipient's own choices as poll state overrides. Replay uses the choices recorded with the event revision. When updating a poll-enabled deployment, coordinate the REST API, WebSocket service and Messenger worker so all event readers support the compact format when writes resume. Older readers still serve shared counts and public previews from compact events, with empty `my_votes` and no open `after_vote` previews.
 
 ## Storage and sizing
 
-The first release computes poll totals from the vote rows. The history query selects the page keys first and aggregates only its polls. A poll action reads the totals for its response after applying the action. Reading the content, revision, counts and personal choices in one SQL statement keeps them consistent during concurrent votes or account deletion. A materialized total would have to track both paths in the same transaction.
+The first release computes poll totals from the vote rows. The history query selects the page keys first and aggregates only its polls. A poll action reads the totals for its response after applying the action. Reading the content, revision, counts, personal choices and bounded voter previews in one SQL statement keeps them consistent during concurrent votes or account deletion. A materialized total would have to track both paths in the same transaction.
 
 The voter list has its own page-size contract. Omitting `page_limit` returns up to 50 UUIDs. Values from 1 through 100 are accepted, and zero or values above 100 return HTTP 400. A withdrawn vote can still serve as the exclusive UUID boundary for the next page.
 
