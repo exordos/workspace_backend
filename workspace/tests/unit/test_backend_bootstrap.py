@@ -3,14 +3,76 @@
 
 """Exercise the bootstrap's actual config parser against libpq URI semantics."""
 
+import os
 import pathlib
 import re
 import shlex
+import signal
 import subprocess
 import sys
 
 import psycopg.conninfo
 import pytest
+
+
+@pytest.mark.parametrize("hung_connection", [False, True])
+def test_database_readiness_releases_caller_for_a_later_configuration(
+    tmp_path, hung_connection
+):
+    script = (
+        pathlib.Path(__file__).resolve().parents[3]
+        / "exordos/images/backend-bootstrap.sh"
+    ).read_text()
+    readiness = (
+        "attempt=1\n"
+        + script.split("attempt=1\n", 1)[1].split(
+            '\nsource "$GC_PATH/.venv/bin/activate"', 1
+        )[0]
+    )
+    psql = tmp_path / "psql"
+    psql.write_text(
+        '#!/bin/sh\nif [ "${PROBE_DATABASE_HANG:-0}" = 1 ]; then exec sleep 60; fi\n'
+        'exit "${PROBE_DATABASE_READY:-1}"\n'
+    )
+    psql.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
+        "WORKSPACE_DB_READY_TIMEOUT": "1",
+        "PROBE_DATABASE_HANG": str(int(hung_connection)),
+        "WORKSPACE_PG_ENDPOINT": "unready.invalid",
+        "WORKSPACE_PG_PORT": "5432",
+        "WORKSPACE_PG_USER": "workspace",
+        "WORKSPACE_PG_DB": "workspace",
+        "WORKSPACE_PG_PASS": "unused-fixture",
+    }
+    with subprocess.Popen(
+        ["bash", "-eu", "-c", readiness],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    ) as process:
+        try:
+            process.communicate(timeout=3)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGTERM)
+            process.communicate(timeout=3)
+            pytest.fail(
+                "Database readiness blocked the agent from applying a new config"
+            )
+        assert process.returncode != 0
+    # The same hook can succeed once the caller applies a ready configuration.
+    result = subprocess.run(
+        ["bash", "-eu", "-c", readiness],
+        check=False,
+        env={**env, "PROBE_DATABASE_HANG": "0", "PROBE_DATABASE_READY": "0"},
+        capture_output=True,
+        text=True,
+        timeout=3,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_image_exports_every_manifest_workspace_service(tmp_path):

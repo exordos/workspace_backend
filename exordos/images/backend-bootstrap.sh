@@ -120,14 +120,25 @@ PY
 )"
 
 attempt=1
-until PGPASSWORD="$WORKSPACE_PG_PASS" psql \
-    -h "$WORKSPACE_PG_ENDPOINT" \
-    -p "$WORKSPACE_PG_PORT" \
-    -U "$WORKSPACE_PG_USER" \
-    -d "$WORKSPACE_PG_DB" \
-    -c "SELECT 1;" >/dev/null 2>&1; do
-    echo "Projection database attempt $attempt is not ready; waiting 5 seconds"
-    sleep 5
+database_deadline=$((SECONDS + ${WORKSPACE_DB_READY_TIMEOUT:-30}))
+while true; do
+    remaining=$((database_deadline - SECONDS))
+    if [ "$remaining" -le 0 ]; then
+        echo "Projection database is not ready; deferring bootstrap until a later configuration." >&2
+        exit 1
+    fi
+    # The config hook runs synchronously in the agent. It must return so the
+    # agent can apply a later config when the database address changes.
+    if PGPASSWORD="$WORKSPACE_PG_PASS" PGCONNECT_TIMEOUT=5 timeout "$remaining" psql \
+        -h "$WORKSPACE_PG_ENDPOINT" \
+        -p "$WORKSPACE_PG_PORT" \
+        -U "$WORKSPACE_PG_USER" \
+        -d "$WORKSPACE_PG_DB" \
+        -c "SELECT 1;" >/dev/null 2>&1; then
+        break
+    fi
+    echo "Projection database attempt $attempt is not ready; waiting 1 second"
+    sleep 1
     attempt=$((attempt + 1))
 done
 
