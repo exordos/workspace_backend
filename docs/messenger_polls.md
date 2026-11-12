@@ -34,7 +34,7 @@ Use the public message UUID for the following endpoints. All four POST actions r
 | `POST actions/close_poll/invoke` | `{}`. Close permanently. |
 | `POST actions/update_settings/invoke` | `{settings: {closes_at, allow_adding_options}}`. Save both fields together; null removes a future deadline. |
 | `POST actions/add_poll_option/invoke` | `{question_uuid, option: {uuid, text}}`. Append without voting. Retrying the same UUID and text succeeds even after closing. |
-| `GET poll_voters/` | `question_uuid`, `option_uuid`; optional `page_limit` (default 50, range 1–100) and `page_marker`. Returns objects containing only `uuid`; use `X-Pagination-Marker` for the next page. Anonymous polls forbid this lookup for everyone. |
+| `GET poll_voters/` | `question_uuid`, `option_uuid`; optional `page_limit` (default 50, range 1–100) and `page_marker`. Returns objects containing only `uuid`; use `X-Pagination-Marker` for the next page. Anonymous polls forbid this lookup for everyone. Other polls allow it when results are always visible, the poll has closed, or the caller has voted on that question. |
 
 Only a current participant can vote or append. The author and current stream owners, administrators and moderators can manage the poll. Without revoting, a single choice cannot be replaced and existing selections cannot be removed; a question in a multiple-choice poll still accepts additional selections. Questions are independent. Once the deadline passes or a manager closes the poll, no further changes are accepted. Ordinary message edits cannot change polls or convert another message into a poll. Forwarded results are Markdown snapshots.
 
