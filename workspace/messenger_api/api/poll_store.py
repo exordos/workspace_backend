@@ -182,6 +182,39 @@ def mutate(
             values,
             now,
         )
+        retried = None
+        if synchronized and not changed:
+            # Only retry the latest failed write for this option. Successful
+            # and in-flight repetitions must remain no-ops.
+            retried = session.execute(
+                """UPDATE zulip_outgoing_intents intent
+                   SET status='new', request=NULL, error=NULL, next_attempt_at=now()
+                   WHERE id=(
+                       SELECT id FROM zulip_outgoing_intents
+                       WHERE status<>'done' AND project_id=%s
+                         AND entity_type='poll_vote' AND entity_uuid=%s
+                         AND external_account_uuid=%s AND data->>'question_uuid'=%s
+                         AND data->>'option_uuid'=%s
+                       ORDER BY id DESC LIMIT 1
+                   ) AND status='error' AND data->'selected'=%s::jsonb
+                   AND NOT EXISTS (
+                       SELECT 1 FROM zulip_outgoing_intents later
+                       WHERE later.id>intent.id AND later.project_id=intent.project_id
+                         AND later.entity_type=intent.entity_type AND later.entity_uuid=intent.entity_uuid
+                         AND later.external_account_uuid=intent.external_account_uuid
+                         AND later.data->>'question_uuid'=intent.data->>'question_uuid'
+                         AND later.data->>'option_uuid'=intent.data->>'option_uuid'
+                   )
+                   RETURNING id""",
+                (
+                    project_uuid,
+                    canonical_uuid,
+                    account["uuid"],
+                    values["question_uuid"],
+                    values["option_uuid"],
+                    json.dumps(values["selected"]),
+                ),
+            ).fetchone()
         if synchronized and changed:
             session.execute(
                 """INSERT INTO zulip_outgoing_intents
@@ -204,6 +237,7 @@ def mutate(
                     ),
                 ),
             )
+        if synchronized and (changed or retried):
             session.execute(
                 "UPDATE messenger_messages SET status='new' WHERE project_id=%s AND uuid=%s",
                 (project_uuid, canonical_uuid),
