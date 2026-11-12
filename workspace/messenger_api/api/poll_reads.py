@@ -238,7 +238,16 @@ def voters(
     # must remain distinguishable without separate access and vote snapshots.
     row = session.execute(
         """
-        SELECT visible.payload, page.users
+        SELECT visible.payload, page.users,
+               (visible.payload->>'results_visibility'='always'
+                OR visible.payload->>'closed_at' IS NOT NULL
+                OR (visible.payload->>'closes_at')::timestamptz <= statement_timestamp()
+                OR EXISTS (
+                    SELECT 1 FROM messenger_poll_votes own
+                    WHERE own.project_id=visible.project_id
+                      AND own.message_uuid=visible.canonical_message_uuid
+                      AND own.user_uuid=visible.user_uuid AND own.question_uuid=%s
+                )) IS TRUE AS results_visible
         FROM messenger_api_user_messages_v1 visible
         CROSS JOIN LATERAL (
             SELECT array_agg(user_uuid ORDER BY user_uuid) AS users FROM (
@@ -253,6 +262,7 @@ def voters(
         WHERE visible.project_id=%s AND visible.uuid=%s AND visible.user_uuid=%s AND visible.visible
         """,
         (
+            question_uuid,
             question_uuid,
             option_uuid,
             marker,
@@ -276,4 +286,6 @@ def voters(
         for q in payload["questions"]
     ):
         raise ra_exc.ValidationErrorException()
+    if not row["results_visible"]:
+        raise exceptions.PollForbiddenError()
     return [{"uuid": str(user)} for user in row["users"] or []]

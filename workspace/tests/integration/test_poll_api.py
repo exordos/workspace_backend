@@ -78,6 +78,30 @@ def selection(q, option=0, selected=True):
     }
 
 
+def test_voter_pages_follow_per_question_visibility_until_closure(api, room):
+    message = create(api, room, allow_revote=True)
+    path = native.MESSAGES + message["uuid"]
+    first, second = message["payload"]["questions"]
+    for q in (first, second):
+        invoke(api, path, "vote", selection(q), user=room[1])
+
+    def voters(q):
+        return api.get(
+            path + "/poll_voters/",
+            params={"question_uuid": q["uuid"], "option_uuid": q["options"][0]["uuid"]},
+        )
+
+    assert voters(first).status_code == 403
+    invoke(api, path, "vote", selection(first))
+    assert voters(first).status_code == 200
+    assert voters(second).status_code == 403
+    invoke(api, path, "vote", selection(first, selected=False))
+    assert voters(first).status_code == 403
+    invoke(api, path, "close_poll", {})
+    assert voters(first).status_code == 200
+    assert voters(second).status_code == 200
+
+
 def test_poll_clicks_noop_and_personal_snapshots(api, db, room):
     message = create(api, room, is_anonymous=True)
     stream, peer = room
