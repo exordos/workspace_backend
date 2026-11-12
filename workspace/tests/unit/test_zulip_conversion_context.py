@@ -1,7 +1,7 @@
 # Copyright 2026 Genesis Corporation.
 # Licensed under the Apache License, Version 2.0 (the "License").
 
-"""Compatibility with the frozen 3.0.10 context and bounded batch catalog work."""
+"""Stable source message links and bounded batch catalog work."""
 
 import asyncio
 import collections.abc
@@ -15,7 +15,7 @@ from tools import benchmark_history_prepare as benchmark
 from workspace.bridges.zulip import incoming_operations, message_conversion
 
 
-def legacy_context(
+def reference_context(
     account: dict,
     data: dict,
     stream: dict,
@@ -31,10 +31,11 @@ def legacy_context(
         "own_user_id": account["external_account_id"],
         "normalize_emoji": True,
         "strict_identities": True,
+        "provider_message_reference_policy": message_conversion.PROVIDER_MESSAGE_REFERENCE_POLICY,
         "current_message_uuid": str(public_uuid),
         "message_uuids": {str(data["id"]): str(public_uuid)},
         "topic_uuids": {},
-        "messages": prepared.get("quoted_messages", {}),
+        "messages": {},
         "mention_uuids": {},
         "stream_uuids": {},
         "stream_ids": {},
@@ -56,8 +57,6 @@ def legacy_context(
         context["topic_uuids"][f"{stream['name']}>{data['subject']}"] = str(
             topic["uuid"]
         )
-    for item in prepared.get("references", []):
-        context["message_uuids"][item["remote_id"]] = str(item["uuid"])
     for item in prepared.get("topics", []):
         context["topic_uuids"][f"{item['stream_name']}>{item['name']}"] = str(
             item["uuid"]
@@ -112,7 +111,7 @@ def example():
 @pytest.mark.parametrize(
     "profile", ["stream", "done", "dm", "mentions", "quote", "unsupported"]
 )
-def test_batch_context_matches_release_bytes_and_converted_payload(example, profile):
+def test_batch_context_matches_reference_bytes_and_converted_payload(example, profile):
     account, data, stream, topic, public, prepared = copy.deepcopy(example)
     if profile == "done":
         data["subject"] = "✔ topic-0"
@@ -135,7 +134,7 @@ def test_batch_context_matches_release_bytes_and_converted_payload(example, prof
         )
     elif profile == "unsupported":
         data["content"] = "```math\nx+y\n```"
-    expected = legacy_context(account, data, stream, topic, public, prepared)
+    expected = reference_context(account, data, stream, topic, public, prepared)
     shared = incoming_operations.conversion_context_base(account, prepared)
     actual = incoming_operations.conversion_context(
         account, data, stream, topic, public, prepared, base=shared
@@ -174,7 +173,7 @@ def test_catalog_override_order_is_preserved(example, direct):
     prepared["topics"].append(
         {**topic, "uuid": benchmark.identifier("override-topic", 1)}
     )
-    expected = legacy_context(account, data, stream, topic, public, prepared)
+    expected = reference_context(account, data, stream, topic, public, prepared)
     shared = incoming_operations.conversion_context_base(account, prepared)
     actual = incoming_operations.conversion_context(
         account, data, stream, topic, public, prepared, base=shared
@@ -203,7 +202,7 @@ def test_batch_messages_do_not_leak_dynamic_context(example):
     assert str(data["id"]) not in second["message_uuids"]
     assert first["current_message_uuid"] != second["current_message_uuid"]
     assert encoded(second) == encoded(
-        legacy_context(
+        reference_context(
             account,
             {**data, "id": 999},
             stream,
@@ -269,7 +268,7 @@ def test_complete_prepared_rows_match_release_context(new_topics):
     with mock.patch.object(
         incoming_operations,
         "conversion_context",
-        side_effect=lambda *args, **kwargs: legacy_context(*args),
+        side_effect=lambda *args, **kwargs: reference_context(*args),
     ):
         expected = asyncio.run(benchmark.prepare(account, page, database))
     actual = asyncio.run(benchmark.prepare(account, page, database))

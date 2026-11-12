@@ -52,6 +52,7 @@ _REFERENCE_URN = re.compile(
 )
 _SILENT_USER_LINK = re.compile(r'\]\(urn:user:[\da-f-]{36} "silent"\)', re.IGNORECASE)
 _MAX_QUOTE_DEPTH = 32
+PROVIDER_MESSAGE_REFERENCE_POLICY = "source-snapshots-v2"
 
 
 class _ConversionLimitExceeded(Exception):
@@ -511,6 +512,8 @@ class _ZulipToWorkspace:
         if (url.scheme, url.netloc) == (server.scheme, server.netloc):
             message_id = _near_id(absolute)
             if message_id is not None:
+                if self.context.get("provider_message_reference_policy"):
+                    return f"urn:url:{absolute}"
                 mapped = self.context.get("message_uuids", {}).get(message_id)
                 if mapped is not None:
                     return f"urn:message:{mapped}"
@@ -664,8 +667,17 @@ class _ZulipToWorkspace:
                     topic = value
                 label = "#" + topic.replace(">", " > ")
                 if separator:
-                    mapped = self.context.get("message_uuids", {}).get(message_id)
-                    target = f"urn:message:{mapped}" if mapped else None
+                    if (
+                        self.context.get("provider_message_reference_policy")
+                        and message_id.isdigit()
+                    ):
+                        target = (
+                            f"urn:url:{self.context['server_url'].rstrip('/')}"
+                            f"/#narrow/near/{message_id}"
+                        )
+                    else:
+                        mapped = self.context.get("message_uuids", {}).get(message_id)
+                        target = f"urn:message:{mapped}" if mapped else None
                 elif ">" in topic:
                     mapped = self.context.get("topic_uuids", {}).get(topic)
                     target = f"urn:topic:{mapped}" if mapped else None
@@ -749,6 +761,7 @@ class _ZulipToWorkspace:
                     message_id = _near_id(header["url"]) if header else None
                     if (
                         header is not None
+                        and not self.context.get("provider_message_reference_policy")
                         and message_id is not None
                         and urllib.parse.urlsplit(header["url"]).netloc
                         == urllib.parse.urlsplit(self.context["server_url"]).netloc
@@ -792,7 +805,14 @@ class _ZulipToWorkspace:
                                     )
                                 )
                     else:
-                        output.append(self.snapshot(self.inline(content, quoted=True)))
+                        converted = (
+                            self.body(content, quoted=True, depth=depth + 1)
+                            if self.context.get("provider_message_reference_policy")
+                            and header is not None
+                            and message_id is not None
+                            else self.inline(content, quoted=True)
+                        )
+                        output.append(self.snapshot(converted))
                         if header is not None and self.context.get("strict_identities"):
                             source = self.target(header["url"])
                             output.append(

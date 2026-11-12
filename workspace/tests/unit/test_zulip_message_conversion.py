@@ -14,6 +14,7 @@ import pytest
 
 from workspace.bridges.zulip import message_conversion
 from workspace.bridges.zulip import content_cache
+from workspace.bridges.zulip import incoming_operations
 
 
 @pytest.mark.parametrize(
@@ -48,6 +49,57 @@ EXAMPLES = json.loads(
     (pathlib.Path(__file__).parents[1] / "fixtures" / "zulip_messages.json").read_text()
 )
 MESSAGES = {str(example["message"]["id"]): example["message"] for example in EXAMPLES}
+
+
+@pytest.mark.parametrize(
+    "fragment",
+    [
+        "narrow/near/101",
+        "narrow/with/101",
+        "narrow/channel/42-Channel/topic/General/near/101",
+        "narrow/channel/42-Channel/topic/General/with/101",
+    ],
+)
+def test_message_reference_fingerprints_cover_accepted_provider_link_forms(fragment):
+    url = "https://zulip.example.test/#" + fragment
+    assert message_conversion._near_id(url) == "101"
+    assert incoming_operations.references(
+        [{"sender_id": 7, "content": f"[Target]({url})"}]
+    )["messages"] == ["101"]
+
+
+@pytest.mark.parametrize("syntax", ["link", "bare", "channel", "quote", "nested_quote"])
+def test_shared_provider_links_do_not_depend_on_local_target_knowledge(syntax):
+    origin = "https://zulip.example.test"
+    target = origin + "/#narrow/near/101"
+    content = {
+        "link": f"[Target]({target})",
+        "bare": target,
+        "channel": "#**Channel>General@101**",
+        "quote": f"@_**Alice|7** [said]({target}):\n```quote\nSupplied text\n```",
+        "nested_quote": (
+            f"@_**Alice|7** [said]({target}):\n````quote\n"
+            "```quote\nSupplied text\n```\n````"
+        ),
+    }[syntax]
+    context = {
+        "server_url": origin,
+        "original_url": origin + "/#narrow/near/201",
+        "current_message_uuid": "11111111-1111-4111-8111-111111111111",
+        "strict_identities": True,
+        "provider_message_reference_policy": message_conversion.PROVIDER_MESSAGE_REFERENCE_POLICY,
+        "message_uuids": {},
+        "messages": {},
+    }
+    message = {"id": 201, "content": content}
+    before = message_conversion.zulip_to_workspace(message, context)
+    context["message_uuids"]["101"] = "22222222-2222-4222-8222-222222222222"
+    context["messages"]["101"] = {"content": "Private target body"}
+    after = message_conversion.zulip_to_workspace(message, context)
+    assert after == before
+    assert f"urn:url:{target}" in after["content"]
+    assert "urn:message:" not in after["content"]
+    assert "urn:quote:" not in after["content"]
 FILE_COUNTS = {
     "fenced_literal_markup": 1,
     "uploaded_document": 1,

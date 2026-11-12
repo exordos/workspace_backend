@@ -304,25 +304,11 @@ async def context(
         ],
         key=lambda row: str(row["uuid"]),
     )
+    # Only blocks containing source message references need the new policy.
+    # Unrelated receipts keep their existing context fingerprint.
     references = (
-        prepared["references"]
-        if prepared is not None
-        else await incoming_operations.rows(
-            connection,
-            incoming_operations.SELECT_MESSAGE_REFERENCES_SQL,
-            (
-                account["project_id"],
-                account["owner_user_uuid"],
-                sorted(refs["messages"]),
-                account["provider_uuid"],
-            ),
-        )
+        message_conversion.PROVIDER_MESSAGE_REFERENCE_POLICY if refs["messages"] else {}
     )
-    references = {
-        str(row["remote_id"]): str(row["uuid"])
-        for row in references
-        if str(row["remote_id"]) in refs["messages"]
-    }
     active = {row["provider_identity"] for row in streams if row["active"]}
     paths = upload_paths(
         account,
