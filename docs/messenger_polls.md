@@ -59,6 +59,10 @@ queue. Repeated submessages and retries do not duplicate votes. An incoming
 provider snapshot preserves local selections whose outgoing writes are pending.
 Provider widgets outside the native payload limits remain readable snapshots.
 
+Shared provider observations preserve each connected account's own read and
+starred flags for polls as well as text messages. Poll payloads do not have a
+Markdown `content` field and do not contribute text mentions.
+
 Zulip widgets cannot close or enforce a different voting policy. Those settings
 are fixed for a compatible poll in a Zulip conversation; the API returns 409
 rather than accepting a change that the other client would ignore. Create an
