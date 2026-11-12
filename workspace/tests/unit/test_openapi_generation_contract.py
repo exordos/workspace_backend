@@ -4,10 +4,12 @@
 # you may not use this file except in compliance with the License.
 
 import json
+import pathlib
 from unittest import mock
 
 import pytest
 import webob
+import yaml
 from restalchemy.api import applications
 from restalchemy.api import constants
 from restalchemy.api import contexts
@@ -255,6 +257,26 @@ def _build_openapi(app_module):
     assert specification["openapi"] == OPENAPI_VERSION
     json.dumps(specification)
     return specification
+
+
+def test_published_poll_state_schema_matches_the_generated_response():
+    specification = _build_openapi(workspace_app)
+    published = yaml.safe_load(
+        (
+            pathlib.Path(__file__).resolve().parents[3]
+            / "docs/public_workspace_api.yaml"
+        ).read_text()
+    )
+    assert (
+        _component_schema(published, "WorkspaceUserMessage_Get")["properties"][
+            "poll_state"
+        ]
+        == (
+            _component_schema(specification, "WorkspaceUserMessage_Get")["properties"][
+                "poll_state"
+            ]
+        )
+    )
 
 
 def _assert_all_local_references_resolve(specification):
