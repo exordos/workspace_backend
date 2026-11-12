@@ -1071,6 +1071,19 @@ components:
                       minimum: 0
                     example:
                       key: 0
+                  option_voter_previews:
+                    type: object
+                    additionalProperties:
+                      type: array
+                      items:
+                        type: string
+                        example: 00000000-0000-0000-0000-000000000000
+                        format: uuid
+                      minItems: 1
+                      maxItems: 20
+                    example:
+                      key:
+                      - 00000000-0000-0000-0000-000000000000
                 additionalProperties: false
                 required:
                 - question_uuid
