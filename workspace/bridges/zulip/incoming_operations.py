@@ -3384,7 +3384,7 @@ class Operations:
         state_cursor = await connection.execute(
             ENSURE_MESSAGE_MENTIONS_SQL,
             (
-                message["payload"]["content"].lower(),
+                message_payloads.markdown_content(message["payload"]).lower(),
                 account["project_id"],
                 placement["uuid"],
                 [account["owner_user_uuid"]],
