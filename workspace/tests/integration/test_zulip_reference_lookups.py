@@ -5,7 +5,7 @@ import uuid
 
 import pytest
 
-from workspace.bridges.zulip import incoming_operations, outgoing_operations
+from workspace.bridges.zulip import outgoing_operations
 from workspace.tests.integration import test_projection_performance as projection_tests
 from workspace.tests.integration import test_zulip_bounded_lookups as bounded_tests
 from workspace.tests.integration import test_zulip_incoming as incoming_tests
@@ -61,39 +61,6 @@ def test_outgoing_message_reference_does_not_scan_unrelated_history(
     assert scanned < 100, plan
 
 
-@pytest.mark.isolated_schema
-@pytest.mark.parametrize(
-    "identities", [["101"], ["101", "101", "missing"], ["missing"]]
-)
-def test_message_reference_lookup_does_not_scan_unrelated_history(
-    large_history, identities
-):
-    db, account, target = large_history
-    args = list(parameters(account))
-    args[2] = identities
-    assert db.execute(
-        incoming_operations.SELECT_MESSAGE_REFERENCES_SQL, args
-    ).fetchall() == ([(target[3], "101")] if "101" in identities else [])
-    plan = db.execute(
-        "EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) "
-        + incoming_operations.SELECT_MESSAGE_REFERENCES_SQL,
-        args,
-    ).fetchone()[0][0]
-    scanned = sum(
-        (node["Actual Rows"] + node.get("Rows Removed by Filter", 0))
-        * node["Actual Loops"]
-        for node in projection_tests._plan_nodes(plan["Plan"])
-        if node.get("Relation Name")
-        in {
-            "messenger_messages",
-            "messenger_message_placements",
-            "messenger_user_message_bindings",
-            "messenger_user_message_unreads",
-        }
-    )
-    assert scanned < 100, plan
-
-
 @pytest.mark.parametrize(
     "case",
     [
@@ -110,8 +77,8 @@ def test_message_reference_lookup_does_not_scan_unrelated_history(
         "other_provider",
     ],
 )
-def test_message_references_keep_the_complete_visibility_rules(incoming, case):
-    _, db, account, _, _ = incoming
+def test_message_reads_and_outgoing_references_keep_target_access_checks(incoming, case):
+    api, db, account, _, _ = incoming
     incoming_tests.apply(incoming, incoming_tests.event(identifier=101))
     message, placement, topic, stream = db.execute(
         "SELECT message.uuid,placement.uuid,placement.topic_uuid,placement.stream_uuid "
@@ -160,13 +127,15 @@ def test_message_references_keep_the_complete_visibility_rules(incoming, case):
         args[{"other_project": 0, "other_user": 1, "other_provider": 3}[case]] = (
             uuid.uuid4()
         )
-    assert db.execute(
-        incoming_operations.SELECT_MESSAGE_REFERENCES_SQL, args
-    ).fetchall() == ([(placement, "101")] if case in ("visible", "empty_flags") else [])
     for identifier in (placement, message):
         reference_args = (args[0], args[1], identifier) * 2
         assert db.execute(
             outgoing_operations.SELECT_MESSAGE_REFERENCE_SQL, reference_args
         ).fetchall() == (
             [(message,)] if case in ("visible", "empty_flags", "other_provider") else []
+        )
+    if case not in ("other_project", "other_provider"):
+        response = api.get(f"/v1/messenger/messages/{placement}", user=args[1])
+        assert response.status_code == (
+            200 if case in ("visible", "empty_flags") else 404
         )

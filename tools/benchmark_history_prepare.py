@@ -22,7 +22,7 @@ import time
 import uuid
 from unittest import mock
 
-from workspace.bridges.zulip import history, incoming_operations
+from workspace.bridges.zulip import history
 
 
 def identifier(kind, number):
@@ -99,7 +99,6 @@ class Database:
         if query in (
             history.MESSAGES_SQL,
             history.FILES_SQL,
-            incoming_operations.SELECT_MESSAGE_REFERENCES_SQL,
         ):
             return []
         if (

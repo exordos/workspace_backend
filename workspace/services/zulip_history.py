@@ -203,12 +203,32 @@ class ZulipHistoryService:
                 and receipt["upper_id"] == batch["before_id"]
                 and receipt["data_hash"] == data_hash
             ):
+                if state_hash == receipt["state_hash"] and await self.busy(
+                    account["project_id"]
+                ):
+                    await self.defer(account, self.poll_interval)
+                    return
                 async with self.db.transaction() as connection:
                     context_hash = await history_blocks.context(
                         connection, account, batch["messages"], self.reaction_user_limit
                     )
-                if context_hash == receipt["context_hash"]:
-                    mode = "skip" if state_hash == receipt["state_hash"] else "flags"
+                    if context_hash == receipt["context_hash"]:
+                        mode = (
+                            "skip" if state_hash == receipt["state_hash"] else "flags"
+                        )
+                        if mode == "skip":
+                            if not await self.operations.current(connection, account):
+                                return
+                            # No preparation runs between validation and cursor
+                            # advancement, so this is the final context check.
+                            fetched = prepared = time.monotonic()
+                            await self.advance(connection, account, batch)
+                            merged = time.monotonic()
+                if mode == "skip":
+                    self.log_batch(
+                        account, batch, mode, started, fetched, prepared, merged
+                    )
+                    return
             fetched = time.monotonic()
             normalized: dict = {}
             if mode == "flags":
@@ -241,7 +261,7 @@ class ZulipHistoryService:
             async with self.db.transaction() as connection:
                 if not await self.operations.current(connection, account):
                     return
-                if mode != "full" and context_hash != await history_blocks.context(
+                if mode == "flags" and context_hash != await history_blocks.context(
                     connection, account, batch["messages"], self.reaction_user_limit
                 ):
                     return
@@ -282,42 +302,9 @@ class ZulipHistoryService:
                             "DELETE FROM zulip_history_block_receipts WHERE external_account_uuid=%s AND upper_id=%s",
                             (account["uuid"], batch["before_id"]),
                         )
-                await connection.execute(
-                    f"""
-                    UPDATE {history.account_table(account)} SET before_id=%s,finished=%s,error=NULL,next_attempt_at=now()
-                    WHERE external_account_uuid=%s AND cutoff_at=%s
-                """,
-                    (
-                        batch["next_before_id"],
-                        batch["finished"],
-                        account["uuid"],
-                        account["cutoff_at"],
-                    ),
-                )
-                await connection.execute(
-                    f"DELETE FROM {history.batch_table(account)} WHERE id=%s",
-                    (batch["id"],),
-                )
-                if account.get("_recovery") and batch["finished"]:
-                    await connection.execute(
-                        "DELETE FROM zulip_history_recovery_accounts WHERE external_account_uuid=%s AND cutoff_at=%s",
-                        (account["uuid"], account["cutoff_at"]),
-                    )
+                await self.advance(connection, account, batch)
                 merged = time.monotonic()
-            finished = time.monotonic()
-            LOG.info(
-                "History batch account=%s messages=%s before=%s mode=%s fetch_ms=%.1f prepare_ms=%.1f merge_ms=%.1f commit_ms=%.1f total_ms=%.1f range=%s",
-                account["uuid"],
-                len(batch["messages"]),
-                batch["next_before_id"],
-                mode,
-                1000 * (fetched - started),
-                1000 * (prepared - fetched),
-                1000 * (merged - prepared),
-                1000 * (finished - merged),
-                1000 * (finished - started),
-                "recovery" if account.get("_recovery") else "initial",
-            )
+            self.log_batch(account, batch, mode, started, fetched, prepared, merged)
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -329,6 +316,55 @@ class ZulipHistoryService:
             """,
                 (str(error), account["uuid"], account["cutoff_at"]),
             )
+
+    async def advance(
+        self, connection: psycopg.AsyncConnection[dict], account: dict, batch: dict
+    ) -> None:
+        await connection.execute(
+            f"""
+            UPDATE {history.account_table(account)} SET before_id=%s,finished=%s,error=NULL,next_attempt_at=now()
+            WHERE external_account_uuid=%s AND cutoff_at=%s
+        """,
+            (
+                batch["next_before_id"],
+                batch["finished"],
+                account["uuid"],
+                account["cutoff_at"],
+            ),
+        )
+        await connection.execute(
+            f"DELETE FROM {history.batch_table(account)} WHERE id=%s", (batch["id"],)
+        )
+        if account.get("_recovery") and batch["finished"]:
+            await connection.execute(
+                "DELETE FROM zulip_history_recovery_accounts WHERE external_account_uuid=%s AND cutoff_at=%s",
+                (account["uuid"], account["cutoff_at"]),
+            )
+
+    def log_batch(
+        self,
+        account: dict,
+        batch: dict,
+        mode: str,
+        started: float,
+        fetched: float,
+        prepared: float,
+        merged: float,
+    ) -> None:
+        finished = time.monotonic()
+        LOG.info(
+            "History batch account=%s messages=%s before=%s mode=%s fetch_ms=%.1f prepare_ms=%.1f merge_ms=%.1f commit_ms=%.1f total_ms=%.1f range=%s",
+            account["uuid"],
+            len(batch["messages"]),
+            batch["next_before_id"],
+            mode,
+            1000 * (fetched - started),
+            1000 * (prepared - fetched),
+            1000 * (merged - prepared),
+            1000 * (finished - merged),
+            1000 * (finished - started),
+            "recovery" if account.get("_recovery") else "initial",
+        )
 
     async def fetch_block(
         self, account: dict, batch: dict, receipt: dict | None

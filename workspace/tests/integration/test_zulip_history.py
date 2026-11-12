@@ -2,6 +2,7 @@
 # Licensed under the Apache License, Version 2.0 (the "License").
 
 import asyncio
+import base64
 import contextlib
 import copy
 import datetime
@@ -1115,7 +1116,7 @@ def test_history_snapshot_preserves_native_reaction_facts_and_aggregates(incomin
     assert result["reactions"] == {"heart": 1}
 
 
-def test_bulk_page_resolves_quotes_before_either_message_is_persisted(incoming):
+def test_bulk_page_keeps_source_quote_snapshot_and_link(incoming):
     api, db, account, _, _ = incoming
     messages = {
         101: message(101, "Source text"),
@@ -1134,11 +1135,11 @@ def test_bulk_page_resolves_quotes_before_either_message_is_persisted(incoming):
     asyncio.run(run())
     rows = api.get("/v1/messenger/messages/").json()
     by_remote = {row["provider_identity"]: row for row in rows}
-    assert (
-        f"urn:quote:{by_remote['101']['uuid']}"
-        in by_remote["102"]["payload"]["content"]
-    )
-    assert "urn:forward:" not in by_remote["102"]["payload"]["content"]
+    content = by_remote["102"]["payload"]["content"]
+    snapshot = base64.urlsafe_b64encode(b"Source text").decode().rstrip("=")
+    assert f"urn:forward:{by_remote['102']['uuid']}?snapshot={snapshot}" in content
+    assert "urn:url:https://zulip.example.com/#narrow/near/101" in content
+    assert "urn:quote:" not in content
 
 
 @pytest.mark.parametrize("separate_streams", [False, True])
@@ -2243,7 +2244,7 @@ def test_new_topic_reference_in_same_block_is_reconverted_before_skipping(incomi
     ).fetchone()[0]
     assert "urn:topic:" in str(payload)
     request(db, account, cutoff_id=102)
-    asyncio.run(repeated(1))
+    asyncio.run(repeated(0))
     edited = db.execute(
         "SELECT content_updated_at FROM messenger_messages WHERE project_id=%s AND provider_identity='101'",
         (account["project_id"],),

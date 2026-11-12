@@ -392,22 +392,6 @@ class Operations(incoming_operations.Operations):
                 identifier, incoming_operations._uuid_text(uuid_strings, stream_uuid)
             )
         prepared = {"catalog": people, "streams": streams, "topics": topics}
-        prepared["references"] = await self.db.sql(
-            incoming_operations.SELECT_MESSAGE_REFERENCES_SQL,
-            (
-                account["project_id"],
-                account["owner_user_uuid"],
-                refs["messages"],
-                account["provider_uuid"],
-            ),
-        )
-        # Every page member will be visible after this merge, including quote
-        # targets which have not reached the working tables yet.
-        prepared["references"].extend(
-            {"remote_id": remote, "uuid": placement}
-            for remote, placement in public_ids.items()
-        )
-        prepared["quoted_messages"] = {str(item["id"]): item for item in messages}
         files = await self.prepare_files(account, messages, stream_map, users)
         context_base = incoming_operations.conversion_context_base(
             account, prepared, uuid_strings=uuid_strings
@@ -645,7 +629,6 @@ class Operations(incoming_operations.Operations):
             # New topics are used for their own placements, but cross-message
             # references were converted with the pre-merge resolver snapshot.
             "topics": topics,
-            "references": prepared["references"],
             "files": [record for record in files.values() if "missing" not in record],
             "edited": {
                 str(row["uuid"]): row["content_updated_at"]

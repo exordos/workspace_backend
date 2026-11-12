@@ -166,27 +166,6 @@ SELECT_TOPIC_REFERENCES_SQL = """
       AND (topic.provider_identity=ANY(%s::text[])
            OR stream.name || '>' || topic.name=ANY(%s::text[]))
 """
-SELECT_MESSAGE_REFERENCES_SQL = """
-    WITH scope(project_id,user_uuid,identities,provider_uuid) AS (
-        VALUES (%s::uuid,%s::uuid,%s::text[],%s::uuid)
-    )
-    SELECT visible.uuid, message.provider_identity AS remote_id
-    FROM scope JOIN messenger_messages message
-      ON message.project_id=scope.project_id AND message.provider_uuid=scope.provider_uuid
-     AND message.provider_identity=ANY(scope.identities)
-    CROSS JOIN LATERAL (
-        SELECT uuid FROM messenger_message_placements
-        WHERE project_id=message.project_id AND message_uuid=message.uuid
-        OFFSET 0
-    ) placement
-    CROSS JOIN LATERAL (
-        SELECT visible.uuid FROM messenger_api_user_messages_v1 visible
-        WHERE visible.project_id=message.project_id AND visible.user_uuid=scope.user_uuid
-          AND visible.uuid=placement.uuid AND visible.visible
-        -- Resolve canonical identities before expanding the keyed visibility view.
-        OFFSET 0
-    ) visible
-"""
 SELECT_SCOPED_FILE_SQL = """
     SELECT file.* FROM m_workspace_files file
     WHERE file.project_id=%s AND (file.stream_uuid=%s OR file.acl_mode='public')
@@ -605,7 +584,7 @@ def references(messages: list) -> dict:
                 message_ids.add(remote)
             elif ">" in value:
                 named_topics.add(value)
-        message_ids.update(re.findall(r"near/([0-9]+)", content))
+        message_ids.update(re.findall(r"(?:near|with)/(\d+)", content))
         for stream, topic in re.findall(
             r"channel/(\d+)(?:-[^/\s)]+)?/topic/([^/\s)]+)", content
         ):
@@ -631,7 +610,7 @@ def conversion_context_base(
 ) -> dict:
     """Resolve the immutable catalog once for a history page."""
     strings: dict = {} if uuid_strings is None else uuid_strings
-    mentions, streams, stream_ids, direct, messages, topics = {}, {}, {}, {}, {}, {}
+    mentions, streams, stream_ids, direct, topics = {}, {}, {}, {}, {}
     for person in prepared.get("catalog", []):
         user = _uuid_text(strings, person["owner_user_uuid"])
         mentions[f"id:{person['external_account_id']}"] = user
@@ -643,8 +622,6 @@ def conversion_context_base(
         stream_ids[item["name"]] = item["provider_identity"]
         if item["provider_identity"].startswith("dm:"):
             direct[item["provider_identity"]] = identifier
-    for item in prepared.get("references", []):
-        messages[item["remote_id"]] = _uuid_text(strings, item["uuid"])
     for item in prepared.get("topics", []):
         topics[f"{item['stream_name']}>{item['name']}"] = _uuid_text(
             strings, item["uuid"]
@@ -653,12 +630,12 @@ def conversion_context_base(
         "server_url": account["settings"]["server_url"],
         "zulip_namespace": _uuid_text(strings, account["provider_uuid"]),
         "own_user_id": account["external_account_id"],
-        "messages": prepared.get("quoted_messages", {}),
+        "messages": {},
         "mention_uuids": types.MappingProxyType(mentions),
         "stream_uuids": types.MappingProxyType(streams),
         "stream_ids": types.MappingProxyType(stream_ids),
         "dm_stream_uuids": types.MappingProxyType(direct),
-        "message_uuids": types.MappingProxyType(messages),
+        "message_uuids": types.MappingProxyType({}),
         "topic_uuids": types.MappingProxyType(topics),
         "uuid_strings": strings,
     }
@@ -696,6 +673,7 @@ def conversion_context(
         "own_user_id": base["own_user_id"],
         "normalize_emoji": True,
         "strict_identities": True,
+        "provider_message_reference_policy": message_conversion.PROVIDER_MESSAGE_REFERENCE_POLICY,
         "current_message_uuid": public,
         # Catalog entries used to be assigned after these per-message defaults.
         # ChainMap preserves both their precedence and insertion order.
@@ -1757,38 +1735,6 @@ class Operations:
             if references_["remote_topics"] or references_["named_topics"]
             else []
         )
-        referenced = references_["messages"]
-        prepared["references"] = (
-            await self.db.sql(
-                SELECT_MESSAGE_REFERENCES_SQL,
-                (
-                    account["project_id"],
-                    account["owner_user_uuid"],
-                    list(referenced),
-                    account["provider_uuid"],
-                ),
-            )
-            if referenced
-            else []
-        )
-        prepared["quoted_messages"] = {}
-        if any("quote" in message["content"] for message in prepared["messages"]):
-            for identifier in referenced:
-                try:
-                    remote = await self.http.request(
-                        account,
-                        "GET",
-                        f"/messages/{identifier}",
-                        {"apply_markdown": False},
-                    )
-                except outgoing_operations.ApiError as error:
-                    if (
-                        error.status != 403
-                        and not outgoing_operations.Operations.absent(error)
-                    ):
-                        raise
-                else:
-                    prepared["quoted_messages"][identifier] = remote["message"]
         return prepared
 
     async def person(self, connection: typing.Any, account: dict, data: dict) -> object:
