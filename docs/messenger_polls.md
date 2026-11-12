@@ -30,7 +30,7 @@ Use the public message UUID for the following endpoints. All four POST actions r
 
 | Endpoint relative to `messages/{uuid}/` | Body or query |
 | --- | --- |
-| `POST actions/vote/invoke` | `{question_uuid, option_uuid, selected}`. Set or remove one selection. Repeating its current value makes no change. |
+| `POST actions/vote/invoke` | `{question_uuid, option_uuid, selected}`. Set or remove one selection. Repeating its current value makes no change. For a synchronized poll, this also retries the latest failed provider write for that option; successful and pending writes are not repeated. |
 | `POST actions/close_poll/invoke` | `{}`. Close permanently. |
 | `POST actions/update_settings/invoke` | `{settings: {closes_at, allow_adding_options}}`. Save both fields together; null removes a future deadline. |
 | `POST actions/add_poll_option/invoke` | `{question_uuid, option: {uuid, text}}`. Append without voting. Retrying the same UUID and text succeeds even after closing. |

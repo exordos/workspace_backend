@@ -192,6 +192,7 @@ def test_compatible_poll_sends_votes_revokes_and_options_through_the_durable_wor
             assert response.status_code == 200, response.text
             await outbound.drain(service)
             assert poll_conversion.read(server.messages[101]).votes["canned,0"] == set()
+
             option = {"uuid": str(uuid.uuid4()), "text": "Wednesday"}
             response = api.post(
                 path + "/actions/add_poll_option/invoke",
@@ -219,6 +220,28 @@ def test_compatible_poll_sends_votes_revokes_and_options_through_the_durable_wor
             await asyncio.gather(*list(service.tasks.values()))
             assert api.get(path).json()["status"] == "error"
             assert poll_conversion.read(server.messages[101]).votes["canned,0"] == set()
+
+            # Retrying the same local selection must recover a failed provider
+            # write without requiring a locally visible unvote first.
+            attempts = db.execute(
+                "SELECT COUNT(*) FROM zulip_outgoing_intents"
+            ).fetchone()[0]
+            server.deny_submessages = False
+            retried = api.post(path + "/actions/vote/invoke", json=vote)
+            assert retried.status_code == 200
+            assert retried.json()["status"] == "new"
+            # A retry while its replacement is pending remains idempotent.
+            assert api.post(path + "/actions/vote/invoke", json=vote).status_code == 200
+            await outbound.drain(service)
+            assert poll_conversion.read(server.messages[101]).votes["canned,0"] == {7}
+            calls = len(server.calls)
+            assert api.post(path + "/actions/vote/invoke", json=vote).status_code == 200
+            await outbound.drain(service)
+            assert len(server.calls) == calls
+            assert (
+                db.execute("SELECT COUNT(*) FROM zulip_outgoing_intents").fetchone()[0]
+                == attempts
+            )
 
     asyncio.run(run())
 
