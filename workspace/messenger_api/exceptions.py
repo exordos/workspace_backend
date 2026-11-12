@@ -38,6 +38,11 @@ class InvalidStreamBindingRoleError(ra_exc.ValidationErrorException):
     code = 400001004
 
 
+class StreamKeySharingUpdateForbiddenError(ra_exc.RestAlchemyException):
+    message = "Only the stream owner can change its key sharing setting"
+    code = 403
+
+
 class StreamBindingUsersPayloadError(ra_exc.ValidationErrorException):
     message = "Stream binding action expects role values to be user UUID lists"
     code = 400001005

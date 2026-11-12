@@ -916,6 +916,8 @@ Content-Type: application/json
 
 After creation, `encryption` is immutable. `PUT` rejects both `encryption` and `current_encryption_key_uuid`, including unchanged values. Only an `owner` may send `key_announced`; the message and new current UUID commit atomically. An announcement is allowed even when `encryption` is `false` and changes only the current UUID, not the flag. A newly created unencrypted stream returns `current_encryption_key_uuid: null`.
 
+`allow_key_sharing_by_holders` is a stream-wide boolean that defaults to `false`. Clients use it to decide who can answer a key request. With `false`, only the stream owner may share the requested key. With `true`, any stream participant holding that key may share it. The field is returned in stream responses and `stream.updated`. Only the stream owner can change it through `PUT /api/workspace/v1/messenger/streams/{stream_uuid}`.
+
 ## Stream Bindings
 
 Stream bindings are canonical PostgreSQL chat-membership records. New bindings

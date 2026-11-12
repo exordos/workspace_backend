@@ -412,6 +412,7 @@ class WorkspaceUserStreamBase(
         types.AllowNone(types.UUID()),
         default=None,
     )
+    allow_key_sharing_by_holders = properties.property(StrictBoolean(), default=False)
 
     notification_mode = properties.property(
         types.Enum([mode.value for mode in WorkspaceStreamNotificationMode]),
