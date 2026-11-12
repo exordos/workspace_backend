@@ -13,6 +13,7 @@ from restalchemy.dm import types
 from restalchemy.dm import types_dynamic
 
 from workspace.common import types as common_types
+from workspace.messenger_api import exceptions
 
 
 MAX_POLL_QUESTIONS = 20
@@ -175,9 +176,95 @@ class PollCreatePayload(types_dynamic.AbstractKindModel):
             ):
                 raise ra_exc.ValidationErrorException()
 
+    def validate_creation(self, now: datetime.datetime) -> None:
+        if (
+            (self.closes_at is not None and self.closes_at <= now)
+            or len(self.questions) > MAX_POLL_QUESTIONS
+            or any(
+                len(q["options"]) > MAX_POLL_OPTIONS_PER_QUESTION
+                for q in self.questions
+            )
+        ):
+            raise ra_exc.ValidationErrorException()
+
 
 class PollPayload(PollCreatePayload):
     closed_at = properties.property(NULLABLE_TIME, default=None)
+
+    def is_closed(self, now: datetime.datetime) -> bool:
+        return self.closed_at is not None or (
+            self.closes_at is not None and self.closes_at <= now
+        )
+
+    def question(self, identifier: str) -> dict:
+        for question in self.questions:
+            if str(question["uuid"]) == identifier:
+                return question
+        raise ra_exc.ValidationErrorException()
+
+    def select_options(
+        self,
+        question_uuid: str,
+        option_uuid: str,
+        selected: bool,
+        current: set[str],
+        now: datetime.datetime,
+    ) -> set[str]:
+        question = self.question(question_uuid)
+        if not any(
+            str(option["uuid"]) == option_uuid for option in question["options"]
+        ):
+            raise ra_exc.ValidationErrorException()
+        if selected == (option_uuid in current):
+            return current
+        if self.is_closed(now):
+            raise exceptions.PollClosedError()
+        replace = selected and bool(current) and not self.multiple_answers
+        if not self.allow_revote and (replace or not selected):
+            raise exceptions.PollRevoteForbiddenError()
+        if replace:
+            return {option_uuid}
+        return current | {option_uuid} if selected else current - {option_uuid}
+
+    def close(self, now: datetime.datetime) -> bool:
+        if self.is_closed(now):
+            return False
+        self.closed_at = now
+        return True
+
+    def append_option(
+        self, question_uuid: str, option: dict, now: datetime.datetime
+    ) -> bool:
+        question = self.question(question_uuid)
+        value = POLL_OPTION.from_simple_type(option)
+        for existing in question["options"]:
+            if existing["uuid"] == value["uuid"]:
+                if existing["text"] != value["text"]:
+                    raise exceptions.PollConflictError()
+                return False
+        if self.is_closed(now):
+            raise exceptions.PollClosedError()
+        if not self.allow_adding_options:
+            raise exceptions.PollConflictError()
+        if len(question["options"]) >= MAX_POLL_OPTIONS_PER_QUESTION:
+            raise ra_exc.ValidationErrorException()
+        question["options"].append(value)
+        return True
+
+    def update_settings(self, settings: dict, now: datetime.datetime) -> bool:
+        if self.is_closed(now):
+            raise exceptions.PollClosedError()
+        deadline = NULLABLE_TIME.from_simple_type(settings["closes_at"])
+        if deadline is not None and deadline <= now:
+            raise ra_exc.ValidationErrorException()
+        if (
+            self.closes_at == deadline
+            and self.allow_adding_options == settings["allow_adding_options"]
+        ):
+            return False
+        self.closes_at = deadline
+        self.allow_adding_options = settings["allow_adding_options"]
+        return True
 
 
 POLL_CREATE_TYPE = types_dynamic.KindModelType(PollCreatePayload)
@@ -192,19 +279,8 @@ def normalize_create(raw_payload: typing.Any, *, retry: bool = False) -> dict:
         if isinstance(raw_payload, PollCreatePayload)
         else POLL_CREATE_TYPE.from_simple_type(raw_payload)
     )
-    if not retry and (
-        (
-            payload.closes_at is not None
-            and payload.closes_at <= datetime.datetime.now(datetime.timezone.utc)
-        )
-        or len(payload.questions)
-        > MAX_POLL_QUESTIONS
-        or any(
-            len(q["options"]) > MAX_POLL_OPTIONS_PER_QUESTION
-            for q in payload.questions
-        )
-    ):
-        raise ra_exc.ValidationErrorException()
+    if not retry:
+        payload.validate_creation(datetime.datetime.now(datetime.timezone.utc))
     return {**POLL_CREATE_TYPE.to_simple_type(payload), "closed_at": None}
 
 

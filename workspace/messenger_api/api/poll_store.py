@@ -15,42 +15,25 @@ from workspace.messenger_api import exceptions
 from workspace.messenger_api.dm import base, polls
 
 
-def _instant(value: str) -> datetime.datetime:
-    return datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
-
-
-def _item(items: list, identifier: str) -> dict:
-    for item in items:
-        if item["uuid"] == identifier:
-            return item
-    raise ra_exc.ValidationErrorException()
-
-
 def _vote(
     session: sessions.PgSQLSession,
     key: tuple,
-    question: dict,
+    poll: polls.PollPayload,
     values: dict,
-    *,
-    allow_revote: bool,
-    multiple_answers: bool,
-    closed: bool,
+    now: datetime.datetime,
 ) -> bool:
-    _item(question["options"], values["option_uuid"])
     where = "project_id=%s AND message_uuid=%s AND user_uuid=%s AND question_uuid=%s"
     rows = session.execute(
         f"SELECT option_uuid FROM messenger_poll_votes WHERE {where}", key
     ).fetchall()
     current = {str(row["option_uuid"]) for row in rows}
     option = values["option_uuid"]
-    if values["selected"] == (option in current):
+    selected = poll.select_options(
+        values["question_uuid"], option, values["selected"], current, now
+    )
+    if selected == current:
         return False
-    if closed:
-        raise exceptions.PollClosedError()
-    replace = values["selected"] and current and not multiple_answers
-    if not allow_revote and (replace or not values["selected"]):
-        raise exceptions.PollRevoteForbiddenError()
-    if replace:
+    if values["selected"] and current and selected == {option}:
         session.execute(
             f"UPDATE messenger_poll_votes SET option_uuid=%s WHERE {where}",
             (option, *key),
@@ -67,24 +50,6 @@ def _vote(
             f"DELETE FROM messenger_poll_votes WHERE {where} AND option_uuid=%s",
             (*key, option),
         )
-    return True
-
-
-def _append_option(
-    question: dict, option: dict, *, closed: bool, allowed: bool
-) -> bool:
-    for existing in question["options"]:
-        if existing["uuid"] == option["uuid"]:
-            if existing["text"] != option["text"]:
-                raise exceptions.PollConflictError()
-            return False
-    if closed:
-        raise exceptions.PollClosedError()
-    if not allowed:
-        raise exceptions.PollConflictError()
-    if len(question["options"]) >= polls.MAX_POLL_OPTIONS_PER_QUESTION:
-        raise ra_exc.ValidationErrorException()
-    question["options"].append(option)
     return True
 
 
@@ -208,20 +173,14 @@ def mutate(
         raise exceptions.PollForbiddenError()
 
     now = session.execute("SELECT clock_timestamp() AS value", ()).fetchone()["value"]
-    deadline = payload["closes_at"]
-    closed = payload["closed_at"] is not None or (
-        deadline is not None and _instant(deadline) <= now
-    )
+    poll = polls.POLL_TYPE.from_simple_type(payload)
     if action == "vote":
-        question = _item(payload["questions"], values["question_uuid"])
         changed = _vote(
             session,
-            (project_uuid, canonical_uuid, user_uuid, question["uuid"]),
-            question,
+            (project_uuid, canonical_uuid, user_uuid, values["question_uuid"]),
+            poll,
             values,
-            allow_revote=payload["allow_revote"],
-            multiple_answers=payload["multiple_answers"],
-            closed=closed,
+            now,
         )
         if synchronized and changed:
             session.execute(
@@ -251,50 +210,27 @@ def mutate(
             )
         return
     if action == "close_poll":
-        if closed:
+        if not poll.close(now):
             return
-        payload["closed_at"] = (
-            now.astimezone(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
-        )
     elif action == "add_poll_option":
-        question = _item(payload["questions"], values["question_uuid"])
-        if synchronized:
-            prospective = {
-                **payload,
-                "questions": [
-                    {**question, "options": [*question["options"], values["option"]]}
-                ],
-            }
-            if not any(
-                o["uuid"] == values["option"]["uuid"] for o in question["options"]
-            ) and not poll_conversion.compatible(prospective):
-                raise exceptions.PollConflictError()
-        if not _append_option(
-            question,
-            values["option"],
-            closed=closed,
-            allowed=payload["allow_adding_options"],
-        ):
+        if not poll.append_option(values["question_uuid"], values["option"], now):
             return
+        if synchronized:
+            if not poll_conversion.compatible(polls.POLL_TYPE.to_simple_type(poll)):
+                raise exceptions.PollConflictError()
     elif action == "update_settings":
-        if closed:
-            raise exceptions.PollClosedError()
-        settings = values["settings"]
-        deadline = settings["closes_at"]
-        if deadline is not None and _instant(deadline) <= now:
-            raise ra_exc.ValidationErrorException()
-        if all(payload[key] == value for key, value in settings.items()):
+        if not poll.update_settings(values["settings"], now):
             return
         # Zulip initializes widgets only when creating a message. Editing a
         # delivered preview cannot turn that existing message into a widget.
         if row["source_name"] == "zulip" and poll_conversion.compatible(
-            {**payload, **settings}
+            polls.POLL_TYPE.to_simple_type(poll)
         ):
             raise exceptions.PollConflictError()
-        payload.update(settings)
     else:
         raise ra_exc.ValidationErrorException()
 
+    payload = polls.POLL_TYPE.to_simple_type(poll)
     session.execute(
         """UPDATE messenger_messages SET content_uuid=messenger_resolve_message_content(%s::jsonb,NULL),
                   poll_state_revision=poll_state_revision+1, updated_at=clock_timestamp() AT TIME ZONE 'UTC'
