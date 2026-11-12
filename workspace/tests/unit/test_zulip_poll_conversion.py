@@ -102,6 +102,33 @@ def test_provider_poll_identity_is_stable_and_preserves_exported_option_ids():
     assert poll_conversion.payload(observed, namespace, message["id"], native) == native
 
 
+def test_reused_provider_option_key_cannot_replace_an_option_or_erase_votes():
+    events = [
+        {
+            "widget_type": "poll",
+            "extra_data": {"question": "When?", "options": ["A", "B"]},
+        },
+        {"type": "new_option", "idx": 0, "option": "Wednesday"},
+        {"type": "vote", "key": "7,0", "vote": 1},
+        {"type": "new_option", "idx": 0, "option": "Thursday"},
+    ]
+    message = {
+        "sender_id": 7,
+        "submessages": [
+            {
+                "id": index,
+                "sender_id": 7,
+                "msg_type": "widget",
+                "content": json.dumps(data),
+            }
+            for index, data in enumerate(events, 1)
+        ],
+    }
+    observed = poll_conversion.read(message)
+    assert observed.options["7,0"] == "Wednesday"
+    assert observed.votes["7,0"] == {7}
+
+
 @pytest.mark.parametrize("question", ["", "Two\nlines", "@**Everyone**", " Padded "])
 def test_unrepresentable_provider_questions_remain_snapshots(question):
     observed = poll_conversion.Poll(

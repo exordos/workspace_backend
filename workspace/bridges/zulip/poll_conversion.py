@@ -138,6 +138,7 @@ def read(message: dict) -> Poll | None:
                 and 0 <= new_index <= 1000
                 and isinstance(new_label, str)
                 and new_label not in result.options.values()
+                and f"{sender},{new_index}" not in result.options
             ):
                 key = f"{sender},{new_index}"
                 result.options[key], result.votes[key] = new_label, set()
