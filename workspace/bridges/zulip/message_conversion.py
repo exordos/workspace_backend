@@ -52,7 +52,7 @@ _REFERENCE_URN = re.compile(
 )
 _SILENT_USER_LINK = re.compile(r'\]\(urn:user:[\da-f-]{36} "silent"\)', re.IGNORECASE)
 _MAX_QUOTE_DEPTH = 32
-PROVIDER_MESSAGE_REFERENCE_POLICY = "source-snapshots-v2"
+PROVIDER_MESSAGE_REFERENCE_POLICY = "source-snapshots-v3"
 
 
 class _ConversionLimitExceeded(Exception):
@@ -812,11 +812,30 @@ class _ZulipToWorkspace:
                             and message_id is not None
                             else self.inline(content, quoted=True)
                         )
-                        output.append(self.snapshot(converted))
+                        if quoted and self.context.get(
+                            "provider_message_reference_policy"
+                        ):
+                            # Nested snapshots share this message's identity;
+                            # clients treat those references as a quote cycle.
+                            output.append(
+                                "\n".join(
+                                    "> " + line if line else ">"
+                                    for line in converted.split("\n")
+                                )
+                            )
+                        else:
+                            output.append(self.snapshot(converted))
                         if header is not None and self.context.get("strict_identities"):
                             source = self.target(header["url"])
                             output.append(
-                                "\n"
+                                (
+                                    "\n\n"
+                                    if self.context.get(
+                                        "provider_message_reference_policy"
+                                    )
+                                    and message_id is not None
+                                    else "\n"
+                                )
                                 + (
                                     _markdown_link(
                                         _escape_label(header["name"]), source
@@ -845,9 +864,16 @@ class _ZulipToWorkspace:
                     position = line_end
                     line_end = text.find("\n", position) + 1 or len(text)
                 content = "".join(lines)
-                output.append(
-                    self.snapshot(self.inline(content.removesuffix("\n"), quoted=True))
-                )
+                converted = self.inline(content.removesuffix("\n"), quoted=True)
+                if quoted and self.context.get("provider_message_reference_policy"):
+                    output.append(
+                        "\n".join(
+                            "> " + line if line else ">"
+                            for line in converted.split("\n")
+                        )
+                    )
+                else:
+                    output.append(self.snapshot(converted))
                 if content.endswith("\n"):
                     output.append("\n")
             else:
