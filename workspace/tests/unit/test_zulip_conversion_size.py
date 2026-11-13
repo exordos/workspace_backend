@@ -146,7 +146,12 @@ def test_unsupported_block_attachment_list_includes_separator_budget(context):
     assert target.call_count < 1000
 
 
-def test_deep_quotes_stop_before_recursion_or_snapshot_growth(context):
+@pytest.mark.parametrize("source_policy", [False, True])
+def test_deep_quotes_stop_before_recursion_or_snapshot_growth(context, source_policy):
+    if source_policy:
+        context["provider_message_reference_policy"] = (
+            message_conversion.PROVIDER_MESSAGE_REFERENCE_POLICY
+        )
     source = "x"
     for depth in range(80):
         fence = "`" * (depth + 3)

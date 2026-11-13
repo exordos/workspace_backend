@@ -38,6 +38,13 @@ Both `near/ID` and `with/ID` provider links participate in invalidation. The sam
 versioned reference policy enters conversion-cache keys, so older quote snapshots
 are not reused under the new policy. Nested source quotes retain the existing
 depth and encoded-size limits.
+Source quote snapshots occupy their own Markdown block; the provider source
+link follows in a separate paragraph. Current clients recognize an immutable
+forward snapshot only when it is the sole link in its block. The versioned
+policy also reconverts receipts and cached conversions with the earlier inline
+layout on their next scan.
+Nested supplied quotes use Markdown blockquotes inside that snapshot, so clients
+do not mistake repeated references to the importing message for a quote cycle.
 
 The worker still downloads source snapshots. A matching newer block does not end
 the scan: edits, reactions and personal flags may change anywhere in history.

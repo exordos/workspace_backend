@@ -68,6 +68,41 @@ def test_message_reference_fingerprints_cover_accepted_provider_link_forms(fragm
     )["messages"] == ["101"]
 
 
+@pytest.mark.parametrize("anchor", ["near", "with"])
+@pytest.mark.parametrize("nested", ["plain", "fence", "blockquote"])
+def test_source_quote_snapshot_is_a_standalone_markdown_block(anchor, nested):
+    origin = "https://zulip.example.test"
+    target = f"{origin}/#narrow/{anchor}/101"
+    quoted = {
+        "plain": "Supplied text",
+        "fence": "```quote\nSupplied text\n```",
+        "blockquote": "> Supplied text",
+    }[nested]
+    fence = "````" if nested == "fence" else "```"
+    message = {
+        "id": 201,
+        "content": f"@_**Alice|7** [said]({target}):\n{fence}quote\n{quoted}\n{fence}",
+    }
+    context = {
+        "server_url": origin,
+        "current_message_uuid": "11111111-1111-4111-8111-111111111111",
+        "strict_identities": True,
+        "provider_message_reference_policy": message_conversion.PROVIDER_MESSAGE_REFERENCE_POLICY,
+    }
+    result = message_conversion.zulip_to_workspace(message, context)
+    first, _, remaining = result["content"].partition("\n\n")
+    # Clients render a forward snapshot only when its link is the whole block.
+    assert re.fullmatch(
+        r"\[[^\]\n]+\]\(urn:forward:[0-9a-f-]+\?snapshot=[A-Za-z0-9_-]+\)", first
+    )
+    assert f"[Alice](urn:url:{target})" in remaining
+    snapshot = base64.urlsafe_b64decode(
+        first.split("?snapshot=", 1)[1][:-1] + "==="
+    ).decode()
+    assert "urn:forward:" not in snapshot
+    assert snapshot == ("Supplied text" if nested == "plain" else "> Supplied text")
+
+
 @pytest.mark.parametrize("syntax", ["link", "bare", "channel", "quote", "nested_quote"])
 def test_shared_provider_links_do_not_depend_on_local_target_knowledge(syntax):
     origin = "https://zulip.example.test"
@@ -100,6 +135,8 @@ def test_shared_provider_links_do_not_depend_on_local_target_knowledge(syntax):
     assert f"urn:url:{target}" in after["content"]
     assert "urn:message:" not in after["content"]
     assert "urn:quote:" not in after["content"]
+
+
 FILE_COUNTS = {
     "fenced_literal_markup": 1,
     "uploaded_document": 1,

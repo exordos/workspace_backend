@@ -6,10 +6,83 @@ from unittest import mock
 
 import pytest
 
-from workspace.bridges.zulip import incoming_operations
+from workspace.bridges.zulip import incoming_operations, message_conversion
 from workspace.tests.integration import test_zulip_history as history_tests
 
 incoming = history_tests.incoming
+
+
+def test_reference_free_block_keeps_its_v2_receipt(incoming):
+    _, db, account, *_ = incoming
+    messages = {201: history_tests.message(201, "No source references")}
+
+    async def scan():
+        history_tests.request(db, account, cutoff_id=201)
+        async with history_tests.worker(incoming, messages) as (service, _):
+            with mock.patch.object(
+                service.operations, "merge_batch", wraps=service.operations.merge_batch
+            ) as merge:
+                await history_tests.drain(service, account)
+                return merge.call_count
+
+    with mock.patch.object(
+        message_conversion, "PROVIDER_MESSAGE_REFERENCE_POLICY", "source-snapshots-v2"
+    ):
+        assert asyncio.run(scan()) == 1
+    assert asyncio.run(scan()) == 0
+
+
+def test_source_quote_reconverts_an_already_certified_v2_snapshot(incoming):
+    api, db, account, *_ = incoming
+    url = account["settings"]["server_url"] + "/#narrow/with/101"
+    messages = {
+        201: history_tests.message(
+            201, f"@_**Alice|7** [said]({url}):\n```quote\nSupplied text\n```"
+        )
+    }
+    convert = message_conversion.zulip_to_workspace_cached
+
+    def previous_layout(*args, **kwargs):
+        result, reusable = convert(*args, **kwargs)
+        return {
+            **result,
+            "content": result["content"].replace(
+                f"\n\n[Alice](urn:url:{url})", f"\n[Alice](urn:url:{url})", 1
+            ),
+        }, reusable
+
+    async def scan():
+        history_tests.request(db, account, cutoff_id=201)
+        async with history_tests.worker(incoming, messages) as (service, _):
+            with mock.patch.object(
+                service.operations, "merge_batch", wraps=service.operations.merge_batch
+            ) as merge:
+                await history_tests.drain(service, account)
+                return merge.call_count
+
+    def content():
+        return next(
+            row["payload"]["content"]
+            for row in api.get("/v1/messenger/messages/").json()
+            if row["provider_identity"] == "201"
+        )
+
+    with (
+        mock.patch.object(
+            message_conversion,
+            "PROVIDER_MESSAGE_REFERENCE_POLICY",
+            "source-snapshots-v2",
+        ),
+        mock.patch.object(
+            message_conversion, "zulip_to_workspace_cached", side_effect=previous_layout
+        ),
+    ):
+        assert asyncio.run(scan()) == 1
+    assert "urn:url:" in content().partition("\n\n")[0]
+    assert asyncio.run(scan()) == 1
+    assert "urn:url:" not in content().partition("\n\n")[0]
+    assert f"\n\n[Alice](urn:url:{url})" in content()
+    assert asyncio.run(scan()) == 0
 
 
 @pytest.mark.parametrize("lane", ["history", "realtime"])
@@ -71,7 +144,9 @@ def test_with_link_reconverts_an_already_certified_legacy_payload(incoming, lane
         )
 
     with (
-        mock.patch.object(incoming_operations, "references", side_effect=legacy_references),
+        mock.patch.object(
+            incoming_operations, "references", side_effect=legacy_references
+        ),
         mock.patch.object(
             incoming_operations, "conversion_context", side_effect=legacy_conversion
         ),
