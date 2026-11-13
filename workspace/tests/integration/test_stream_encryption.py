@@ -120,16 +120,21 @@ def test_key_sharing_migration_defaults_existing_streams_and_rolls_back(_databas
             conn.execute(
                 "GRANT SELECT (name) ON messenger_api_user_streams_v1 TO PUBLIC"
             )
+            view_name_acl = """
+                SELECT attacl FROM pg_attribute
+                WHERE attrelid = 'messenger_api_user_streams_v1'::regclass
+                  AND attname = 'name'
+            """
             view_metadata = """
-                SELECT pg_get_viewdef(view.oid), view.reloptions, attribute.attacl
-                FROM pg_class AS view
-                JOIN pg_attribute AS attribute ON attribute.attrelid = view.oid
-                WHERE view.oid = 'messenger_api_user_streams_v1'::regclass
-                  AND attribute.attname = 'name'
+                SELECT pg_get_viewdef(oid), reloptions, relowner
+                FROM pg_class
+                WHERE oid = 'messenger_api_user_streams_v1'::regclass
             """
             original = conn.execute(view_metadata).fetchone()
+            original_acl = conn.execute(view_name_acl).fetchone()
             engine.apply_migration(KEY_SHARING_MIGRATION)
             assert conn.execute(view_metadata).fetchone()[1:] == original[1:]
+            assert conn.execute(view_name_acl).fetchone() == original_acl
             for relation in ("messenger_streams", "messenger_api_user_streams_v1"):
                 assert conn.execute(
                     f"SELECT {KEY_SHARING_FIELD} FROM {relation} WHERE uuid = %s",

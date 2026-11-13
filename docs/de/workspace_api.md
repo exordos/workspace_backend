@@ -915,6 +915,8 @@ Content-Type: application/json
 
 Nach dem Erstellen ist `encryption` unveränderlich. `PUT` lehnt `encryption` und `current_encryption_key_uuid` auch bei unveränderten Werten ab. Nur ein `owner` darf `key_announced` senden; Nachricht und aktuelle UUID werden atomar gespeichert. Die Ankündigung ist auch bei `encryption: false` erlaubt und ändert nur die UUID, nicht das Flag. Ein neuer unverschlüsselter Stream liefert `current_encryption_key_uuid: null`.
 
+`allow_key_sharing_by_holders` ist ein boolesches Flag für den gesamten Stream und standardmäßig `false`. Clients verwenden es, um zu entscheiden, wer auf eine Schlüsselanfrage antworten darf. Bei `false` darf nur der Stream-Eigentümer den angefragten Schlüssel teilen. Bei `true` darf jeder Teilnehmer, der den Schlüssel besitzt, ihn teilen. Das Feld erscheint in Stream-Antworten und in `stream.updated`. Nur der Stream-Eigentümer kann es über `PUT /api/workspace/v1/messenger/streams/{stream_uuid}` ändern.
+
 ## Strömungsbindungen
 
 Streaming-Bindungen sind kanonische PostgreSQL Chat-Mitgliedschaftsdatensätze.

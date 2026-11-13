@@ -128,15 +128,7 @@ def test_sparse_migration_normalizes_the_legacy_members_role_before_recount(db):
     project, user = uuid.uuid4(), uuid.uuid4()
     stream = conftest.seed_user_stream(db, project, user, "Legacy role")
     topic = conftest.seed_stream_topic(db, project, stream, user, "Unread", True)
-    # The current API model also reads metadata added after this pinned schema.
-    definition = db.execute(
-        "SELECT pg_get_viewdef('messenger_api_user_streams_v1'::regclass)"
-    ).fetchone()[0]
-    db.execute(
-        "CREATE OR REPLACE VIEW messenger_api_user_streams_v1 AS "
-        "SELECT projection.*, false AS allow_key_sharing_by_holders "
-        f"FROM ({definition.rstrip(';')}) AS projection"
-    )
+    conftest.add_key_sharing_to_historical_stream_view(db)
     db.execute(
         "UPDATE messenger_stream_bindings SET role='members' "
         "WHERE project_id=%s AND stream_uuid=%s AND user_uuid=%s",

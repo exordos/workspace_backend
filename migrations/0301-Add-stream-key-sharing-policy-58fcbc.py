@@ -35,32 +35,6 @@ def _view_options(view):
     return " WITH (" + ",".join(view["reloptions"]) + ")" if view["reloptions"] else ""
 
 
-def _grants(session):
-    return session.execute(
-        """SELECT NULL::text AS column_name,
-                  CASE WHEN acl.grantee=0 THEN 'PUBLIC'
-                       ELSE quote_ident(pg_get_userbyid(acl.grantee)) END AS grantee,
-                  acl.privilege_type, acl.is_grantable,
-                  acl.grantor=relation.relowner AS owner_grant
-           FROM pg_class relation,
-                aclexplode(COALESCE(relation.relacl,acldefault('r',relation.relowner))) acl
-           WHERE relation.oid=%s::regclass
-           UNION ALL
-           SELECT quote_ident(attribute.attname),
-                  CASE WHEN acl.grantee=0 THEN 'PUBLIC'
-                       ELSE quote_ident(pg_get_userbyid(acl.grantee)) END,
-                  acl.privilege_type, acl.is_grantable,
-                  acl.grantor=relation.relowner
-           FROM pg_attribute attribute
-                JOIN pg_class relation ON relation.oid=attribute.attrelid,
-                aclexplode(attribute.attacl) acl
-           WHERE attribute.attrelid=%s::regclass
-             AND attribute.attnum>0 AND NOT attribute.attisdropped
-             AND attribute.attname<>'allow_key_sharing_by_holders'""",
-        (USER_STREAM_VIEW, USER_STREAM_VIEW),
-    ).fetchall()
-
-
 class MigrationStep(migrations.AbstractMigrationStep):
     def __init__(self):
         self._depends = [
@@ -93,26 +67,12 @@ class MigrationStep(migrations.AbstractMigrationStep):
 
     def downgrade(self, session):
         view = _view(session)
-        grants = _grants(session)
-        if any(not grant["owner_grant"] for grant in grants):
-            raise ValueError(
-                "Cannot recreate the stream view with delegated view grants"
-            )
         definition = view["definition"].replace(KEY_SHARING_COLUMN, "", 1)
         session.execute(f"DROP VIEW {USER_STREAM_VIEW}")
         session.execute(
             f"CREATE VIEW {USER_STREAM_VIEW}{_view_options(view)} AS {definition}"
         )
         session.execute(f"ALTER VIEW {USER_STREAM_VIEW} OWNER TO {view['owner']}")
-        for grant in _grants(session):
-            session.execute(f"REVOKE ALL ON {USER_STREAM_VIEW} FROM {grant['grantee']}")
-        for grant in grants:
-            option = " WITH GRANT OPTION" if grant["is_grantable"] else ""
-            column = f" ({grant['column_name']})" if grant["column_name"] else ""
-            session.execute(
-                f"GRANT {grant['privilege_type']}{column} ON {USER_STREAM_VIEW} "
-                f"TO {grant['grantee']}{option}"
-            )
         session.execute(
             "ALTER TABLE messenger_streams DROP COLUMN allow_key_sharing_by_holders"
         )

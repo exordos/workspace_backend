@@ -913,6 +913,8 @@ Content-Type: application/json
 
 创建后 `encryption` 不可更改。`PUT` 拒绝 `encryption` 和 `current_encryption_key_uuid`，即使提交的值没有变化。只有 `owner` 可以发送 `key_announced`；消息和当前密钥 UUID 在同一事务中原子保存。即使 `encryption: false` 也允许公告，但它只更新 UUID，不改变标志。新建未加密频道返回 `current_encryption_key_uuid: null`。
 
+`allow_key_sharing_by_holders` 是适用于整个频道的布尔标志，默认为 `false`。客户端使用它判断谁可以响应密钥请求。为 `false` 时，只有频道所有者可以分享请求的密钥。为 `true` 时，持有该密钥的任何频道成员都可以分享它。频道响应和 `stream.updated` 都会返回此字段。只有频道所有者可以通过 `PUT /api/workspace/v1/messenger/streams/{stream_uuid}` 修改此设置。
+
 ## 流体结合
 
 流绑定是正规的 PostgreSQL 聊天会员记录. 新绑定
