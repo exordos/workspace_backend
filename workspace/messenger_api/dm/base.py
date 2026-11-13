@@ -20,13 +20,11 @@ import typing
 import uuid as sys_uuid
 
 from restalchemy.common import exceptions as ra_exc
-from restalchemy.dm import models
-from restalchemy.dm import properties
-from restalchemy.dm import types
+from restalchemy.dm import models, properties, types
 
 from workspace.common import models as common_models
-from workspace.messenger_api.dm import message_payloads
-
+from workspace.common import types as common_types
+from workspace.messenger_api.dm import message_payloads, polls
 
 FOLDER_SYSTEM_TYPE_ALL = "all"
 FOLDER_SYSTEM_TYPE_CREATED = "created"
@@ -53,13 +51,6 @@ class FileProviderIdentity(types.String):
         spec = super().to_openapi_spec(prop_kwargs)
         spec["description"] = "Provider upload path, at most 2048 UTF-8 bytes."
         return spec
-
-
-class StrictBoolean(types.Boolean):
-    def from_simple_type(self, value: typing.Any) -> bool:
-        if not self.validate(value):
-            raise ValueError("Expected a JSON boolean")
-        return value
 
 
 class Color(types.Integer):
@@ -378,7 +369,7 @@ class WorkspaceStreamEncryptionCreation(models.Model):
         types.Enum([source.value for source in StreamSourceName]),
         default=SourceName.NATIVE.value,
     )
-    encryption = properties.property(StrictBoolean(), default=False)
+    encryption = properties.property(common_types.StrictBoolean(), default=False)
     current_encryption_key_uuid = properties.property(
         types.AllowNone(types.UUID()), default=None
     )
@@ -407,12 +398,14 @@ class WorkspaceUserStreamBase(
         types.Enum([role.value for role in WorkspaceStreamRole]),
         required=True,
     )
-    encryption = properties.property(StrictBoolean(), default=False)
+    encryption = properties.property(common_types.StrictBoolean(), default=False)
     current_encryption_key_uuid = properties.property(
         types.AllowNone(types.UUID()),
         default=None,
     )
-    allow_key_sharing_by_holders = properties.property(StrictBoolean(), default=False)
+    allow_key_sharing_by_holders = properties.property(
+        common_types.StrictBoolean(), default=False
+    )
 
     notification_mode = properties.property(
         types.Enum([mode.value for mode in WorkspaceStreamNotificationMode]),
@@ -488,6 +481,10 @@ class WorkspaceUserStreamBase(
 
     def validate_message_creation(self, kind: str) -> None:
         self.validate_message_kind(self.source_name, kind)
+        if kind == polls.PollPayload.KIND and (
+            self.source_name not in {"native", "zulip"} or self.encryption
+        ):
+            raise ra_exc.ValidationErrorException()
         if (
             kind == message_payloads.KeyAnnouncedPayload.KIND
             and self.role != WorkspaceStreamRole.OWNER.value

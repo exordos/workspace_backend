@@ -21,6 +21,8 @@ from restalchemy.dm import properties
 from restalchemy.dm import types
 from restalchemy.dm import types_dynamic
 
+from workspace.messenger_api.dm import polls
+
 
 MARKDOWN_CONTENT_MAX_LENGTH = 40_000
 E2EE_CONTENT_MAX_LENGTH = 4 * ((4 * MARKDOWN_CONTENT_MAX_LENGTH + 2) // 3)
@@ -98,11 +100,31 @@ class KeyAnnouncedPayload(types_dynamic.AbstractKindModel):
     key_uuid = properties.property(types.UUID(), required=True)
 
 
-WORKSPACE_MESSAGE_PAYLOAD_TYPE = types_dynamic.KindModelSelectorType(
+_NON_POLL_PAYLOAD_TYPES = (
     types_dynamic.KindModelType(MarkdownPayload),
     types_dynamic.KindModelType(E2EEPayload),
     types_dynamic.KindModelType(KeyRequestPayload),
     types_dynamic.KindModelType(KeyGrantPayload),
     types_dynamic.KindModelType(KeyRejectPayload),
     types_dynamic.KindModelType(KeyAnnouncedPayload),
+)
+WORKSPACE_MESSAGE_PAYLOAD_TYPE = types_dynamic.KindModelSelectorType(
+    *_NON_POLL_PAYLOAD_TYPES, polls.POLL_TYPE
+)
+
+
+class MessageAPIPayloadType(types_dynamic.KindModelSelectorType):
+    # URL filters and responses use saved payloads; JSON writes use create fields.
+    def from_unicode(self, value: str) -> typing.Any:
+        return WORKSPACE_MESSAGE_PAYLOAD_TYPE.from_unicode(value)
+
+    def to_simple_type(self, value: typing.Any) -> typing.Any:
+        return WORKSPACE_MESSAGE_PAYLOAD_TYPE.to_simple_type(value)
+
+    def to_openapi_spec(self, prop_kwargs: dict) -> dict:
+        return WORKSPACE_MESSAGE_PAYLOAD_TYPE.to_openapi_spec(prop_kwargs)
+
+
+MESSAGE_WRITE_PAYLOAD_TYPE = MessageAPIPayloadType(
+    *_NON_POLL_PAYLOAD_TYPES, polls.POLL_CREATE_TYPE
 )

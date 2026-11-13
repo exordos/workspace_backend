@@ -773,6 +773,7 @@ Provider instances are stored once with their UUID and hostname. Public origins 
 | `role` | `guest`, `member`, `moderator`, `administrator`, `owner` | 不需要 | 是的 | 目前用户的角色. |
 | `encryption` | 布尔值 | 否 | 仅创建时 | 共享标志，默认 `false`，仅在创建时设置，之后不可更改。 |
 | `current_encryption_key_uuid` | UUID 或 `null` | 条件必填 | 通过公告管理 | 以 `encryption: true` 创建时必填；否则省略或为 `null`。之后只通过 `key_announced` 更改。 |
+| `allow_key_sharing_by_holders` | boolean | 否 | 仅所有者可修改 | 客户端共用的密钥分享策略，默认为 `false`。创建后通过频道 `PUT` 设置。 |
 | `notification_mode` | `mentions_only`, `muted`, `all_messages` | 不需要 | 用户范围的操作管理 | 目前用户的流通告模式;默认为`all_messages`. |
 | `unread_count` | 整数 | 不需要 | 是的 | 目前用户的未读数量. |
 | `active_unread_count` | 整数 | 不需要 | 是的 | 根据有效流/topic通知模式,当前用户的未读数值是符合条件的. |
@@ -913,7 +914,20 @@ Content-Type: application/json
 
 创建后 `encryption` 不可更改。`PUT` 拒绝 `encryption` 和 `current_encryption_key_uuid`，即使提交的值没有变化。只有 `owner` 可以发送 `key_announced`；消息和当前密钥 UUID 在同一事务中原子保存。即使 `encryption: false` 也允许公告，但它只更新 UUID，不改变标志。新建未加密频道返回 `current_encryption_key_uuid: null`。
 
-`allow_key_sharing_by_holders` 是适用于整个频道的布尔标志，默认为 `false`。客户端使用它判断谁可以响应密钥请求。为 `false` 时，只有频道所有者可以分享请求的密钥。为 `true` 时，持有该密钥的任何频道成员都可以分享它。频道响应和 `stream.updated` 都会返回此字段。只有频道所有者可以通过 `PUT /api/workspace/v1/messenger/streams/{stream_uuid}` 修改此设置。
+`allow_key_sharing_by_holders` 是适用于整个频道的布尔标志，默认为 `false`。客户端使用它判断谁可以响应密钥请求。为 `false` 时，只有频道所有者可以分享请求的密钥。为 `true` 时，持有该密钥的任何频道成员都可以分享它。
+
+只有频道的规范所有者（`owner` 中的 UUID）可以修改此字段。成员绑定中的 `owner` 或 `administrator` 角色不提供此权限。其他成员提交此字段时会返回 `403`，即使值未改变。仅接受 JSON 布尔值；`null`、字符串和数字会返回 `400`。元数据 `PUT` 省略此字段时保留当前值，因此现有客户端无需提交它。
+
+创建、列表、读取和更新频道的响应，以及新生成的 `stream.created` 和 `stream.updated` 快照均包含此字段，REST 事件读取和 WebSocket 投递一致。事件封装、`schema_version: 1`、WebSocket 子协议和 epoch 游标保持不变。在引入该字段前保存的事件可能不包含它；客户端必须将缺失值视为 `false` 并忽略未知字段。此策略由客户端在响应密钥请求时执行；旧客户端更新后才会执行该策略。
+
+```http
+PUT /api/workspace/v1/messenger/streams/6f4dd690-6b6c-4d32-9abb-3771650b89b7
+Content-Type: application/json
+
+{
+  "allow_key_sharing_by_holders": true
+}
+```
 
 ## 流体结合
 
@@ -1270,7 +1284,9 @@ Authorization: Bearer <access_token>
 
 ### 消息格式 {#message-payloads}
 
-无论频道加密标志如何，均允许全部六种 `kind`，但 Zulip 频道禁止 `e2ee`。示例中的所有 payload 字段都必填，未知字段会被拒绝。`key_uuid` 和 `request_message_uuid` 必须为 UUID。设备标识和名称是不透明字符串，长度最多 255 个字符。
+See [Native Messenger polls](../messenger_polls.md) for the `poll` payload, `poll_state`, voting actions, visibility and pagination.
+
+Polls require a native stream without encryption. The other six `kind` values are independent of the stream encryption flag, except that Zulip streams reject `e2ee`. Unknown payload fields are rejected. `key_uuid` 和 `request_message_uuid` 必须为 UUID。设备标识和名称是不透明字符串，长度最多 255 个字符。
 
 Markdown 的 `content` 为非空字符串，最多 40,000 个字符。`e2ee.content` 最多允许 213,336 个字符，可容纳 40,000 个 UTF-8 字符（每个最多四字节）经过不改变字节长度的加密再转为 Base64 后的内容。`key_grant.content` 非空且最多 40,000 个字符。`key_request.public_key` 是请求设备的公钥，而非频道对称密钥；它非空且最多 2048 个字符。内容和公钥原样传递；后端不裁剪空格、不检查 Base64、不加密或解密，也不保存明文秘密密钥。
 

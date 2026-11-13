@@ -39,6 +39,18 @@ class MessengerStore(typing.Protocol):
     ) -> list[dict[str, typing.Any]]:
         """Read one stable ``(created_at, uuid)`` keyset page."""
 
+    def resolve_message_uuid(self, message_uuid: sys_uuid.UUID) -> sys_uuid.UUID:
+        """Resolve a visible message to its public placement UUID for routing."""
+
+    def poll_voters(
+        self,
+        message_uuid: sys_uuid.UUID,
+        question_uuid: sys_uuid.UUID,
+        option_uuid: sys_uuid.UUID,
+        marker: sys_uuid.UUID | None,
+        limit: int,
+    ) -> list[dict[str, typing.Any]]: ...
+
     def filter_draft_page(
         self,
         filters: dict[str, typing.Any],

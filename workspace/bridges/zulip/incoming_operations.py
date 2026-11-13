@@ -21,10 +21,11 @@ from workspace.bridges.zulip import (
     incoming_registry,
     message_conversion,
     outgoing_operations,
+    poll_conversion,
 )
 from workspace.common import emoji
 from workspace.messenger_api import file_storage, publication
-from workspace.messenger_api.dm import base
+from workspace.messenger_api.dm import base, message_payloads
 
 ENQUEUE_FILE_CLEANUP_SQL = """
     INSERT INTO zulip_outgoing_intents (
@@ -164,27 +165,6 @@ SELECT_TOPIC_REFERENCES_SQL = """
 
       AND (topic.provider_identity=ANY(%s::text[])
            OR stream.name || '>' || topic.name=ANY(%s::text[]))
-"""
-SELECT_MESSAGE_REFERENCES_SQL = """
-    WITH scope(project_id,user_uuid,identities,provider_uuid) AS (
-        VALUES (%s::uuid,%s::uuid,%s::text[],%s::uuid)
-    )
-    SELECT visible.uuid, message.provider_identity AS remote_id
-    FROM scope JOIN messenger_messages message
-      ON message.project_id=scope.project_id AND message.provider_uuid=scope.provider_uuid
-     AND message.provider_identity=ANY(scope.identities)
-    CROSS JOIN LATERAL (
-        SELECT uuid FROM messenger_message_placements
-        WHERE project_id=message.project_id AND message_uuid=message.uuid
-        OFFSET 0
-    ) placement
-    CROSS JOIN LATERAL (
-        SELECT visible.uuid FROM messenger_api_user_messages_v1 visible
-        WHERE visible.project_id=message.project_id AND visible.user_uuid=scope.user_uuid
-          AND visible.uuid=placement.uuid AND visible.visible
-        -- Resolve canonical identities before expanding the keyed visibility view.
-        OFFSET 0
-    ) visible
 """
 SELECT_SCOPED_FILE_SQL = """
     SELECT file.* FROM m_workspace_files file
@@ -604,7 +584,7 @@ def references(messages: list) -> dict:
                 message_ids.add(remote)
             elif ">" in value:
                 named_topics.add(value)
-        message_ids.update(re.findall(r"near/([0-9]+)", content))
+        message_ids.update(re.findall(r"(?:near|with)/(\d+)", content))
         for stream, topic in re.findall(
             r"channel/(\d+)(?:-[^/\s)]+)?/topic/([^/\s)]+)", content
         ):
@@ -630,7 +610,7 @@ def conversion_context_base(
 ) -> dict:
     """Resolve the immutable catalog once for a history page."""
     strings: dict = {} if uuid_strings is None else uuid_strings
-    mentions, streams, stream_ids, direct, messages, topics = {}, {}, {}, {}, {}, {}
+    mentions, streams, stream_ids, direct, topics = {}, {}, {}, {}, {}
     for person in prepared.get("catalog", []):
         user = _uuid_text(strings, person["owner_user_uuid"])
         mentions[f"id:{person['external_account_id']}"] = user
@@ -642,8 +622,6 @@ def conversion_context_base(
         stream_ids[item["name"]] = item["provider_identity"]
         if item["provider_identity"].startswith("dm:"):
             direct[item["provider_identity"]] = identifier
-    for item in prepared.get("references", []):
-        messages[item["remote_id"]] = _uuid_text(strings, item["uuid"])
     for item in prepared.get("topics", []):
         topics[f"{item['stream_name']}>{item['name']}"] = _uuid_text(
             strings, item["uuid"]
@@ -652,12 +630,12 @@ def conversion_context_base(
         "server_url": account["settings"]["server_url"],
         "zulip_namespace": _uuid_text(strings, account["provider_uuid"]),
         "own_user_id": account["external_account_id"],
-        "messages": prepared.get("quoted_messages", {}),
+        "messages": {},
         "mention_uuids": types.MappingProxyType(mentions),
         "stream_uuids": types.MappingProxyType(streams),
         "stream_ids": types.MappingProxyType(stream_ids),
         "dm_stream_uuids": types.MappingProxyType(direct),
-        "message_uuids": types.MappingProxyType(messages),
+        "message_uuids": types.MappingProxyType({}),
         "topic_uuids": types.MappingProxyType(topics),
         "uuid_strings": strings,
     }
@@ -695,6 +673,7 @@ def conversion_context(
         "own_user_id": base["own_user_id"],
         "normalize_emoji": True,
         "strict_identities": True,
+        "provider_message_reference_policy": message_conversion.PROVIDER_MESSAGE_REFERENCE_POLICY,
         "current_message_uuid": public,
         # Catalog entries used to be assigned after these per-message defaults.
         # ChainMap preserves both their precedence and insertion order.
@@ -1457,6 +1436,13 @@ class Operations:
             "files": {},
         }
         kind = event["type"]
+        if kind == "poll_refresh" and event.get("outgoing_intent_uuid") is not None:
+            pending = await self.db.sql(
+                "SELECT 1 FROM zulip_outgoing_intents WHERE uuid=%s AND project_id=%s AND external_account_uuid=%s AND status IN ('new','checking')",
+                (event["outgoing_intent_uuid"], account["project_id"], account["uuid"]),
+            )
+            if pending:
+                raise outgoing_operations.Pending("Waiting for the poll write receipt")
         if event.get("_personal_only"):
             return {"event": event, "personal": True}
         if kind == "ensure_dependency":
@@ -1482,6 +1468,12 @@ class Operations:
                 prepared["messages"][0]["flags"] = event["flags"]
         elif kind == "update_message":
             message_ids = event.get("message_ids", [event.get("message_id")])
+        elif (
+            kind == "submessage"
+            and event["msg_type"] == "widget"
+            or kind == "poll_refresh"
+        ):
+            message_ids = [event["message_id"]]
         elif kind == "reaction":
             for identifier in [event["message_id"]]:
                 message_uuid = await self.identity(account, "message", identifier)
@@ -1569,6 +1561,9 @@ class Operations:
         await self.message_dependencies(account, prepared["messages"], event=event)
         for message in prepared["messages"]:
             people.add(message["sender_id"])
+            poll = poll_conversion.read(message)
+            if poll is not None:
+                people.update(user for votes in poll.votes.values() for user in votes)
             people.update(item["user_id"] for item in message.get("reactions", []))
             people.update(
                 int(value)
@@ -1740,38 +1735,6 @@ class Operations:
             if references_["remote_topics"] or references_["named_topics"]
             else []
         )
-        referenced = references_["messages"]
-        prepared["references"] = (
-            await self.db.sql(
-                SELECT_MESSAGE_REFERENCES_SQL,
-                (
-                    account["project_id"],
-                    account["owner_user_uuid"],
-                    list(referenced),
-                    account["provider_uuid"],
-                ),
-            )
-            if referenced
-            else []
-        )
-        prepared["quoted_messages"] = {}
-        if any("quote" in message["content"] for message in prepared["messages"]):
-            for identifier in referenced:
-                try:
-                    remote = await self.http.request(
-                        account,
-                        "GET",
-                        f"/messages/{identifier}",
-                        {"apply_markdown": False},
-                    )
-                except outgoing_operations.ApiError as error:
-                    if (
-                        error.status != 403
-                        and not outgoing_operations.Operations.absent(error)
-                    ):
-                        raise
-                else:
-                    prepared["quoted_messages"][identifier] = remote["message"]
         return prepared
 
     async def person(self, connection: typing.Any, account: dict, data: dict) -> object:
@@ -2251,6 +2214,27 @@ class Operations:
         prepared: dict,
     ) -> None:
         event = prepared["event"]
+        observed_poll = poll_conversion.read(data)
+        voter_users = {}
+        if observed_poll is not None:
+            # Match API lock order: account parents, scope, placement, root,
+            # then vote facts. Account deletion locks affected roots before its
+            # FK cascade, so inserting votes must pin their users first.
+            voters = {
+                str(user) for votes in observed_poll.votes.values() for user in votes
+            }
+            locked = await rows(
+                connection,
+                """SELECT account.external_account_id,project_user.user_uuid
+                FROM m_external_accounts_v2 account JOIN messenger_project_users project_user
+                  ON (project_user.project_id,project_user.user_uuid)=(account.project_id,account.owner_user_uuid)
+                WHERE account.project_id=%s AND account.provider_uuid=%s AND account.external_account_id=ANY(%s)
+                ORDER BY project_user.user_uuid FOR KEY SHARE OF project_user""",
+                (account["project_id"], account["provider_uuid"], list(voters)),
+            )
+            voter_users = {
+                int(v["external_account_id"]): v["user_uuid"] for v in locked
+            }
         deliveries = await rows(
             connection,
             SELECT_DELIVERY_SQL,
@@ -2290,6 +2274,49 @@ class Operations:
             SELECT_ROW_SQL.format(table="messenger_messages_with_content_v1"),
             (account["project_id"], identifier),
         )
+        stale_poll = False
+        if observed_poll is not None or (old and old[0]["payload"]["kind"] == "poll"):
+            # API clicks lock the root before vote facts. Follow the same order
+            # and refresh the payload after a concurrent click commits.
+            await connection.execute(
+                """SELECT s.uuid FROM messenger_message_placements p
+                JOIN messenger_streams s ON (s.project_id,s.uuid)=(p.project_id,p.stream_uuid)
+                JOIN messenger_topics t ON (t.project_id,t.uuid)=(p.project_id,p.topic_uuid)
+                WHERE p.project_id=%s AND p.message_uuid=%s
+                ORDER BY s.uuid,t.uuid FOR KEY SHARE OF s,t""",
+                (account["project_id"], identifier),
+            )
+            pinned = await rows(
+                connection,
+                """WITH surviving AS MATERIALIZED (
+                SELECT project_id,uuid FROM messenger_messages WHERE project_id=%s AND uuid=%s FOR KEY SHARE
+                ) SELECT p.uuid FROM surviving m JOIN messenger_message_placements p
+                ON (p.project_id,p.message_uuid)=(m.project_id,m.uuid) FOR SHARE OF p""",
+                (account["project_id"], identifier),
+            )
+            if old and not pinned:
+                return
+            locked_root = await rows(
+                connection,
+                "SELECT poll_state_revision FROM messenger_messages WHERE project_id=%s AND uuid=%s FOR NO KEY UPDATE",
+                (account["project_id"], identifier),
+            )
+            old = await rows(
+                connection,
+                SELECT_ROW_SQL.format(table="messenger_messages_with_content_v1"),
+                (account["project_id"], identifier),
+            )
+            if old:
+                old[0]["poll_state_revision"] = locked_root[0]["poll_state_revision"]
+            if observed_poll is not None and old:
+                last = await rows(
+                    connection,
+                    poll_conversion.SELECT_OBSERVATION_SQL,
+                    (account["project_id"], identifier, account["provider_uuid"]),
+                )
+                stale_poll = bool(
+                    last and observed_poll.revision < last[0]["submessage_id"]
+                )
         if deliveries and not old:
             # A pending create/delete may finish after its root was removed.
             await connection.execute(
@@ -2446,6 +2473,68 @@ class Operations:
         # Exact outgoing snapshots retain the author's original spelling. They
         # take precedence over generic conversions, including after a restart.
         content = content_snapshots
+        poll_payload = None
+        pending_poll_users = []
+        poll_pending = stale_poll
+        if observed_poll is not None and not stale_poll:
+            previous = old[0]["payload"] if old else None
+            if (
+                previous is None
+                or previous["kind"] != "poll"
+                or poll_conversion.compatible(previous)
+            ):
+                poll_payload = poll_conversion.payload(
+                    observed_poll,
+                    account["provider_uuid"],
+                    data["id"],
+                    previous if previous and previous["kind"] == "poll" else None,
+                )
+        if stale_poll or (
+            old
+            and old[0]["payload"]["kind"] == "poll"
+            and not poll_conversion.compatible(old[0]["payload"])
+        ):
+            # The provider echo of an extended poll is only a preview. Never
+            # replace the authoritative Workspace poll with that text.
+            payload = old[0]["payload"]
+            content = await rows(
+                connection,
+                content_cache.RESOLVE_SQL,
+                (pg_json.Jsonb(payload), data["content"]),
+            )
+            content[0]["workspace_content"] = payload
+            observed_poll = None
+        elif poll_payload is not None:
+            pending = await rows(
+                connection,
+                "SELECT entity_type,data->>'actor_uuid' AS actor FROM zulip_outgoing_intents WHERE project_id=%s AND entity_uuid=%s AND entity_type IN ('message','poll_vote') AND status IN ('new','checking')",
+                (account["project_id"], identifier),
+            )
+            pending_poll_users = [
+                uuid.UUID(p["actor"])
+                for p in pending
+                if p["entity_type"] == "poll_vote"
+            ]
+            poll_pending = bool(pending)
+            if old and any(p["entity_type"] == "message" for p in pending):
+                poll_payload = old[0]["payload"]
+            payload = poll_payload
+            content = await rows(
+                connection,
+                content_cache.RESOLVE_SQL,
+                (pg_json.Jsonb(payload), data["content"]),
+            )
+            content[0]["workspace_content"] = payload
+        elif observed_poll is not None:
+            # Submessages can outgrow the native poll contract without changing
+            # the body. An old outgoing snapshot is no longer authoritative.
+            payload = message_conversion.zulip_to_workspace(data, context)
+            content = await rows(
+                connection,
+                content_cache.RESOLVE_SQL,
+                (pg_json.Jsonb(payload), data["content"]),
+            )
+            content[0]["workspace_content"] = payload
         if not content and str(data["id"]) not in data["content"]:
             content = await rows(
                 connection,
@@ -2486,6 +2575,10 @@ class Operations:
                     str(data["id"]),
                 ),
             )
+        # Widget submessages have their own revision and do not advance the
+        # message body's edit clock, including echoes of a local creation.
+        if old and observed_poll is not None and not stale_poll:
+            edited = max(edited, old[0]["content_updated_at"].replace(tzinfo=None))
         changed = None
         if not old or edited >= old[0]["content_updated_at"].replace(tzinfo=None):
             changed = await self.save(
@@ -2498,8 +2591,39 @@ class Operations:
                     "content_uuid": content[0]["uuid"],
                     "created_at": created,
                     "content_updated_at": edited,
+                    **(
+                        {"poll_state_revision": old[0]["poll_state_revision"] + 1}
+                        if old
+                        and old[0]["payload"] != payload
+                        and (
+                            old[0]["payload"]["kind"] == "poll"
+                            or payload["kind"] == "poll"
+                        )
+                        else {}
+                    ),
                     **origin(account, str(data["id"])),
+                    **({"status": old[0]["status"]} if poll_pending and old else {}),
                 },
+            )
+        if poll_payload is not None and observed_poll is not None:
+            await self.poll_votes(
+                connection,
+                account,
+                identifier,
+                observed_poll,
+                poll_payload,
+                pending_poll_users,
+                voter_users,
+            )
+        if observed_poll is not None:
+            await connection.execute(
+                poll_conversion.OBSERVE_SQL,
+                (
+                    account["provider_uuid"],
+                    observed_poll.revision,
+                    account["project_id"],
+                    identifier,
+                ),
             )
         if deliveries:
             await connection.execute(
@@ -2600,12 +2724,12 @@ class Operations:
         await connection.execute(
             ENSURE_MESSAGE_MENTIONS_SQL,
             (
-                (
+                message_payloads.markdown_content(
                     old[0]["payload"]
                     if old
                     and edited < old[0]["content_updated_at"].replace(tzinfo=None)
                     else payload
-                )["content"].lower(),
+                ).lower(),
                 account["project_id"],
                 placement["uuid"],
                 recipient_users,
@@ -2668,6 +2792,68 @@ class Operations:
                     account,
                     typing.cast(dict, previous_placement)["topic_uuid"],
                 )
+
+    async def poll_votes(
+        self,
+        connection: typing.Any,
+        account: dict,
+        identifier: object,
+        observed: poll_conversion.Poll,
+        payload: dict,
+        pending_users: list,
+        voter_users: dict,
+    ) -> None:
+        question = payload["questions"][0]
+        options = {o["text"]: uuid.UUID(o["uuid"]) for o in question["options"]}
+        desired = set()
+        for key, label in observed.options.items():
+            if label not in options:
+                continue
+            for remote in observed.votes[key]:
+                user = voter_users.get(remote)
+                if user is not None and user not in pending_users:
+                    desired.add((user, uuid.UUID(question["uuid"]), options[label]))
+        current = await rows(
+            connection,
+            "SELECT user_uuid,question_uuid,option_uuid FROM messenger_poll_votes WHERE project_id=%s AND message_uuid=%s",
+            (account["project_id"], identifier),
+        )
+        existing = {
+            (r["user_uuid"], r["question_uuid"], r["option_uuid"])
+            for r in current
+            if r["user_uuid"] not in pending_users
+            or r["question_uuid"] != uuid.UUID(question["uuid"])
+            or r["option_uuid"] not in options.values()
+        }
+        removed = existing - desired
+        added = desired - existing
+        if removed:
+            await connection.execute(
+                """DELETE FROM messenger_poll_votes vote USING jsonb_array_elements(%s::jsonb) choice
+                   WHERE vote.project_id=%s AND vote.message_uuid=%s
+                     AND (vote.user_uuid,vote.question_uuid,vote.option_uuid)
+                         =((choice->>0)::uuid,(choice->>1)::uuid,(choice->>2)::uuid)""",
+                (
+                    pg_json.Jsonb([[str(v) for v in choice] for choice in removed]),
+                    account["project_id"],
+                    identifier,
+                ),
+            )
+        if added:
+            await connection.execute(
+                """INSERT INTO messenger_poll_votes(project_id,message_uuid,user_uuid,question_uuid,option_uuid)
+                   SELECT %s,%s,(choice->>0)::uuid,(choice->>1)::uuid,(choice->>2)::uuid
+                   FROM jsonb_array_elements(%s::jsonb) choice ON CONFLICT DO NOTHING""",
+                (
+                    account["project_id"],
+                    identifier,
+                    pg_json.Jsonb([[str(v) for v in choice] for choice in added]),
+                ),
+            )
+        await connection.execute(
+            "UPDATE messenger_messages SET poll_state_revision=1 WHERE project_id=%s AND uuid=%s AND poll_state_revision=0",
+            (account["project_id"], identifier),
+        )
 
     async def flags(
         self,
@@ -3144,7 +3330,7 @@ class Operations:
         state_cursor = await connection.execute(
             ENSURE_MESSAGE_MENTIONS_SQL,
             (
-                message["payload"]["content"].lower(),
+                message_payloads.markdown_content(message["payload"]).lower(),
                 account["project_id"],
                 placement["uuid"],
                 [account["owner_user_uuid"]],

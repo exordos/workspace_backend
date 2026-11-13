@@ -6,8 +6,7 @@
 import copy
 import typing
 
-from workspace.messenger_api.dm import message_payloads
-
+from workspace.messenger_api.dm import message_payloads, polls
 
 PAGINATION_LIMIT_PARAMETER = {
     "name": "page_limit",
@@ -259,6 +258,16 @@ def add_public_projection_contract(
     specification: dict[str, typing.Any],
 ) -> dict[str, typing.Any]:
     schemas = specification["components"]["schemas"]
+    # Draft persistence only supports markdown.
+    draft = _component_schema(schemas, "WorkspaceDraft_Get")["properties"]
+    draft["payload"] = copy.deepcopy(DRAFT_PAYLOAD_SCHEMA)
+    specification["components"]["parameters"]["WorkspaceDraft_payload"]["schema"] = (
+        copy.deepcopy(DRAFT_PAYLOAD_SCHEMA)
+    )
+    specification["components"]["parameters"].pop(
+        "WorkspaceUserMessage_poll_state", None
+    )
+    schemas["PollVoter_Filter"]["required"] = ["uuid"]
     for name in schemas:
         schema = _component_schema(schemas, name)
         if name.startswith("WorkspaceUserMessage_"):
@@ -273,6 +282,9 @@ def add_public_projection_contract(
                 variant["required"] = list(variant["properties"])
                 variant["additionalProperties"] = False
                 variant.pop("example", None)
+            schema["properties"]["poll_state"]["readOnly"] = True
+            if "poll_state" not in schema["required"]:
+                schema["required"].append("poll_state")
             schema["properties"]["reaction_users"] = {
                 "type": "object",
                 "readOnly": True,
@@ -443,11 +455,24 @@ def add_message_encryption_contract(
             "description": "An absent or null topic UUID selects the default topic.",
         }
     )
+    for variant in message_create_schema["properties"]["payload"]["oneOf"]:
+        if variant["properties"]["kind"]["enum"] == [polls.PollCreatePayload.KIND]:
+            fields = polls.PollCreatePayload.properties.properties
+            variant.update(
+                _object_schema(
+                    polls.POLL_CREATE_TYPE.to_openapi_spec({})["properties"],
+                    [
+                        name
+                        for name, prop in fields.items()
+                        if prop.get_kwargs().get("required")
+                    ],
+                )
+            )
     message_create["requestBody"] = _request_body(message_create_schema)
     message_create["description"] = (
         "Send a message; an absent or null topic_uuid selects the stream's "
-        "default topic. All six payload kinds are allowed regardless of "
-        "encryption, except e2ee is forbidden for a shared Zulip stream. "
+        "default topic. Creating a new poll requires an unencrypted native or Zulip stream. "
+        "An e2ee payload is forbidden for a shared Zulip stream. "
         "Only the owner role may send key_announced; saving the message and "
         "updating current_encryption_key_uuid is atomic. Old e2ee key UUIDs "
         "are accepted. The backend does not validate Base64, encrypt, or store "
@@ -457,7 +482,7 @@ def add_message_encryption_contract(
     editable_payload["oneOf"] = [
         variant
         for variant in editable_payload["oneOf"]
-        if variant["properties"]["kind"]["enum"] != ["key_announced"]
+        if variant["properties"]["kind"]["enum"][0] not in {"key_announced", "poll"}
     ]
     message_update = specification["paths"][
         f"{root}messages/{{WorkspaceUserMessageUuid}}"
@@ -467,13 +492,70 @@ def add_message_encryption_contract(
     )
     message_update["description"] = (
         "Replace a message payload as its author. PUT cannot create or edit "
-        "key_announced messages. e2ee is rejected if any placement of the "
+        "poll or key_announced messages. e2ee is rejected if any placement of the "
         "canonical message belongs to a shared Zulip stream."
     )
+    message_update["responses"] = {
+        **message_update["responses"],
+        409: {"description": "Published polls cannot be edited with PUT."},
+    }
     for operation in (streams["post"], stream_update, message_create, message_update):
         operation["responses"][400] = {
             "description": "Invalid payload, encryption metadata, kind, or stream role.",
         }
+    return specification
+
+
+def add_poll_contract(specification: dict, root: str) -> dict:
+    message_path = f"{root}messages/{{WorkspaceUserMessageUuid}}"
+    for action, body in polls.ACTION_BODIES.items():
+        operation = specification["paths"][f"{message_path}/actions/{action}/invoke"][
+            "post"
+        ]
+        operation["requestBody"] = _request_body(body.to_openapi_spec({}))
+        operation["responses"] = {
+            200: _external_response("#/components/schemas/WorkspaceUserMessage_Get"),
+            400: {"description": "Invalid action body, question, or option."},
+            403: {"description": "The current member cannot perform this action."},
+            404: {"description": "The message is unavailable."},
+            409: {
+                "description": "The poll is closed or its configuration does not allow this change."
+            },
+            "default": {"$ref": "#/components/responses/Error"},
+        }
+    operation = specification["paths"][f"{message_path}/poll_voters/"]["get"]
+    operation["description"] = (
+        "List voters of one option in an accessible non-anonymous poll in ascending user UUID order."
+    )
+    operation["parameters"] = [
+        {"$ref": "#/components/parameters/WorkspaceUserMessageUuid"},
+        *[
+            {
+                "name": name,
+                "in": "query",
+                "required": True,
+                "schema": {"type": "string", "format": "uuid"},
+            }
+            for name in ("question_uuid", "option_uuid")
+        ],
+        {
+            "name": "page_limit",
+            "in": "query",
+            "schema": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50},
+        },
+        {
+            "name": "page_marker",
+            "in": "query",
+            "schema": {"type": "string", "format": "uuid"},
+            "description": "Exclusive UUID boundary, including when that user has withdrawn their vote.",
+        },
+    ]
+    operation["responses"] = {
+        **operation["responses"],
+        400: {"description": "Invalid question, option, or pagination parameters."},
+        403: {"description": "This poll is anonymous."},
+        404: {"description": "The message is unavailable."},
+    }
     return specification
 
 

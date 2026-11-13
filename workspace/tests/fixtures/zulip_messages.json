@@ -1966,10 +1966,10 @@
     },
     "expected_payload": {
       "kind": "markdown",
-      "content": "Not supported in Workspace: interactive poll\n\n[Original message](urn:url:https://zulip.example.test/#narrow/near/1047)"
+      "content": "Poll snapshot (read-only)\n\n```text\nWhich deployment window works best?\n- Monday — 0 votes\n- Tuesday — 1 votes\n- Wednesday — 0 votes\n```\n\n[Original message](urn:url:https://zulip.example.test/#narrow/near/1047)"
     },
-    "unsupported_features": ["interactive_poll"],
-    "expected_zulip_content": "Not supported in Workspace: interactive poll\n\n[Original message](https://zulip.example.test/#narrow/near/1047)"
+    "unsupported_features": [],
+    "expected_zulip_content": "Poll snapshot (read-only)\n\n```text\nWhich deployment window works best?\n- Monday — 0 votes\n- Tuesday — 1 votes\n- Wednesday — 0 votes\n```\n\n[Original message](https://zulip.example.test/#narrow/near/1047)"
   },
   {
     "name": "collaborative_todo_list",

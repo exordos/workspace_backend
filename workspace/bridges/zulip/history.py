@@ -19,6 +19,7 @@ from workspace.bridges.zulip import (
     incoming_operations,
     message_conversion,
     outgoing_operations,
+    poll_conversion,
 )
 from workspace.common import emoji
 from workspace.messenger_api import file_storage
@@ -391,22 +392,6 @@ class Operations(incoming_operations.Operations):
                 identifier, incoming_operations._uuid_text(uuid_strings, stream_uuid)
             )
         prepared = {"catalog": people, "streams": streams, "topics": topics}
-        prepared["references"] = await self.db.sql(
-            incoming_operations.SELECT_MESSAGE_REFERENCES_SQL,
-            (
-                account["project_id"],
-                account["owner_user_uuid"],
-                refs["messages"],
-                account["provider_uuid"],
-            ),
-        )
-        # Every page member will be visible after this merge, including quote
-        # targets which have not reached the working tables yet.
-        prepared["references"].extend(
-            {"remote_id": remote, "uuid": placement}
-            for remote, placement in public_ids.items()
-        )
-        prepared["quoted_messages"] = {str(item["id"]): item for item in messages}
         files = await self.prepare_files(account, messages, stream_map, users)
         context_base = incoming_operations.conversion_context_base(
             account, prepared, uuid_strings=uuid_strings
@@ -611,7 +596,7 @@ class Operations(incoming_operations.Operations):
                 batch["messenger_user_message_unreads"].append(flag)
             if "starred" in item["flags"]:
                 batch["messenger_user_message_stars"].append(flag)
-            if f"](urn:user:{owner})" in payload["content"].lower():
+            if f"](urn:user:{owner})" in payload.get("content", "").lower():
                 batch["messenger_user_message_mentions"].append(flag)
         batch["messenger_topics"] = list(new_topics.values())
         batch["messenger_user_topic_bindings"] = list(personal_topics.values())
@@ -634,12 +619,16 @@ class Operations(incoming_operations.Operations):
         # Keep the exact resolver snapshot used above. Reading a newer catalog
         # after merge could otherwise certify a payload prepared with old mappings.
         batch["_context"] = {
+            "poll_refresh": [
+                (identities[str(item["id"])], item["id"], poll.revision)
+                for item in messages
+                if (poll := poll_conversion.read(item)) is not None
+            ],
             "catalog": people,
             "streams": streams,
             # New topics are used for their own placements, but cross-message
             # references were converted with the pre-merge resolver snapshot.
             "topics": topics,
-            "references": prepared["references"],
             "files": [record for record in files.values() if "missing" not in record],
             "edited": {
                 str(row["uuid"]): row["content_updated_at"]
@@ -896,6 +885,20 @@ class Operations(incoming_operations.Operations):
             WHERE message.content_uuid=src.uuid
         """,
         )
+        # History can be prepared before a newer realtime poll observation.
+        # Keep that interactive payload under the root lock; the durable inbox
+        # refresh below fetches current provider votes after this merge commits.
+        await execute(
+            connection,
+            "preserve.polls",
+            """
+            UPDATE history_messenger_messages src SET content_uuid=dst.content_uuid
+            FROM messenger_messages dst
+            JOIN messenger_message_contents contents ON contents.uuid=dst.content_uuid
+            WHERE dst.project_id=src.project_id AND dst.uuid=src.uuid
+              AND contents.workspace_content->>'kind'='poll'
+            """,
+        )
         if batch["messenger_messages"]:
             await merge(
                 connection,
@@ -1000,6 +1003,35 @@ class Operations(incoming_operations.Operations):
                     "entity_uuid",
                     "provider_uuid",
                     "external_account_uuid",
+                ),
+            )
+        polls = batch["_context"].get("poll_refresh", [])
+        if polls:
+            await execute(
+                connection,
+                "refresh.polls",
+                """INSERT INTO zulip_incoming_events
+                (project_id,external_account_uuid,provider_uuid,owner_user_uuid,
+                 account_identity,queue_id,event_id,payload,ordering_keys)
+                SELECT %s,%s,%s,%s,%s,
+                       'history-poll:'||src.remote_id||':'||src.revision,0,
+                       jsonb_build_object('type','poll_refresh','message_id',src.remote_id),
+                       ARRAY['message:'||src.remote_id]
+                FROM unnest(%s::uuid[],%s::bigint[],%s::bigint[])
+                    src(message_uuid,remote_id,revision)
+                JOIN messenger_messages message
+                  ON message.project_id=%s AND message.uuid=src.message_uuid
+                ON CONFLICT(external_account_uuid,queue_id,event_id) DO NOTHING""",
+                (
+                    account["project_id"],
+                    account["uuid"],
+                    account["provider_uuid"],
+                    account["owner_user_uuid"],
+                    account["external_account_id"],
+                    [p[0] for p in polls],
+                    [p[1] for p in polls],
+                    [p[2] for p in polls],
+                    account["project_id"],
                 ),
             )
         await self.queue_counters(connection)

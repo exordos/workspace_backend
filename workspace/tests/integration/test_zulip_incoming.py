@@ -88,6 +88,58 @@ def event(content="Hello", identifier=101):
     }
 
 
+def test_poll_import_is_interactive_without_reusing_another_messages_votes(incoming):
+    api, *_ = incoming
+    first = event("/poll Deployment?\nMonday\nTuesday", 721)
+    first["message"]["submessages"] = [
+        {
+            "sender_id": 7,
+            "msg_type": "widget",
+            "content": json.dumps(
+                {
+                    "widget_type": "poll",
+                    "extra_data": {
+                        "question": "Deployment?",
+                        "options": ["Monday", "Tuesday"],
+                    },
+                }
+            ),
+        },
+        {
+            "sender_id": 8,
+            "msg_type": "widget",
+            "content": json.dumps(
+                {
+                    "type": "vote",
+                    "key": "canned,1",
+                    "vote": 1,
+                }
+            ),
+        },
+    ]
+    second = event(first["message"]["content"], 722)
+    second["message"]["submessages"] = first["message"]["submessages"][:1]
+    apply(
+        incoming,
+        {
+            "type": "realm_user",
+            "op": "add",
+            "person": {
+                "user_id": 8,
+                "full_name": "Voter",
+                "email": "voter@example.test",
+            },
+        },
+        first,
+        second,
+    )
+    messages = api.get("/v1/messenger/messages/").json()
+    assert len(messages) == 2
+    assert all(m["payload"]["kind"] == "poll" for m in messages)
+    assert all(m["payload"]["questions"][0]["text"] == "Deployment?" for m in messages)
+    assert sorted(m["poll_state"]["voter_count"] for m in messages) == [0, 1]
+
+
 def test_repeated_incoming_content_reuses_conversion_and_page(incoming):
     api, db, *_ = incoming
     with mock.patch.object(
@@ -3332,9 +3384,9 @@ def test_permanent_non_message_failure_releases_the_account_lane(incoming):
     assert api.get("/v1/messenger/streams/").json()[0]["name"] == "Valid catalog event"
 
 
-@pytest.mark.parametrize("attachment", [False, True])
+@pytest.mark.parametrize("content_kind", ["markdown", "attachment", "poll"])
 def test_shared_message_copies_keep_every_accounts_personal_effects(
-    incoming, monkeypatch, tmp_path, attachment
+    incoming, monkeypatch, tmp_path, content_kind
 ):
     api, db, account, http, url = incoming
     monkeypatch.setenv("WORKSPACE_FILE_STORAGE_PATH", str(tmp_path))
@@ -3351,15 +3403,31 @@ def test_shared_message_copies_keep_every_accounts_personal_effects(
         },
     )
     http.request.reset_mock()
-    content = (
-        "[shared file](/user_uploads/1/shared/file.txt)"
-        if attachment
-        else "Shared change"
-    )
+    content = {
+        "attachment": "[shared file](/user_uploads/1/shared/file.txt)",
+        "poll": "/poll Shared poll\nMonday\nTuesday",
+        "markdown": "Shared change",
+    }[content_kind]
     first = {"id": 1, **event(content, 201)}
     first["message"]["flags"] = ["read"]
     second = {"id": 99, **event(content, 201)}
     second["message"]["flags"] = ["starred"]
+    if content_kind == "poll":
+        initialization = {
+            "sender_id": 7,
+            "msg_type": "widget",
+            "content": json.dumps(
+                {
+                    "widget_type": "poll",
+                    "extra_data": {
+                        "question": "Shared poll",
+                        "options": ["Monday", "Tuesday"],
+                    },
+                }
+            ),
+        }
+        for value in (first, second):
+            value["message"]["submessages"] = [initialization]
     try:
 
         async def run():
@@ -3391,6 +3459,9 @@ def test_shared_message_copies_keep_every_accounts_personal_effects(
                 assert len(service.registry.entries) == 1
                 await drain_incoming(service)
                 assert shared.await_count == 1
+                assert not await service.db.sql(
+                    "SELECT id FROM zulip_incoming_events WHERE processed_at IS NULL OR error IS NOT NULL"
+                )
                 assert (
                     next(iter(service.registry.entries.values())).completed_at
                     is not None
@@ -3407,7 +3478,16 @@ def test_shared_message_copies_keep_every_accounts_personal_effects(
             (account["owner_user_uuid"], True, False),
             (peer_data["owner_user_uuid"], False, True),
         }
-        if attachment:
+        if content_kind == "poll":
+            for owner in (account, peer_data):
+                imported = api.get(
+                    "/v1/messenger/messages/", user=owner["owner_user_uuid"]
+                ).json()
+                imported = next(
+                    row for row in imported if row["payload"]["kind"] == "poll"
+                )
+                assert imported["payload"]["questions"][0]["text"] == "Shared poll"
+        if content_kind == "attachment":
             http.download.assert_awaited_once()
             assert (
                 db.execute(

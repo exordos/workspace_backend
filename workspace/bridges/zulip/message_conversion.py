@@ -23,9 +23,9 @@ import re
 import urllib.parse
 import uuid
 
-from workspace.messenger_api.dm import message_payloads
+from workspace.bridges.zulip import poll_conversion
 from workspace.common import emoji
-
+from workspace.messenger_api.dm import message_payloads
 
 _INLINE = (
     r"(?P<escape>\\[^\n])"
@@ -52,6 +52,7 @@ _REFERENCE_URN = re.compile(
 )
 _SILENT_USER_LINK = re.compile(r'\]\(urn:user:[\da-f-]{36} "silent"\)', re.IGNORECASE)
 _MAX_QUOTE_DEPTH = 32
+PROVIDER_MESSAGE_REFERENCE_POLICY = "source-snapshots-v3"
 
 
 class _ConversionLimitExceeded(Exception):
@@ -74,6 +75,55 @@ class _ConversionParts(list[str]):
 
 def _escape_label(value: str) -> str:
     return re.sub(r"([\\`*_{()\[\]#+.!|>~-])", r"\\\1", value)
+
+
+def _poll_snapshot(
+    questions: list[tuple[str, list[tuple[str, int | None]]]], *, closed: bool = False
+) -> str:
+    """Keep user text literal: a snapshot must never notify mentioned users."""
+    lines: list[str] = []
+    for question, options in questions:
+        lines.extend((question,))
+        for text, count in options:
+            lines.append(
+                f"- {text}" + (f" — {count} votes" if count is not None else "")
+            )
+        if not options or any(count is None for _, count in options):
+            lines.append("Results unavailable")
+        lines.append("")
+    body = "\n".join(lines).rstrip()
+    fence = "`" * max(
+        3, 1 + max((len(m[0]) for m in re.finditer(r"`+", body)), default=0)
+    )
+    state = "closed; read-only" if closed else "read-only"
+    result = f"Poll snapshot ({state})\n\n{fence}text\n{body}\n{fence}"
+    if len(result) > message_payloads.MARKDOWN_CONTENT_MAX_LENGTH:
+        raise ValueError("Poll snapshot exceeds the message limit")
+    return result
+
+
+def _zulip_poll_snapshot(message: dict, file_notices: dict[str, str | None]) -> str:
+    """Export the point-in-time widget totals without voter identities."""
+    observed = poll_conversion.read(message)
+    if observed is None:
+        source = message["content"].removeprefix("/poll").strip().splitlines()
+        question = source[0] if source else "Poll"
+        options: list[tuple[str, int | None]] = [(text, None) for text in source[1:]]
+    else:
+        question = observed.question or "Poll"
+        options = [
+            (text, len(observed.votes[key])) for key, text in observed.options.items()
+        ]
+
+    def literal(text: str) -> str:
+        for url, notice in file_notices.items():
+            if notice is not None:
+                text = text.replace(url, notice)
+        return text
+
+    return _poll_snapshot(
+        [(literal(question), [(literal(text), count) for text, count in options])]
+    )
 
 
 def _unescape(value: str) -> str:
@@ -370,6 +420,11 @@ class _ZulipToWorkspace:
     def block_notice(self, description: str, source: str) -> str:
         parts = _ConversionParts()
         parts.append(self.notice(description, block=True))
+        parts.append(self.block_files(source))
+        return "".join(parts)
+
+    def block_files(self, source: str) -> str:
+        parts = _ConversionParts()
         for url in get_zulip_files({"content": source}, self.context):
             parts.append("\n\n")
             unavailable = self.unavailable_file(url)
@@ -457,6 +512,8 @@ class _ZulipToWorkspace:
         if (url.scheme, url.netloc) == (server.scheme, server.netloc):
             message_id = _near_id(absolute)
             if message_id is not None:
+                if self.context.get("provider_message_reference_policy"):
+                    return f"urn:url:{absolute}"
                 mapped = self.context.get("message_uuids", {}).get(message_id)
                 if mapped is not None:
                     return f"urn:message:{mapped}"
@@ -610,8 +667,17 @@ class _ZulipToWorkspace:
                     topic = value
                 label = "#" + topic.replace(">", " > ")
                 if separator:
-                    mapped = self.context.get("message_uuids", {}).get(message_id)
-                    target = f"urn:message:{mapped}" if mapped else None
+                    if (
+                        self.context.get("provider_message_reference_policy")
+                        and message_id.isdigit()
+                    ):
+                        target = (
+                            f"urn:url:{self.context['server_url'].rstrip('/')}"
+                            f"/#narrow/near/{message_id}"
+                        )
+                    else:
+                        mapped = self.context.get("message_uuids", {}).get(message_id)
+                        target = f"urn:message:{mapped}" if mapped else None
                 elif ">" in topic:
                     mapped = self.context.get("topic_uuids", {}).get(topic)
                     target = f"urn:topic:{mapped}" if mapped else None
@@ -654,6 +720,19 @@ class _ZulipToWorkspace:
             raise _ConversionLimitExceeded
         command = re.match(r"^/(me|poll|todo)(?:\s|$)", text)
         if command:
+            if command[1] == "poll" and not quoted:
+                self.uses_current_message = True
+                try:
+                    snapshot = _zulip_poll_snapshot(
+                        self.message,
+                        {
+                            url: self.unavailable_file(url)
+                            for url in get_zulip_files(self.message, self.context)
+                        },
+                    )
+                except ValueError:
+                    raise _ConversionLimitExceeded from None
+                return snapshot + self.block_files(text) + "\n\n" + self.original_link()
             return self.block_notice(
                 {
                     "me": "/me action",
@@ -682,6 +761,7 @@ class _ZulipToWorkspace:
                     message_id = _near_id(header["url"]) if header else None
                     if (
                         header is not None
+                        and not self.context.get("provider_message_reference_policy")
                         and message_id is not None
                         and urllib.parse.urlsplit(header["url"]).netloc
                         == urllib.parse.urlsplit(self.context["server_url"]).netloc
@@ -725,11 +805,37 @@ class _ZulipToWorkspace:
                                     )
                                 )
                     else:
-                        output.append(self.snapshot(self.inline(content, quoted=True)))
+                        converted = (
+                            self.body(content, quoted=True, depth=depth + 1)
+                            if self.context.get("provider_message_reference_policy")
+                            and header is not None
+                            and message_id is not None
+                            else self.inline(content, quoted=True)
+                        )
+                        if quoted and self.context.get(
+                            "provider_message_reference_policy"
+                        ):
+                            # Nested snapshots share this message's identity;
+                            # clients treat those references as a quote cycle.
+                            output.append(
+                                "\n".join(
+                                    "> " + line if line else ">"
+                                    for line in converted.split("\n")
+                                )
+                            )
+                        else:
+                            output.append(self.snapshot(converted))
                         if header is not None and self.context.get("strict_identities"):
                             source = self.target(header["url"])
                             output.append(
-                                "\n"
+                                (
+                                    "\n\n"
+                                    if self.context.get(
+                                        "provider_message_reference_policy"
+                                    )
+                                    and message_id is not None
+                                    else "\n"
+                                )
                                 + (
                                     _markdown_link(
                                         _escape_label(header["name"]), source
@@ -758,9 +864,16 @@ class _ZulipToWorkspace:
                     position = line_end
                     line_end = text.find("\n", position) + 1 or len(text)
                 content = "".join(lines)
-                output.append(
-                    self.snapshot(self.inline(content.removesuffix("\n"), quoted=True))
-                )
+                converted = self.inline(content.removesuffix("\n"), quoted=True)
+                if quoted and self.context.get("provider_message_reference_policy"):
+                    output.append(
+                        "\n".join(
+                            "> " + line if line else ">"
+                            for line in converted.split("\n")
+                        )
+                    )
+                else:
+                    output.append(self.snapshot(converted))
                 if content.endswith("\n"):
                     output.append("\n")
             else:
@@ -827,6 +940,41 @@ def workspace_to_zulip(payload: dict, context: dict) -> str:
     require the referenced original messages; notices are not reversible.
     """
     model = message_payloads.WORKSPACE_MESSAGE_PAYLOAD_TYPE.from_simple_type(payload)
+    if model.kind == "poll":
+        canonical = message_payloads.WORKSPACE_MESSAGE_PAYLOAD_TYPE.to_simple_type(
+            model
+        )
+        if poll_conversion.compatible(canonical):
+            return poll_conversion.command(canonical)
+        state = context.get("poll_state")
+        counts = (
+            {q["question_uuid"]: q["option_counts"] for q in state["questions"]}
+            if state
+            else {}
+        )
+        snapshot = _poll_snapshot(
+            [
+                (
+                    q["text"],
+                    [
+                        (
+                            o["text"],
+                            counts[str(q["uuid"])][str(o["uuid"])] if state else None,
+                        )
+                        for o in q["options"]
+                    ],
+                )
+                for q in model.questions
+            ],
+            closed=state["is_closed"] if state else model.closed_at is not None,
+        )
+        return (
+            "This poll is not fully supported in Zulip. "
+            "[View and vote in Workspace]("
+            + context["workspace_message_url"]
+            + ")\n\n"
+            + snapshot
+        )
     if model.kind != "markdown":
         raise ValueError("Only Markdown messages can be converted to Zulip")
 

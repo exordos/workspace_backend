@@ -21,7 +21,7 @@ from workspace.tests.integration import test_messenger_v2
 STREAMS = "/v1/messenger/streams/"
 MESSAGES = "/v1/messenger/messages/"
 ENCRYPTION_MIGRATION = "0186-Add-stream-encryption-metadata-17aa3c.py"
-KEY_SHARING_MIGRATION = "0301-Add-stream-key-sharing-policy-58fcbc.py"
+KEY_SHARING_MIGRATION = "0305-Add-stream-key-sharing-policy-58fcbc.py"
 KEY_SHARING_FIELD = "allow_key_sharing_by_holders"
 
 
@@ -105,7 +105,10 @@ def test_owner_changes_key_sharing_policy_in_stream_responses_and_events(
         assert updates[-1][KEY_SHARING_FIELD] is enabled
 
 
-def test_key_sharing_migration_defaults_existing_streams_and_rolls_back(_database):
+@pytest.mark.parametrize("default_grants", [False, True])
+def test_key_sharing_migration_defaults_existing_streams_and_rolls_back(
+    _database, default_grants
+):
     with conftest.isolated_migration_database(KEY_SHARING_MIGRATION) as database_url:
         engine = ra_migrations.MigrationEngine(
             migrations_path=str(conftest.MIGRATIONS_DIR)
@@ -120,13 +123,26 @@ def test_key_sharing_migration_defaults_existing_streams_and_rolls_back(_databas
             conn.execute(
                 "GRANT SELECT (name) ON messenger_api_user_streams_v1 TO PUBLIC"
             )
+            conn.execute(
+                "GRANT SELECT ON messenger_api_user_streams_v1 "
+                "TO CURRENT_USER WITH GRANT OPTION"
+            )
+            conn.execute(
+                "GRANT SELECT (name) ON messenger_api_user_streams_v1 "
+                "TO CURRENT_USER WITH GRANT OPTION"
+            )
+            if default_grants:
+                conn.execute(
+                    "ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO PUBLIC"
+                )
             view_name_acl = """
                 SELECT attacl FROM pg_attribute
                 WHERE attrelid = 'messenger_api_user_streams_v1'::regclass
                   AND attname = 'name'
             """
             view_metadata = """
-                SELECT pg_get_viewdef(oid), reloptions, relowner
+                SELECT pg_get_viewdef(oid), reloptions, relowner,
+                       COALESCE(relacl, acldefault('r', relowner))
                 FROM pg_class
                 WHERE oid = 'messenger_api_user_streams_v1'::regclass
             """
@@ -142,6 +158,7 @@ def test_key_sharing_migration_defaults_existing_streams_and_rolls_back(_databas
                 ).fetchone() == (False,)
             engine.rollback_migration(KEY_SHARING_MIGRATION)
             assert conn.execute(view_metadata).fetchone() == original
+            assert conn.execute(view_name_acl).fetchone() == original_acl
             assert conn.execute(
                 "SELECT name FROM messenger_api_user_streams_v1 WHERE uuid = %s",
                 (stream,),

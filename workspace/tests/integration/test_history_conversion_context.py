@@ -72,7 +72,7 @@ def test_batch_context_preserves_prepared_rows_and_persisted_messages(incoming):
             with mock.patch.object(
                 incoming_operations,
                 "conversion_context",
-                side_effect=lambda *args, **kwargs: context_tests.legacy_context(*args),
+                    side_effect=lambda *args, **kwargs: context_tests.reference_context(*args),
             ):
                 expected = await prepare()
             actual = await prepare()

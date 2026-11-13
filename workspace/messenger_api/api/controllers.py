@@ -33,6 +33,8 @@ from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api import exceptions as messenger_exc
 from workspace.messenger_api import topic_summarization
 from workspace.messenger_api.api import store as api_store
+from workspace.messenger_api.dm import message_responses
+from workspace.messenger_api.dm import polls
 from workspace.messenger_api.dm import models
 from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.dm import helpers
@@ -104,6 +106,19 @@ class ContractJSONPacker(ra_packers.JSONPacker):
         return result
 
 
+class ObjectJSONPacker(ContractJSONPacker):
+    """Require an object without reserved controller argument names."""
+
+    def unpack(self, value: typing.Any) -> typing.Any:
+        body = ra_packers.JSONPacker(None, self._req).unpack(value)
+        if (
+            not isinstance(body, dict)
+            or {"resource", "self", "controller"} & body.keys()
+        ):
+            raise ra_exc.ValidationErrorException()
+        return ra_packers.BaseResourcePacker.unpack(self, body)
+
+
 class ContractMultipartPacker(ra_packers.MultipartPacker):
     pack_resource = ContractJSONPacker.pack_resource
 
@@ -147,7 +162,7 @@ class StoreResourceController(ra_controllers.BaseResourceControllerPaginated):
         packer = (
             ContractMultipartPacker
             if "multipart/form-data" in content_type
-            else ContractJSONPacker
+            else self.__packer__ or ContractJSONPacker
         )
         return packer(resource_type or self.get_resource(), request=self.request)
 
@@ -807,15 +822,102 @@ class WorkspaceStreamBindingController(StoreResourceController):
         return self._action(resource, "add_users", kwargs)
 
 
+class PollVoterController(StoreResourceController):
+    __resource__ = ra_resources.ResourceByRAModel(
+        model_class=polls.PollVoter,
+        convert_underscore=False,
+    )
+
+    def _prepare_pagination_meta(self) -> None:
+        super()._prepare_pagination_meta()
+        if "page_limit" not in self.request.params:
+            self._pagination_limit = 50
+        if not 1 <= self._pagination_limit <= 100:
+            raise ra_exc.ValidationErrorException()
+
+    def _prepare_filters(self, params: multidict.MultiDict) -> dict:
+        if sorted(params.keys()) != ["option_uuid", "question_uuid"]:
+            raise ra_exc.ValidationErrorException()
+        try:
+            return {name: sys_uuid.UUID(value) for name, value in params.items()}
+        except ValueError as exc:
+            raise ra_exc.ValidationErrorException() from exc
+
+    def filter(
+        self,
+        filters: typing.Any,
+        order_by: typing.Any = None,
+        parent_resource: typing.Any = None,
+    ) -> list[dict]:
+        if order_by:
+            raise ra_exc.ValidationErrorException()
+        with api_store.open_store(self._get_project_id(), self._get_user_uuid()) as db:
+            rows = db.poll_voters(
+                parent_resource["uuid"],
+                filters["question_uuid"],
+                filters["option_uuid"],
+                self._pagination_marker,
+                self._pagination_limit + 1,
+            )
+        return self._paginate_result(rows)
+
+
 class WorkspaceMessageController(StoreResourceController):
+    __packer__ = ObjectJSONPacker
     resource_name = "messages"
     __default_sort__ = {"created_at": "asc"}
     __sortable_fields__ = ("created_at",)
     __resource__ = ra_resources.ResourceByRAModel(
-        model_class=models.WorkspaceUserMessage,
+        model_class=message_responses.WorkspaceUserMessage,
         convert_underscore=False,
+        fields_permissions=ra_field_permissions.FieldsPermissions(
+            fields={
+                "poll_state": {ra_constants.ALL: ra_field_permissions.Permissions.RO}
+            }
+        ),
         process_filters=True,
     )
+
+    def get_resource_by_uuid(
+        self, uuid: str, parent_resource: typing.Any = None
+    ) -> typing.Any:
+        # Actions and child collections need only the accessible placement ID.
+        # A resource lookup for a relationship still returns the full message.
+        if self.request.path_info_peek() not in {"actions", "poll_voters"}:
+            return super().get_resource_by_uuid(uuid, parent_resource)
+        identifier = self._parse_resource_uuid(
+            "uuid", uuid, self.get_resource().get_id_type()
+        )
+        with api_store.open_store(self._get_project_id(), self._get_user_uuid()) as db:
+            return {"uuid": db.resolve_message_uuid(identifier)}
+
+    def _is_queryable_field(self, model_field_name: str) -> bool:
+        # poll_state is personalized after the SQL page has been selected.
+        return model_field_name != "poll_state" and super()._is_queryable_field(
+            model_field_name
+        )
+
+    @ra_actions.post
+    def vote(self, resource: typing.Any, **kwargs: typing.Any) -> typing.Any:
+        return self._action(resource, "vote", polls.action_body("vote", kwargs))
+
+    @ra_actions.post
+    def close_poll(self, resource: typing.Any, **kwargs: typing.Any) -> typing.Any:
+        return self._action(
+            resource, "close_poll", polls.action_body("close_poll", kwargs)
+        )
+
+    @ra_actions.post
+    def update_settings(self, resource: typing.Any, **kwargs: typing.Any) -> typing.Any:
+        return self._action(
+            resource, "update_settings", polls.action_body("update_settings", kwargs)
+        )
+
+    @ra_actions.post
+    def add_poll_option(self, resource: typing.Any, **kwargs: typing.Any) -> typing.Any:
+        return self._action(
+            resource, "add_poll_option", polls.action_body("add_poll_option", kwargs)
+        )
 
     def filter(self, filters: typing.Any, order_by: typing.Any = None) -> typing.Any:
         order_by = order_by or self.__default_sort__

@@ -27,6 +27,11 @@ The published database migration chain remains intact for fresh schema creation.
 Existing native identities and the `workspace_zulip_v5_legacy_archive` recovery
 archive are retained. Ordinary bootstrap still serializes concurrent starts,
 drains database writers and applies schema migrations before starting services.
+Database readiness is bounded to 30 seconds per invocation. If the database
+address is not available yet, bootstrap returns an error so the configuration
+agent can receive a later configuration and retry. This deadline does not limit
+schema migrations. `WORKSPACE_DB_READY_TIMEOUT` overrides the readiness budget
+in seconds for controlled checks.
 
 Migration 0251 introduces the message-recovery fingerprint cache. It does not
 rehash retained history inside the migration: the next bounded recovery scan

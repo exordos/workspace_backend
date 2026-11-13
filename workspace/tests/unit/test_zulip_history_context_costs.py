@@ -107,8 +107,6 @@ def context_data(profile="stream", topics=256):
 
 def context_rows(prepared, bindings, observed):
     async def rows(connection, query, parameters=()):
-        if query == incoming_operations.SELECT_MESSAGE_REFERENCES_SQL:
-            return prepared["references"]
         if "FROM m_external_accounts_v2" in query:
             return prepared["catalog"]
         if "FROM messenger_streams stream" in query:
@@ -138,8 +136,11 @@ EXPECTED = {
 
 @pytest.mark.parametrize("profile", ["stream", "done", "dm"])
 @pytest.mark.parametrize("prepared_context", [False, True])
-def test_context_keeps_released_fingerprint(profile, prepared_context):
+def test_context_keeps_released_fingerprint_without_message_references(
+    profile, prepared_context
+):
     account, messages, prepared, bindings = context_data(profile)
+    messages[0]["content"] = "Plain source without references"
     with (
         mock.patch.object(content_cache, "CONVERTER_VERSION", 1),
         mock.patch.object(
@@ -153,7 +154,41 @@ def test_context_keeps_released_fingerprint(profile, prepared_context):
                 None, account, messages, 5, prepared if prepared_context else None
             )
         )
-    assert actual.hex() == EXPECTED[profile]
+    # Captured from the released implementation with the same plain sources.
+    released = {
+        "stream": "ff6ac3753998cecd69ccf2a06c33481d1e42cf90d84448ba3d7556f46c0fb3fc",
+        "done": "ff6ac3753998cecd69ccf2a06c33481d1e42cf90d84448ba3d7556f46c0fb3fc",
+        "dm": "d9eba23c5ddea10eeb832c4024f2bc07483af5f785a180bbb1848d70600fc050",
+    }
+    assert actual.hex() == released[profile]
+
+
+@pytest.mark.parametrize("prepared_context", [False, True])
+def test_source_link_policy_invalidates_only_message_reference_context(
+    prepared_context,
+):
+    account, messages, prepared, bindings = context_data()
+    with (
+        mock.patch.object(content_cache, "CONVERTER_VERSION", 1),
+        mock.patch.object(
+            incoming_operations,
+            "rows",
+            side_effect=context_rows(prepared, bindings, []),
+        ),
+    ):
+        before = asyncio.run(
+            history_blocks.context(
+                None, account, messages, 5, prepared if prepared_context else None
+            )
+        )
+        prepared["references"] = [{"remote_id": "101", "uuid": uid(99999)}]
+        after = asyncio.run(
+            history_blocks.context(
+                None, account, messages, 5, prepared if prepared_context else None
+            )
+        )
+    assert before == after
+    assert before.hex() != EXPECTED["stream"]
 
 
 def test_context_does_not_scan_page_for_each_catalog_name():

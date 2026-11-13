@@ -218,3 +218,5 @@ V1 message content uses the markdown payload shape:
 Presence is updated through the REST
 `users/{uuid}/actions/presence/invoke` action. The worker marks stale users
 offline and emits `user.updated` with the full public user snapshot.
+
+Poll updates carry each reader’s own selections. See [poll revisions and deadline ordering](../messenger_polls.md#realtime-ordering).

@@ -4,10 +4,12 @@
 # you may not use this file except in compliance with the License.
 
 import json
+import pathlib
 from unittest import mock
 
 import pytest
 import webob
+import yaml
 from restalchemy.api import applications
 from restalchemy.api import constants
 from restalchemy.api import contexts
@@ -257,6 +259,26 @@ def _build_openapi(app_module):
     return specification
 
 
+def test_published_poll_state_schema_matches_the_generated_response():
+    specification = _build_openapi(workspace_app)
+    published = yaml.safe_load(
+        (
+            pathlib.Path(__file__).resolve().parents[3]
+            / "docs/public_workspace_api.yaml"
+        ).read_text()
+    )
+    assert (
+        _component_schema(published, "WorkspaceUserMessage_Get")["properties"][
+            "poll_state"
+        ]
+        == (
+            _component_schema(specification, "WorkspaceUserMessage_Get")["properties"][
+                "poll_state"
+            ]
+        )
+    )
+
+
 def _assert_all_local_references_resolve(specification):
     pending = [specification]
     while pending:
@@ -384,6 +406,17 @@ def test_generated_openapi_describes_encryption_requests_and_fixed_payloads(
             "recipient_device_id",
         },
         "key_announced": {"kind", "key_uuid"},
+        "poll": {
+            "kind",
+            "multiple_answers",
+            "questions",
+            "is_anonymous",
+            "allow_revote",
+            "results_visibility",
+            "allow_adding_options",
+            "closes_at",
+            "closed_at",
+        },
     }
     for name in (
         "WorkspaceUserMessage_Filter",
@@ -458,7 +491,7 @@ def test_generated_openapi_describes_encryption_requests_and_fixed_payloads(
     assert {
         variant["properties"]["kind"]["enum"][0]
         for variant in update_message["properties"]["payload"]["oneOf"]
-    } == set(expected_fields) - {"key_announced"}
+    } == set(expected_fields) - {"key_announced", "poll"}
     _assert_draft_contract(paths, f"{root}drafts/")
 
 
@@ -736,3 +769,69 @@ def test_external_account_status_contract():
     )
     for method in ("get", "put"):
         assert "ETag" not in resource[method]["responses"][200].get("headers", {})
+
+
+def test_poll_creation_does_not_advertise_removed_feature_switch():
+    spec = _build_openapi(workspace_app)
+    responses = spec["paths"]["/v1/messenger/messages/"]["post"]["responses"]
+    descriptions = [response.get("description", "") for response in responses.values()]
+    assert "New poll creation is disabled." not in descriptions
+
+
+def test_poll_openapi_matches_the_create_actions_and_voter_page():
+    spec = _build_openapi(workspace_app)
+    paths = spec["paths"]
+    root = "/v1/messenger/messages/{WorkspaceUserMessageUuid}"
+    create = paths["/v1/messenger/messages/"]["post"]["requestBody"]["content"][
+        "application/json"
+    ]["schema"]
+    variant = next(
+        v
+        for v in create["properties"]["payload"]["oneOf"]
+        if v["properties"]["kind"]["enum"] == ["poll"]
+    )
+    assert "closed_at" not in variant["properties"]
+    assert {"closes_at", "allow_adding_options"}.isdisjoint(variant["required"])
+    assert "multiple_answers" in variant["required"]
+    assert variant["properties"]["multiple_answers"]["type"] == "boolean"
+    question = variant["properties"]["questions"]["items"]
+    assert question["additionalProperties"] is False
+    assert "multiple_answers" not in question["properties"]
+    assert "multiple_answers" not in question["required"]
+    vote = paths[f"{root}/actions/vote/invoke"]["post"]
+    body = vote["requestBody"]["content"]["application/json"]["schema"]
+    assert set(body["required"]) == {"question_uuid", "option_uuid", "selected"}
+    assert vote["responses"][200]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/WorkspaceUserMessage_Get"
+    }
+    response = _component_schema(spec, "WorkspaceUserMessage_Get")["properties"]
+    parameter = spec["components"]["parameters"]["WorkspaceUserMessage_payload"][
+        "schema"
+    ]
+    parameter_poll = next(
+        v for v in parameter["oneOf"] if v["properties"]["kind"]["enum"] == ["poll"]
+    )
+    assert "closed_at" in parameter_poll["properties"]
+    state = response["poll_state"]
+    assert state["nullable"] and state["readOnly"]
+    assert set(state["required"]) == {
+        "revision",
+        "is_closed",
+        "voter_count",
+        "questions",
+        "my_votes",
+    }
+    question_state = state["properties"]["questions"]["items"]
+    assert "option_voter_previews" not in question_state["required"]
+    preview = question_state["properties"]["option_voter_previews"]
+    assert preview["type"] == "object"
+    uuid_list = preview["additionalProperties"]
+    assert uuid_list["type"] == "array"
+    assert uuid_list["minItems"] == 1 and uuid_list["maxItems"] == 20
+    assert uuid_list["items"]["format"] == "uuid"
+    voters = paths[f"{root}/poll_voters/"]["get"]
+    assert {p["name"] for p in voters["parameters"] if p.get("required")} == {
+        "question_uuid",
+        "option_uuid",
+    }
+    assert "X-Pagination-Marker" in voters["responses"][200]["headers"]

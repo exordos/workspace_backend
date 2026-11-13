@@ -29,9 +29,11 @@ from restalchemy.common import contexts
 from restalchemy.dm import filters as dm_filters
 from workspace.common import mutation_journal_opts
 from workspace.messenger_api import publication
+from workspace.messenger_api.api import poll_reads
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.dm import event_payloads
 from workspace.messenger_api.dm import message_payloads
+from workspace.messenger_api.dm import message_responses
 from workspace.messenger_api.dm import models
 
 
@@ -143,7 +145,9 @@ WORKSPACE_EVENT_RESOURCE = ra_resources.ResourceByRAModel(
 )
 DEFAULT_EVENTS_LIMIT = 100
 MESSAGE_EVENT_MAX_AGE = datetime.timedelta(weeks=2)
-WORKSPACE_USER_MESSAGE_FIELDS = tuple(models.WorkspaceUserMessage.properties.properties)
+WORKSPACE_USER_MESSAGE_FIELDS = tuple(
+    message_responses.WorkspaceUserMessage.properties.properties
+)
 WORKSPACE_USER_STREAM_FIELDS = tuple(
     name
     for name in models.WorkspaceUserStream.properties.properties
@@ -393,7 +397,13 @@ def _get_packer_request() -> typing.Any:
     return _PACKER_REQUEST
 
 
-def pack_workspace_event(event: typing.Any, request: typing.Any = None) -> typing.Any:
+def pack_workspace_event(
+    event: typing.Any,
+    request: typing.Any = None,
+    *,
+    poll_previews: typing.Any = None,
+    poll_my_votes: typing.Any = None,
+) -> typing.Any:
     request = request or _get_packer_request()
     result = ra_packers.BaseResourcePacker(
         WORKSPACE_EVENT_RESOURCE,
@@ -408,11 +418,72 @@ def pack_workspace_event(event: typing.Any, request: typing.Any = None) -> typin
             for name, users in result["payload"]["reaction_users"].items()
             if users
         }
+    if poll_previews is not None or poll_my_votes is not None:
+        payload = result["payload"]
+        state = {**payload["poll_state"], "my_votes": poll_my_votes or []}
+        if poll_previews and not payload["payload"]["is_anonymous"]:
+            voted_questions = {vote["question_uuid"] for vote in state["my_votes"]}
+            questions = []
+            for question in state["questions"]:
+                q = question["question_uuid"]
+                if q in voted_questions and q in poll_previews:
+                    question = {**question, "option_voter_previews": poll_previews[q]}
+                questions.append(question)
+            state["questions"] = questions
+        result["payload"] = {**payload, "poll_state": state}
     return result
 
 
 def event_row_to_messenger_event(row: typing.Any) -> typing.Any:
-    return pack_workspace_event(_workspace_event_from_row(row))
+    return pack_workspace_event(
+        _workspace_event_from_row(row),
+        poll_previews=_event_row_get(row, "poll_previews"),
+        poll_my_votes=_event_row_get(row, "poll_my_votes"),
+    )
+
+
+def _split_poll_event_state(
+    common: dict, overrides: dict[str, dict], payloads: dict[str, dict]
+) -> None:
+    state = next(iter(payloads.values()))["poll_state"]
+    common["poll_state"] = {**state, "my_votes": []}
+    restricted = (
+        not state["is_closed"]
+        and common["payload"]["results_visibility"] == "after_vote"
+    )
+    missing_previews = {
+        question["question_uuid"]
+        for question in state["questions"]
+        if restricted
+        and not common["payload"]["is_anonymous"]
+        and question["voter_count"]
+    }
+    previews = {}
+    for user_uuid, payload in payloads.items():
+        personal = payload["poll_state"]
+        if personal["my_votes"]:
+            # Both old broadcast readers overwrite user_uuid with the actual
+            # recipient. Keep storage metadata in this slot off the public wire.
+            overrides[user_uuid]["user_uuid"] = {
+                "poll_my_votes_v1": personal["my_votes"]
+            }
+            if missing_previews:
+                for question in personal["questions"]:
+                    q = question["question_uuid"]
+                    if q in missing_previews and "option_voter_previews" in question:
+                        previews[q] = question["option_voter_previews"]
+                        missing_previews.remove(q)
+    if restricted:
+        common["poll_state"]["questions"] = [
+            {
+                key: value
+                for key, value in question.items()
+                if key != "option_voter_previews"
+            }
+            for question in state["questions"]
+        ]
+        if previews:
+            common["user_uuid"] = {"poll_previews_v1": previews}
 
 
 def _create_workspace_event(
@@ -423,6 +494,17 @@ def _create_workspace_event(
     session: typing.Any = None,
 ) -> typing.Any:
     if mutation_journal_opts.enabled() or publication.DEFERRED.get():
+        overrides = None
+        if payload.get("poll_state"):
+            payload, overrides = _compress_recipient_payloads(
+                {
+                    str(user_uuid): {
+                        key: value
+                        for key, value in payload.items()
+                        if key != "user_uuid"
+                    }
+                }
+            )
         pending = publication.enqueue(
             session or contexts.Context().get_session(),
             project_id,
@@ -430,6 +512,7 @@ def _create_workspace_event(
             [user_uuid],
             kind,
             payload,
+            overrides,
         )
         return pending[0]
     object_type, action = _event_metadata_for_kind(kind)
@@ -443,6 +526,22 @@ def _create_workspace_event(
         payload=_payload_with_kind(kind, payload),
     )
     return event.insert(session=session)
+
+
+def _create_personal_message_events(
+    messages: typing.Iterable[typing.Any], kind: str, session: typing.Any
+) -> list[typing.Any]:
+    snapshots = [_message_from_event_payload(row) for row in messages]
+    return [
+        _create_workspace_event(
+            project_id=sys_uuid.UUID(row["project_id"]),
+            user_uuid=sys_uuid.UUID(row["user_uuid"]),
+            kind=kind,
+            payload=row,
+            session=session,
+        )
+        for row in poll_reads.hydrate(session, snapshots)
+    ]
 
 
 def create_message_events(
@@ -465,14 +564,9 @@ def create_message_events(
             session=session,
         )
         return sorted(
-            _create_workspace_event(
-                project_id=user_message.project_id,
-                user_uuid=user_message.user_uuid,
-                kind=MESSAGE_CREATED_EVENT,
-                payload=_message_from_event_payload(user_message, session=session),
-                session=session,
+            _create_personal_message_events(
+                user_messages, MESSAGE_CREATED_EVENT, session
             )
-            for user_message in user_messages
         )
     recipients = sorted({sys_uuid.UUID(str(value)) for value in recipients}, key=str)
     author_uuid = sys_uuid.UUID(str(message.user_uuid))
@@ -534,24 +628,6 @@ def create_compact_message_events(
     )
 
 
-def _split_common_recipient_payloads(
-    resources: typing.Any, payload_factory: typing.Any, session: typing.Any = None
-) -> typing.Any:
-    """Deduplicate identical resource fields without changing event payloads."""
-    payloads = {
-        str(_event_payload_get(resource, "user_uuid")): payload_factory(
-            resource,
-            session=session,
-        )
-        for resource in resources
-    }
-    for payload in payloads.values():
-        # The visibility view injects the scoped recipient and must not retain
-        # one copy of the same UUID in every override.
-        payload.pop("user_uuid", None)
-    return _compress_recipient_payloads(payloads)
-
-
 def _compress_recipient_payloads(
     payloads: dict[str, dict[str, typing.Any]],
 ) -> tuple[dict[str, typing.Any], dict[str, dict[str, typing.Any]]]:
@@ -560,7 +636,10 @@ def _compress_recipient_payloads(
         return {}, {}
     values = list(payloads.values())
     common = {}
+    shared_poll = all(value.get("poll_state") for value in values)
     for key in set.intersection(*(set(value) for value in values)):
+        if key == "poll_state" and shared_poll:
+            continue
         variants: dict[str, list[typing.Any]] = {}
         for payload in values:
             value = payload[key]
@@ -573,10 +652,13 @@ def _compress_recipient_payloads(
         user_uuid: {
             key: value
             for key, value in payload.items()
-            if key not in common or common[key] != value
+            if (key != "poll_state" or not shared_poll)
+            and (key not in common or common[key] != value)
         }
         for user_uuid, payload in payloads.items()
     }
+    if shared_poll:
+        _split_poll_event_state(common, overrides, payloads)
     return common, {key: value for key, value in overrides.items() if value}
 
 
@@ -624,22 +706,28 @@ def prepare_resource_broadcast_event(
     if previous_cache is missing_cache:
         session._workspace_event_metadata_cache = {}
     try:
-        common, recipient_payloads = _split_common_recipient_payloads(
-            resources,
-            payload_factory,
-            session=session,
-        )
+        payloads = [payload_factory(item, session=session) for item in resources]
+        if kind in (MESSAGE_CREATED_EVENT, MESSAGE_UPDATED_EVENT) and any(
+            (payload.get("payload") or {}).get("kind") == "poll" for payload in payloads
+        ):
+            payloads = poll_reads.hydrate(session, payloads)
+            if not payloads:
+                return None
+            for payload in payloads:
+                if payload["poll_state"] is None:
+                    del payload["poll_state"]
     finally:
         if previous_cache is missing_cache:
             delattr(session, "_workspace_event_metadata_cache")
         else:
             session._workspace_event_metadata_cache = previous_cache
+    # The visibility view injects the scoped recipient.
+    payloads_by_recipient = {payload.pop("user_uuid"): payload for payload in payloads}
+    common, recipient_payloads = _compress_recipient_payloads(payloads_by_recipient)
     return {
         "project_id": project_id,
         "entity_uuid": entity_uuid,
-        "recipients": [
-            _event_payload_get(resource, "user_uuid") for resource in resources
-        ],
+        "recipients": list(payloads_by_recipient),
         "kind": kind,
         "payload": common,
         "recipient_payloads": recipient_payloads,
@@ -825,10 +913,9 @@ def create_message_updated_events(
     compact: typing.Any = False,
 ) -> typing.Any:
     if not compact:
-        return [
-            create_message_updated_event(message, session=session)
-            for message in user_messages
-        ]
+        return _create_personal_message_events(
+            user_messages, MESSAGE_UPDATED_EVENT, session
+        )
     user_messages = list(user_messages)
     if not user_messages:
         return []
@@ -1005,25 +1092,15 @@ def create_message_deleted_events(
 def create_message_updated_event(
     message: typing.Any, session: typing.Any = None
 ) -> typing.Any:
-    return _create_workspace_event(
-        project_id=message.project_id,
-        user_uuid=message.user_uuid,
-        kind=MESSAGE_UPDATED_EVENT,
-        payload=_message_from_event_payload(message, session=session),
-        session=session,
-    )
+    events = _create_personal_message_events([message], MESSAGE_UPDATED_EVENT, session)
+    return events[0] if events else None
 
 
 def create_message_read_event(
     message: typing.Any, session: typing.Any = None
 ) -> typing.Any:
-    return _create_workspace_event(
-        project_id=message.project_id,
-        user_uuid=message.user_uuid,
-        kind=MESSAGE_READ_EVENT,
-        payload=_message_from_event_payload(message, session=session),
-        session=session,
-    )
+    events = _create_personal_message_events([message], MESSAGE_READ_EVENT, session)
+    return events[0] if events else None
 
 
 def create_message_deleted_event(

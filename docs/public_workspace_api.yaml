@@ -178,129 +178,19 @@ components:
           format: uuid
         payload:
           type: object
-          oneOf:
-          - type: object
-            properties:
-              kind:
-                type: string
-                enum:
-                - markdown
-              content:
-                type: string
-                example: any_string
-                minLength: 1
-                maxLength: 40000
-            example:
-              key: value
-          - type: object
-            properties:
-              kind:
-                type: string
-                enum:
-                - e2ee
-              key_uuid:
-                type: string
-                example: 00000000-0000-0000-0000-000000000000
-                format: uuid
-              content:
-                type: string
-                example: any_string
-                minLength: 1
-                maxLength: 213336
-            example:
-              key: value
-          - type: object
-            properties:
-              kind:
-                type: string
-                enum:
-                - key_request
-              key_uuid:
-                type: string
-                example: 00000000-0000-0000-0000-000000000000
-                format: uuid
-              device_id:
-                type: string
-                example: any_string
-                maxLength: 255
-              device_name:
-                type: string
-                example: any_string
-                maxLength: 255
-              public_key:
-                type: string
-                example: any_string
-                minLength: 1
-                maxLength: 2048
-            example:
-              key: value
-          - type: object
-            properties:
-              kind:
-                type: string
-                enum:
-                - key_grant
-              key_uuid:
-                type: string
-                example: 00000000-0000-0000-0000-000000000000
-                format: uuid
-              request_message_uuid:
-                type: string
-                example: 00000000-0000-0000-0000-000000000000
-                format: uuid
-              sender_device_id:
-                type: string
-                example: any_string
-                maxLength: 255
-              recipient_device_id:
-                type: string
-                example: any_string
-                maxLength: 255
-              content:
-                type: string
-                example: any_string
-                minLength: 1
-                maxLength: 40000
-            example:
-              key: value
-          - type: object
-            properties:
-              kind:
-                type: string
-                enum:
-                - key_reject
-              key_uuid:
-                type: string
-                example: 00000000-0000-0000-0000-000000000000
-                format: uuid
-              request_message_uuid:
-                type: string
-                example: 00000000-0000-0000-0000-000000000000
-                format: uuid
-              sender_device_id:
-                type: string
-                example: any_string
-                maxLength: 255
-              recipient_device_id:
-                type: string
-                example: any_string
-                maxLength: 255
-            example:
-              key: value
-          - type: object
-            properties:
-              kind:
-                type: string
-                enum:
-                - key_announced
-              key_uuid:
-                type: string
-                example: 00000000-0000-0000-0000-000000000000
-                format: uuid
-            example:
-              key: value
-          example:
-            key: value
+          required:
+          - kind
+          - content
+          additionalProperties: false
+          properties:
+            kind:
+              type: string
+              enum:
+              - markdown
+            content:
+              type: string
+              minLength: 1
+              maxLength: 40000
         revision:
           type: integer
           example: 1
@@ -995,6 +885,99 @@ components:
             - kind
             - key_uuid
             additionalProperties: false
+          - type: object
+            properties:
+              kind:
+                type: string
+                enum:
+                - poll
+              questions:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    uuid:
+                      type: string
+                      example: 00000000-0000-0000-0000-000000000000
+                      format: uuid
+                    text:
+                      type: string
+                      example: any_string
+                      minLength: 1
+                      maxLength: 1000
+                    options:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          uuid:
+                            type: string
+                            example: 00000000-0000-0000-0000-000000000000
+                            format: uuid
+                          text:
+                            type: string
+                            example: any_string
+                            minLength: 1
+                            maxLength: 200
+                        additionalProperties: false
+                        required:
+                        - uuid
+                        - text
+                      minItems: 2
+                    correct_option_uuids:
+                      type: array
+                      items:
+                        type: string
+                        example: 00000000-0000-0000-0000-000000000000
+                        format: uuid
+                  additionalProperties: false
+                  required:
+                  - uuid
+                  - text
+                  - options
+                minItems: 1
+              multiple_answers:
+                type: boolean
+                example: true
+              is_anonymous:
+                type: boolean
+                example: true
+              allow_revote:
+                type: boolean
+                example: true
+              results_visibility:
+                type: string
+                enum:
+                - after_vote
+                - always
+                example: always
+              allow_adding_options:
+                type: boolean
+                example: true
+                default: false
+              closes_at:
+                type: string
+                x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
+                example: '2006-01-02T15:04:05.000576Z'
+                format: date-time
+                nullable: true
+              closed_at:
+                type: string
+                x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
+                example: '2006-01-02T15:04:05.000576Z'
+                format: date-time
+                nullable: true
+            required:
+            - kind
+            - questions
+            - multiple_answers
+            - is_anonymous
+            - allow_revote
+            - results_visibility
+            - allow_adding_options
+            - closes_at
+            - closed_at
+            additionalProperties: false
           description: Fixed message payload selected by kind. Only markdown is interpreted
             as Markdown and used for mentions and summaries. Other kinds remain opaque
             in history and realtime.
@@ -1053,6 +1036,87 @@ components:
             items:
               type: string
               format: uuid
+        poll_state:
+          type: object
+          properties:
+            revision:
+              type: integer
+              example: 1
+              minimum: 1
+            is_closed:
+              type: boolean
+              example: true
+            voter_count:
+              type: integer
+              example: 0
+              minimum: 0
+            questions:
+              type: array
+              items:
+                type: object
+                properties:
+                  question_uuid:
+                    type: string
+                    example: 00000000-0000-0000-0000-000000000000
+                    format: uuid
+                  voter_count:
+                    type: integer
+                    example: 0
+                    minimum: 0
+                  option_counts:
+                    type: object
+                    additionalProperties:
+                      type: integer
+                      example: 0
+                      minimum: 0
+                    example:
+                      key: 0
+                  option_voter_previews:
+                    type: object
+                    additionalProperties:
+                      type: array
+                      items:
+                        type: string
+                        example: 00000000-0000-0000-0000-000000000000
+                        format: uuid
+                      minItems: 1
+                      maxItems: 20
+                    example:
+                      key:
+                      - 00000000-0000-0000-0000-000000000000
+                additionalProperties: false
+                required:
+                - question_uuid
+                - voter_count
+                - option_counts
+            my_votes:
+              type: array
+              items:
+                type: object
+                properties:
+                  question_uuid:
+                    type: string
+                    example: 00000000-0000-0000-0000-000000000000
+                    format: uuid
+                  option_uuids:
+                    type: array
+                    items:
+                      type: string
+                      example: 00000000-0000-0000-0000-000000000000
+                      format: uuid
+                additionalProperties: false
+                required:
+                - question_uuid
+                - option_uuids
+          additionalProperties: false
+          required:
+          - revision
+          - is_closed
+          - voter_count
+          - questions
+          - my_votes
+          nullable: true
+          readOnly: true
       required:
       - user_uuid
       - project_id
@@ -1060,6 +1124,7 @@ components:
       - topic_uuid
       - payload
       - author_uuid
+      - poll_state
     WorkspaceUserMessage_Create:
       $ref: '#/components/schemas/WorkspaceUserMessage_Get'
     WorkspaceUserMessage_Update:
@@ -1956,6 +2021,16 @@ components:
       required:
       - username
       - avatar
+    PollVoter_Filter:
+      type: object
+      properties:
+        uuid:
+          type: string
+          example: 00000000-0000-0000-0000-000000000000
+          format: uuid
+          readOnly: true
+      required:
+      - uuid
   parameters:
     WorkspaceEvent_uuid:
       name: uuid
@@ -2280,129 +2355,19 @@ components:
       in: query
       schema:
         type: object
-        oneOf:
-        - type: object
-          properties:
-            kind:
-              type: string
-              enum:
-              - markdown
-            content:
-              type: string
-              example: any_string
-              minLength: 1
-              maxLength: 40000
-          example:
-            key: value
-        - type: object
-          properties:
-            kind:
-              type: string
-              enum:
-              - e2ee
-            key_uuid:
-              type: string
-              example: 00000000-0000-0000-0000-000000000000
-              format: uuid
-            content:
-              type: string
-              example: any_string
-              minLength: 1
-              maxLength: 213336
-          example:
-            key: value
-        - type: object
-          properties:
-            kind:
-              type: string
-              enum:
-              - key_request
-            key_uuid:
-              type: string
-              example: 00000000-0000-0000-0000-000000000000
-              format: uuid
-            device_id:
-              type: string
-              example: any_string
-              maxLength: 255
-            device_name:
-              type: string
-              example: any_string
-              maxLength: 255
-            public_key:
-              type: string
-              example: any_string
-              minLength: 1
-              maxLength: 2048
-          example:
-            key: value
-        - type: object
-          properties:
-            kind:
-              type: string
-              enum:
-              - key_grant
-            key_uuid:
-              type: string
-              example: 00000000-0000-0000-0000-000000000000
-              format: uuid
-            request_message_uuid:
-              type: string
-              example: 00000000-0000-0000-0000-000000000000
-              format: uuid
-            sender_device_id:
-              type: string
-              example: any_string
-              maxLength: 255
-            recipient_device_id:
-              type: string
-              example: any_string
-              maxLength: 255
-            content:
-              type: string
-              example: any_string
-              minLength: 1
-              maxLength: 40000
-          example:
-            key: value
-        - type: object
-          properties:
-            kind:
-              type: string
-              enum:
-              - key_reject
-            key_uuid:
-              type: string
-              example: 00000000-0000-0000-0000-000000000000
-              format: uuid
-            request_message_uuid:
-              type: string
-              example: 00000000-0000-0000-0000-000000000000
-              format: uuid
-            sender_device_id:
-              type: string
-              example: any_string
-              maxLength: 255
-            recipient_device_id:
-              type: string
-              example: any_string
-              maxLength: 255
-          example:
-            key: value
-        - type: object
-          properties:
-            kind:
-              type: string
-              enum:
-              - key_announced
-            key_uuid:
-              type: string
-              example: 00000000-0000-0000-0000-000000000000
-              format: uuid
-          example:
-            key: value
-        example:
-          key: value
+        required:
+        - kind
+        - content
+        additionalProperties: false
+        properties:
+          kind:
+            type: string
+            enum:
+            - markdown
+          content:
+            type: string
+            minLength: 1
+            maxLength: 40000
     WorkspaceDraft_revision:
       name: revision
       in: query
@@ -3372,6 +3337,90 @@ components:
               type: string
               example: 00000000-0000-0000-0000-000000000000
               format: uuid
+          example:
+            key: value
+        - type: object
+          properties:
+            kind:
+              type: string
+              enum:
+              - poll
+            questions:
+              type: array
+              items:
+                type: object
+                properties:
+                  uuid:
+                    type: string
+                    example: 00000000-0000-0000-0000-000000000000
+                    format: uuid
+                  text:
+                    type: string
+                    example: any_string
+                    minLength: 1
+                    maxLength: 1000
+                  options:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        uuid:
+                          type: string
+                          example: 00000000-0000-0000-0000-000000000000
+                          format: uuid
+                        text:
+                          type: string
+                          example: any_string
+                          minLength: 1
+                          maxLength: 200
+                      additionalProperties: false
+                      required:
+                      - uuid
+                      - text
+                    minItems: 2
+                  correct_option_uuids:
+                    type: array
+                    items:
+                      type: string
+                      example: 00000000-0000-0000-0000-000000000000
+                      format: uuid
+                additionalProperties: false
+                required:
+                - uuid
+                - text
+                - options
+              minItems: 1
+            multiple_answers:
+              type: boolean
+              example: true
+            is_anonymous:
+              type: boolean
+              example: true
+            allow_revote:
+              type: boolean
+              example: true
+            results_visibility:
+              type: string
+              enum:
+              - after_vote
+              - always
+              example: always
+            allow_adding_options:
+              type: boolean
+              example: true
+              default: false
+            closes_at:
+              type: string
+              x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
+              example: '2006-01-02T15:04:05.000576Z'
+              format: date-time
+              nullable: true
+            closed_at:
+              type: string
+              x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
+              example: '2006-01-02T15:04:05.000576Z'
+              format: date-time
+              nullable: true
           example:
             key: value
         example:
@@ -4500,6 +4549,23 @@ components:
         pattern: ^(?:http|ftp)s?://(?:(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+(?:[A-Za-z]{2,6}\.?|[A-Za-z0-9-]{2,}\.?)|localhost|\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})(?::\d+)?(?:/?|[/?]\S+)$
         example: http://example.com
         nullable: true
+    PollVoter_uuid:
+      name: uuid
+      in: query
+      schema:
+        type: string
+        example: 00000000-0000-0000-0000-000000000000
+        format: uuid
+        readOnly: true
+    PollVoterUuid:
+      name: PollVoterUuid
+      in: path
+      schema:
+        type: string
+        example: 00000000-0000-0000-0000-000000000000
+        format: uuid
+        readOnly: true
+      required: true
   securitySchemes:
     bearerAuth:
       type: http
@@ -6554,6 +6620,90 @@ paths:
                     - kind
                     - key_uuid
                     additionalProperties: false
+                  - type: object
+                    properties:
+                      kind:
+                        type: string
+                        enum:
+                        - poll
+                      questions:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            uuid:
+                              type: string
+                              example: 00000000-0000-0000-0000-000000000000
+                              format: uuid
+                            text:
+                              type: string
+                              example: any_string
+                              minLength: 1
+                              maxLength: 1000
+                            options:
+                              type: array
+                              items:
+                                type: object
+                                properties:
+                                  uuid:
+                                    type: string
+                                    example: 00000000-0000-0000-0000-000000000000
+                                    format: uuid
+                                  text:
+                                    type: string
+                                    example: any_string
+                                    minLength: 1
+                                    maxLength: 200
+                                additionalProperties: false
+                                required:
+                                - uuid
+                                - text
+                              minItems: 2
+                            correct_option_uuids:
+                              type: array
+                              items:
+                                type: string
+                                example: 00000000-0000-0000-0000-000000000000
+                                format: uuid
+                          additionalProperties: false
+                          required:
+                          - uuid
+                          - text
+                          - options
+                        minItems: 1
+                      multiple_answers:
+                        type: boolean
+                        example: true
+                      is_anonymous:
+                        type: boolean
+                        example: true
+                      allow_revote:
+                        type: boolean
+                        example: true
+                      results_visibility:
+                        type: string
+                        enum:
+                        - after_vote
+                        - always
+                        example: always
+                      allow_adding_options:
+                        type: boolean
+                        example: true
+                        default: false
+                      closes_at:
+                        type: string
+                        x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
+                        example: '2006-01-02T15:04:05.000576Z'
+                        format: date-time
+                        nullable: true
+                    required:
+                    - kind
+                    - questions
+                    - multiple_answers
+                    - is_anonymous
+                    - allow_revote
+                    - results_visibility
+                    additionalProperties: false
                   description: Fixed message payload selected by kind. Only markdown
                     is interpreted as Markdown and used for mentions and summaries.
                     Other kinds remain opaque in history and realtime.
@@ -6563,11 +6713,11 @@ paths:
       security:
       - bearerAuth: []
       description: Send a message; an absent or null topic_uuid selects the stream's
-        default topic. All six payload kinds are allowed regardless of encryption,
-        except e2ee is forbidden for a shared Zulip stream. Only the owner role may
-        send key_announced; saving the message and updating current_encryption_key_uuid
-        is atomic. Old e2ee key UUIDs are accepted. The backend does not validate
-        Base64, encrypt, or store plaintext private or symmetric keys.
+        default topic. Creating a new poll requires an unencrypted native or Zulip stream.
+        An e2ee payload is forbidden for a shared Zulip stream. Only the owner role may send key_announced;
+        saving the message and updating current_encryption_key_uuid is atomic. Old
+        e2ee key UUIDs are accepted. The backend does not validate Base64, encrypt,
+        or store plaintext private or symmetric keys.
   /v1/messenger/messages/{WorkspaceUserMessageUuid}:
     get:
       summary: Get WorkspaceUserMessage
@@ -6604,6 +6754,8 @@ paths:
           $ref: '#/components/responses/Error'
         '400':
           description: Invalid payload, encryption metadata, kind, or stream role.
+        '409':
+          description: Published polls cannot be edited with PUT.
       operationId: Update_v1_messenger_messages_WorkspaceUserMessageUuid
       requestBody:
         required: true
@@ -6753,7 +6905,7 @@ paths:
       security:
       - bearerAuth: []
       description: Replace a message payload as its author. PUT cannot create or edit
-        key_announced messages. e2ee is rejected if any placement of the canonical
+        poll or key_announced messages. e2ee is rejected if any placement of the canonical
         message belongs to a shared Zulip stream.
     delete:
       summary: Delete WorkspaceUserMessage
@@ -8874,6 +9026,272 @@ paths:
       operationId: Presence_v1_users_WorkspaceUserUuid_actions_presence_invoke
       security:
       - bearerAuth: []
+  /v1/messenger/messages/{WorkspaceUserMessageUuid}/poll_voters/:
+    get:
+      summary: Get PollVoters
+      tags:
+      - PollVoter
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceUserMessageUuid'
+      - name: question_uuid
+        in: query
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: option_uuid
+        in: query
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: page_limit
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 50
+      - name: page_marker
+        in: query
+        schema:
+          type: string
+          format: uuid
+        description: Exclusive UUID boundary, including when that user has withdrawn
+          their vote.
+      responses:
+        '200':
+          description: PollVoter_Filter
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/PollVoter_Filter'
+          headers:
+            X-Pagination-Limit:
+              description: Requested page limit.
+              schema:
+                type: integer
+            X-Pagination-Marker:
+              description: Continuation marker. Present only when another resource
+                exists.
+              schema:
+                type: string
+                format: uuid
+        default:
+          $ref: '#/components/responses/Error'
+        '400':
+          description: Invalid question, option, or pagination parameters.
+        '403':
+          description: This poll is anonymous.
+        '404':
+          description: The message is unavailable.
+      operationId: Filter_v1_messenger_messages_WorkspaceUserMessageUuid_poll_voters
+      security:
+      - bearerAuth: []
+      description: List voters of one option in an accessible non-anonymous poll in
+        ascending user UUID order.
+  /v1/messenger/messages/{WorkspaceUserMessageUuid}/actions/add_poll_option/invoke:
+    post:
+      summary: Add_poll_option WorkspaceUserMessage
+      tags:
+      - WorkspaceUserMessage
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceUserMessageUuid'
+      responses:
+        '200':
+          description: WorkspaceUserMessage_Get
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceUserMessage_Get'
+        '400':
+          description: Invalid action body, question, or option.
+        '403':
+          description: The current member cannot perform this action.
+        '404':
+          description: The message is unavailable.
+        '409':
+          description: The poll is closed or its configuration does not allow this
+            change.
+        default:
+          $ref: '#/components/responses/Error'
+      operationId: Add_poll_option_v1_messenger_messages_WorkspaceUserMessageUuid_actions_add_poll_option_invoke
+      security:
+      - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                question_uuid:
+                  type: string
+                  example: 00000000-0000-0000-0000-000000000000
+                  format: uuid
+                option:
+                  type: object
+                  properties:
+                    uuid:
+                      type: string
+                      example: 00000000-0000-0000-0000-000000000000
+                      format: uuid
+                    text:
+                      type: string
+                      example: any_string
+                      minLength: 1
+                      maxLength: 200
+                  additionalProperties: false
+                  required:
+                  - uuid
+                  - text
+              additionalProperties: false
+              required:
+              - question_uuid
+              - option
+  /v1/messenger/messages/{WorkspaceUserMessageUuid}/actions/close_poll/invoke:
+    post:
+      summary: Close_poll WorkspaceUserMessage
+      tags:
+      - WorkspaceUserMessage
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceUserMessageUuid'
+      responses:
+        '200':
+          description: WorkspaceUserMessage_Get
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceUserMessage_Get'
+        '400':
+          description: Invalid action body, question, or option.
+        '403':
+          description: The current member cannot perform this action.
+        '404':
+          description: The message is unavailable.
+        '409':
+          description: The poll is closed or its configuration does not allow this
+            change.
+        default:
+          $ref: '#/components/responses/Error'
+      operationId: Close_poll_v1_messenger_messages_WorkspaceUserMessageUuid_actions_close_poll_invoke
+      security:
+      - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: {}
+              additionalProperties: false
+  /v1/messenger/messages/{WorkspaceUserMessageUuid}/actions/update_settings/invoke:
+    post:
+      summary: Update_settings WorkspaceUserMessage
+      tags:
+      - WorkspaceUserMessage
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceUserMessageUuid'
+      responses:
+        '200':
+          description: WorkspaceUserMessage_Get
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceUserMessage_Get'
+        '400':
+          description: Invalid action body, question, or option.
+        '403':
+          description: The current member cannot perform this action.
+        '404':
+          description: The message is unavailable.
+        '409':
+          description: The poll is closed or its configuration does not allow this
+            change.
+        default:
+          $ref: '#/components/responses/Error'
+      operationId: Update_settings_v1_messenger_messages_WorkspaceUserMessageUuid_actions_update_settings_invoke
+      security:
+      - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                settings:
+                  type: object
+                  properties:
+                    closes_at:
+                      type: string
+                      x-ogen-time-format: '2006-01-02T15:04:05.000576Z'
+                      example: '2006-01-02T15:04:05.000576Z'
+                      format: date-time
+                      nullable: true
+                    allow_adding_options:
+                      type: boolean
+                      example: true
+                  additionalProperties: false
+                  required:
+                  - closes_at
+                  - allow_adding_options
+              additionalProperties: false
+              required:
+              - settings
+  /v1/messenger/messages/{WorkspaceUserMessageUuid}/actions/vote/invoke:
+    post:
+      summary: Vote WorkspaceUserMessage
+      tags:
+      - WorkspaceUserMessage
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceUserMessageUuid'
+      responses:
+        '200':
+          description: WorkspaceUserMessage_Get
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceUserMessage_Get'
+        '400':
+          description: Invalid action body, question, or option.
+        '403':
+          description: The current member cannot perform this action.
+        '404':
+          description: The message is unavailable.
+        '409':
+          description: The poll is closed or its configuration does not allow this
+            change.
+        default:
+          $ref: '#/components/responses/Error'
+      operationId: Vote_v1_messenger_messages_WorkspaceUserMessageUuid_actions_vote_invoke
+      security:
+      - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                question_uuid:
+                  type: string
+                  example: 00000000-0000-0000-0000-000000000000
+                  format: uuid
+                option_uuid:
+                  type: string
+                  example: 00000000-0000-0000-0000-000000000000
+                  format: uuid
+                selected:
+                  type: boolean
+                  example: true
+              additionalProperties: false
+              required:
+              - question_uuid
+              - option_uuid
+              - selected
 servers:
 - url: http://localhost
   description: ''
@@ -8916,4 +9334,6 @@ tags:
 - name: Service
   description: ''
 - name: WorkspaceUser
+  description: ''
+- name: PollVoter
   description: ''

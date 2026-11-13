@@ -2,6 +2,7 @@
 # Licensed under the Apache License, Version 2.0 (the "License").
 
 import asyncio
+import base64
 
 import pytest
 
@@ -14,12 +15,24 @@ incoming = incoming_tests.incoming
 
 @pytest.mark.parametrize("direction", ["history", "realtime"])
 @pytest.mark.parametrize(
-    "leaf,preserve_source",
-    [("x" * 6000, True), ("😀" * 1200, True), ("x" * 40_001, False)],
-    ids=["ascii", "unicode", "oversized-source"],
+    "leaf,oversized,preserve_source",
+    [
+        ("x" * 6000, False, True),
+        ("😀" * 1200, False, True),
+        ("x" * 30_000, True, True),
+        ("😀" * 8000, True, True),
+        ("x" * 40_001, True, False),
+    ],
+    ids=[
+        "ascii",
+        "unicode",
+        "oversized-ascii",
+        "oversized-unicode",
+        "oversized-source",
+    ],
 )
 def test_large_nested_quotes_import_and_replay_without_blocking(
-    incoming, direction, leaf, preserve_source
+    incoming, direction, leaf, oversized, preserve_source
 ):
     api, db, account, http, *_ = incoming
     source = leaf
@@ -76,16 +89,31 @@ def test_large_nested_quotes_import_and_replay_without_blocking(
     assert by_remote["111"]["payload"]["content"] == "After the large quotes"
     for remote in ("109", "110"):
         content = by_remote[remote]["payload"]["content"]
-        assert content.startswith(
-            "Not supported in Workspace: formatted message is too large"
-        )
         assert len(content) <= 40_000
-        assert (source in content) == preserve_source
-        assert f"/near/{remote})" in content
+        if oversized:
+            assert content.startswith(
+                "Not supported in Workspace: formatted message is too large"
+            )
+            assert (source in content) == preserve_source
+            assert f"/near/{remote})" in content
+        else:
+            assert content.startswith("[unknown](urn:forward:")
+            encoded = content.split("?snapshot=", 1)[1].split(")", 1)[0]
+            body = base64.urlsafe_b64decode(encoded + "===").decode()
+            assert body.startswith("> " * 7 + leaf)
+            assert "urn:forward:" not in body
+            assert "/near/108)" in content
     assert db.execute(
-        "SELECT count(*) FROM messenger_message_contents WHERE provider_content=%s",
-        (source,),
+        "SELECT count(DISTINCT content_uuid) FROM messenger_messages "
+        "WHERE project_id=%s AND provider_identity IN ('109','110')",
+        (account["project_id"],),
     ).fetchone() == (2,)
+    contents = db.execute(
+        "SELECT uuid FROM messenger_message_contents WHERE provider_content=%s ORDER BY uuid",
+        (source,),
+    ).fetchall()
+    if oversized:
+        assert len(contents) == 2
     assert db.execute(
         "SELECT count(*) FROM bridge_zulip_v5_content_snapshots cache "
         "JOIN messenger_message_contents contents ON contents.uuid=cache.content_uuid "
@@ -101,5 +129,12 @@ def test_large_nested_quotes_import_and_replay_without_blocking(
         roots
         == db.execute(
             "SELECT uuid,content_uuid,content_revision FROM messenger_messages ORDER BY uuid"
+        ).fetchall()
+    )
+    assert (
+        contents
+        == db.execute(
+            "SELECT uuid FROM messenger_message_contents WHERE provider_content=%s ORDER BY uuid",
+            (source,),
         ).fetchall()
     )
