@@ -773,6 +773,7 @@ Provider instances are stored once with their UUID and hostname. Public origins 
 | `role` | `guest`, `member`, `moderator`, `administrator`, `owner` | - Nein. | - Ja, das ist es. | Die Rolle des aktuellen Benutzers. |
 | `encryption` | boolean | nein | nur beim Erstellen | Gemeinsames Flag; standardmäßig `false`, nur beim Erstellen festgelegt und danach unveränderlich. |
 | `current_encryption_key_uuid` | UUID oder `null` | bedingt | über Ankündigung | Beim Erstellen mit `encryption: true` erforderlich; sonst fehlend oder `null`. Danach nur durch `key_announced` geändert. |
+| `allow_key_sharing_by_holders` | boolean | nein | nur Eigentümer | Gemeinsame clientseitige Richtlinie zur Schlüsselweitergabe; standardmäßig `false`. Nach dem Erstellen über Stream-`PUT` setzen. |
 | `notification_mode` | `mentions_only`, `muted`, `all_messages` | - Nein. | von Benutzern gesteuerte Aktionen | Der aktuelle Nutzer ist in einem Stream-Benachrichtigungsmodus; Standardwert ist `all_messages`. |
 | `unread_count` | ganzzahl | - Nein. | - Ja, das ist es. | Die ungelesenen Daten des aktuellen Benutzers. |
 | `active_unread_count` | ganzzahl | - Nein. | - Ja, das ist es. | Die Anzahl der nicht gelesenen Daten des aktuellen Benutzers, die unter den Notifizierungsmodi effektiver Streams /topic zulässig ist. |
@@ -914,6 +915,21 @@ Content-Type: application/json
 `source_name` hat für den gesamten Stream einen gemeinsamen Wert, `native` oder `zulip`, der für alle Teilnehmer identisch ist. Ein Zulip-Stream erlaubt weder `encryption: true` noch `e2ee`-Nachrichten. Die öffentliche API erstellt nur native Streams; Zulip-Streams werden vom Provider verwaltet und behalten `encryption: false`.
 
 Nach dem Erstellen ist `encryption` unveränderlich. `PUT` lehnt `encryption` und `current_encryption_key_uuid` auch bei unveränderten Werten ab. Nur ein `owner` darf `key_announced` senden; Nachricht und aktuelle UUID werden atomar gespeichert. Die Ankündigung ist auch bei `encryption: false` erlaubt und ändert nur die UUID, nicht das Flag. Ein neuer unverschlüsselter Stream liefert `current_encryption_key_uuid: null`.
+
+`allow_key_sharing_by_holders` ist ein boolesches Flag für den gesamten Stream und standardmäßig `false`. Clients verwenden es, um zu entscheiden, wer auf eine Schlüsselanfrage antworten darf. Bei `false` darf nur der Stream-Eigentümer den angefragten Schlüssel teilen. Bei `true` darf jeder Teilnehmer, der den Schlüssel besitzt, ihn teilen.
+
+Nur der kanonische Stream-Eigentümer (UUID in `owner`) darf das Feld ändern. Die Bindungsrollen `owner` und `administrator` verleihen dieses Recht nicht. Sendet ein anderer Teilnehmer das Feld, folgt `403`, auch bei unverändertem Wert. Nur JSON-Boolesche Werte sind zulässig; `null`, Zeichenketten und Zahlen ergeben `400`. Fehlt das Feld in einem Metadaten-`PUT`, bleibt der aktuelle Wert erhalten. Bestehende Clients müssen es daher nicht mitsenden.
+
+Das Feld erscheint in Antworten auf Stream-Erstellung, Auflistung, Abruf und Änderung sowie in neu erzeugten Snapshots `stream.created` und `stream.updated`, sowohl beim REST-Abruf als auch über WebSocket. Event-Hülle, `schema_version: 1`, WebSocket-Subprotokoll und Epoch-Cursor bleiben unverändert. Gespeicherte ältere Events können das Feld weglassen; Clients müssen einen fehlenden Wert als `false` behandeln und unbekannte Felder ignorieren. Clients wenden die Richtlinie beim Beantworten von Schlüsselanfragen an; ältere Clients setzen sie erst nach einem Update durch.
+
+```http
+PUT /api/workspace/v1/messenger/streams/6f4dd690-6b6c-4d32-9abb-3771650b89b7
+Content-Type: application/json
+
+{
+  "allow_key_sharing_by_holders": true
+}
+```
 
 ## Strömungsbindungen
 

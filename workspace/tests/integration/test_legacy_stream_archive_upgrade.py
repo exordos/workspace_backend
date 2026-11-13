@@ -55,6 +55,8 @@ def test_merge_preserves_unarchived_direct_conversation(
         }
         with contexts.Context().session_manager() as session:
             zulip_upgrade_data.rekey(session, mapping)
+        with psycopg.connect(url, autocommit=True) as db:
+            conftest.add_key_sharing_to_historical_stream_view(db)
         response = conftest.ApiClient(http_server, owner, project).get(
             "/v1/messenger/streams/" + str(destination)
         )

@@ -773,6 +773,7 @@ Provider instances are stored once with their UUID and hostname. Public origins 
 | `role` | `guest`, `member`, `moderator`, `administrator`, `owner` | no | yes | Current user's role. |
 | `encryption` | boolean | no | creation-only | Shared flag; defaults to `false`, set only at creation and immutable afterwards. |
 | `current_encryption_key_uuid` | UUID or `null` | conditional | announcement-managed | Required at creation when `encryption` is `true`; otherwise absent or `null`. Later changed only by `key_announced`. |
+| `allow_key_sharing_by_holders` | boolean | no | owner-only update | Shared client key-sharing policy; defaults to `false`. Set with stream `PUT`, not on creation. |
 | `notification_mode` | `mentions_only`, `muted`, `all_messages` | no | user-scoped action-managed | Current user's stream notification mode; defaults to `all_messages`. |
 | `unread_count` | integer | no | yes | Current user's raw unread count. |
 | `active_unread_count` | integer | no | yes | Current user's unread count eligible under the effective stream/topic notification modes. |
@@ -915,6 +916,21 @@ Content-Type: application/json
 `source_name` is one shared `native` or `zulip` value for the whole stream, identical for all participants. A Zulip stream cannot enable `encryption: true`, and cannot accept `e2ee` messages. Public stream creation is native-only; provider-managed Zulip streams retain `encryption: false`.
 
 After creation, `encryption` is immutable. `PUT` rejects both `encryption` and `current_encryption_key_uuid`, including unchanged values. Only an `owner` may send `key_announced`; the message and new current UUID commit atomically. An announcement is allowed even when `encryption` is `false` and changes only the current UUID, not the flag. A newly created unencrypted stream returns `current_encryption_key_uuid: null`.
+
+`allow_key_sharing_by_holders` is a stream-wide boolean that defaults to `false`. Clients use it to decide who can answer a key request. With `false`, only the stream owner may share the requested key. With `true`, any stream participant holding that key may share it.
+
+The canonical stream owner (`owner` UUID) may update this field. A binding role of `owner` or `administrator` does not grant this permission. Including the field as a non-owner returns `403`, even when its value is unchanged. Values must be JSON booleans; `null`, strings and numbers return `400`. Omitting the field from a metadata `PUT` preserves its current value, so existing callers do not need to send it.
+
+The field is present in stream create/list/get/update responses and newly generated `stream.created` and `stream.updated` snapshots, through both REST event catch-up and WebSocket delivery. The event envelope, `schema_version: 1`, WebSocket subprotocol and epoch cursor are unchanged. Saved events from before this field was introduced may omit it; clients must treat an absent field as `false` and ignore unknown fields. This policy is enforced by clients when answering key requests; older clients do not enforce it until updated.
+
+```http
+PUT /api/workspace/v1/messenger/streams/6f4dd690-6b6c-4d32-9abb-3771650b89b7
+Content-Type: application/json
+
+{
+  "allow_key_sharing_by_holders": true
+}
+```
 
 ## Stream Bindings
 

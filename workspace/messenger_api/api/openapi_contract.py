@@ -327,7 +327,16 @@ def add_public_projection_contract(
                     ),
                 }
             )
-            for field in ("encryption", "current_encryption_key_uuid"):
+            schema["properties"]["allow_key_sharing_by_holders"]["description"] = (
+                "Client key sharing policy. When true, any stream participant "
+                "holding the requested key may share it. Only the stream owner "
+                "may change this setting."
+            )
+            for field in (
+                "encryption",
+                "current_encryption_key_uuid",
+                "allow_key_sharing_by_holders",
+            ):
                 if field not in schema["required"]:
                     schema["required"].append(field)
     return specification
@@ -401,7 +410,14 @@ def add_message_encryption_contract(
     update_schema = _object_schema(
         {
             name: stream_properties[name]
-            for name in ("name", "description", "invite_only", "announce", "color")
+            for name in (
+                "name",
+                "description",
+                "invite_only",
+                "announce",
+                "color",
+                "allow_key_sharing_by_holders",
+            )
         },
         [],
     )
@@ -410,8 +426,12 @@ def add_message_encryption_contract(
     stream_update["description"] = (
         "Update stream metadata. encryption and current_encryption_key_uuid "
         "are forbidden, including unchanged values. Only an owner "
-        "key_announced message may change the current key UUID."
+        "key_announced message may change the current key UUID. Only the stream "
+        "owner can update allow_key_sharing_by_holders."
     )
+    stream_update["responses"][403] = {
+        "description": "The caller is not the stream owner."
+    }
     message_properties = _component_schema(schemas, "WorkspaceUserMessage_Create")[
         "properties"
     ]

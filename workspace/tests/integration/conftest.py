@@ -410,6 +410,18 @@ def isolated_migration_database(migration, *, current_models=False):
             )
 
 
+def add_key_sharing_to_historical_stream_view(connection):
+    # Allow current API reads against schemas predating the key sharing policy.
+    definition = connection.execute(
+        "SELECT pg_get_viewdef('messenger_api_user_streams_v1'::regclass)"
+    ).fetchone()[0]
+    connection.execute(
+        "CREATE OR REPLACE VIEW messenger_api_user_streams_v1 AS "
+        "SELECT projection.*, false AS allow_key_sharing_by_holders "
+        f"FROM ({definition.rstrip(';')}) AS projection"
+    )
+
+
 @pytest.fixture(scope="session")
 def http_server(_database):
     """Start the real WSGI app on an ephemeral port for the whole session."""

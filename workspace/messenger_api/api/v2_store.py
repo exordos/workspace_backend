@@ -17,6 +17,7 @@ from restalchemy.storage.sql import filters as sql_filters
 
 from workspace.messenger_api import message_flags
 from workspace.messenger_api import events as messenger_events
+from workspace.messenger_api import exceptions as messenger_exceptions
 from workspace.messenger_api.api import outgoing
 from workspace.messenger_api.api import poll_reads
 from workspace.messenger_api.api import poll_store
@@ -1299,6 +1300,11 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         if resource == "streams":
             stream = self._stream(resource_uuid)
             stream.validate_encryption_update(values)
+            if (
+                "allow_key_sharing_by_holders" in values
+                and stream.owner != self.user_uuid
+            ):
+                raise messenger_exceptions.StreamKeySharingUpdateForbiddenError()
             forbidden = {
                 "source_name",
                 "provider_uuid",
@@ -1310,7 +1316,14 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             }
             if forbidden.intersection(values):
                 raise ra_exceptions.ValidationErrorException()
-            allowed = {"name", "description", "invite_only", "announce", "color"}
+            allowed = {
+                "name",
+                "description",
+                "invite_only",
+                "announce",
+                "color",
+                "allow_key_sharing_by_holders",
+            }
             updates = {name: values[name] for name in allowed if name in values}
             if not updates:
                 raise ra_exceptions.ValidationErrorException()

@@ -21,6 +21,8 @@ from workspace.tests.integration import test_messenger_v2
 STREAMS = "/v1/messenger/streams/"
 MESSAGES = "/v1/messenger/messages/"
 ENCRYPTION_MIGRATION = "0186-Add-stream-encryption-metadata-17aa3c.py"
+KEY_SHARING_MIGRATION = "0305-Add-stream-key-sharing-policy-58fcbc.py"
+KEY_SHARING_FIELD = "allow_key_sharing_by_holders"
 
 
 @pytest.fixture
@@ -46,6 +48,130 @@ def test_created_stream_returns_explicit_encryption_defaults(api):
     stream = response.json()
     assert stream["encryption"] is False
     assert stream["current_encryption_key_uuid"] is None
+    assert stream[KEY_SHARING_FIELD] is False
+
+
+def test_owner_changes_key_sharing_policy_in_stream_responses_and_events(
+    api, workspace_api, db
+):
+    response = api.post(
+        STREAMS,
+        json={
+            "name": "Key sharing policy",
+            "encryption": True,
+            "current_encryption_key_uuid": str(sys_uuid.uuid4()),
+        },
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()[KEY_SHARING_FIELD] is False
+    stream_uuid = response.json()["uuid"]
+    path = f"{STREAMS}{stream_uuid}"
+    workspace_api.project_id = api.project_id
+    for user, role in (
+        (workspace_api.user_uuid, "member"),
+        (sys_uuid.uuid4(), "administrator"),
+        (sys_uuid.uuid4(), "owner"),
+    ):
+        conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, user, role)
+        response = api.put(path, user=user, json={KEY_SHARING_FIELD: True})
+        assert response.status_code == 403, response.text
+    for invalid in ("true", 1, None):
+        response = api.put(path, json={KEY_SHARING_FIELD: invalid})
+        assert response.status_code == 400, response.text
+
+    for enabled in (True, False):
+        response = api.put(path, json={KEY_SHARING_FIELD: enabled})
+        assert response.status_code == 200, response.text
+        assert response.json()[KEY_SHARING_FIELD] is enabled
+        response = workspace_api.get(path)
+        assert response.status_code == 200, response.text
+        assert response.json()[KEY_SHARING_FIELD] is enabled
+        response = workspace_api.get(STREAMS, params={"uuid": stream_uuid})
+        assert response.status_code == 200, response.text
+        assert response.json()[0][KEY_SHARING_FIELD] is enabled
+        with contexts.Context().session_manager() as session:
+            v2_projection.drain_projection_queue(
+                session, f"key-sharing-test:{sys_uuid.uuid4()}"
+            )
+        response = workspace_api.get("/v1/events/")
+        assert response.status_code == 200, response.text
+        updates = [
+            event["payload"]
+            for event in response.json()
+            if event["payload"]["kind"] == "stream.updated"
+            and event["payload"]["uuid"] == stream_uuid
+        ]
+        assert updates
+        assert updates[-1][KEY_SHARING_FIELD] is enabled
+
+
+@pytest.mark.parametrize("default_grants", [False, True])
+def test_key_sharing_migration_defaults_existing_streams_and_rolls_back(
+    _database, default_grants
+):
+    with conftest.isolated_migration_database(KEY_SHARING_MIGRATION) as database_url:
+        engine = ra_migrations.MigrationEngine(
+            migrations_path=str(conftest.MIGRATIONS_DIR)
+        )
+        engine.rollback_migration(KEY_SHARING_MIGRATION)
+        with psycopg.connect(database_url, autocommit=True) as conn:
+            project, user = sys_uuid.uuid4(), sys_uuid.uuid4()
+            stream = conftest.seed_user_stream(conn, project, user, "Existing stream")
+            conn.execute(
+                "ALTER VIEW messenger_api_user_streams_v1 SET (security_barrier=true)"
+            )
+            conn.execute(
+                "GRANT SELECT (name) ON messenger_api_user_streams_v1 TO PUBLIC"
+            )
+            conn.execute(
+                "GRANT SELECT ON messenger_api_user_streams_v1 "
+                "TO CURRENT_USER WITH GRANT OPTION"
+            )
+            conn.execute(
+                "GRANT SELECT (name) ON messenger_api_user_streams_v1 "
+                "TO CURRENT_USER WITH GRANT OPTION"
+            )
+            if default_grants:
+                conn.execute(
+                    "ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO PUBLIC"
+                )
+            view_name_acl = """
+                SELECT attacl FROM pg_attribute
+                WHERE attrelid = 'messenger_api_user_streams_v1'::regclass
+                  AND attname = 'name'
+            """
+            view_metadata = """
+                SELECT pg_get_viewdef(oid), reloptions, relowner,
+                       COALESCE(relacl, acldefault('r', relowner))
+                FROM pg_class
+                WHERE oid = 'messenger_api_user_streams_v1'::regclass
+            """
+            original = conn.execute(view_metadata).fetchone()
+            original_acl = conn.execute(view_name_acl).fetchone()
+            engine.apply_migration(KEY_SHARING_MIGRATION)
+            assert conn.execute(view_metadata).fetchone()[1:] == original[1:]
+            assert conn.execute(view_name_acl).fetchone() == original_acl
+            for relation in ("messenger_streams", "messenger_api_user_streams_v1"):
+                assert conn.execute(
+                    f"SELECT {KEY_SHARING_FIELD} FROM {relation} WHERE uuid = %s",
+                    (stream,),
+                ).fetchone() == (False,)
+            engine.rollback_migration(KEY_SHARING_MIGRATION)
+            assert conn.execute(view_metadata).fetchone() == original
+            assert conn.execute(view_name_acl).fetchone() == original_acl
+            assert conn.execute(
+                "SELECT name FROM messenger_api_user_streams_v1 WHERE uuid = %s",
+                (stream,),
+            ).fetchone() == ("Existing stream",)
+            assert (
+                conn.execute(
+                    "SELECT 1 FROM information_schema.columns "
+                    "WHERE table_name IN ('messenger_streams', 'messenger_api_user_streams_v1') "
+                    "AND column_name = %s",
+                    (KEY_SHARING_FIELD,),
+                ).fetchall()
+                == []
+            )
 
 
 @pytest.mark.parametrize("encryption", [True, False])

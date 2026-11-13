@@ -445,6 +445,7 @@ def test_generated_openapi_describes_encryption_requests_and_fixed_payloads(
         field.get("readOnly") for field in create_stream["properties"].values()
     )
     assert create_stream["properties"]["encryption"]["default"] is False
+    assert "allow_key_sharing_by_holders" not in create_stream["properties"]
     assert "readOnly" not in create_stream["properties"]["encryption"]
     assert create_stream["oneOf"][0]["properties"]["current_encryption_key_uuid"][
         "enum"
@@ -458,6 +459,10 @@ def test_generated_openapi_describes_encryption_requests_and_fixed_payloads(
     ]["content"]["application/json"]["schema"]
     assert "encryption" not in update_stream["properties"]
     assert "current_encryption_key_uuid" not in update_stream["properties"]
+    assert (
+        update_stream["properties"]["allow_key_sharing_by_holders"]["type"] == "boolean"
+    )
+    assert "allow_key_sharing_by_holders" not in update_stream.get("required", [])
     for name in (
         "WorkspaceUserStream_Filter",
         "WorkspaceUserStream_Get",
@@ -468,6 +473,8 @@ def test_generated_openapi_describes_encryption_requests_and_fixed_payloads(
         assert {"encryption", "current_encryption_key_uuid"} <= set(schema["required"])
         assert schema["properties"]["encryption"]["readOnly"] is True
         assert schema["properties"]["current_encryption_key_uuid"]["nullable"] is True
+        assert "allow_key_sharing_by_holders" in schema["required"]
+        assert schema["properties"]["allow_key_sharing_by_holders"]["default"] is False
         assert "current_encryption_key" not in schema["properties"]
     create_message = paths[f"{root}messages/"]["post"]["requestBody"]["content"][
         "application/json"

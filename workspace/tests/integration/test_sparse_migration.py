@@ -128,6 +128,7 @@ def test_sparse_migration_normalizes_the_legacy_members_role_before_recount(db):
     project, user = uuid.uuid4(), uuid.uuid4()
     stream = conftest.seed_user_stream(db, project, user, "Legacy role")
     topic = conftest.seed_stream_topic(db, project, stream, user, "Unread", True)
+    conftest.add_key_sharing_to_historical_stream_view(db)
     db.execute(
         "UPDATE messenger_stream_bindings SET role='members' "
         "WHERE project_id=%s AND stream_uuid=%s AND user_uuid=%s",
@@ -152,11 +153,14 @@ def test_sparse_migration_normalizes_the_legacy_members_role_before_recount(db):
         migration.migration_step.upgrade(session)
     with contexts.Context().session_manager() as session:
         assert counters.process_pending(session, 10) == 1
-    assert db.execute(
-        "SELECT next_retry_at FROM messenger_counter_updates "
-        "WHERE project_id=%s AND user_uuid=%s AND topic_uuid=%s",
-        (project, user, topic),
-    ).fetchall() == []
+    assert (
+        db.execute(
+            "SELECT next_retry_at FROM messenger_counter_updates "
+            "WHERE project_id=%s AND user_uuid=%s AND topic_uuid=%s",
+            (project, user, topic),
+        ).fetchall()
+        == []
+    )
     with contexts.Context().session_manager() as session:
         streams = v2_models.WorkspaceUserStream.objects.get_all(
             filters=stream_filters, session=session
