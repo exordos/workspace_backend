@@ -16,6 +16,11 @@ INLINE_CODE_RE = re.compile(r"(?<!`)`[^`\n]+`(?!`)")
 LINK_RE = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
 HEADING_RE = re.compile(r"(?m)^(#{1,6})[ \t]+")
 TABLE_ROW_RE = re.compile(r"(?m)^\|.*\|[ \t]*$")
+# These internal design contracts were explicitly commissioned in Russian.
+RU_ONLY_DESIGN_DOCS = {
+    "sticker_catalog_api_implementation_plan.md",
+    "sticker_catalog_api_tz.md",
+}
 
 
 def _language_artifacts(language):
@@ -23,7 +28,9 @@ def _language_artifacts(language):
     return {
         path.relative_to(root).as_posix()
         for path in root.rglob("*")
-        if path.is_file() and path.suffix in DOCUMENT_SUFFIXES
+        if path.is_file()
+        and path.suffix in DOCUMENT_SUFFIXES
+        and path.relative_to(root).as_posix() not in RU_ONLY_DESIGN_DOCS
     }
 
 

@@ -84,6 +84,11 @@ class WorkspaceOpenApiPaths(openapi_structures.OpenApiPaths):
             "/v1/messenger/",
             components,
         )
+        specification = openapi_contract.add_sticker_catalog_contract(
+            specification,
+            "/v1/messenger/",
+            components,
+        )
         specification = openapi_contract.add_events_cursor_contract(
             specification,
             "/v1/events/",
@@ -94,7 +99,9 @@ class WorkspaceOpenApiPaths(openapi_structures.OpenApiPaths):
             specification,
             "/v1/me/",
         )
-        specification = openapi_contract.add_poll_contract(specification, "/v1/messenger/")
+        specification = openapi_contract.add_poll_contract(
+            specification, "/v1/messenger/"
+        )
         return openapi_contract.add_current_user_contract(
             specification,
             "/v1/messenger/me/",

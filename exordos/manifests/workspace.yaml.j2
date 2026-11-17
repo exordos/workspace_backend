@@ -129,6 +129,9 @@ resources:
     workspace_topic_summary_settings_manage:
       name: "workspace.topic_summary_settings.manage"
       description: "Manage global and project Workspace topic summary settings"
+    workspace_sticker_catalog_manage:
+      name: "workspace.sticker_catalog.manage"
+      description: "Manage the global Workspace sticker catalog"
 
     # Preserve installed legacy grants until their consumers are retired.
     workspace_external_account_reconnect:
@@ -176,6 +179,10 @@ resources:
       name: "workspace-topic-summary-admin"
       description: "Administer Workspace topic summarization"
       project_id: null
+    workspace_sticker_catalog_admin:
+      name: "workspace-sticker-catalog-admin"
+      description: "Administer the global Workspace sticker catalog"
+      project_id: null
 
     # Preserve installed legacy grants until their consumers are retired.
     workspace_external_integration_admin:
@@ -207,6 +214,10 @@ resources:
     workspace_topic_summary_admin_settings_manage:
       role: $core.iam.roles.$workspace_topic_summary_admin:uuid
       permission: $core.iam.permissions.$workspace_topic_summary_settings_manage:uuid
+      project_id: null
+    workspace_sticker_catalog_admin_manage:
+      role: $core.iam.roles.$workspace_sticker_catalog_admin:uuid
+      permission: $core.iam.permissions.$workspace_sticker_catalog_manage:uuid
       project_id: null
 
     # Preserve installed legacy grants until their consumers are retired.
