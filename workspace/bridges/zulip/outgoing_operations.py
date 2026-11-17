@@ -5,6 +5,7 @@
 
 import asyncio
 import datetime
+import hashlib
 import json
 import typing
 import urllib.parse
@@ -14,7 +15,7 @@ from psycopg.types import json as pg_json
 
 from workspace.bridges.zulip import content_cache, message_conversion, poll_conversion
 from workspace.common import emoji
-from workspace.messenger_api import file_storage
+from workspace.messenger_api import file_storage, sticker_catalog, sticker_storage
 from workspace.messenger_api.dm import message_payloads
 
 TABLES = {
@@ -249,6 +250,12 @@ SELECT_VISIBLE_FILE_SQL = """
     LIMIT 1
 """
 
+SELECT_ACTIVE_STICKERS_SQL = """
+    SELECT uuid, format, size_bytes, sha256, media_object_id
+    FROM m_workspace_stickers
+    WHERE uuid = ANY(%s::uuid[]) AND active AND NOT blocked
+"""
+
 SELECT_VISIBLE_STREAM_SQL = """
     SELECT 1
     FROM messenger_api_user_streams_v1
@@ -374,6 +381,27 @@ def request(
     kind: str, method: str, path: str, data: dict | None = None, **extra: typing.Any
 ) -> dict:
     return {"kind": kind, "method": method, "path": path, "data": data or {}, **extra}
+
+
+def _sticker_upload_path(server_url: str, target: str) -> str | None:
+    origin = urllib.parse.urlsplit(server_url)
+    endpoint = message_conversion.parse_url(target, server_url)
+    if endpoint is None or (endpoint.scheme, endpoint.netloc) != (
+        origin.scheme,
+        origin.netloc,
+    ):
+        return None
+    path = message_conversion.zulip_upload_path(endpoint.path)
+    if path is None or not path.startswith("/user_uploads/"):
+        return None
+    decoded = urllib.parse.unquote(path)
+    if (
+        "\\" in decoded
+        or any(part in ("", ".", "..") for part in decoded.split("/")[2:])
+        or any(ord(character) < 32 or ord(character) == 127 for character in decoded)
+    ):
+        return None
+    return urllib.parse.quote(decoded, safe="/")
 
 
 class Operations:
@@ -990,6 +1018,85 @@ class Operations:
             "-group" if route["channel_type"] == "group" else ""
         )
 
+    async def _sticker_uploads(
+        self, intent: dict, account: dict, sticker_ids: list[str]
+    ) -> dict[str, str]:
+        rows = await self.db.sql(SELECT_ACTIVE_STICKERS_SQL, (sticker_ids,))
+        if not rows:
+            return {}
+        # The send or edit request is persisted only after conversion. On a
+        # retry the file upload may already have succeeded, even when its
+        # response or the prepared message request did not reach us.
+        attachments = []
+        if intent["attempts"]:
+            attachments = (await self.http.request(account, "GET", "/attachments"))[
+                "attachments"
+            ]
+        result = {}
+        for sticker in rows:
+            name = f"workspace-sticker-{intent['uuid']}-{sticker['uuid']}.{sticker['format']}"
+            path = await self._sticker_upload(account, sticker, name, attachments)
+            if path is not None:
+                result[str(sticker["uuid"])] = path
+        return result
+
+    async def _sticker_upload(
+        self, account: dict, sticker: dict, name: str, attachments: list[dict]
+    ) -> str | None:
+        for attachment in attachments:
+            if (
+                attachment["name"] != name
+                or attachment["size"] != sticker["size_bytes"]
+            ):
+                continue
+            path = _sticker_upload_path(
+                account["settings"]["server_url"],
+                "/user_uploads/" + attachment["path_id"],
+            )
+            if path is None:
+                continue
+            try:
+                content, _ = await self.http.download(account, path)
+            except ApiError as error:
+                if error.status not in (403, 404):
+                    raise
+                continue
+            if (
+                len(content) == sticker["size_bytes"]
+                and hashlib.sha256(content).hexdigest() == sticker["sha256"]
+            ):
+                return path
+
+        try:
+            content = await asyncio.to_thread(
+                lambda: sticker_storage.get_sticker_storage().read(
+                    sticker["media_object_id"]
+                )
+            )
+        except sticker_storage.StickerStorageNotFoundError:
+            return None
+        except sticker_storage.StickerStorageBackendError as error:
+            raise Pending("Sticker storage is temporarily unavailable") from error
+        if (
+            len(content) != sticker["size_bytes"]
+            or hashlib.sha256(content).hexdigest() != sticker["sha256"]
+        ):
+            raise ValueError("Sticker media does not match its catalog entry")
+        uploaded = await self.http.request(
+            account,
+            "POST",
+            "/user_uploads",
+            file=(
+                name,
+                content,
+                sticker_catalog.MEDIA_CONTENT_TYPES[sticker["format"]],
+            ),
+        )
+        path = _sticker_upload_path(account["settings"]["server_url"], uploaded["uri"])
+        if path is None:
+            raise Pending("Zulip did not return a valid sticker upload path")
+        return path
+
     async def convert(self, intent: dict, account: dict) -> dict:
         payload = intent["data"]["payload"]
         references = {
@@ -1116,6 +1223,13 @@ class Operations:
                         if "/#narrow/channel/" in url
                         else ""
                     )
+        sticker_ids = sorted(
+            identifier for kind, identifier in references if kind == "sticker"
+        )
+        if sticker_ids:
+            context["stickers"] = await self._sticker_uploads(
+                intent, account, sticker_ids
+            )
         cache_key = content_cache.key(
             account["provider_uuid"], "outgoing", payload, context
         )

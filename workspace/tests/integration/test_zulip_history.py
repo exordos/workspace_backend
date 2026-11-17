@@ -711,7 +711,9 @@ def test_history_process_is_silent_for_an_actual_websocket_client(
         async def provider(request):
             transports.append(request.transport)
             assert not db.execute(
-                "SELECT 1 FROM pg_stat_activity WHERE application_name='workspace-zulip-history' AND state='idle in transaction'"
+                "SELECT 1 FROM pg_stat_activity WHERE datname=current_database() "
+                "AND application_name='workspace-zulip-history' "
+                "AND state='idle in transaction'"
             ).fetchone()
             if request.path.endswith("/messages"):
                 return web.json_response(
@@ -1140,6 +1142,61 @@ def test_bulk_page_keeps_source_quote_snapshot_and_link(incoming):
     assert f"urn:forward:{by_remote['102']['uuid']}?snapshot={snapshot}" in content
     assert "urn:url:https://zulip.example.com/#narrow/near/101" in content
     assert "urn:quote:" not in content
+
+
+@pytest.mark.parametrize("preexisting_attachment", [False, True])
+def test_history_sticker_restoration_tracks_catalog_without_copying_an_attachment(
+    incoming, monkeypatch, tmp_path, preexisting_attachment
+):
+    api, db, account, http, _ = incoming
+    monkeypatch.setenv("WORKSPACE_FILE_STORAGE_PATH", str(tmp_path))
+    data = b"sticker image"
+    sticker = incoming_tests.seed_global_sticker(db, data)
+    path = "/user_uploads/1/a/sticker.png"
+    if preexisting_attachment:
+        http.download = mock.AsyncMock(return_value=(data, "image/png"))
+        incoming_tests.apply(
+            incoming, incoming_tests.event(f"![ordinary]({path})", 100)
+        )
+    source = f"Before ![workspace-sticker:v1:{sticker}]({path}) after."
+    messages = {101: message(101, source)}
+    downloads = mock.AsyncMock(return_value=(data, "image/png"))
+
+    async def run():
+        async with worker(incoming, messages) as (service, _):
+            service.http.download = downloads
+            await drain(service, account)
+
+    def snapshot():
+        messages = [
+            row
+            for row in api.get("/v1/messenger/messages/").json()
+            if row["provider_identity"] == "101"
+        ]
+        assert len(messages) == 1
+        assert len(api.get("/v1/messenger/files/").json()) == int(
+            preexisting_attachment
+        )
+        return messages[0]["payload"]["content"]
+
+    request(db, account)
+    asyncio.run(run())
+    assert snapshot() == f"Before ![sticker](urn:sticker:{sticker}) after."
+    assert downloads.await_count == 1
+    request(db, account)
+    asyncio.run(run())
+    assert snapshot() == f"Before ![sticker](urn:sticker:{sticker}) after."
+    assert downloads.await_count == 1
+
+    deleted = api.delete(
+        f"/v1/messenger/stickers/{sticker}",
+        permissions=("workspace.sticker_catalog.manage",),
+    )
+    assert deleted.status_code == 204, deleted.text
+    request(db, account)
+    asyncio.run(run())
+    assert snapshot() == "Before **Sticker unavailable** after."
+    assert downloads.await_count == 2
 
 
 @pytest.mark.parametrize("separate_streams", [False, True])

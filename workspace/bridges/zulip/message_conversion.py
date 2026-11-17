@@ -9,7 +9,8 @@ Context contains server_url and original_url, plus optional mention_uuids
 (id:<Zulip ID> or name:<name>), stream_uuids (name), topic_uuids (channel>topic),
 message_uuids (Zulip ID), stream_ids (name -> Zulip ID), dm_stream_uuids
 (provider identity -> visible Workspace stream UUID), files (URL -> Workspace
-file URN), deleted_files and inaccessible_files (source URLs), linkifier_urls,
+file URN), stickers (upload URL -> catalog UUID -> verification result),
+deleted_files and inaccessible_files (source URLs), linkifier_urls,
 user_group_ids, and custom_emoji_names.
 The optional messages mapping contains
 original Zulip messages keyed by their string IDs, for full/partial quotes.
@@ -52,6 +53,13 @@ _REFERENCE_URN = re.compile(
 )
 _SILENT_USER_LINK = re.compile(r'\]\(urn:user:[\da-f-]{36} "silent"\)', re.IGNORECASE)
 _MAX_QUOTE_DEPTH = 32
+STICKER_LABEL_PREFIX = "workspace-sticker:v1:"
+STICKER_UNAVAILABLE = "**Sticker unavailable**"
+_STICKER_UUID = (
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+_STICKER_LABEL = re.compile(re.escape(STICKER_LABEL_PREFIX) + f"({_STICKER_UUID})")
+_STICKER_URN = re.compile(r"urn:sticker:(" + _STICKER_UUID + ")")
 PROVIDER_MESSAGE_REFERENCE_POLICY = "source-snapshots-v3"
 
 
@@ -220,7 +228,15 @@ def zulip_upload_path(path: str) -> str | None:
     return "/user_uploads/" + urllib.parse.quote(original, safe="/")
 
 
+def sticker_uuid_from_label(label: str) -> str | None:
+    """Read the complete marker placed on a Zulip sticker upload."""
+    match = _STICKER_LABEL.fullmatch(label)
+    return match[1].lower() if match is not None else None
+
+
 def _workspace_reference(target: str) -> tuple[str, str, str] | None:
+    if sticker := _STICKER_URN.fullmatch(target):
+        return "sticker", sticker[1].lower(), ""
     match = _REFERENCE_URN.fullmatch(target)
     if match is None:
         return None
@@ -245,7 +261,7 @@ def _url_target(token: str) -> str:
     return target
 
 
-def _message_links(text: str) -> collections.abc.Iterator[tuple[str, bool]]:
+def _message_links(text: str) -> collections.abc.Iterator[tuple[str, bool, str | None]]:
     tokens = re.compile(r"\\[^\n]|!?\[|<?https?://[^\s<>`]+>?|/user_uploads/[^\s<>`]+")
     position = 0
     while match := tokens.search(text, position):
@@ -256,38 +272,50 @@ def _message_links(text: str) -> collections.abc.Iterator[tuple[str, bool]]:
         if token in ("[", "!["):
             link = _link(text, match.start())
             if link is not None:
-                _, target, _, image, position = link
-                yield target, image
+                label, target, _, image, position = link
+                yield target, image, label
         else:
-            yield _url_target(token), False
+            yield _url_target(token), False, None
 
 
 def workspace_references(text: str) -> collections.abc.Iterator[tuple[str, str, str]]:
     """Yield parsed Workspace links; malformed references remain ordinary text."""
-    for target, _image in _message_links(text):
+    for target, _image, _label in _message_links(text):
         reference = _workspace_reference(target)
         if reference is not None:
             yield reference
 
 
-def get_zulip_files(
+def get_zulip_file_links(
     message: dict, context: dict, *, include_quotes: bool = False
-) -> list[str]:
-    """Return this message's file URLs in occurrence order, excluding quotes.
+) -> list[tuple[str, str | None]]:
+    """Return this message's attachment URLs and Markdown labels in occurrence order, excluding quotes.
 
     Context uses the same files mapping as conversion to recognize external
     file URLs. Repeated references are retained, as in the converted payload.
     """
     files = context.get("files", {})
     return [
-        target
-        for target, image in _message_links(
+        (target, label)
+        for target, image, label in _message_links(
             message["content"]
             if include_quotes
             else _without_quotes(message["content"])
         )
         if (url := parse_url(target)) is not None
         and (target in files or image or url.path.startswith("/user_uploads/"))
+    ]
+
+
+def get_zulip_files(
+    message: dict, context: dict, *, include_quotes: bool = False
+) -> list[str]:
+    """Return attachment URLs in occurrence order."""
+    return [
+        target
+        for target, _label in get_zulip_file_links(
+            message, context, include_quotes=include_quotes
+        )
     ]
 
 
@@ -311,7 +339,7 @@ def get_workspace_files(payload: dict, *, include_quotes: bool = False) -> list[
     text = workspace_reference_text(text) if include_quotes else _without_quotes(text)
     return [
         target
-        for target, _ in _message_links(text)
+        for target, _image, _label in _message_links(text)
         if (reference := _workspace_reference(target)) is not None
         and reference[0] in ("file", "image", "video")
     ]
@@ -417,6 +445,17 @@ class _ZulipToWorkspace:
             )
         return f"{label} ({reason})"
 
+    def sticker_link(self, target: str, label: str) -> str | None:
+        identifier = sticker_uuid_from_label(label)
+        if identifier is None:
+            return None
+        verified = self.context.get("stickers", {}).get(target, {}).get(identifier)
+        if verified is None:
+            return None
+        if not verified:
+            return STICKER_UNAVAILABLE
+        return _markdown_link("sticker", f"urn:sticker:{identifier}", image=True)
+
     def block_notice(self, description: str, source: str) -> str:
         parts = _ConversionParts()
         parts.append(self.notice(description, block=True))
@@ -425,8 +464,14 @@ class _ZulipToWorkspace:
 
     def block_files(self, source: str) -> str:
         parts = _ConversionParts()
-        for url in get_zulip_files({"content": source}, self.context):
+        for url, label in get_zulip_file_links({"content": source}, self.context):
             parts.append("\n\n")
+            if (
+                label is not None
+                and (sticker := self.sticker_link(url, label)) is not None
+            ):
+                parts.append(sticker)
+                continue
             unavailable = self.unavailable_file(url)
             if unavailable is not None:
                 parts.append(unavailable)
@@ -588,6 +633,9 @@ class _ZulipToWorkspace:
                     output.append(token)
                     continue
                 label, destination, title, image, position = link
+                if (sticker := self.sticker_link(destination, label)) is not None:
+                    output.append(sticker)
+                    continue
                 unavailable = self.unavailable_file(destination, label)
                 if unavailable is not None:
                     output.append(unavailable)
@@ -988,8 +1036,15 @@ def workspace_to_zulip(payload: dict, context: dict) -> str:
             return _markdown_link(label, value, title, image)
         reference = _workspace_reference(target)
         if reference is None:
-            return None
+            return STICKER_UNAVAILABLE if target.startswith("urn:sticker:") else None
         kind, identifier, query = reference
+        if kind == "sticker":
+            destination = context.get("stickers", {}).get(identifier)
+            if destination is None:
+                return STICKER_UNAVAILABLE
+            return _markdown_link(
+                STICKER_LABEL_PREFIX + identifier, destination, image=True
+            )
         if kind == "user":
             prefix = (
                 "@_" if title.strip() in ('"silent"', "'silent'", "(silent)") else "@"

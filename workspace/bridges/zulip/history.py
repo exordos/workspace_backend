@@ -17,6 +17,7 @@ from psycopg.types import json as pg_json
 
 from workspace.bridges.zulip import (
     incoming_operations,
+    incoming_stickers,
     message_conversion,
     outgoing_operations,
     poll_conversion,
@@ -392,7 +393,10 @@ class Operations(incoming_operations.Operations):
                 identifier, incoming_operations._uuid_text(uuid_strings, stream_uuid)
             )
         prepared = {"catalog": people, "streams": streams, "topics": topics}
-        files = await self.prepare_files(account, messages, stream_map, users)
+        stickers = await incoming_stickers.catalog(self.db.sql, account, messages)
+        files, context_files = await self.prepare_files(
+            account, messages, stream_map, users, stickers
+        )
         context_base = incoming_operations.conversion_context_base(
             account, prepared, uuid_strings=uuid_strings
         )
@@ -480,6 +484,7 @@ class Operations(incoming_operations.Operations):
             context = incoming_operations.conversion_context(
                 account, item, stream, topic, placement, prepared, base=context_base
             )
+            context["stickers"] = item.get("_stickers", {})
             for target, path in item.get("_files", []):
                 record = files[(stream["uuid"], path)]
                 if "missing" in record:
@@ -629,7 +634,8 @@ class Operations(incoming_operations.Operations):
             # New topics are used for their own placements, but cross-message
             # references were converted with the pre-merge resolver snapshot.
             "topics": topics,
-            "files": [record for record in files.values() if "missing" not in record],
+            "files": context_files,
+            "stickers": stickers,
             "edited": {
                 str(row["uuid"]): row["content_updated_at"]
                 for row in batch["messenger_messages"]
@@ -638,13 +644,14 @@ class Operations(incoming_operations.Operations):
         return batch
 
     async def prepare_files(
-        self, account: dict, messages: list, streams: dict, users: dict
-    ) -> dict:
-        targets = {}
+        self, account: dict, messages: list, streams: dict, users: dict, stickers: dict
+    ) -> tuple[dict[tuple, dict], list[dict]]:
+        targets: dict[tuple, list[tuple[dict, str, str | None]]] = {}
         for item in messages:
             stream = streams[incoming_operations.stream_identity(account, item)]["uuid"]
             item["_files"] = []
-            for target in message_conversion.get_zulip_files(item, {}):
+            item.pop("_stickers", None)
+            for target, label in message_conversion.get_zulip_file_links(item, {}):
                 endpoint = message_conversion.parse_url(
                     target, account["settings"]["server_url"]
                 )
@@ -653,8 +660,14 @@ class Operations(incoming_operations.Operations):
                 path = message_conversion.zulip_upload_path(endpoint.path)
                 if path is None:
                     continue
-                item["_files"].append((target, path))
-                targets[(stream, path)] = item
+                identifier = (
+                    incoming_stickers.marker(account, target, label)
+                    if stickers
+                    else None
+                )
+                targets.setdefault((stream, path), []).append(
+                    (item, target, identifier)
+                )
         existing = await self.db.sql(
             FILES_SQL,
             (
@@ -664,25 +677,47 @@ class Operations(incoming_operations.Operations):
             ),
         )
         by_path = {
-            (row["stream_uuid"], row["provider_identity"]): row for row in existing
+            (row["stream_uuid"], row["provider_identity"]): row
+            for row in existing
+            if (row["stream_uuid"], row["provider_identity"]) in targets
         }
         files: dict[tuple, dict] = {}
         blobs: dict[tuple, dict] = {}
         downloaded: dict[str, dict] = {}
-        for (stream, path), item in targets.items():
+        for (stream, path), links in targets.items():
+            decisions, upload = await incoming_stickers.verify(
+                self.http,
+                account,
+                path,
+                (identifier for _, _, identifier in links),
+                stickers,
+            )
+            file_item = None
+            for item, target, identifier in links:
+                if identifier is not None and identifier in decisions:
+                    item.setdefault("_stickers", {}).setdefault(target, {})[
+                        identifier
+                    ] = decisions[identifier]
+                else:
+                    item["_files"].append((target, path))
+                    file_item = item
+            if file_item is None:
+                continue
+            item = file_item
             if not base.FileProviderIdentity().validate(path):
                 files[(stream, path)] = {"missing": "path_too_long"}
                 continue
             known = by_path.get((stream, path))
             if known is None:
                 if path not in downloaded:
-                    try:
-                        content, content_type = await self.http.download(account, path)
-                    except outgoing_operations.ApiError as error:
-                        if error.status not in (403, 404):
-                            raise
-                        downloaded[path] = {"missing": error.status}
+                    if upload is None:
+                        upload = await incoming_stickers.download(
+                            self.http, account, path
+                        )
+                    if isinstance(upload, int):
+                        downloaded[path] = {"missing": upload}
                     else:
+                        content, content_type = upload
                         digest = hashlib.sha256(content).hexdigest()
                         key = (digest, len(content))
                         if key not in blobs:
@@ -769,7 +804,11 @@ class Operations(incoming_operations.Operations):
                 "status",
             )
             files[(stream, path)] = {key: known[key] for key in columns}
-        return files
+        # A previously imported file may still exist for a path we now
+        # recognize as a sticker. Keep it in the receipt context without
+        # relinking it as a regular attachment.
+        by_path.update((key, row) for key, row in files.items() if "missing" not in row)
+        return files, list(by_path.values())
 
     async def merge_batch(
         self, connection: typing.Any, account: dict, batch: dict

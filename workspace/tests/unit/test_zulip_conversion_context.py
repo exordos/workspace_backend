@@ -291,6 +291,8 @@ def test_prepare_formats_repeated_attachment_uuid_once():
         }
     }
     CountedUuid.counts = {}
-    with mock.patch.object(history.Operations, "prepare_files", return_value=files):
+    with mock.patch.object(
+        history.Operations, "prepare_files", return_value=(files, list(files.values()))
+    ):
         asyncio.run(benchmark.prepare(account, page, database))
     assert CountedUuid.counts[identifier.int] == 1
