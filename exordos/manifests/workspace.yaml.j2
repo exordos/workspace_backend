@@ -57,6 +57,10 @@ imports:
     element: "$core"
     kind: "resource"
     link: "$core.vs.variables.$core_ip_address"
+  core_api_vhost:
+    element: "$core"
+    kind: "resource"
+    link: "$core.network.lb.$core_lb.vhosts.$core_lb_core_http"
   var_hs256_jwks_encryption_key:
     element: "$core"
     kind: "resource"
@@ -535,6 +539,7 @@ resources:
       body:
         kind: text
         content: |
+          f"
           upstream workspace_core_api {
               include /etc/nginx/workspace.d/core-upstream.conf;
           }
@@ -545,7 +550,7 @@ resources:
               client_max_body_size 50m;
 
               location /api/core/ {
-                  proxy_pass https://workspace_core_api/api/core/;
+                  proxy_pass {$workspace.imports.$core_api_vhost:protocol}://workspace_core_api/api/core/;
                   proxy_set_header Host $http_host;
                   proxy_set_header X-Real-IP $remote_addr;
                   proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -578,6 +583,7 @@ resources:
                   return 404;
               }
           }
+          "
 
     workspace_backend_nginx_core_upstream:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
@@ -591,7 +597,7 @@ resources:
       body:
         kind: text
         content: |
-          f"server {$workspace.imports.$var_core_ip_address:value}:443;"
+          f"server {$workspace.imports.$var_core_ip_address:value}:{$workspace.imports.$core_api_vhost:port};"
 
   $core.em.services:
     workspace_bootstrap:

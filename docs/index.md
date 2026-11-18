@@ -35,6 +35,10 @@ cleanup; the generated public API describes the current supported contract.
 - [Unread and deletion validation](messenger_physical_deletion_testing.md)
 - [Zulip topic renames and completion](zulip_topic_renames.md)
 
+## Deployment
+
+- [Core API proxy transport and regression checks](core_api_proxy.md)
+
 ## Translation contract
 
 All four language trees contain the same Markdown and PlantUML paths. Code
