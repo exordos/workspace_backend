@@ -32,6 +32,11 @@ normal RestAlchemy model only if that same snapshot is still current. Terminal
 events immediately clear the token and ciphertext and are deleted after one
 hour.
 
+When upgrading a development installation, the migration converts pending
+legacy single-device events to the current format without changing their
+UUID or ciphertext. Already terminal events and unsupported legacy batches
+have their device data cleared and are not retried.
+
 ## Direct Notification topology
 
 Install `workspace_mobile_push` after `workspace`, `exordos_notification` and

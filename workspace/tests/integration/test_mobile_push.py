@@ -427,3 +427,44 @@ def test_sdk_enqueue_rolls_back_with_its_projection_transaction(api, workspace_a
     assert db.execute(
         "SELECT count(*) FROM gcl_sdk_events WHERE uuid=%s", (event["uuid"],)
     ).fetchone() == (0,)
+
+
+@pytest.mark.parametrize("status", ["NEW", "IN_PROGRESS"])
+def test_upgraded_device_array_can_be_sent_and_polled(api, workspace_api, db, status):
+    _, user, _, _ = prepared_message(api, workspace_api, db)
+    event_uuid, event = db.execute(
+        "SELECT uuid,event_data FROM gcl_sdk_events "
+        "WHERE event_data->>'kind'='WorkspacePush' "
+        "AND event_data #>> '{body,exchange,user_uuid}'=%s",
+        (str(user),),
+    ).fetchone()
+    params = event["body"]["event_params"]
+    payload = json.loads(params.pop("payload"))
+    params["devices"] = [
+        {
+            "device_uuid": params.pop("device_uuid"),
+            "registration_token": params.pop("registration_token"),
+            "content": payload["content"],
+        }
+    ]
+    db.execute(
+        "UPDATE gcl_sdk_events SET status=%s,event_data=%s::jsonb WHERE uuid=%s",
+        (status, json.dumps(event), event_uuid),
+    )
+    filename = "0307-Convert-legacy-mobile-push-device-arrays-5057f9.py"
+    migration = conftest.DataMigration(filename)
+    migration.rollback_migration(filename)
+    migration.apply_migration(filename)
+
+    client = mock.Mock()
+    client.get_event.return_value = {"status": "ACTIVE"}
+    _run_sender(client)
+    assert client.send_event.call_count == (1 if status == "NEW" else 0)
+    if status == "NEW":
+        (sent,) = client.send_event.call_args.args
+        assert sent.uuid == event_uuid
+        assert json.loads(sent.event_data.body["event_params"]["payload"]) == payload
+    client.get_event.assert_called_once_with(str(event_uuid))
+    assert db.execute(
+        "SELECT status FROM gcl_sdk_events WHERE uuid=%s", (event_uuid,)
+    ).fetchone() == ("ACTIVE",)

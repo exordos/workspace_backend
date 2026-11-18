@@ -1,8 +1,9 @@
 # Copyright 2026 Genesis Corporation.
 # Licensed under the Apache License, Version 2.0 (the "License").
 
-import json
 import copy
+import datetime
+import json
 import pathlib
 import uuid
 
@@ -23,11 +24,20 @@ def test_deployed_sdk_head_does_not_skip_new_master_dependencies(
 ):
     """Reproduce the real upgrade from the feature's previous lab image."""
     fixture = pathlib.Path(__file__).parents[1] / "fixtures/topic_push_events.json"
-    body = json.loads(fixture.read_text())["event"]
+    examples = json.loads(fixture.read_text())
+    body = examples["event"]
+    body["_membership_generation"] = 1
+    body["last_retry_at"] = (
+        datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=1)
+    ).isoformat()
     with contexts.Context().session_manager() as session:
         sdk = sdk_utils.MigrationEngine._get_migration_engine(sdk_migrations)
         sdk.apply_migration("0000-init-events-table-2cfd220e.py", session)
         push_events._insert(body, uuid.UUID(body["exchange"]["user_uuid"]))
+        session.execute(
+            "UPDATE gcl_sdk_events SET status=%s WHERE uuid=%s",
+            (signal_status, body["uuid"]),
+        )
         signal = copy.deepcopy(body)
         signal["uuid"] = str(uuid.uuid4())
         signal["event_params"]["devices"] = []
@@ -42,6 +52,12 @@ def test_deployed_sdk_head_does_not_skip_new_master_dependencies(
             "UPDATE gcl_sdk_events SET status=%s WHERE uuid=%s",
             (signal_status, signal["uuid"]),
         )
+        batch = copy.deepcopy(body)
+        batch["uuid"] = str(uuid.uuid4())
+        batch["event_params"]["devices"].append(
+            dict(batch["event_params"]["devices"][0], device_uuid=str(uuid.uuid4()))
+        )
+        push_events._insert(batch, uuid.UUID(body["exchange"]["user_uuid"]))
         session.execute(
             "INSERT INTO ra_migrations(uuid,applied) VALUES (%s,true)",
             ("4408ccb7-46a5-4cd1-9101-876958bc79df",),
@@ -67,10 +83,27 @@ def test_deployed_sdk_head_does_not_skip_new_master_dependencies(
             is not None
         )
         stored = session.execute(
-            "SELECT event_data->'body' AS body FROM gcl_sdk_events WHERE uuid=%s",
+            "SELECT status,event_data->'body' AS body FROM gcl_sdk_events WHERE uuid=%s",
             (body["uuid"],),
         ).fetchone()
-        assert stored["body"] == body
+        assert stored["status"] == signal_status
+        assert stored["body"]["uuid"] == body["uuid"]
+        assert stored["body"]["last_retry_at"] == body["last_retry_at"]
+        assert stored["body"]["_membership_generation"] == 1
+        params = stored["body"]["event_params"]
+        assert "devices" not in params
+        target = body["event_params"]["devices"][0]
+        assert params["device_uuid"] == target["device_uuid"]
+        assert params["registration_token"] == target["registration_token"]
+        assert params["priority"] == body["event_params"]["priority"]
+        assert json.loads(params["payload"]) == examples["payloads"]["first"]
+        unsupported = session.execute(
+            "SELECT status,event_data #> '{body,event_params}' AS params "
+            "FROM gcl_sdk_events WHERE uuid=%s",
+            (batch["uuid"],),
+        ).fetchone()
+        assert unsupported["status"] == "ERROR"
+        assert "devices" not in unsupported["params"]
         converted = session.execute(
             "SELECT status,event_data FROM gcl_sdk_events WHERE uuid=%s",
             (signal["uuid"],),
