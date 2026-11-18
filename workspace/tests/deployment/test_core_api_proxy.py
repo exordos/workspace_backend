@@ -4,6 +4,7 @@
 """Run against an isolated Realm's real Core API and Workspace gateway."""
 
 import os
+from urllib import parse
 
 import pytest
 import requests
@@ -26,6 +27,7 @@ def http():
 
 
 def test_core_api_reaches_the_gateway_without_a_redirect(http):
+    assert parse.urlsplit(CORE).scheme == "https"
     for base in (CORE, GATEWAY):
         response = http.get(
             base + "/api/core/v1/", timeout=(3, 10), allow_redirects=False
@@ -47,3 +49,11 @@ def test_gateway_preserves_the_iam_refresh_response(http):
     )
     assert direct.status_code in (400, 401)
     assert proxied.status_code == direct.status_code
+
+
+def test_gateway_proxies_iam_key_discovery(http):
+    path = "/api/core/v1/iam/clients/default/actions/jwks"
+    for base in (CORE, GATEWAY):
+        response = http.get(base + path, timeout=(3, 10), allow_redirects=False)
+        assert response.status_code == 200
+        assert response.json()["keys"]

@@ -7,6 +7,9 @@ api_version: "v1"
 requirements:
   core:
     from_version: "0.0.0"
+  core_api_https:
+    # First development build with the public trust export.
+    from_version: "0.4.9-dev+20261118142019"
   dbaas:
     from_version: "0.0.0"
   s3aas:
@@ -25,6 +28,10 @@ imports:
     element: "$core"
     kind: "resource"
     link: "$core.dns.domains.$local_domain"
+  core_api_trust_pem:
+    element: "$core_api_https"
+    kind: "resource"
+    link: "$core.vs.variables.$core_api_trust_pem"
   profile_develop:
     element: "$core"
     kind: "resource"
@@ -53,14 +60,6 @@ imports:
     element: "$core"
     kind: "resource"
     link: "$core.vs.variables.$default_ram"
-  var_core_ip_address:
-    element: "$core"
-    kind: "resource"
-    link: "$core.vs.variables.$core_ip_address"
-  core_api_vhost:
-    element: "$core"
-    kind: "resource"
-    link: "$core.network.lb.$core_lb.vhosts.$core_lb_core_http"
   var_hs256_jwks_encryption_key:
     element: "$core"
     kind: "resource"
@@ -421,7 +420,7 @@ resources:
 
 
           [iam]
-          iam_endpoint = http://core.{$workspace.imports.$core_local_domain:name}/api/core/v1/iam/clients/default
+          iam_endpoint = http://127.0.0.1/api/core/v1/iam/clients/default
           audience = {$workspace.imports.$var_iam_default_client_id:value}
           hs256_jwks_decryption_key = {$workspace.imports.$var_hs256_jwks_encryption_key:value}
 
@@ -540,18 +539,19 @@ resources:
         kind: text
         content: |
           f"
-          upstream workspace_core_api {
-              include /etc/nginx/workspace.d/core-upstream.conf;
-          }
-
           server {
               listen 80;
               server_name _;
               client_max_body_size 50m;
 
               location /api/core/ {
-                  proxy_pass {$workspace.imports.$core_api_vhost:protocol}://workspace_core_api/api/core/;
-                  proxy_set_header Host $http_host;
+                  proxy_pass https://core.{$workspace.imports.$core_local_domain:name}:443/api/core/;
+                  proxy_ssl_server_name on;
+                  proxy_ssl_name core.{$workspace.imports.$core_local_domain:name};
+                  proxy_ssl_trusted_certificate /etc/nginx/workspace.d/core-ca.pem;
+                  proxy_ssl_verify on;
+                  proxy_ssl_verify_depth 3;
+                  proxy_set_header Host core.{$workspace.imports.$core_local_domain:name};
                   proxy_set_header X-Real-IP $remote_addr;
                   proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
                   proxy_set_header X-Forwarded-Proto https;
@@ -585,9 +585,9 @@ resources:
           }
           "
 
-    workspace_backend_nginx_core_upstream:
+    workspace_backend_nginx_core_trust:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
-      path: /etc/nginx/workspace.d/core-upstream.conf
+      path: /etc/nginx/workspace.d/core-ca.pem
       target:
         kind: node
         node: $core.compute.nodes.$workspace_backend:uuid
@@ -596,8 +596,7 @@ resources:
         command: /usr/local/bin/workspace-nginx-reload
       body:
         kind: text
-        content: |
-          f"server {$workspace.imports.$var_core_ip_address:value}:{$workspace.imports.$core_api_vhost:port};"
+        content: $workspace.imports.$core_api_trust_pem:value
 
   $core.em.services:
     workspace_bootstrap:

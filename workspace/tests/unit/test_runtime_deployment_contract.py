@@ -4,10 +4,8 @@
 # you may not use this file except in compliance with the License.
 
 import pathlib
-import re
 
 import jinja2
-import pytest
 import yaml
 
 PROJECT_ROOT = pathlib.Path(__file__).parents[3]
@@ -222,50 +220,49 @@ def test_manifest_exposes_only_api_routes_from_the_backend_node():
     assert "location / {\n                  return 404;" in manifest
 
 
-@pytest.mark.parametrize(
-    "protocol,port", [("http", 80), ("https", 443), ("https", 8443)]
-)
-def test_manifest_uses_the_declared_core_api_listener(protocol, port):
+def test_core_api_proxy_requires_and_verifies_the_core_https_listener():
     manifest = yaml.safe_load(
         jinja2.Template(_read("exordos/manifests/workspace.yaml.j2")).render(
             version="test", images={"workspace_backend": "fixture-image"}
         )
     )
-    values = {
-        "$workspace.imports.$var_core_ip_address:value": "192.0.2.10",
-        "$workspace.imports.$core_api_vhost:protocol": protocol,
-        "$workspace.imports.$core_api_vhost:port": str(port),
+    assert manifest["requirements"]["core_api_https"] == {
+        "from_version": "0.4.9-dev+20261118142019"
     }
+    resources = manifest["resources"]
+    configs = resources["$core.config.configs"]
+    nginx = configs["workspace_backend_nginx"]["body"]["content"]
+    core_location = nginx.split("location /api/core/ {", 1)[1].split(
+        "location = /api/workspace", 1
+    )[0]
+    core_name = "core.{$workspace.imports.$core_local_domain:name}"
+    assert f"proxy_pass https://{core_name}:443/api/core/;" in core_location
+    assert "proxy_ssl_server_name on;" in core_location
+    assert f"proxy_ssl_name {core_name};" in core_location
+    assert f"proxy_set_header Host {core_name};" in core_location
+    assert "proxy_ssl_verify on;" in core_location
+    assert "proxy_set_header X-Forwarded-Proto https;" in core_location
 
-    def content(name):
-        text = manifest["resources"]["$core.config.configs"][name]["body"]["content"]
-        if text.startswith('f"'):
-            text = re.sub(
-                r"\{([^\n{}]+)\}",
-                lambda match: values[match[1]],
-                text[2 : text.rfind('"')],
-            )
-        return text
-
-    nginx = content("workspace_backend_nginx")
-    upstream = content("workspace_backend_nginx_core_upstream")
-    assert f"proxy_pass {protocol}://workspace_core_api/api/core/;" in nginx
-    assert upstream.strip() == f"server 192.0.2.10:{port};"
-    # Public HTTPS termination is independent of the internal Core listener.
-    assert "proxy_set_header X-Forwarded-Proto https;" in nginx
-
-
-def test_manifest_imports_the_core_api_vhost():
-    manifest = yaml.safe_load(
-        jinja2.Template(_read("exordos/manifests/workspace.yaml.j2")).render(
-            version="test", images={"workspace_backend": "fixture-image"}
-        )
-    )
-    assert manifest["imports"]["core_api_vhost"] == {
-        "element": "$core",
+    trust = configs["workspace_backend_nginx_core_trust"]
+    assert f"proxy_ssl_trusted_certificate {trust['path']};" in core_location
+    assert trust["body"]["content"] == "$workspace.imports.$core_api_trust_pem:value"
+    assert manifest["imports"]["core_api_trust_pem"] == {
+        "element": "$core_api_https",
         "kind": "resource",
-        "link": "$core.network.lb.$core_lb.vhosts.$core_lb_core_http",
+        "link": "$core.vs.variables.$core_api_trust_pem",
     }
+    assert trust["target"] == configs["workspace_backend_nginx"]["target"]
+    assert trust["on_change"] == configs["workspace_backend_nginx"]["on_change"]
+    assert "workspace_core_api_transport" not in resources["$core.vs.variables"]
+
+    # Updating the main config changes the scheme and destination together.
+    assert "workspace_backend_nginx_core_upstream" not in configs
+    assert "var_core_ip_address" not in manifest["imports"]
+
+
+def test_backend_iam_uses_the_same_verified_core_proxy():
+    manifest = _read("exordos/manifests/workspace.yaml.j2")
+    assert "iam_endpoint = http://127.0.0.1/api/core/v1/iam/clients/default" in manifest
 
 
 def test_backend_bootstrap_has_no_secondary_storage_gate():
