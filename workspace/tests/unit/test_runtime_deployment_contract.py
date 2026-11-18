@@ -4,6 +4,11 @@
 # you may not use this file except in compliance with the License.
 
 import pathlib
+import re
+
+import jinja2
+import pytest
+import yaml
 
 PROJECT_ROOT = pathlib.Path(__file__).parents[3]
 
@@ -217,15 +222,50 @@ def test_manifest_exposes_only_api_routes_from_the_backend_node():
     assert "location / {\n                  return 404;" in manifest
 
 
-def test_manifest_proxies_core_api_over_https():
-    manifest = _read("exordos/manifests/workspace.yaml.j2")
-
-    assert "proxy_pass https://workspace_core_api/api/core/;" in manifest
-    assert "proxy_pass http://workspace_core_api/api/core/;" not in manifest
-    assert 'f"server {$workspace.imports.$var_core_ip_address:value}:443;"' in manifest
-    assert (
-        'f"server {$workspace.imports.$var_core_ip_address:value}:80;"' not in manifest
+@pytest.mark.parametrize(
+    "protocol,port", [("http", 80), ("https", 443), ("https", 8443)]
+)
+def test_manifest_uses_the_declared_core_api_listener(protocol, port):
+    manifest = yaml.safe_load(
+        jinja2.Template(_read("exordos/manifests/workspace.yaml.j2")).render(
+            version="test", images={"workspace_backend": "fixture-image"}
+        )
     )
+    values = {
+        "$workspace.imports.$var_core_ip_address:value": "192.0.2.10",
+        "$workspace.imports.$core_api_vhost:protocol": protocol,
+        "$workspace.imports.$core_api_vhost:port": str(port),
+    }
+
+    def content(name):
+        text = manifest["resources"]["$core.config.configs"][name]["body"]["content"]
+        if text.startswith('f"'):
+            text = re.sub(
+                r"\{([^\n{}]+)\}",
+                lambda match: values[match[1]],
+                text[2 : text.rfind('"')],
+            )
+        return text
+
+    nginx = content("workspace_backend_nginx")
+    upstream = content("workspace_backend_nginx_core_upstream")
+    assert f"proxy_pass {protocol}://workspace_core_api/api/core/;" in nginx
+    assert upstream.strip() == f"server 192.0.2.10:{port};"
+    # Public HTTPS termination is independent of the internal Core listener.
+    assert "proxy_set_header X-Forwarded-Proto https;" in nginx
+
+
+def test_manifest_imports_the_core_api_vhost():
+    manifest = yaml.safe_load(
+        jinja2.Template(_read("exordos/manifests/workspace.yaml.j2")).render(
+            version="test", images={"workspace_backend": "fixture-image"}
+        )
+    )
+    assert manifest["imports"]["core_api_vhost"] == {
+        "element": "$core",
+        "kind": "resource",
+        "link": "$core.network.lb.$core_lb.vhosts.$core_lb_core_http",
+    }
 
 
 def test_backend_bootstrap_has_no_secondary_storage_gate():
