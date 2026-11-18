@@ -14,6 +14,7 @@ import typing
 
 import aiohttp
 import psycopg
+import yarl
 from psycopg import abc as pg_abc
 from psycopg import conninfo, rows
 from psycopg.types import json as pg_json
@@ -318,11 +319,48 @@ class Http:
         url = account["settings"]["server_url"].rstrip("/") + path
         session = await self.session(account)
         async with session.get(url, allow_redirects=False) as response:
-            if response.status >= 300:
+            if response.status < 300:
+                return await response.read(), response.content_type
+            if response.status != 302 or not path.startswith("/user_uploads/"):
                 raise outgoing_operations.ApiError(
                     response.status, {"msg": response.reason}, "GET"
                 )
-            return await response.read(), response.content_type
+
+        return await self._download_signed_upload(account, path, session.timeout)
+
+    async def _download_signed_upload(
+        self, account: dict, path: str, timeout: aiohttp.ClientTimeout
+    ) -> tuple[bytes, str]:
+        attachment = await self.request(account, "GET", path)
+        try:
+            signed_url = yarl.URL(attachment["url"], encoded=True)
+            if (
+                signed_url.scheme not in ("http", "https")
+                or not signed_url.raw_host
+                or signed_url.raw_user is not None
+                or signed_url.raw_password is not None
+                or signed_url.raw_fragment
+            ):
+                raise ValueError("Invalid signed upload URL")
+        except (KeyError, TypeError, ValueError):
+            raise aiohttp.ClientPayloadError(
+                "Invalid Zulip signed upload URL"
+            ) from None
+
+        # The URL is already signed. Keep its encoding and use a session
+        # without the Zulip account's Authorization header.
+        async with aiohttp.ClientSession(
+            connector=self.connector,
+            connector_owner=False,
+            timeout=timeout,
+            cookie_jar=aiohttp.DummyCookieJar(),
+        ) as storage:
+            async with storage.get(signed_url, allow_redirects=False) as response:
+                if response.status >= 300:
+                    raise outgoing_operations.ApiError(
+                        response.status, {"msg": "Signed upload download failed"}, "GET"
+                    )
+                return await response.read(), response.content_type
 
 
 class ZulipOutgoingService:

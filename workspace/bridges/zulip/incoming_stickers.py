@@ -13,7 +13,7 @@ from workspace.messenger_api.dm import base
 
 
 SELECT_CATALOG_SQL = """
-    SELECT uuid, size_bytes, sha256, active AND NOT blocked AS available
+    SELECT uuid, size_bytes, sha256, NOT blocked AS available
     FROM m_workspace_stickers
     WHERE uuid=ANY(%s::uuid[])
     UNION ALL

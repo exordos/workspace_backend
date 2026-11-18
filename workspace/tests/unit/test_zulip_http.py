@@ -13,6 +13,65 @@ from workspace.bridges.zulip import outgoing_operations
 from workspace.services import zulip_outgoing
 
 
+@pytest.mark.parametrize("status", [200, 302, 403, 404])
+def test_zulip_upload_download_authorizes_before_using_signed_storage(status):
+    async def run():
+        path = "/user_uploads/1/key/sticker.png"
+        signed_path = "/bucket/1/key/sticker.png?X-Amz-Signature=signature&key=%2f%2B"
+        seen = []
+
+        async def handle(request):
+            seen.append((request.raw_path, request.headers.get("Authorization")))
+            if request.path == path:
+                if status == 302:
+                    raise web.HTTPFound(storage_url)
+                return web.Response(
+                    status=status, body=b"image", content_type="image/png"
+                )
+            if request.path == f"/api/v1{path}":
+                return web.json_response({"result": "success", "url": storage_url})
+            return web.Response(body=b"image", content_type="image/png")
+
+        app = web.Application()
+        app.router.add_get("/{path:.*}", handle)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        zulip = web.TCPSite(runner, "127.0.0.1", 0)
+        storage = web.TCPSite(runner, "127.0.0.1", 0)
+        await zulip.start()
+        await storage.start()
+        zulip_port, storage_port = (address[1] for address in runner.addresses)
+        storage_url = f"http://127.0.0.1:{storage_port}{signed_path}"
+        http = zulip_outgoing.Http()
+        account = {
+            "uuid": "account",
+            "settings": {
+                "server_url": f"http://127.0.0.1:{zulip_port}",
+                "email": "user@example.com",
+                "api_key": "test-key",
+            },
+        }
+        try:
+            if status in (403, 404):
+                with pytest.raises(outgoing_operations.ApiError) as error:
+                    await http.download(account, path)
+                assert error.value.status == status
+            else:
+                assert await http.download(account, path) == (b"image", "image/png")
+            authorization = "Basic dXNlckBleGFtcGxlLmNvbTp0ZXN0LWtleQ=="
+            expected = [(path, authorization)]
+            if status == 302:
+                expected.extend(
+                    [(f"/api/v1{path}", authorization), (signed_path, None)]
+                )
+            assert seen == expected
+        finally:
+            await http.close()
+            await runner.cleanup()
+
+    asyncio.run(run())
+
+
 def test_http_connection_keeps_idle_tcp_path_alive_and_remains_reusable():
     async def run():
         body_ready = asyncio.Event()

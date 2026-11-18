@@ -1150,7 +1150,7 @@ def test_history_sticker_restoration_tracks_catalog_without_copying_an_attachmen
 ):
     api, db, account, http, _ = incoming
     monkeypatch.setenv("WORKSPACE_FILE_STORAGE_PATH", str(tmp_path))
-    data = b"sticker image"
+    data = f"sticker image, prior attachment: {preexisting_attachment}".encode()
     sticker = incoming_tests.seed_global_sticker(db, data)
     path = "/user_uploads/1/a/sticker.png"
     if preexisting_attachment:
@@ -1183,6 +1183,13 @@ def test_history_sticker_restoration_tracks_catalog_without_copying_an_attachmen
     asyncio.run(run())
     assert snapshot() == f"Before ![sticker](urn:sticker:{sticker}) after."
     assert downloads.await_count == 1
+
+    hidden = api.put(
+        f"/v1/messenger/stickers/{sticker}",
+        permissions=("workspace.sticker_catalog.manage",),
+        json={"active": False},
+    )
+    assert hidden.status_code == 200, hidden.text
     request(db, account)
     asyncio.run(run())
     assert snapshot() == f"Before ![sticker](urn:sticker:{sticker}) after."

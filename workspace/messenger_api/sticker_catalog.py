@@ -72,27 +72,14 @@ def normalize_emoji(values: typing.Iterable[str]) -> list[str]:
     """Deduplicate emoji in input order without inspecting media content."""
 
     normalized = [normalize_whitespace(value) for value in values]
-    result = _stable_dedupe(value for value in normalized if value)
-    if len(result) > sticker_models.MAX_EMOJI_COUNT:
-        raise ValueError("emoji cannot contain more than 5 values")
-    return result
+    return _stable_dedupe(value for value in normalized if value)
 
 
 def normalize_tags(values: typing.Iterable[str]) -> list[str]:
     """Normalize searchable tags and retain their first-seen order."""
 
     normalized = [normalize_whitespace(value).lower() for value in values]
-    result = _stable_dedupe(value for value in normalized if value)
-    if len(result) > sticker_models.MAX_TAG_COUNT:
-        raise ValueError("tags cannot contain more than 64 values")
-    if any(len(value) > sticker_models.MAX_TAG_LENGTH for value in result):
-        raise ValueError("one tag exceeds 64 characters")
-    if (
-        sum(len(value.encode("utf-8")) for value in result)
-        > sticker_models.MAX_TAGS_BYTES
-    ):
-        raise ValueError("tags exceed 4096 UTF-8 bytes")
-    return result
+    return _stable_dedupe(value for value in normalized if value)
 
 
 def normalize_search_text(value: str) -> str:

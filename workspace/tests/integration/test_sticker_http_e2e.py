@@ -238,6 +238,19 @@ def test_real_http_catalog_full_flow_through_unified_mount(
         assert [card["id"] for card in format_filtered.json()] == [second_uuid]
 
         detail = workspace_api.get(f"{UNIFIED_ROOT}/{first_uuid}")
+        for invalid_fields in (
+            {"tags": [f"tag-{i}" for i in range(65)]},
+            {"tags": [f"{i:02d}" + "я" * 62 for i in range(33)]},
+            {"emoji": ["😀", "😄", "😆", "🙂", "😎", "🤔"]},
+        ):
+            rejected = workspace_api.put(
+                f"{UNIFIED_ROOT}/{first_uuid}",
+                permissions=(MANAGE_PERMISSION,),
+                json=invalid_fields,
+            )
+            assert rejected.status_code == 400, rejected.text
+        current = workspace_api.get(f"{UNIFIED_ROOT}/{first_uuid}")
+        assert current.json() == detail.json()
         assert detail.status_code == 200, detail.text
         _assert_public_card(detail.json())
         assert detail.json()["media"] == {
