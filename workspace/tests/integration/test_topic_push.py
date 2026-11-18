@@ -13,6 +13,7 @@ from gcl_sdk.events.dm import models as sdk_models
 
 from workspace.common import mutation_journal_opts
 from workspace.messenger_api import push_events, push_notifications
+from workspace.services import push_notifications as push_handler
 from workspace.services.messenger_workers import mutation_runtime
 from workspace.tests.integration import (
     test_mobile_push,
@@ -448,6 +449,28 @@ def test_read_before_signal_handler_never_recreates_an_unread_card(
     assert all(c["unread_count"] == c["active_unread_count"] == 0 for c in contents)
 
 
+def test_zero_update_does_not_reference_a_message_after_access_is_removed(
+    api, workspace_api, db
+):
+    _, user, _, first = prepared_message(api, workspace_api, db)
+    response = api.post(
+        f"/v1/messenger/messages/{first['uuid']}/actions/read/invoke", user=user
+    )
+    assert response.status_code == 200
+    drain(db)
+    db.execute(
+        "DELETE FROM messenger_user_message_bindings "
+        "WHERE project_id=%s AND user_uuid=%s AND placement_uuid=%s",
+        (api.project_id, user, first["uuid"]),
+    )
+    drain(db)
+
+    contents = expand()
+    assert contents
+    assert all(c["unread_count"] == 0 and c["text"] == "" for c in contents)
+    assert all(c["event_params"]["message_uuid"] is None for c in queued(db, user))
+
+
 def test_sdk_sender_only_consumes_prepared_device_events(api, workspace_api, db):
     _, user, _, _ = prepared_message(api, workspace_api, db)
     client = mock.Mock()
@@ -476,6 +499,21 @@ def test_handler_waits_for_pending_counter_before_reading_preview(
     )
     assert expand() == []
     assert db.execute("SELECT status FROM gcl_sdk_events").fetchone() == ("NEW",)
+    (generation,) = db.execute(
+        "SELECT membership_generation FROM messenger_stream_bindings "
+        "WHERE project_id=%s AND user_uuid=%s AND stream_uuid=%s AND active",
+        (api.project_id, user, first["stream_uuid"]),
+    ).fetchone()
+    plan = db.execute(
+        "EXPLAIN (ANALYZE, TIMING OFF, FORMAT JSON) " + push_handler.TOPIC_SNAPSHOT_SQL,
+        (api.project_id, user, first["topic_uuid"], generation),
+    ).fetchone()[0][0]["Plan"]
+    nodes = [plan]
+    while nodes:
+        node = nodes.pop()
+        if node.get("Relation Name") == "messenger_user_message_unreads":
+            assert node["Actual Loops"] == 0
+        nodes.extend(node.get("Plans", ()))
     drain(db)
     contents = expand()
     assert contents and all(c["unread_count"] == 0 for c in contents)

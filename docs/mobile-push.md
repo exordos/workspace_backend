@@ -12,6 +12,11 @@ agree, reads the current notification policy and first unread preview, and
 creates one encrypted SDK event per current Android device. No device lookup,
 encryption or network request runs in the counter transaction.
 
+The handler reads the topic, membership, published counters and preview within
+one PostgreSQL statement snapshot. Pending counter or publication work skips
+the preview lookup. The chosen message must still belong to that topic and be
+accessible to that user before its UUID or contents are sent.
+
 Each event contains one compact Android payload. The routing envelope and
 preview are bound with HPKE associated data and the preview is encrypted with
 `HPKE-v1-BASE-X25519-HKDF-SHA256-AES-256-GCM`. Muted topics are suppressed;

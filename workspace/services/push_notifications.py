@@ -20,6 +20,92 @@ from workspace.messenger_api.dm import push_events as event_payloads
 
 LOG = logging.getLogger(__name__)
 
+# One snapshot for access, the published counters and the preview. The unread
+# facts already reference the user's message binding (messenger_unread_access_fk).
+TOPIC_SNAPSHOT_SQL = """
+    WITH topic_state AS MATERIALIZED (
+        SELECT topic.project_id, topic.uuid AS topic_uuid, topic.stream_uuid,
+               member.user_uuid, member.membership_generation,
+               topic.name AS topic_name, stream.name AS stream_name,
+               personal.notification_mode AS topic_mode,
+               member.notification_mode AS stream_mode,
+               personal.unread_count, personal.active_unread_count,
+               personal.passive_unread_count, last_message.placement_uuid AS last_message_uuid,
+               cursor.epoch_generation
+        FROM messenger_topics topic
+        JOIN messenger_streams stream
+          ON (stream.project_id, stream.uuid) = (topic.project_id, topic.stream_uuid)
+        JOIN messenger_stream_bindings member
+          ON (member.project_id, member.stream_uuid) = (topic.project_id, topic.stream_uuid)
+        JOIN messenger_user_topic_bindings personal
+          ON (personal.project_id, personal.user_uuid, personal.topic_uuid) =
+             (topic.project_id, member.user_uuid, topic.uuid)
+        JOIN m_workspace_event_cursors cursor
+          ON (cursor.project_id, cursor.user_uuid) = (topic.project_id, member.user_uuid)
+        LEFT JOIN messenger_topic_last_messages last_message
+          ON (last_message.project_id, last_message.topic_uuid) = (topic.project_id, topic.uuid)
+        WHERE topic.project_id = %s AND member.user_uuid = %s AND topic.uuid = %s
+          AND member.active AND member.membership_generation = %s
+          AND topic.deleted_at IS NULL AND stream.deleted_at IS NULL
+    )
+    SELECT state.*, published.epoch_version, preview.*
+    FROM topic_state state
+    LEFT JOIN LATERAL (
+        SELECT event.epoch_version, event.payload || COALESCE(override.payload, '{}') AS counts
+        FROM m_workspace_broadcast_message_events_v1 event
+        JOIN m_workspace_event_audience_members_v1 audience
+          ON audience.audience_snapshot_uuid = event.audience_snapshot_uuid
+          AND audience.user_uuid = state.user_uuid
+        LEFT JOIN m_workspace_event_recipient_payloads_v1 override
+          ON override.event_uuid = event.uuid AND override.user_uuid = state.user_uuid
+        WHERE event.project_id = state.project_id AND event.entity_uuid = state.topic_uuid
+          AND event.object_type = 'topic' AND event.action = 'updated'
+          AND NOT EXISTS (
+              SELECT 1 FROM messenger_counter_updates dirty
+              WHERE (dirty.project_id, dirty.user_uuid, dirty.topic_uuid) =
+                    (state.project_id, state.user_uuid, state.topic_uuid)
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM messenger_publication_outbox pending
+              WHERE pending.project_id = state.project_id AND pending.entity_uuid = state.topic_uuid
+                AND state.user_uuid = ANY(pending.recipients)
+          )
+        ORDER BY event.epoch_version DESC LIMIT 1
+    ) published ON (published.counts->>'unread_count')::bigint = state.unread_count
+       AND (published.counts->>'active_unread_count')::bigint = state.active_unread_count
+       AND (published.counts->>'passive_unread_count')::bigint = state.passive_unread_count
+    LEFT JOIN LATERAL (
+        SELECT CASE WHEN message.uuid IS NOT NULL THEN placement.uuid END AS message_uuid,
+               message.payload, message.created_at,
+               author.username, author.first_name, author.last_name
+        FROM (
+            SELECT COALESCE((
+                SELECT unread.placement_uuid FROM messenger_user_message_unreads unread
+                JOIN messenger_message_placements placement
+                  ON (placement.project_id, placement.uuid) = (unread.project_id, unread.placement_uuid)
+                JOIN messenger_messages message
+                  ON (message.project_id, message.uuid) = (placement.project_id, placement.message_uuid)
+                WHERE state.unread_count > 0 AND message.deleted_at IS NULL
+                  AND (unread.project_id, unread.user_uuid, unread.topic_uuid) =
+                      (state.project_id, state.user_uuid, state.topic_uuid)
+                ORDER BY message.created_at, placement.uuid LIMIT 1
+            ), state.last_message_uuid) AS message_uuid
+            WHERE published.epoch_version IS NOT NULL
+            OFFSET 0
+        ) picked
+        LEFT JOIN messenger_user_message_bindings access
+          ON (access.project_id, access.user_uuid, access.placement_uuid) =
+             (state.project_id, state.user_uuid, picked.message_uuid)
+        LEFT JOIN messenger_message_placements placement
+          ON (placement.project_id, placement.uuid) = (access.project_id, access.placement_uuid)
+          AND (placement.stream_uuid, placement.topic_uuid) = (state.stream_uuid, state.topic_uuid)
+        LEFT JOIN messenger_messages_with_content_v1 message
+          ON (message.project_id, message.uuid) = (placement.project_id, placement.message_uuid)
+          AND message.deleted_at IS NULL
+        LEFT JOIN m_workspace_users author ON author.uuid = message.author_uuid
+    ) preview ON true
+"""
+
 
 class TopicPushHandler(basic.BasicService):
     def __init__(self, **kwargs: typing.Any) -> None:
@@ -73,59 +159,7 @@ class TopicPushHandler(basic.BasicService):
             if cursor is None:
                 return  # The ordinary publication worker has not committed its epoch yet.
             route = session.execute(
-                """SELECT topic.name AS topic_name,stream.name AS stream_name,
-                       topic.notification_mode AS topic_mode,membership.notification_mode AS stream_mode,
-                       membership.membership_generation,
-                       current_epoch.epoch_version,routing_cursor.epoch_generation,
-                       EXISTS(SELECT 1 FROM messenger_publication_outbox pending
-                         WHERE pending.project_id=topic.project_id AND pending.entity_uuid=topic.uuid
-                           AND topic.user_uuid=ANY(pending.recipients)) AS publication_pending,
-                       topic.unread_count,topic.active_unread_count,topic.passive_unread_count,
-                       EXISTS(SELECT 1 FROM messenger_counter_updates dirty
-                         WHERE dirty.project_id=topic.project_id AND dirty.user_uuid=topic.user_uuid
-                           AND dirty.topic_uuid=topic.uuid) AS counters_pending,
-                       COALESCE(first_unread.placement_uuid,topic.last_message_uuid) AS message_uuid,
-                       contents.workspace_content AS payload,message.created_at,
-                       author.username,author.first_name,author.last_name
-                FROM messenger_api_user_topics_v1 topic
-                JOIN messenger_streams stream ON stream.project_id=topic.project_id AND stream.uuid=topic.stream_uuid
-                JOIN messenger_stream_bindings membership ON membership.project_id=topic.project_id
-                  AND membership.user_uuid=topic.user_uuid AND membership.stream_uuid=stream.uuid AND membership.active
-                JOIN m_workspace_event_cursors routing_cursor ON routing_cursor.project_id=topic.project_id
-                  AND routing_cursor.user_uuid=topic.user_uuid
-                LEFT JOIN LATERAL (
-                    SELECT event.epoch_version,event.payload||COALESCE(override.payload,'{}'::jsonb) AS payload
-                    FROM m_workspace_broadcast_message_events_v1 event
-                    JOIN m_workspace_event_audience_members_v1 audience ON
-                      audience.audience_snapshot_uuid=event.audience_snapshot_uuid AND audience.user_uuid=topic.user_uuid
-                    LEFT JOIN m_workspace_event_recipient_payloads_v1 override ON
-                      override.event_uuid=event.uuid AND override.user_uuid=topic.user_uuid
-                    WHERE event.project_id=topic.project_id AND event.entity_uuid=topic.uuid
-                      AND event.object_type='topic' AND event.action='updated'
-                    ORDER BY event.epoch_version DESC LIMIT 1
-                ) current_epoch ON (current_epoch.payload->>'unread_count')::bigint=topic.unread_count
-                  AND (current_epoch.payload->>'active_unread_count')::bigint=topic.active_unread_count
-                  AND (current_epoch.payload->>'passive_unread_count')::bigint=topic.passive_unread_count
-                LEFT JOIN LATERAL (
-                    SELECT unread.placement_uuid
-                    FROM messenger_user_message_unreads unread
-                    JOIN messenger_user_message_bindings access ON
-                      (access.project_id,access.user_uuid,access.placement_uuid)=(unread.project_id,unread.user_uuid,unread.placement_uuid)
-                    JOIN messenger_message_placements placement ON placement.project_id=unread.project_id AND placement.uuid=unread.placement_uuid
-                    JOIN messenger_messages message ON message.project_id=placement.project_id AND message.uuid=placement.message_uuid AND message.deleted_at IS NULL
-                    WHERE unread.project_id=topic.project_id AND unread.user_uuid=topic.user_uuid AND unread.topic_uuid=topic.uuid AND topic.unread_count>0
-                    ORDER BY message.created_at,placement.uuid LIMIT 1
-                ) first_unread ON true
-                LEFT JOIN messenger_message_placements placement ON placement.project_id=topic.project_id
-                  AND placement.uuid=COALESCE(first_unread.placement_uuid,topic.last_message_uuid)
-                LEFT JOIN messenger_user_message_bindings access ON access.project_id=topic.project_id
-                  AND access.user_uuid=topic.user_uuid AND access.placement_uuid=placement.uuid
-                LEFT JOIN messenger_messages message ON message.project_id=placement.project_id
-                  AND message.uuid=placement.message_uuid AND message.deleted_at IS NULL AND access.uuid IS NOT NULL
-                LEFT JOIN messenger_message_contents contents ON contents.uuid=message.content_uuid
-                LEFT JOIN m_workspace_users author ON author.uuid=message.author_uuid
-                WHERE topic.project_id=%s AND topic.user_uuid=%s AND topic.uuid=%s AND topic.visible AND stream.deleted_at IS NULL
-                  AND membership.membership_generation=%s""",
+                TOPIC_SNAPSHOT_SQL,
                 (
                     signal["project_id"],
                     signal["user_uuid"],
@@ -133,11 +167,7 @@ class TopicPushHandler(basic.BasicService):
                     cursor["membership_generation"],
                 ),
             ).fetchone()
-            if route is not None and (
-                route["counters_pending"]
-                or route["publication_pending"]
-                or route["epoch_version"] is None
-            ):
+            if route is not None and route["epoch_version"] is None:
                 return  # Wait until current counters and their WebSocket publication agree.
             if route is None or (
                 route["unread_count"] > 0 and route["message_uuid"] is None
