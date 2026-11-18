@@ -29,6 +29,12 @@ SERVICE_NAMES=(
     workspace-push-sender
 )
 
+case "$*" in
+    "") ;;
+    --push-sender) SERVICE_NAMES=(workspace-push-sender) ;;
+    *) echo "Usage: $0 [--push-sender]" >&2; exit 2 ;;
+esac
+
 for service_name in "${SERVICE_NAMES[@]}"; do
     pattern="(^|[ /])${service_name}([[:space:]]|$)"
     if pgrep -f "$pattern" >/dev/null; then

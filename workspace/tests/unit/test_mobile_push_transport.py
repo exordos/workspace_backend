@@ -4,19 +4,30 @@
 
 import http.server
 import json
+import logging
+import os
+import pathlib
+import shlex
+import subprocess
 import threading
 import uuid
 from unittest import mock
 
+import jinja2
 import pytest
+import yaml
 from gcl_sdk.events.services import senders
+from oslo_config import cfg
 
+from workspace.common import config, mobile_push_opts
 from workspace.messenger_api import push_events
 from workspace.messenger_api.dm import push_events as event_payloads
 
+ROOT = pathlib.Path(__file__).resolve().parents[3]
+
 
 @pytest.fixture
-def notification_http(tmp_path):
+def notification_http():
     received = []
     redirect = []
 
@@ -45,12 +56,9 @@ def notification_http(tmp_path):
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     endpoint = f"http://127.0.0.1:{server.server_port}"
-    auth = tmp_path / "auth.json"
-    auth.write_text(json.dumps({"access_token": "synthetic-core-token"}))
-    auth.chmod(0o600)
-    client = push_events.PushEventHttpClient(endpoint, str(auth))
+    client = push_events.PushEventHttpClient(endpoint, "synthetic-core-token")
     try:
-        yield endpoint, client, redirect, received, auth
+        yield endpoint, client, redirect, received
     finally:
         server.shutdown()
         thread.join(timeout=5)
@@ -61,7 +69,7 @@ def notification_http(tmp_path):
 def test_notification_client_redacts_request_and_echoed_response(
     notification_http, caplog, level
 ):
-    _, client, _, _, _ = notification_http
+    _, client, _, _ = notification_http
     body = {
         "uuid": str(uuid.uuid4()),
         "devices": [{"registration_token": "synthetic-device-token"}],
@@ -81,23 +89,56 @@ def test_notification_client_redacts_request_and_echoed_response(
 def test_notification_client_never_redirects_a_post_with_device_addresses(
     notification_http,
 ):
-    endpoint, client, redirect, received, _ = notification_http
+    endpoint, client, redirect, received = notification_http
     redirect.append(endpoint + "/sink")
     with pytest.raises(ValueError, match="notification_redirect"):
         client.send_event_body({"registration_token": "synthetic-device-token"})
     assert all(path != "/sink" for path, _, _ in received)
 
 
-@pytest.mark.parametrize("level", ["INFO", "DEBUG"])
-def test_platform_token_rotation_is_loaded_without_login_or_service_restart(
-    notification_http, caplog, level
+def test_sender_reads_managed_token_at_startup_and_redacts_it(
+    notification_http, caplog, monkeypatch, tmp_path
 ):
-    endpoint, first, _, received, auth_file = notification_http
-    with caplog.at_level(level):
-        first.send_event_body({"uuid": str(uuid.uuid4())})
-        auth_file.write_text(json.dumps({"access_token": "synthetic-renewed-token"}))
-        first.send_event_body({"uuid": str(uuid.uuid4())})
+    endpoint, _, _, received = notification_http
+    base = tmp_path / "workspace.conf"
+    base.touch()
+    conf_dir = tmp_path / "workspace.conf.d"
+    conf_dir.mkdir()
+    (conf_dir / "90-mobile-push.conf").write_text(
+        "[mobile_push]\n"
+        f"organization_uuid = {uuid.uuid4()}\n"
+        f"notification_endpoint = {endpoint}\n"
+    )
+    token_conf = conf_dir / "91-mobile-push-token.conf"
+
+    def start_sender():
+        conf = cfg.ConfigOpts()
+        conf.register_opts(mobile_push_opts.OPTS, mobile_push_opts.DOMAIN)
+        monkeypatch.setattr(cfg, "CONF", conf)
+        config.parse(["--config-file", str(base), "--config-dir", str(conf_dir)])
+        conf.log_opt_values(logging.getLogger(__name__), logging.DEBUG)
+        return push_events.WorkspacePushSender()
+
+    with caplog.at_level("DEBUG"):
+        unconfigured = start_sender()
+        assert mobile_push_opts.enabled()
+        with mock.patch.object(unconfigured, "_fetch_new_events") as fetch:
+            unconfigured._iteration()
+        fetch.assert_not_called()
+
+        token_conf.write_text(
+            "[mobile_push]\nnotification_token = synthetic-core-token\n"
+        )
+        first = start_sender()._notification_client
+        body = {"uuid": str(uuid.uuid4())}
+        first.send_event_body(body)
+        token_conf.write_text(
+            "[mobile_push]\nnotification_token = synthetic-renewed-token\n"
+        )
+        first.send_event_body(body)
+        start_sender()._notification_client.send_event_body(body)
     assert [(path, auth) for path, auth, _ in received] == [
+        ("/v1/events/", "Bearer synthetic-core-token"),
         ("/v1/events/", "Bearer synthetic-core-token"),
         ("/v1/events/", "Bearer synthetic-renewed-token"),
     ]
@@ -120,7 +161,7 @@ def test_messenger_worker_does_not_own_push_services(monkeypatch):
 def test_shared_sdk_sender_does_not_log_an_echoed_provider_error(
     notification_http, caplog, level
 ):
-    _, client, _, received, _ = notification_http
+    _, client, _, received = notification_http
     body = {
         "uuid": str(uuid.uuid4()),
         "_test_error_status": 500,
@@ -143,37 +184,46 @@ def test_shared_sdk_sender_does_not_log_an_echoed_provider_error(
     event.save.assert_called_once_with()
 
 
-def test_token_manifest_renews_without_restart_or_password_delivery():
-    import pathlib
-    import jinja2
-    import yaml
-
-    template = (
-        pathlib.Path(__file__).resolve().parents[3]
-        / "exordos/manifests/workspace_mobile_push.yaml.j2"
-    )
+def test_managed_token_config_renews_and_restarts_only_the_push_sender(tmp_path):
+    template = ROOT / "exordos/manifests/workspace_mobile_push.yaml.j2"
     manifest = yaml.safe_load(jinja2.Template(template.read_text()).render())
     resources = manifest["resources"]
     token = resources["$core.iam.tokens"]["push_sender"]
     assert token["auto_renew"] is True
     assert token["scope"] == ""
     config = resources["$core.config.configs"]["authentication"]
+    assert config["path"] == "/etc/workspace/workspace.conf.d/91-mobile-push-token.conf"
     assert config["mode"] == "0600"
-    assert config["on_change"] == {"kind": "no_action"}
-    assert "$core.iam.tokens.$push_sender:access_token" in config["body"]["content"]
-    assert "password" not in config["body"]["content"]
+    assert "[mobile_push]" in config["body"]["content"]
+    assert (
+        "notification_token = {$core.iam.tokens.$push_sender:access_token}"
+        in config["body"]["content"]
+    )
+    assert config["on_change"]["kind"] == "shell"
+    executable, *args = shlex.split(config["on_change"]["command"])
+    assert executable == "/usr/local/bin/workspace-restart-services"
+    pgrep = tmp_path / "pgrep"
+    pgrep.write_text("#!/bin/sh\nexit 0\n")
+    pgrep.chmod(0o700)
+    pkill = tmp_path / "pkill"
+    pkill.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\"\n")
+    pkill.chmod(0o700)
+    result = subprocess.run(
+        ["bash", ROOT / "exordos/images/workspace-restart-services.sh", *args],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"},
+    )
+    assert result.stdout.splitlines() == [
+        "-TERM",
+        "-f",
+        "(^|[ /])workspace-push-sender([[:space:]]|$)",
+    ]
 
 
 def test_manifest_owns_direct_firebase_event_contract():
-    import pathlib
-
-    import jinja2
-    import yaml
-
-    template = (
-        pathlib.Path(__file__).resolve().parents[3]
-        / "exordos/manifests/workspace_mobile_push.yaml.j2"
-    )
+    template = ROOT / "exordos/manifests/workspace_mobile_push.yaml.j2"
     manifest = yaml.safe_load(jinja2.Template(template.read_text()).render())
     assert set(manifest["requirements"]) == {
         "workspace",
@@ -202,14 +252,9 @@ def test_manifest_owns_direct_firebase_event_contract():
 
 
 def test_push_preparation_and_delivery_have_independent_managed_services():
-    import pathlib
-    import jinja2
-    import yaml
-
-    root = pathlib.Path(__file__).resolve().parents[3]
     manifest = yaml.safe_load(
         jinja2.Template(
-            (root / "exordos/manifests/workspace_mobile_push.yaml.j2").read_text()
+            (ROOT / "exordos/manifests/workspace_mobile_push.yaml.j2").read_text()
         ).render()
     )
     services = manifest["resources"]["$core.em.services"]
@@ -221,11 +266,11 @@ def test_push_preparation_and_delivery_have_independent_managed_services():
         assert "--config-dir /etc/workspace/workspace.conf.d" in service["path"]
         assert (
             f"workspace-push-{kind}"
-            in (root / "exordos/images/backend-install.sh").read_text()
+            in (ROOT / "exordos/images/backend-install.sh").read_text()
         )
         assert (
             f"workspace-push-{kind}"
-            in (root / "exordos/images/workspace-restart-services.sh").read_text()
+            in (ROOT / "exordos/images/workspace-restart-services.sh").read_text()
         )
     assert (
         push_events.WorkspacePushSender._send_new_events
@@ -237,12 +282,22 @@ def test_push_preparation_and_delivery_have_independent_managed_services():
     )
 
 
+def test_core_managed_workspace_api_and_counter_worker_load_push_config():
+    template = ROOT / "exordos/manifests/workspace.yaml.j2"
+    manifest = yaml.safe_load(
+        jinja2.Template(template.read_text()).render(
+            images={"workspace_backend": "test"}
+        )
+    )
+    services = manifest["resources"]["$core.em.services"]
+    for name in ("workspace_api", "workspace_messenger_worker"):
+        args = shlex.split(services[name]["path"])
+        assert "--config-dir" in args
+        assert args[args.index("--config-dir") + 1] == "/etc/workspace/workspace.conf.d"
+
+
 def test_mobile_push_element_is_available_to_the_standard_builder():
-    import pathlib
-
-    import yaml
-
-    config_path = pathlib.Path(__file__).parents[3] / "exordos" / "exordos.yaml"
+    config_path = ROOT / "exordos/exordos.yaml"
     config = yaml.safe_load(config_path.read_text())
 
     manifests = [element["manifest"] for element in config["build"]["elements"]]

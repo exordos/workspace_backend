@@ -37,7 +37,7 @@ def configured_push(_database):
     for name, value in {
         "organization_uuid": str(sys_uuid.uuid4()),
         "notification_endpoint": "http://notification.invalid",
-        "notification_auth_file": "/nonexistent/test-only.json",
+        "notification_token": "synthetic-notification-token",
     }.items():
         cfg.CONF.set_override(name, value, group=mobile_push_opts.DOMAIN)
     api_store.configure_store_factory(store_factory.build_store_factory())
@@ -50,7 +50,7 @@ def configured_push(_database):
     for name in (
         "organization_uuid",
         "notification_endpoint",
-        "notification_auth_file",
+        "notification_token",
     ):
         cfg.CONF.clear_override(name, group=mobile_push_opts.DOMAIN)
 

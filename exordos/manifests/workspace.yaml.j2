@@ -628,7 +628,7 @@ resources:
     workspace_api:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       name: workspace-api
-      path: /usr/bin/workspace-api --config-file /etc/workspace/workspace.conf
+      path: /usr/bin/workspace-api --config-file /etc/workspace/workspace.conf --config-dir /etc/workspace/workspace.conf.d
       user: root
       target:
         kind: node
@@ -688,7 +688,7 @@ resources:
     workspace_messenger_worker:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       name: workspace-messenger-worker
-      path: /usr/bin/workspace-messenger-worker --config-file /etc/workspace/workspace.conf
+      path: /usr/bin/workspace-messenger-worker --config-file /etc/workspace/workspace.conf --config-dir /etc/workspace/workspace.conf.d
       user: root
       target:
         kind: node

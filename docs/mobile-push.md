@@ -41,8 +41,12 @@ The template passes `device_uuid`, `registration_token`, the encrypted
 `payload` string and Android `priority` to the Firebase transport. Firebase
 credentials remain only on the Notification node at
 `/etc/exordos_notification/firebase-service-account.json` with mode `0600`.
-The Workspace node receives only its platform-managed Notification token in
-`/etc/workspace/mobile-push-auth.json`.
+The Workspace node receives only its platform-managed Notification bearer
+token. Core renders it as `[mobile_push] notification_token` in the private
+oslo.config drop-in `/etc/workspace/workspace.conf.d/91-mobile-push-token.conf`
+with mode `0600`. When the token changes, the config hook restarts only
+`workspace-push-sender` so it reads the new token at startup. The API and
+the handler can still queue events when the sender has no token.
 
 An `ACTIVE` Notification event proves only that FCM accepted the request. Full
 acceptance must also verify receipt, HPKE decryption, notification display and

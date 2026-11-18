@@ -132,19 +132,21 @@ resources:
   $core.config.configs:
     authentication:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
-      path: /etc/workspace/mobile-push-auth.json
+      path: /etc/workspace/workspace.conf.d/91-mobile-push-token.conf
       mode: "0600"
       on_change:
-        kind: no_action
+        kind: shell
+        command: /usr/local/bin/workspace-restart-services --push-sender
       target:
         kind: node
         node: $workspace_mobile_push.imports.$backend_node:uuid
       body:
         kind: text
         content: |
-          f"{
-            "access_token": "{$core.iam.tokens.$push_sender:access_token}"
-          }"
+          f"
+          [mobile_push]
+          notification_token = {$core.iam.tokens.$push_sender:access_token}
+          "
 
     notification_endpoint:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
@@ -163,7 +165,6 @@ resources:
           [mobile_push]
           organization_uuid = {$core.vs.variables.$organization_uuid:value}
           notification_endpoint = http://{$workspace_mobile_push.imports.$notification_node:default_network:ipv4}:8080
-          notification_auth_file = /etc/workspace/mobile-push-auth.json
           "
 
   $core.em.services:

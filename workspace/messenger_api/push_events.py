@@ -128,21 +128,15 @@ class PushDeliveryError(RuntimeError):
 class PushEventHttpClient(event_clients.HttpEventClient):
     """Use SDK transport with the prepared Workspace payload and managed token."""
 
-    def __init__(self, endpoint: str, auth_file: str) -> None:
-        self._auth_file = auth_file
+    def __init__(self, endpoint: str, token: str) -> None:
         super().__init__(
             event_type_mapping={},
             endpoint=endpoint.rstrip("/"),
             version="v1",
-            auth_token="",
+            auth_token=token,
             project_id=None,
             http_client=NotificationHttpClient(default_timeout=10),
         )
-
-    def _get_headers(self) -> dict[str, str]:
-        with open(self._auth_file) as stream:
-            token = json.load(stream)["access_token"]
-        return {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
 
     def _build_event_body(self, event: event_models.Event) -> dict[str, typing.Any]:
         if isinstance(event.event_data, event_payloads.WorkspaceTopicSignal):
@@ -195,12 +189,13 @@ class WorkspacePushSender(event_senders.EventSenderService):
     """Only push policy; persistence, scheduling and retries belong to the SDK."""
 
     def __init__(self, **kwargs: typing.Any) -> None:
+        options = cfg.CONF.mobile_push
         super().__init__(
             notification_client=PushEventHttpClient(
-                cfg.CONF.mobile_push.notification_endpoint,
-                cfg.CONF.mobile_push.notification_auth_file,
+                options.notification_endpoint,
+                options.notification_token,
             ),
-            enabled=mobile_push_opts.enabled(),
+            enabled=mobile_push_opts.enabled() and bool(options.notification_token),
             **kwargs,
         )
 

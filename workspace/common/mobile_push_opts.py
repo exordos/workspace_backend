@@ -3,27 +3,22 @@
 from oslo_config import cfg
 
 DOMAIN = "mobile_push"
-cfg.CONF.register_opts(
-    [
-        cfg.StrOpt(
-            "organization-uuid", help="Stable UUID of this Workspace installation"
-        ),
-        cfg.StrOpt(
-            "notification-endpoint",
-            help="Local Notification base URL; unset disables pushes",
-        ),
-        cfg.StrOpt(
-            "notification-auth-file", help="Private platform-managed token JSON file"
-        ),
-    ],
-    DOMAIN,
-)
+OPTS = [
+    cfg.StrOpt("organization-uuid", help="Stable UUID of this Workspace installation"),
+    cfg.StrOpt(
+        "notification-endpoint",
+        help="Local Notification base URL; unset disables pushes",
+    ),
+    cfg.StrOpt(
+        "notification-token",
+        default="",
+        secret=True,
+        help="Platform-managed bearer token used by the push sender",
+    ),
+]
+cfg.CONF.register_opts(OPTS, DOMAIN)
 
 
 def enabled() -> bool:
     options = cfg.CONF[DOMAIN]
-    return bool(
-        options.organization_uuid
-        and options.notification_endpoint
-        and options.notification_auth_file
-    )
+    return bool(options.organization_uuid and options.notification_endpoint)
