@@ -106,10 +106,7 @@ class StickerController(ra_controllers.BaseResourceController):
         content_type: typing.Any,
         resource_type: typing.Any = None,
     ) -> typing.Any:
-        if self.request.api_context.get_active_method() in {
-            ra_constants.UPDATE,
-            ra_constants.DELETE,
-        }:
+        if self.request.method in {"PUT", "DELETE"}:
             permission_guards.require_iam_permission(
                 self.get_context(),
                 sticker_catalog.STICKER_CATALOG_MANAGE_PERMISSION,

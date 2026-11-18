@@ -285,7 +285,11 @@ def test_real_http_catalog_full_flow_through_unified_mount(
 
         other_user = sys_uuid.uuid4()
         other_project = sys_uuid.uuid4()
-        starred = workspace_api.post(f"{UNIFIED_ROOT}/{first_uuid}/actions/star/invoke")
+        starred = workspace_api.post(
+            f"{UNIFIED_ROOT}/{first_uuid}/actions/star/invoke",
+            json={},
+            headers={"Content-Type": "application/json; charset=utf-8"},
+        )
         assert starred.status_code == 200, starred.text
         personalized_update = workspace_api.put(
             f"{UNIFIED_ROOT}/{first_uuid}",
@@ -315,6 +319,8 @@ def test_real_http_catalog_full_flow_through_unified_mount(
         unstarred = workspace_api.post(
             f"{UNIFIED_ROOT}/{first_uuid}/actions/unstar/invoke",
             project=other_project,
+            json={},
+            headers={"Content-Type": "application/json; charset=utf-8"},
         )
         assert unstarred.status_code == 200, unstarred.text
         repeated_unstar = workspace_api.post(
