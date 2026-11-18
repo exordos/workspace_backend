@@ -44,8 +44,17 @@ Install `workspace_mobile_push` after `workspace`, `exordos_notification` and
 `notification_topic_update` event type, its Firebase Android template, the
 restricted IAM sender identity and the rotating token. It imports only the
 shared Firebase provider from `notification_firebase` and sends directly to
-the local Notification API. No relay Notification instance or public
-Workspace-to-Notification gateway is part of this path.
+the same installation's Notification API through its existing HTTPS ingress
+at `/api/notification/v1/events/`. No relay Notification instance is needed.
+This protects the connection from Workspace to the ingress; the ingress's
+upstream connection to Notification is still HTTP.
+
+The producer imports the installation's exported
+`$core.dns.domains.$public_domain` DNS resource. For a managed Realm, build
+the producer with `--manifest-var managed_realm=true` and install a version
+of `ecosystem_realm` that exports its existing `$core.vs.variables.$realm_domain`
+variable. The manifest uses the complete Realm hostname from that variable,
+not the parent DNS zone. There is no hardcoded host or internal HTTP fallback.
 
 The template passes `device_uuid`, `registration_token`, the encrypted
 `payload` string and Android `priority` to the Firebase transport. Firebase

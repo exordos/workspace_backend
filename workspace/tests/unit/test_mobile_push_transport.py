@@ -33,8 +33,11 @@ def notification_http():
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
-            self.send_response(404)
+            received.append((self.path, self.headers.get("Authorization"), b""))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
             self.end_headers()
+            self.wfile.write(json.dumps({"uuid": self.path.split("/")[-1]}).encode())
 
         def do_POST(self):
             body = self.rfile.read(int(self.headers["Content-Length"]))
@@ -94,6 +97,20 @@ def test_notification_client_never_redirects_a_post_with_device_addresses(
     with pytest.raises(ValueError, match="notification_redirect"):
         client.send_event_body({"registration_token": "synthetic-device-token"})
     assert all(path != "/sink" for path, _, _ in received)
+
+
+def test_notification_client_keeps_ingress_prefix(notification_http):
+    endpoint, _, _, received = notification_http
+    client = push_events.PushEventHttpClient(
+        endpoint + "/api/notification", "synthetic-core-token"
+    )
+    event_id = str(uuid.uuid4())
+    client.send_event_body({"uuid": event_id})
+    assert client.get_event(event_id)["uuid"] == event_id
+    assert [path for path, _, _ in received] == [
+        "/api/notification/v1/events/",
+        f"/api/notification/v1/events/{event_id}",
+    ]
 
 
 def test_sender_reads_managed_token_at_startup_and_redacts_it(
@@ -249,6 +266,43 @@ def test_manifest_owns_direct_firebase_event_contract():
         "priority": "{{ priority | default('normal') }}",
     }
     assert "public_notification_gateway" not in resources["$core.config.configs"]
+
+
+@pytest.mark.parametrize(
+    ("manifest_vars", "element", "link", "field"),
+    [
+        ({}, "core", "$core.dns.domains.$public_domain", "name"),
+        (
+            {"managed_realm": "true"},
+            "ecosystem_realm",
+            "$core.vs.variables.$realm_domain",
+            "value",
+        ),
+    ],
+)
+def test_manifest_routes_to_notification_over_installation_https(
+    manifest_vars, element, link, field
+):
+    template = ROOT / "exordos/manifests/workspace_mobile_push.yaml.j2"
+    source = template.read_text()
+    # The CLI selects --element by loading the source before rendering Jinja.
+    assert yaml.safe_load(source)["name"] == "workspace_mobile_push"
+    manifest = yaml.safe_load(jinja2.Template(source).render(**manifest_vars))
+    assert "notification_node" not in manifest["imports"]
+    assert manifest["imports"]["installation_domain"] == {
+        "element": f"${element}",
+        "kind": "resource",
+        "link": link,
+    }
+    assert ("ecosystem_realm" in manifest["requirements"]) == (
+        element == "ecosystem_realm"
+    )
+    configs = manifest["resources"]["$core.config.configs"]
+    assert (
+        "notification_endpoint = https://"
+        f"{{$workspace_mobile_push.imports.$installation_domain:{field}}}"
+        "/api/notification" in configs["notification_endpoint"]["body"]["content"]
+    )
 
 
 def test_push_preparation_and_delivery_have_independent_managed_services():

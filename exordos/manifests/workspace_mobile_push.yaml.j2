@@ -1,3 +1,5 @@
+# Keep Jinja directives in YAML comments for `exordos build --element`.
+# {% set use_realm_domain = managed_realm | default(false) | string | lower == 'true' %}
 # Native Workspace producer for direct Firebase delivery through local Notification.
 name: workspace_mobile_push
 description: Native Workspace mobile push producer
@@ -12,16 +14,20 @@ requirements:
     from_version: "2.0.3-dev"
   notification_firebase:
     from_version: "1.0.0"
+# {% if use_realm_domain %}
+  ecosystem_realm:
+    from_version: "0.0.0"
+# {% endif %}
 
 imports:
   backend_node:
     element: "$workspace"
     kind: resource
     link: "$core.compute.nodes.$workspace_backend"
-  notification_node:
-    element: "$exordos_notification"
+  installation_domain:
+    element: "{{ '$ecosystem_realm' if use_realm_domain else '$core' }}"
     kind: resource
-    link: "$core.compute.nodes.$notification_cp"
+    link: "{{ '$core.vs.variables.$realm_domain' if use_realm_domain else '$core.dns.domains.$public_domain' }}"
   firebase_provider:
     element: "$notification_firebase"
     kind: resource
@@ -164,7 +170,7 @@ resources:
           f"
           [mobile_push]
           organization_uuid = {$core.vs.variables.$organization_uuid:value}
-          notification_endpoint = http://{$workspace_mobile_push.imports.$notification_node:default_network:ipv4}:8080
+          notification_endpoint = https://{$workspace_mobile_push.imports.$installation_domain:{{ 'value' if use_realm_domain else 'name' }}}/api/notification
           "
 
   $core.em.services:
