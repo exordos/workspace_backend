@@ -68,3 +68,21 @@ realtime task retains that snapshot across restarts, uses the original sender's
 account, and cancels if that account has been rebound. Repeating a DELETE after
 a lost response accepts an already absent provider message; permission failures
 remain errors. Existing deletion events without a captured route are ignored.
+
+## Signed Zulip attachments
+
+To download signed attachments, configure each Zulip storage origin in the
+shared worker configuration. Exordos reads the optional
+`/etc/workspace/zulip-signed-uploads.conf` after the managed configuration.
+For other installations, use the worker config or a second `--config-file`.
+
+```ini
+[zulip_signed_uploads]
+allowed_origins = {"https://uploads.example.com": [], "http://minio.internal:9000": ["10.20.30.40"]}
+```
+
+Use the exact scheme, hostname and port from signed URLs. An empty address list
+allows only public destinations over HTTPS. For private storage, pin the
+storage IP addresses or a dedicated storage CIDR. Restart the Zulip workers
+after changing this policy. With no origins configured, signed attachments are
+unavailable. Zulip-served attachments continue to download directly.

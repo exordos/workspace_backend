@@ -100,15 +100,12 @@ def _public(row: typing.Any, resource: str) -> dict[str, typing.Any]:
 def _sticker_references(payload: dict[str, typing.Any]) -> collections.Counter[str]:
     content = message_payloads.markdown_content(payload)
     lower_content = content.lower()
-    if "urn:forward:" in lower_content or "urn:quote:" in lower_content:
-        content = message_conversion.workspace_reference_text(content)
-    if "urn:sticker:" not in content:
+    if not any(
+        prefix in lower_content
+        for prefix in ("urn:sticker:", "urn:forward:", "urn:quote:")
+    ):
         return collections.Counter()
-    return collections.Counter(
-        identifier
-        for kind, identifier, _ in message_conversion.workspace_references(content)
-        if kind == "sticker"
-    )
+    return collections.Counter(message_conversion.workspace_sticker_references(content))
 
 
 class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):

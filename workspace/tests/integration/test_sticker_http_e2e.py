@@ -700,13 +700,34 @@ def test_native_messages_require_active_stickers_for_new_references(
         )
         assert rejected_forward.status_code == 400, rejected_forward.text
 
-        literal = {"kind": "markdown", "content": f"urn:sticker:{sticker_uuid}"}
-        plain = workspace_api.post(messages, json={**new_body, "payload": literal})
-        assert plain.status_code == 201, plain.text
-        plain_path = messages + plain.json()["uuid"]
-        rejected_edit = workspace_api.put(plain_path, json={"payload": payload})
-        assert rejected_edit.status_code == 400, rejected_edit.text
-        assert workspace_api.get(plain_path).json()["payload"] == literal
+        for example in (
+            f"`{content}`",
+            f"```markdown\n{content}\n```",
+            f"~~~~\n{content}",
+            f"> ```markdown\n> {content}\n> ````",
+        ):
+            literal = {"kind": "markdown", "content": example}
+            plain = workspace_api.post(
+                messages,
+                json={**body, "uuid": str(sys_uuid.uuid4()), "payload": literal},
+            )
+            assert plain.status_code == 201, plain.text
+            plain_path = messages + plain.json()["uuid"]
+            rejected_edit = workspace_api.put(plain_path, json={"payload": payload})
+            assert rejected_edit.status_code == 400, rejected_edit.text
+            assert workspace_api.get(plain_path).json()["payload"] == literal
+
+        for example in (
+            f"```spoiler Details\n{content}\n```",
+            f"Unmatched ` {content}",
+            f"Unmatched `\n# {content}\nLater `",
+            f"> > ```markdown\n> > example\n> {content}",
+        ):
+            rendered = {"kind": "markdown", "content": example}
+            rejected_rendered = workspace_api.post(
+                messages, json={**new_body, "payload": rendered}
+            )
+            assert rejected_rendered.status_code == 400, rejected_rendered.text
 
         duplicated = {"kind": "markdown", "content": f"{content}\n{content}"}
         rejected_duplicate = workspace_api.put(
