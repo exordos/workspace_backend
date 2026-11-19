@@ -538,6 +538,12 @@ def test_real_http_admin_delete_is_atomic_and_hides_storage_identity(
     )
     assert missing.status_code == 404, missing.text
     assert "storage_object_id" not in missing.text
+    missing_update = workspace_api.put(
+        f"{UNIFIED_ROOT}/{sticker_uuid}",
+        permissions=(MANAGE_PERMISSION,),
+        json={"title": "Missing"},
+    )
+    assert missing_update.status_code == 404, missing_update.text
     db.execute(
         "DELETE FROM messenger_sticker_cleanup_tasks WHERE sticker_uuid = %s",
         (sticker_uuid,),

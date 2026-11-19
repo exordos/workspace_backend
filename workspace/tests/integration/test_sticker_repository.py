@@ -386,6 +386,7 @@ def test_repository_visibility_favorite_and_keyset(db) -> None:
             db,
             user_uuid,
             sticker_catalog.build_list_query(
+                q="кот",
                 uuids=[third, third, first],
                 category="sticker",
                 format="png",
@@ -490,6 +491,9 @@ def test_repository_visibility_favorite_and_keyset(db) -> None:
         )
         assert updated_text is not None
         assert updated_text.sticker.search_text == "еж кот лиса"
+        unchanged = repository.update(db, third, {})
+        assert unchanged is not None
+        assert unchanged.sticker.updated_at == updated_text.sticker.updated_at
         assert [
             item.uuid
             for item in repository.list_stickers(

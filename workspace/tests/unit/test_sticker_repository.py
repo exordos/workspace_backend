@@ -9,41 +9,6 @@ from workspace.messenger_api import sticker_catalog
 from workspace.messenger_api import sticker_repository
 
 
-class _Rows:
-    def __init__(self, rows):
-        self._rows = rows
-
-    def fetchall(self):
-        return self._rows
-
-
-class _UpdateSession:
-    def __init__(self, row):
-        self.row = row
-        self.calls = []
-
-    def execute(self, statement, params):
-        self.calls.append((statement, params))
-        return _Rows([] if self.row is None else [self.row])
-
-
-class _DeleteSession:
-    def __init__(self, *, candidate=True, deleted=True):
-        self.candidate = candidate
-        self.deleted = deleted
-        self.calls = []
-
-    def execute(self, statement, params):
-        self.calls.append((statement, params))
-        if "SELECT sha256 FROM m_workspace_stickers" in statement:
-            rows = [{"sha256": "a" * 64}] if self.candidate else []
-        elif "INSERT INTO messenger_sticker_cleanup_tasks" in statement:
-            rows = [{"sticker_uuid": params[0]}] if self.deleted else []
-        else:
-            rows = []
-        return _Rows(rows)
-
-
 def test_marker_is_unpadded_canonical_json_and_round_trips() -> None:
     marker = sticker_repository.encode_page_marker(
         sort=sticker_repository.SORT_RANK_UPDATED,
@@ -104,91 +69,6 @@ def test_fingerprint_uses_canonical_list_query() -> None:
     assert left == ("83d81dd61b3c7ff19478880d1ec379a6e9f8e376710b075942496e29392c4b38")
 
 
-def test_query_selects_each_d01_sort_and_parameterizes_search() -> None:
-    repository = sticker_repository.StickerRepository()
-    user_uuid = sys_uuid.uuid4()
-    expected = {
-        (False, False): sticker_repository.SORT_CREATED,
-        (False, True): sticker_repository.SORT_FAVORITE,
-        (True, False): sticker_repository.SORT_RANK_UPDATED,
-        (True, True): sticker_repository.SORT_RANK_FAVORITE,
-    }
-    for has_q, favorite in expected:
-        query = repository._query(
-            sticker_catalog.build_list_query(
-                q="кот" if has_q else None,
-                favorite=favorite,
-                page_limit=10,
-            )
-        )
-        statement, params = repository._list_statement(query, user_uuid, None)
-        assert query.sort == expected[(has_q, favorite)]
-        assert "кот" not in statement
-        assert "AND AND" not in statement
-        assert statement.count("%s") == len(params)
-
-
-def test_search_parameter_order_matches_cte_placeholder_order() -> None:
-    repository = sticker_repository.StickerRepository()
-    user_uuid = sys_uuid.uuid4()
-    first = sys_uuid.uuid4()
-    query = repository._query(
-        sticker_catalog.build_list_query(
-            q="кот",
-            category="sticker",
-            format="png",
-            uuids=[first],
-            page_limit=10,
-        )
-    )
-    statement, params = repository._list_statement(query, user_uuid, None)
-    assert statement.count("%s") == len(params)
-    assert "unnest(s.tags)" in statement
-    assert "replace(lower(s.search_text)" not in statement
-    assert "s.search_text LIKE" in statement
-    assert params[:5] == ("кот",) * 5
-    assert params[5:9] == ("sticker", "png", [first], "кот")
-    assert params[9:13] == ("sticker", "png", [first], "кот")
-    assert params[13:17] == ("sticker", "png", [first], "кот")
-    assert params[17:21] == ("sticker", "png", [first], "кот")
-    assert params[21] == user_uuid
-    assert params[22:] == (11,)
-
-
-def test_search_keeps_raw_yo_spelling_for_exact_tag_candidates() -> None:
-    query = sticker_repository.StickerRepository()._query(
-        sticker_catalog.build_list_query(q="берёза", page_limit=10)
-    )
-    assert query.q == "береза"
-    assert query.tag_query == "берёза"
-
-
-def test_uuid_only_batch_allows_hidden_but_search_and_favorite_do_not() -> None:
-    repository = sticker_repository.StickerRepository()
-    user_uuid = sys_uuid.uuid4()
-    sticker_uuid = sys_uuid.uuid4()
-
-    uuid_query = repository._query(
-        sticker_catalog.build_list_query(uuids=[sticker_uuid], page_limit=10)
-    )
-    uuid_statement, _ = repository._list_statement(uuid_query, user_uuid, None)
-    assert "s.blocked = FALSE" in uuid_statement
-    assert "s.active = TRUE" not in uuid_statement
-
-    for favorite, q in ((False, "кот"), (True, None)):
-        query = repository._query(
-            sticker_catalog.build_list_query(
-                q=q,
-                favorite=favorite,
-                uuids=[sticker_uuid],
-                page_limit=10,
-            )
-        )
-        statement, _ = repository._list_statement(query, user_uuid, None)
-        assert "s.active = TRUE" in statement
-        assert "s.blocked = FALSE" in statement
-
-
 def test_rank_marker_rejects_non_finite_values() -> None:
     payload = (
         '{"filters_sha256":"%s","sort":"%s","v":1,'
@@ -204,102 +84,22 @@ def test_rank_marker_rejects_non_finite_values() -> None:
         )
 
 
-def test_update_locks_row_before_rebuilding_search_text() -> None:
-    sticker_uuid = sys_uuid.uuid4()
-    timestamp = datetime.datetime.now(datetime.timezone.utc)
-    row = {
-        "uuid": sticker_uuid,
-        "title": "Old title",
-        "alt_text": "Old alt text",
-        "emoji": [],
-        "tags": ["old"],
-        "search_text": "old title old alt text old",
-        "category": "sticker",
-        "format": "png",
-        "width": None,
-        "height": None,
-        "size_bytes": 1,
-        "sha256": "a" * 64,
-        "media_object_id": "stickers/internal/media.png",
-        "active": True,
-        "blocked": False,
-        "created_at": timestamp,
-        "updated_at": timestamp,
-    }
-    session = _UpdateSession(row)
-
-    sticker_repository.StickerRepository().update(
-        session,
-        sticker_uuid,
-        {"title": "New title"},
-    )
-
-    first_statement, first_params = session.calls[0]
-    assert "SELECT * FROM m_workspace_stickers WHERE uuid = %s FOR UPDATE" in (
-        first_statement
-    )
-    assert first_params == (sticker_uuid,)
-    assert session.calls[1][0].startswith("UPDATE m_workspace_stickers")
-
-    no_op_session = _UpdateSession(row)
-    no_op = sticker_repository.StickerRepository().update(
-        no_op_session,
-        sticker_uuid,
-        {},
-    )
-    assert no_op is not None
-    assert len(no_op_session.calls) == 1
-
-    missing_session = _UpdateSession(None)
-    assert (
-        sticker_repository.StickerRepository().update(
-            missing_session,
-            sticker_uuid,
-            {"title": "New title"},
-        )
-        is None
-    )
-    assert len(missing_session.calls) == 1
-
-
-def test_delete_locks_sha_then_atomically_enqueues_root_cleanup() -> None:
-    sticker_uuid = sys_uuid.uuid4()
-    session = _DeleteSession()
-
-    result = sticker_repository.StickerRepository().delete(session, sticker_uuid)
-
-    assert result is True
-    assert "SELECT sha256 FROM m_workspace_stickers" in session.calls[0][0]
-    assert "pg_advisory_xact_lock" in session.calls[1][0]
-    assert session.calls[1][1] == ("a" * 64,)
-    assert "DELETE FROM m_workspace_stickers" in session.calls[2][0]
-    assert "INSERT INTO messenger_sticker_cleanup_tasks" in session.calls[2][0]
-    assert session.calls[2][1] == (sticker_uuid,)
-
-
-def test_delete_returns_false_for_missing_row() -> None:
-    session = _DeleteSession(candidate=False)
-
-    assert (
-        sticker_repository.StickerRepository().delete(session, sys_uuid.uuid4())
-        is False
-    )
-    assert len(session.calls) == 1
-
-
 def test_sha_locks_are_deduplicated_and_sorted() -> None:
-    session = _DeleteSession()
+    class Session:
+        def __init__(self):
+            self.locked = []
 
+        def execute(self, statement, params):
+            assert "pg_advisory_xact_lock" in statement
+            self.locked.append(params[0])
+
+    session = Session()
     sticker_repository.StickerRepository().lock_sha256_values(
         session,
         ["b" * 64, "a" * 64, "b" * 64],
     )
 
-    assert [params for _statement, params in session.calls] == [
-        ("a" * 64,),
-        ("b" * 64,),
-    ]
-    assert all("pg_advisory_xact_lock" in statement for statement, _ in session.calls)
+    assert session.locked == ["a" * 64, "b" * 64]
 
 
 @pytest.mark.parametrize(

@@ -288,16 +288,6 @@ def get_public_sticker(
     return _public_record(record)
 
 
-def resolve_public_stickers(
-    session: typing.Any,
-    user_uuid: sys_uuid.UUID,
-    repository: typing.Any,
-    sticker_uuids: typing.Iterable[sys_uuid.UUID],
-) -> list[dict[str, object]]:
-    records = repository.resolve_batch(session, user_uuid, sticker_uuids)
-    return [_public_record(record) for record in records]
-
-
 def download_sticker(
     session: typing.Any,
     user_uuid: sys_uuid.UUID,
@@ -375,7 +365,7 @@ def update_sticker(
         raise ra_exc.ValidationErrorException()
     if set(values).difference(sticker_models.STICKER_ADMIN_MUTABLE_FIELDS):
         raise ra_exc.ValidationErrorException()
-    updated = repository.update_admin_fields(session, sticker_uuid, values)
+    updated = repository.update(session, sticker_uuid, values)
     if updated is None:
         raise ra_exc.ResourceNotFoundError(
             resource="Sticker",

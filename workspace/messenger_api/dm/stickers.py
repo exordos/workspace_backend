@@ -280,26 +280,6 @@ class StickerCard(_StrictModel):
     )
     is_favorite = properties.property(types.Boolean(), default=False, read_only=True)
 
-    def as_plain_dict(self) -> dict[str, object]:
-        """Keep nested media serializable without exposing storage fields."""
-
-        media = self.media
-        return {
-            "id": str(self.id),
-            "title": self.title,
-            "alt_text": self.alt_text,
-            "emoji": list(self.emoji),
-            "tags": list(self.tags),
-            "category": self.category,
-            "media": {
-                "format": media.format,
-                "width": media.width,
-                "height": media.height,
-                "url": media.url,
-            },
-            "is_favorite": self.is_favorite,
-        }
-
 
 class StickerManifestItem(_StrictModel):
     """One strict schema-v1 manifest item; media bytes are validated elsewhere."""

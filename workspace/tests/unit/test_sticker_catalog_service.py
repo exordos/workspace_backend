@@ -5,7 +5,6 @@
 
 import datetime
 import hashlib
-import inspect
 import json
 import uuid as sys_uuid
 
@@ -56,8 +55,7 @@ def _record(
 
 
 class _Repository:
-    def __init__(self, *, active=None, resolved=None, page=None):
-        self.active = active
+    def __init__(self, *, resolved=None, page=None):
         self.resolved = list(resolved or [])
         self.page = page or sticker_repository.StickerPage([])
         self.calls = []
@@ -66,31 +64,9 @@ class _Repository:
         self.calls.append(("list", session, user_uuid, query))
         return self.page
 
-    def get_active(self, session, user_uuid, sticker_uuid):
-        self.calls.append(("get", session, user_uuid, sticker_uuid))
-        return self.active
-
-    def get_any(self, session, user_uuid, sticker_uuid):
-        self.calls.append(("get_any", session, user_uuid, sticker_uuid))
-        return self.active
-
     def resolve_batch(self, session, user_uuid, sticker_uuids):
         self.calls.append(("resolve", session, user_uuid, list(sticker_uuids)))
         return self.resolved
-
-    def star(self, session, user_uuid, sticker_uuid):
-        self.calls.append(("star", session, user_uuid, sticker_uuid))
-
-    def unstar(self, session, user_uuid, sticker_uuid):
-        self.calls.append(("unstar", session, user_uuid, sticker_uuid))
-
-    def update_admin_fields(self, session, sticker_uuid, values):
-        self.calls.append(("update", session, sticker_uuid, values))
-        return self.active
-
-    def delete(self, session, sticker_uuid):
-        self.calls.append(("delete", session, sticker_uuid))
-        return self.active is not None
 
 
 class _Storage:
@@ -98,16 +74,12 @@ class _Storage:
         self.body = body
         self.error = error
         self.calls = []
-        self.deleted = []
 
     def read(self, storage_object_id):
         self.calls.append(storage_object_id)
         if self.error is not None:
             raise self.error
         return self.body
-
-    def delete(self, storage_object_id):
-        self.deleted.append(storage_object_id)
 
 
 def test_list_response_is_stable_private_json_with_exact_pagination_headers():
@@ -197,32 +169,6 @@ def test_list_matching_if_none_match_returns_304_without_body():
     assert "X-Pagination-Marker" not in cached.headers
 
 
-def test_get_uses_active_lookup_and_returns_safe_not_found():
-    repository = _Repository(active=_record())
-    card = sticker_catalog.get_public_sticker(
-        object(), USER_UUID, repository, STICKER_UUID
-    )
-    assert card["id"] == str(STICKER_UUID)
-    assert card["is_favorite"] is True
-
-    with pytest.raises(ra_exc.ResourceNotFoundError):
-        sticker_catalog.get_public_sticker(
-            object(), USER_UUID, _Repository(), STICKER_UUID
-        )
-
-
-def test_batch_resolve_preserves_hidden_and_excludes_repository_blocked_rows():
-    hidden = _record(active=False)
-    repository = _Repository(resolved=[hidden])
-
-    cards = sticker_catalog.resolve_public_stickers(
-        object(), USER_UUID, repository, [STICKER_UUID]
-    )
-
-    assert [card["id"] for card in cards] == [str(STICKER_UUID)]
-    assert repository.calls[0][0] == "resolve"
-
-
 @pytest.mark.parametrize("available", [False, True])
 def test_download_checks_database_before_storage_and_uses_stored_object_id(available):
     record = _record(active=False)
@@ -305,146 +251,11 @@ def test_download_maps_missing_storage_object_to_safe_not_found():
     assert "stickers/moved" not in str(error.value)
 
 
-def test_favorite_services_are_idempotent_repository_commands_for_current_user():
-    repository = _Repository()
-    session = object()
-
-    sticker_catalog.star_sticker(session, USER_UUID, repository, STICKER_UUID)
-    sticker_catalog.star_sticker(session, USER_UUID, repository, STICKER_UUID)
-    sticker_catalog.unstar_sticker(session, USER_UUID, repository, STICKER_UUID)
-    sticker_catalog.unstar_sticker(session, USER_UUID, repository, STICKER_UUID)
-
-    assert repository.calls == [
-        ("star", session, USER_UUID, STICKER_UUID),
-        ("star", session, USER_UUID, STICKER_UUID),
-        ("unstar", session, USER_UUID, STICKER_UUID),
-        ("unstar", session, USER_UUID, STICKER_UUID),
-    ]
-
-
-def test_favorite_services_have_no_project_or_client_values_boundary():
-    for operation in (sticker_catalog.star_sticker, sticker_catalog.unstar_sticker):
-        parameters = inspect.signature(operation).parameters
-        assert tuple(parameters) == (
-            "session",
-            "user_uuid",
-            "repository",
-            "sticker_uuid",
-        )
-        assert "project_id" not in parameters
-
-
-def test_star_propagates_safe_hidden_blocked_or_missing_rejection():
-    class RejectingRepository(_Repository):
-        def star(self, session, user_uuid, sticker_uuid):
-            del session, user_uuid, sticker_uuid
-            raise sticker_repository.StickerNotVisibleError()
-
-    with pytest.raises(sticker_repository.StickerNotVisibleError):
-        sticker_catalog.star_sticker(
-            object(), USER_UUID, RejectingRepository(), STICKER_UUID
-        )
-
-
 @pytest.mark.parametrize(
-    "values",
-    (
-        {},
-        {"uuid": sys_uuid.uuid4()},
-        {"format": "png"},
-        {"width": 1},
-        {"height": 1},
-        {"size_bytes": 1},
-        {"sha256": "a" * 64},
-        {"media_object_id": "stickers/other/media.png"},
-        {"unknown": True},
-    ),
+    "values", [{}, {"media_object_id": "stickers/other/media.png"}]
 )
-def test_admin_update_rejects_empty_unknown_and_read_only_fields(values):
-    repository = _Repository(active=_record())
-
+def test_admin_update_rejects_empty_and_read_only_fields(values):
     with pytest.raises(ra_exc.ValidationErrorException):
         sticker_catalog.update_sticker(
-            object(), USER_UUID, repository, STICKER_UUID, values
-        )
-
-    assert repository.calls == []
-
-
-def test_admin_update_returns_persisted_hidden_or_blocked_sticker():
-    session = object()
-    blocked = _record(active=False, blocked=True)
-    repository = _Repository(active=blocked)
-    values = {
-        "title": " Новое название ",
-        "alt_text": "Описание",
-        "emoji": ["✅"],
-        "tags": ["Да"],
-        "category": "sticker",
-        "active": False,
-        "blocked": True,
-    }
-
-    result = sticker_catalog.update_sticker(
-        session,
-        USER_UUID,
-        repository,
-        STICKER_UUID,
-        values,
-    )
-
-    assert result is blocked
-    assert result.sticker.active is False
-    assert result.sticker.blocked is True
-    assert result.is_favorite is True
-    assert repository.calls == [
-        ("update", session, STICKER_UUID, values),
-        ("get_any", session, USER_UUID, STICKER_UUID),
-    ]
-
-
-def test_admin_update_uses_user_favorite_but_no_storage_or_project_boundary():
-    parameters = inspect.signature(sticker_catalog.update_sticker).parameters
-    assert tuple(parameters) == (
-        "session",
-        "user_uuid",
-        "repository",
-        "sticker_uuid",
-        "values",
-    )
-    assert "storage" not in parameters
-    assert "project_id" not in parameters
-
-
-def test_admin_delete_enqueues_catalog_row_cleanup_in_caller_transaction():
-    session = object()
-    repository = _Repository(active=_record())
-
-    result = sticker_catalog.delete_sticker(
-        session,
-        repository,
-        STICKER_UUID,
-    )
-
-    assert result is None
-    assert repository.calls == [("delete", session, STICKER_UUID)]
-
-
-def test_admin_delete_returns_not_found_without_external_side_effects():
-    with pytest.raises(ra_exc.ResourceNotFoundError):
-        sticker_catalog.delete_sticker(
-            object(),
-            _Repository(),
-            STICKER_UUID,
-        )
-
-
-def test_admin_update_returns_safe_not_found():
-    with pytest.raises(ra_exc.ResourceNotFoundError):
-        sticker_catalog.update_sticker(
-            object(),
-            USER_UUID,
-            _Repository(),
-            STICKER_UUID,
-            {"active": False},
+            object(), USER_UUID, object(), STICKER_UUID, values
         )

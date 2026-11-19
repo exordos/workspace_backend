@@ -60,13 +60,6 @@ class StickerRepositoryValidationError(ra_exc.ValidationErrorException):
     code = 400
 
 
-class StickerNotFoundError(ra_exc.RestAlchemyException):
-    """A requested sticker is not available for the requested operation."""
-
-    message = "Sticker was not found"
-    code = 404
-
-
 class StickerNotVisibleError(ra_exc.RestAlchemyException):
     """A hidden or blocked sticker cannot be used by a new operation."""
 
@@ -759,8 +752,6 @@ class StickerRepository:
             "SELECT * FROM m_workspace_stickers WHERE uuid = %s", (sticker_uuid,)
         ).fetchall()
         return self._record_from_row(updated_rows[0]) if updated_rows else None
-
-    update_admin_fields = update
 
     def delete(
         self,

@@ -61,12 +61,14 @@ class StickerJSONPackerPreEncoded(ra_packers.JSONPackerPreEncoded):
 
     def unpack(self, value: typing.Any) -> dict[str, typing.Any]:
         try:
-            decoded = json.loads(value)
-        except (TypeError, UnicodeDecodeError, json.JSONDecodeError):
+            decoded = ra_packers.JSONPacker(None, self._req).unpack(value)
+        except ValueError:
             raise ra_exceptions.ParseBodyError() from None
         if not isinstance(decoded, dict):
             raise ra_exceptions.ValidationErrorException()
-        return typing.cast(dict[str, typing.Any], super().unpack(value))
+        return typing.cast(
+            dict[str, typing.Any], ra_packers.BaseResourcePacker.unpack(self, decoded)
+        )
 
 
 class StickerController(ra_controllers.BaseResourceController):
