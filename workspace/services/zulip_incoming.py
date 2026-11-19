@@ -21,6 +21,7 @@ from workspace.bridges.zulip import (
     incoming_operations,
     incoming_registry,
     outgoing_operations,
+    signed_uploads,
 )
 from workspace.services import zulip_outgoing
 
@@ -177,6 +178,7 @@ class ZulipIncomingService:
         reaction_user_limit: int = 5,
         poll_interval: float = 1,
         dependency_delay: float = 0.01,
+        signed_upload_origins: signed_uploads.Origins | None = None,
     ) -> None:
         self.db = zulip_outgoing.Database(
             db_url,
@@ -188,6 +190,7 @@ class ZulipIncomingService:
         self.reaction_user_limit = reaction_user_limit
         self.tasks: dict[int, asyncio.Task] = {}
         self.poll_interval = poll_interval
+        self.signed_upload_origins = signed_upload_origins
         self.dependency_delay = dependency_delay
         self.registry = incoming_registry.Registry()
         self.ready = asyncio.Event()
@@ -197,7 +200,9 @@ class ZulipIncomingService:
 
     async def run(self) -> None:
         await self.db.open()
-        self.http = zulip_outgoing.Http(self.connections)
+        self.http = zulip_outgoing.Http(
+            self.connections, signed_upload_origins=self.signed_upload_origins
+        )
         # Each account keeps a long poll open. They must not exhaust the pool
         # used for registration, object lookups or attachment downloads.
         self.poll_http = zulip_outgoing.Http(0)

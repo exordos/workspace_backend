@@ -5,6 +5,7 @@
 import asyncio
 import contextlib
 import datetime
+import hashlib
 import importlib.util
 import json
 import types
@@ -20,6 +21,7 @@ from restalchemy.common import contexts
 from restalchemy.dm import filters
 
 from workspace.bridges.zulip import message_conversion, outgoing_operations
+from workspace.messenger_api import sticker_storage
 from workspace.messenger_api.dm import external_models, v2_models
 from workspace.services import zulip_outgoing
 from workspace.services.messenger_workers import v2_projection
@@ -170,6 +172,8 @@ class Server:
         self.calls = []
         self.messages = {}
         self.attachments = []
+        self.uploaded = {}
+        self.lose_upload_response = False
         self.events = []
         self.next_id = 100
         self.lose_response = False
@@ -185,7 +189,9 @@ class Server:
         assert http.headers["Authorization"] == self.auth
         with psycopg.connect(self.db_url) as connection:
             assert not connection.execute(
-                "SELECT 1 FROM pg_stat_activity WHERE application_name='workspace-zulip-outgoing' AND state='idle in transaction'"
+                "SELECT 1 FROM pg_stat_activity WHERE datname=current_database() "
+                "AND application_name='workspace-zulip-outgoing' "
+                "AND state='idle in transaction'"
             ).fetchall()
         self.active += 1
         self.maximum = max(self.maximum, self.active)
@@ -199,6 +205,7 @@ class Server:
                 )
             if path.startswith("/attachments/"):
                 self.attachments = []
+                self.uploaded.clear()
                 return web.json_response({"result": "success"})
             if path == "/user_uploads":
                 upload = data["file"]
@@ -207,13 +214,26 @@ class Server:
                     "name": upload.filename,
                     "path_id": f"1/abc/{upload.filename}",
                 }
+                body = upload.file.read()
+                attachment["size"] = len(body)
+                self.uploaded[attachment["path_id"]] = (body, upload.content_type)
                 self.attachments.append(attachment)
+                if self.lose_upload_response:
+                    self.lose_upload_response = False
+                    http.transport.close()
+                    return web.Response()
                 return web.json_response(
                     {
                         "result": "success",
                         "uri": "/user_uploads/" + attachment["path_id"],
                     }
                 )
+            if path.startswith("/user_uploads/") and http.method == "GET":
+                uploaded = self.uploaded.get(path.removeprefix("/user_uploads/"))
+                if uploaded is None:
+                    raise web.HTTPNotFound()
+                body, content_type = uploaded
+                return web.Response(body=body, content_type=content_type)
             if path == "/messages" and http.method == "GET":
                 return web.json_response(
                     {"result": "success", "messages": list(self.messages.values())}
@@ -290,6 +310,7 @@ async def sender(account, db_url, **options):
     server = Server(db_url, account)
     app = web.Application()
     app.router.add_route("*", "/api/v1/{path:.*}", server.handle)
+    app.router.add_get("/user_uploads/{path:.*}", server.handle)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", 0)
@@ -912,6 +933,92 @@ def test_attachment_dependency_added_after_message_does_not_starve(
     asyncio.run(run())
 
 
+def test_sticker_send_recovers_lost_upload_response_and_edit_hides_unavailable_sticker(
+    outgoing, db, _test_database_url, tmp_path, monkeypatch
+):
+    api, account, _, message, *_ = outgoing
+    monkeypatch.setenv("WORKSPACE_FILE_STORAGE_PATH", str(tmp_path))
+    sticker_uuid = uuid.uuid4()
+    blocked_uuid = uuid.uuid4()
+    media = b"sticker bytes"
+    digest = hashlib.sha256(media).hexdigest()
+    object_id = (
+        sticker_storage.get_sticker_storage()
+        .save(sticker_uuid, "png", media)
+        .storage_object_id
+    )
+    db.execute(
+        """
+        INSERT INTO m_workspace_stickers (
+            uuid, title, alt_text, emoji, tags, search_text, format,
+            size_bytes, sha256, media_object_id, active, blocked
+        ) VALUES
+            (%s, 'Sticker', '', '{}', '{}', '', 'png', %s, %s, %s, true, false),
+            (%s, 'Other sticker', '', '{}', '{}', '', 'png', 1, 'other', 'unused', true, false)
+        """,
+        (sticker_uuid, len(media), digest, object_id, blocked_uuid),
+    )
+    reference = f"![sticker](urn:sticker:{sticker_uuid})"
+    blocked_reference = f"![sticker](urn:sticker:{blocked_uuid})"
+    message["content"] = (
+        f"before {reference} again {reference} after {blocked_reference}"
+    )
+    public = create(outgoing)
+
+    async def run():
+        async with sender(account, _test_database_url, concurrency=1) as (
+            service,
+            server,
+        ):
+            await service.db.sql(
+                "UPDATE m_workspace_stickers SET active=false, blocked=true WHERE uuid=%s",
+                (blocked_uuid,),
+            )
+            server.lose_upload_response = True
+            await drain(service)
+            assert len(server.attachments) == len(server.messages) == 1
+            path_id = server.attachments[0]["path_id"]
+            assert server.uploaded[path_id] == (media, "image/png")
+            assert [(method, path) for method, path, _ in server.calls] == [
+                ("POST", "/api/v1/user_uploads"),
+                ("GET", "/api/v1/attachments"),
+                ("GET", f"/user_uploads/{path_id}"),
+                ("POST", "/api/v1/messages"),
+            ]
+            marker = f"![workspace-sticker:v1:{sticker_uuid}](/user_uploads/{path_id})"
+            assert (
+                server.messages[101]["content"]
+                == f"before {marker} again {marker} after **Sticker unavailable**"
+            )
+
+            await service.db.sql(
+                "DELETE FROM m_workspace_stickers WHERE uuid=%s", (sticker_uuid,)
+            )
+            response = api.put(
+                f"/v1/messenger/messages/{public['uuid']}",
+                json={
+                    "payload": {
+                        "kind": "markdown",
+                        "content": f"edited {reference} {blocked_reference}",
+                    },
+                },
+            )
+            assert response.status_code == 200, response.text
+            await drain(service)
+            assert len(server.attachments) == 1
+            assert server.messages[101]["content"] == (
+                "edited **Sticker unavailable** **Sticker unavailable**"
+            )
+
+    try:
+        asyncio.run(run())
+    finally:
+        db.execute(
+            "DELETE FROM m_workspace_stickers WHERE uuid=ANY(%s)",
+            ([sticker_uuid, blocked_uuid],),
+        )
+
+
 def test_create_then_delete_executes_from_snapshots_after_root_cleanup(
     outgoing, db, _test_database_url
 ):
@@ -991,6 +1098,7 @@ def export(account, payload, stream_uuid, zulip):
         intent = {
             "id": 0,
             "uuid": uuid.uuid4(),
+            "attempts": 0,
             "entity_uuid": uuid.uuid4(),
             "entity_type": "message",
             "project_id": account.project_id,

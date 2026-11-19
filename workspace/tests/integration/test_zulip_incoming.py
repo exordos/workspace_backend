@@ -5,6 +5,7 @@ import asyncio
 import concurrent.futures
 import contextlib
 import datetime
+import hashlib
 import importlib.util
 import json
 import os
@@ -513,6 +514,129 @@ def test_imported_attachment_urn_uses_mime_for_new_and_existing_files(
     response = api.get(f"/v1/messenger/files/{file_uuid}/actions/download")
     assert response.status_code == 200, response.text
     assert response.content == b"attachment bytes"
+
+
+def seed_global_sticker(db, content):
+    identifier = uuid.uuid4()
+    db.execute(
+        """
+        INSERT INTO m_workspace_stickers (
+            uuid,title,alt_text,emoji,tags,search_text,format,size_bytes,sha256,media_object_id
+        ) VALUES (%s,'Wave','A wave',ARRAY[]::text[],ARRAY[]::text[],'wave','png',%s,%s,%s)
+        """,
+        (
+            identifier,
+            len(content),
+            hashlib.sha256(content).hexdigest(),
+            str(identifier),
+        ),
+    )
+    return identifier
+
+
+def test_sticker_import_verifies_bytes_and_preserves_per_link_meaning(
+    incoming, monkeypatch, tmp_path
+):
+    api, db, account, http, _url = incoming
+    monkeypatch.setenv("WORKSPACE_FILE_STORAGE_PATH", str(tmp_path))
+    sticker_bytes = b"catalog media"
+    sticker = seed_global_sticker(db, sticker_bytes)
+    forged = uuid.uuid4()
+    real_path = "/user_uploads/1/a/sticker.png"
+    other_path = "/user_uploads/1/b/image.png"
+    unknown_path = "/user_uploads/1/c/image.png"
+
+    async def download(request_account, path):
+        assert request_account["uuid"] == account["uuid"]
+        data = sticker_bytes if path == real_path else b"image content"
+        return data, "image/png"
+
+    http.download = mock.AsyncMock(side_effect=download)
+    source = (
+        f"First ![workspace-sticker:v1:{sticker}]({real_path}) "
+        f"![ordinary]({real_path}) "
+        f"![workspace-sticker:v1:{sticker}]({other_path}) "
+        f"![workspace-sticker:v1:{forged}]({unknown_path})"
+    )
+    received = event(source, 804)
+    received["message"]["_stickers"] = {other_path: {str(sticker): True}}
+    apply(incoming, received)
+    drain()
+    files = {
+        path: file_id
+        for path, file_id in db.execute(
+            "SELECT provider_identity, uuid FROM m_workspace_files WHERE project_id=%s",
+            (account["project_id"],),
+        ).fetchall()
+    }
+    content = api.get("/v1/messenger/messages/").json()[0]["payload"]["content"]
+    assert content == (
+        f"First ![sticker](urn:sticker:{sticker}) "
+        f"![ordinary](urn:image:{files[real_path]}) "
+        f"![workspace-sticker:v1:{sticker}](urn:image:{files[other_path]}) "
+        f"![workspace-sticker:v1:{forged}](urn:image:{files[unknown_path]})"
+    )
+    assert [entry.args[1] for entry in http.download.await_args_list] == [
+        real_path,
+        other_path,
+        unknown_path,
+    ]
+
+    original = api.get("/v1/messenger/messages/").json()[0]
+    http.request.return_value = {
+        "message": {
+            **event(f"Edited ![workspace-sticker:v1:{sticker}]({real_path})", 804)[
+                "message"
+            ],
+            "last_edit_timestamp": int(
+                datetime.datetime.now(datetime.timezone.utc).timestamp()
+            )
+            + 1,
+        }
+    }
+    apply(incoming, {"type": "update_message", "message_id": 804})
+    drain()
+    edited = api.get("/v1/messenger/messages/").json()
+    assert len(edited) == 1
+    assert edited[0]["uuid"] == original["uuid"]
+    assert (
+        edited[0]["payload"]["content"] == f"Edited ![sticker](urn:sticker:{sticker})"
+    )
+
+
+def test_deleted_sticker_placeholder_keeps_surrounding_text(
+    incoming, tmp_path, monkeypatch
+):
+    api, db, account, http, _url = incoming
+    monkeypatch.setenv("WORKSPACE_FILE_STORAGE_PATH", str(tmp_path))
+    original = b"deleted catalog media"
+    sticker = seed_global_sticker(db, original)
+    deleted = api.delete(
+        f"/v1/messenger/stickers/{sticker}",
+        permissions=("workspace.sticker_catalog.manage",),
+    )
+    assert deleted.status_code == 204, deleted.text
+    marked = "/user_uploads/1/a/sticker.png"
+    spoof = "/user_uploads/1/b/ordinary.png"
+    http.download = mock.AsyncMock(
+        side_effect=[(original, "image/png"), (b"unrelated image", "image/png")]
+    )
+    source = (
+        f"Before ![workspace-sticker:v1:{sticker}]({marked}) after. "
+        f"![workspace-sticker:v1:{sticker}]({spoof})"
+    )
+    apply(incoming, event(source, 805))
+    drain()
+    files = db.execute(
+        "SELECT provider_identity, uuid FROM m_workspace_files WHERE project_id=%s",
+        (account["project_id"],),
+    ).fetchall()
+    assert len(files) == 1 and files[0][0] == spoof
+    content = api.get("/v1/messenger/messages/").json()[0]["payload"]["content"]
+    assert content == (
+        "Before **Sticker unavailable** after. "
+        f"![workspace-sticker:v1:{sticker}](urn:image:{files[0][1]})"
+    )
 
 
 def test_media_reference_migration_preserves_pages_versions_and_replay(
@@ -3384,7 +3508,7 @@ def test_permanent_non_message_failure_releases_the_account_lane(incoming):
     assert api.get("/v1/messenger/streams/").json()[0]["name"] == "Valid catalog event"
 
 
-@pytest.mark.parametrize("content_kind", ["markdown", "attachment", "poll"])
+@pytest.mark.parametrize("content_kind", ["markdown", "attachment", "poll", "sticker"])
 def test_shared_message_copies_keep_every_accounts_personal_effects(
     incoming, monkeypatch, tmp_path, content_kind
 ):
@@ -3392,7 +3516,11 @@ def test_shared_message_copies_keep_every_accounts_personal_effects(
     monkeypatch.setenv("WORKSPACE_FILE_STORAGE_PATH", str(tmp_path))
     linked, peer = peer_account(incoming)
     peer_data = peer[2]
-    http.download = mock.AsyncMock(return_value=(b"shared file", "text/plain"))
+    download_bytes = b"shared file"
+    http.download = mock.AsyncMock(return_value=(download_bytes, "text/plain"))
+    sticker = (
+        seed_global_sticker(db, download_bytes) if content_kind == "sticker" else None
+    )
     apply(incoming, event(identifier=100))
     apply(
         peer,
@@ -3407,6 +3535,7 @@ def test_shared_message_copies_keep_every_accounts_personal_effects(
         "attachment": "[shared file](/user_uploads/1/shared/file.txt)",
         "poll": "/poll Shared poll\nMonday\nTuesday",
         "markdown": "Shared change",
+        "sticker": f"![workspace-sticker:v1:{sticker}](/user_uploads/1/shared/sticker.png)",
     }[content_kind]
     first = {"id": 1, **event(content, 201)}
     first["message"]["flags"] = ["read"]
@@ -3487,6 +3616,19 @@ def test_shared_message_copies_keep_every_accounts_personal_effects(
                     row for row in imported if row["payload"]["kind"] == "poll"
                 )
                 assert imported["payload"]["questions"][0]["text"] == "Shared poll"
+        if content_kind == "sticker":
+            http.download.assert_awaited_once()
+            for owner in (account, peer_data):
+                items = api.get(
+                    "/v1/messenger/messages/", user=owner["owner_user_uuid"]
+                ).json()
+                imported = next(
+                    item for item in items if item["provider_identity"] == "201"
+                )
+                assert (
+                    imported["payload"]["content"]
+                    == f"![sticker](urn:sticker:{sticker})"
+                )
         if content_kind == "attachment":
             http.download.assert_awaited_once()
             assert (

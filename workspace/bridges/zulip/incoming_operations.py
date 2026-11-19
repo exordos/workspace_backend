@@ -19,6 +19,7 @@ from psycopg.types import json as pg_json
 from workspace.bridges.zulip import (
     content_cache,
     incoming_registry,
+    incoming_stickers,
     message_conversion,
     outgoing_operations,
     poll_conversion,
@@ -1559,6 +1560,9 @@ class Operations:
         if kind == "subscription" and event["op"] in ("peer_add", "peer_remove"):
             people.update(event["user_ids"])
         await self.message_dependencies(account, prepared["messages"], event=event)
+        stickers = await incoming_stickers.catalog(
+            self.db.sql, account, prepared["messages"]
+        )
         for message in prepared["messages"]:
             people.add(message["sender_id"])
             poll = poll_conversion.read(message)
@@ -1590,7 +1594,9 @@ class Operations:
                 )
             )
             message["_files"] = []
-            for target in message_conversion.get_zulip_files(message, {}):
+            message.pop("_stickers", None)
+            targets: dict[tuple[str, str], list[tuple[str, str | None]]] = {}
+            for target, label in message_conversion.get_zulip_file_links(message, {}):
                 endpoint = message_conversion.parse_url(
                     target, account["settings"]["server_url"]
                 )
@@ -1606,8 +1612,32 @@ class Operations:
                     message["_files"].append((target, endpoint.path))
                     prepared["files"][key] = {"missing": 403}
                     continue
+                identifier = (
+                    incoming_stickers.marker(account, target, label)
+                    if stickers
+                    else None
+                )
+                targets.setdefault((path, endpoint.path), []).append(
+                    (target, identifier)
+                )
+            for (path, original_path), links in targets.items():
                 key = (file_stream, path)
-                message["_files"].append((target, path))
+                decisions, downloaded = await incoming_stickers.verify(
+                    self.http,
+                    account,
+                    path,
+                    (identifier for _, identifier in links),
+                    stickers,
+                )
+                for target, identifier in links:
+                    if identifier is not None and identifier in decisions:
+                        message.setdefault("_stickers", {}).setdefault(target, {})[
+                            identifier
+                        ] = decisions[identifier]
+                    else:
+                        message["_files"].append((target, path))
+                if all(identifier in decisions for _, identifier in links):
+                    continue
                 if not base.FileProviderIdentity().validate(path):
                     prepared["files"][key] = {"missing": "path_too_long"}
                     continue
@@ -1622,14 +1652,14 @@ class Operations:
                         path,
                     ),
                 )
-                if not existing and path != endpoint.path:
+                if not existing and path != original_path:
                     existing = await self.db.sql(
                         SELECT_SCOPED_FILE_SQL,
                         (
                             account["project_id"],
                             file_stream,
                             account["provider_uuid"],
-                            endpoint.path,
+                            original_path,
                         ),
                     )
                 if existing:
@@ -1637,13 +1667,14 @@ class Operations:
                         "existing": {**existing[0], "provider_identity": path}
                     }
                     continue
-                try:
-                    content, content_type = await self.http.download(account, path)
-                except outgoing_operations.ApiError as error:
-                    if error.status not in (403, 404):
-                        raise
-                    prepared["files"][key] = {"missing": error.status}
+                if downloaded is None:
+                    downloaded = await incoming_stickers.download(
+                        self.http, account, path
+                    )
+                if isinstance(downloaded, int):
+                    prepared["files"][key] = {"missing": downloaded}
                     continue
+                content, content_type = downloaded
                 identifier = uuid.uuid5(
                     file_stream, f"{account['provider_uuid']}:file:{path}"
                 )
@@ -2393,6 +2424,7 @@ class Operations:
         context = conversion_context(
             account, data, stream, topic, public_uuid, prepared
         )
+        context["stickers"] = data.get("_stickers", {})
         for target, path in data.get("_files", []):
             file = prepared["files"][(stream_uuid, path)]
             if "missing" in file:

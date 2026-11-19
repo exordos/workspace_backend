@@ -26,11 +26,22 @@ from workspace.workspace_api.api import routes as workspace_routes
 from workspace.messenger_api.api import controllers
 from workspace.messenger_api.api import middlewares
 from workspace.messenger_api.api import routes
+from workspace.messenger_api.api import sticker_controllers
 from workspace.messenger_api.dm import models
 from workspace.messenger_api import events
 
 
 ROUTE_MANIFEST = {
+    "stickers": (
+        routes.StickerRoute,
+        sticker_controllers.StickerController,
+        {
+            ra_routes.FILTER,
+            ra_routes.GET,
+            ra_routes.UPDATE,
+            ra_routes.DELETE,
+        },
+    ),
     "message_mutations": (
         routes.WorkspaceMutationStatusRoute,
         controllers.WorkspaceMutationStatusController,
@@ -163,6 +174,18 @@ ROUTE_MANIFEST = {
 
 
 ACTION_MANIFEST = {
+    (routes.StickerRoute, "download"): (
+        sticker_controllers.StickerController,
+        False,
+    ),
+    (routes.StickerRoute, "star"): (
+        sticker_controllers.StickerController,
+        True,
+    ),
+    (routes.StickerRoute, "unstar"): (
+        sticker_controllers.StickerController,
+        True,
+    ),
     (routes.FolderItemRoute, "pin"): (
         controllers.FolderItemController,
         True,
