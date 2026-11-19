@@ -116,6 +116,7 @@ def test_sticker_catalog_migration_round_trip_schema_constraints_indexes_and_gra
                 'm_workspace_stickers'::regclass,
                 'm_workspace_sticker_favorites'::regclass
             )
+            AND contype <> 'n'  -- Column nullability is checked above.
             ORDER BY conname
             """
         )
