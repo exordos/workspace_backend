@@ -25,6 +25,7 @@ import stat
 import tempfile
 import typing
 import zipfile
+import zlib
 import uuid as sys_uuid
 
 from restalchemy.common import exceptions as ra_exc
@@ -331,7 +332,13 @@ def _validate_zip(
             )
     except StickerImportValidationError:
         raise
-    except (zipfile.BadZipFile, zipfile.LargeZipFile, OSError, RuntimeError) as error:
+    except (
+        zipfile.BadZipFile,
+        zipfile.LargeZipFile,
+        OSError,
+        RuntimeError,
+        zlib.error,
+    ) as error:
         _invalid("Archive is invalid", error)
 
 

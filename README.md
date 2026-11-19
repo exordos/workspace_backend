@@ -47,6 +47,22 @@ Run each Zulip service as one separate process with
 `--config-file /etc/workspace/workspace.conf`. They use asyncio, direct PostgreSQL
 and persistent aiohttp connections. SQL transactions end before HTTP or waits.
 
+To download signed attachments, configure each Zulip storage origin in the
+shared worker configuration. Exordos reads the optional
+`/etc/workspace/zulip-signed-uploads.conf` after the managed configuration.
+For other installations, use the worker config or a second `--config-file`.
+
+```ini
+[zulip_signed_uploads]
+allowed_origins = {"https://uploads.example.com": [], "http://minio.internal:9000": ["10.20.30.40"]}
+```
+
+Use the exact scheme, hostname and port from signed URLs. An empty address list
+allows only public destinations over HTTPS. For private storage, pin the
+storage IP addresses or a dedicated storage CIDR. Restart the Zulip workers
+after changing this policy. With no origins configured, signed attachments are
+unavailable. Zulip-served attachments continue to download directly.
+
 The incoming service supervises enabled external accounts and keeps one long poll
 per account. It persists each received batch and its queue cursor atomically,
 then applies the durable inbox in account order. Different accounts run

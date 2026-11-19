@@ -2,19 +2,39 @@
 # Licensed under the Apache License, Version 2.0 (the "License").
 
 import asyncio
+import configparser
 import datetime
+import json
 import socket
 from unittest import mock
 
+import aiohttp
 import pytest
 from aiohttp import web
 
-from workspace.bridges.zulip import outgoing_operations
+from workspace.bridges.zulip import outgoing_operations, signed_uploads
 from workspace.services import zulip_outgoing
 
 
-@pytest.mark.parametrize("status", [200, 302, 403, 404])
-def test_zulip_upload_download_authorizes_before_using_signed_storage(status):
+@pytest.mark.parametrize(
+    ("zulip_status", "storage_policy", "expected_status"),
+    [
+        (200, None, 200),
+        (403, None, 403),
+        (404, None, 404),
+        (302, "allowed", 200),
+        (302, "redirect", 302),
+        (302, "mixed-dns-offline", None),
+        (302, None, 403),
+        (302, "other-port", 403),
+        (302, "other-address", 403),
+        (302, "public-only", 403),
+        (302, "same-origin", 403),
+    ],
+)
+def test_zulip_upload_download_checks_origin_and_connection_address(
+    zulip_status, storage_policy, expected_status
+):
     async def run():
         path = "/user_uploads/1/key/sticker.png"
         signed_path = "/bucket/1/key/sticker.png?X-Amz-Signature=signature&key=%2f%2B"
@@ -23,13 +43,15 @@ def test_zulip_upload_download_authorizes_before_using_signed_storage(status):
         async def handle(request):
             seen.append((request.raw_path, request.headers.get("Authorization")))
             if request.path == path:
-                if status == 302:
+                if zulip_status == 302:
                     raise web.HTTPFound(storage_url)
                 return web.Response(
-                    status=status, body=b"image", content_type="image/png"
+                    status=zulip_status, body=b"image", content_type="image/png"
                 )
             if request.path == f"/api/v1{path}":
                 return web.json_response({"result": "success", "url": storage_url})
+            if storage_policy == "redirect" and request.raw_path == signed_path:
+                raise web.HTTPFound("/unexpected")
             return web.Response(body=b"image", content_type="image/png")
 
         app = web.Application()
@@ -41,8 +63,31 @@ def test_zulip_upload_download_authorizes_before_using_signed_storage(status):
         await zulip.start()
         await storage.start()
         zulip_port, storage_port = (address[1] for address in runner.addresses)
-        storage_url = f"http://127.0.0.1:{storage_port}{signed_path}"
-        http = zulip_outgoing.Http()
+        storage_hostname = "storage.example.test"
+        signed_host, signed_port = storage_hostname, storage_port
+        if storage_policy == "same-origin":
+            signed_host, signed_port = "127.0.0.1", zulip_port
+        scheme = "https" if storage_policy == "public-only" else "http"
+        storage_url = f"{scheme}://{signed_host}:{signed_port}{signed_path}"
+        config = configparser.ConfigParser()
+        if storage_policy:
+            port = zulip_port if storage_policy == "other-port" else signed_port
+            address = (
+                "127.0.0.2"
+                if storage_policy in ("other-address", "same-origin")
+                else "127.0.0.1"
+            )
+            addresses = [] if storage_policy == "public-only" else [address]
+            config["zulip_signed_uploads"] = {
+                "allowed_origins": json.dumps(
+                    {f"{scheme}://{signed_host}:{port}": addresses}
+                ),
+            }
+        http = zulip_outgoing.Http(
+            signed_upload_origins=signed_uploads.configured_origins(config)
+        )
+        if storage_policy == "mixed-dns-offline":
+            await storage.stop()
         account = {
             "uuid": "account",
             "settings": {
@@ -51,20 +96,46 @@ def test_zulip_upload_download_authorizes_before_using_signed_storage(status):
                 "api_key": "test-key",
             },
         }
+
+        loop = asyncio.get_running_loop()
+        getaddrinfo = loop.getaddrinfo
+
+        async def resolve(host, port, **kwargs):
+            if host != storage_hostname:
+                return await getaddrinfo(host, port, **kwargs)
+            addresses = await getaddrinfo("127.0.0.1", port, **kwargs)
+            if storage_policy == "mixed-dns-offline":
+                addresses.extend(await getaddrinfo("127.0.0.2", port, **kwargs))
+            return addresses
+
         try:
-            if status in (403, 404):
-                with pytest.raises(outgoing_operations.ApiError) as error:
-                    await http.download(account, path)
-                assert error.value.status == status
-            else:
-                assert await http.download(account, path) == (b"image", "image/png")
+            with (
+                mock.patch.object(loop, "getaddrinfo", side_effect=resolve),
+                mock.patch.object(
+                    loop, "sock_connect", wraps=loop.sock_connect
+                ) as dial,
+            ):
+                if expected_status is None:
+                    with pytest.raises(aiohttp.ClientConnectorError):
+                        await http.download(account, path)
+                elif expected_status != 200:
+                    with pytest.raises(outgoing_operations.ApiError) as error:
+                        await http.download(account, path)
+                    assert error.value.status == expected_status
+                else:
+                    assert await http.download(account, path) == (b"image", "image/png")
+
             authorization = "Basic dXNlckBleGFtcGxlLmNvbTp0ZXN0LWtleQ=="
             expected = [(path, authorization)]
-            if status == 302:
-                expected.extend(
-                    [(f"/api/v1{path}", authorization), (signed_path, None)]
-                )
+            if zulip_status == 302:
+                expected.append((f"/api/v1{path}", authorization))
+            if storage_policy in ("allowed", "redirect"):
+                expected.append((signed_path, None))
             assert seen == expected
+            assert any(
+                call.args[1][1] == storage_port for call in dial.await_args_list
+            ) == (storage_policy in ("allowed", "redirect", "mixed-dns-offline"))
+            assert all(call.args[1][0] == "127.0.0.1" for call in dial.await_args_list)
         finally:
             await http.close()
             await runner.cleanup()

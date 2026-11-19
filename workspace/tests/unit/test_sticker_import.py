@@ -21,6 +21,7 @@ import stat
 import tempfile
 import uuid as sys_uuid
 import zipfile
+import zlib
 from unittest import mock
 
 import pytest
@@ -284,6 +285,22 @@ def test_item_count_and_crc_errors_are_rejected():
         with pytest.raises(sticker_import.StickerImportValidationError):
             with sticker_import.validate_archive(payload):
                 pass
+
+
+@pytest.mark.parametrize("entry_name", ["manifest.json", f"media/{CLIENT_ID}.png"])
+def test_decompression_errors_are_archive_validation_errors(monkeypatch, entry_name):
+    original_read = zipfile.ZipExtFile.read
+
+    def broken_read(source, *args, **kwargs):
+        if source.name == entry_name:
+            raise zlib.error("invalid compressed data")
+        return original_read(source, *args, **kwargs)
+
+    monkeypatch.setattr(zipfile.ZipExtFile, "read", broken_read)
+
+    with pytest.raises(sticker_import.StickerImportValidationError):
+        with sticker_import.validate_archive(_archive()):
+            pass
 
 
 def test_actual_streamed_bytes_cannot_exceed_cumulative_unpacked_limit(monkeypatch):

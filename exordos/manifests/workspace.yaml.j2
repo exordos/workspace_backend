@@ -649,7 +649,7 @@ resources:
     workspace_zulip_incoming:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       name: workspace-zulip-incoming
-      path: /usr/bin/workspace-zulip-incoming --config-file /etc/workspace/workspace.conf
+      path: /usr/bin/workspace-zulip-incoming --config-file /etc/workspace/workspace.conf --config-file /etc/workspace/zulip-signed-uploads.conf
       user: root
       target:
         kind: node
@@ -664,7 +664,7 @@ resources:
     workspace_zulip_history:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       name: workspace-zulip-history
-      path: /usr/bin/workspace-zulip-history --config-file /etc/workspace/workspace.conf
+      path: /usr/bin/workspace-zulip-history --config-file /etc/workspace/workspace.conf --config-file /etc/workspace/zulip-signed-uploads.conf
       user: root
       target:
         kind: node
@@ -679,7 +679,7 @@ resources:
     workspace_zulip_outgoing:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       name: workspace-zulip-outgoing
-      path: /usr/bin/workspace-zulip-outgoing --config-file /etc/workspace/workspace.conf
+      path: /usr/bin/workspace-zulip-outgoing --config-file /etc/workspace/workspace.conf --config-file /etc/workspace/zulip-signed-uploads.conf
       user: root
       target:
         kind: node

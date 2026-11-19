@@ -609,6 +609,23 @@ class StickerRepository:
         ).fetchall()
         return [self._record_from_row(row) for row in rows]
 
+    def require_active_for_message(
+        self, session: typing.Any, sticker_uuids: set[str]
+    ) -> None:
+        """Keep newly referenced stickers available until the message is committed."""
+        if not sticker_uuids:
+            return
+        rows = session.execute(
+            """
+            SELECT uuid FROM m_workspace_stickers
+            WHERE uuid = ANY(%s::uuid[]) AND active AND NOT blocked
+            ORDER BY uuid FOR SHARE
+            """,
+            (list(sticker_uuids),),
+        ).fetchall()
+        if len(rows) != len(sticker_uuids):
+            raise StickerRepositoryValidationError()
+
     def find_duplicates(
         self,
         session: typing.Any,

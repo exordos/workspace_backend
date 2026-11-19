@@ -5,12 +5,16 @@
 
 """Sticker catalog acceptance tests through real WSGI and PostgreSQL."""
 
+import base64
 import hashlib
 import io
 import json
 import pathlib
+import struct
 import uuid as sys_uuid
 import zipfile
+
+import pytest
 
 from workspace.messenger_api import file_storage
 from workspace.messenger_api import sticker_storage
@@ -540,6 +544,54 @@ def test_real_http_admin_delete_is_atomic_and_hides_storage_identity(
     )
 
 
+@pytest.mark.parametrize("corrupt_entry", ["manifest", "media"])
+def test_real_http_import_rejects_corrupt_compressed_entries(
+    workspace_api,
+    db,
+    tmp_path: pathlib.Path,
+    monkeypatch,
+    corrupt_entry: str,
+) -> None:
+    monkeypatch.setenv(file_storage.ENV_STORAGE_PATH, str(tmp_path))
+    client_id = sys_uuid.uuid4()
+    data = client_id.bytes
+    item = _manifest_item(
+        client_id,
+        data,
+        format="png",
+        title="Corrupt archive",
+        category="sticker",
+        tags=["corrupt"],
+    )
+    media_name = str(item["file"])
+    archive = bytearray(_archive([item], {media_name: data}))
+    entry_name = "manifest.json" if corrupt_entry == "manifest" else media_name
+    with zipfile.ZipFile(io.BytesIO(archive)) as zip_file:
+        header_offset = zip_file.getinfo(entry_name).header_offset
+    name_length, extra_length = struct.unpack_from("<HH", archive, header_offset + 26)
+    data_offset = header_offset + 30 + name_length + extra_length
+    archive[data_offset] |= 0b110  # Reserved DEFLATE block type.
+
+    digest = str(item["sha256"])
+    try:
+        response = workspace_api.post(
+            f"{UNIFIED_ROOT}/actions/import_archive/invoke",
+            permissions=(MANAGE_PERMISSION,),
+            files={"archive": ("stickers.zip", io.BytesIO(archive), "application/zip")},
+        )
+
+        assert response.status_code == 400, response.text
+        assert (
+            db.execute(
+                "SELECT 1 FROM m_workspace_stickers WHERE sha256 = %s", (digest,)
+            ).fetchone()
+            is None
+        )
+        assert not any(path.is_file() for path in tmp_path.rglob("*"))
+    finally:
+        _delete_imported_stickers(db, [digest])
+
+
 def test_real_http_import_checks_permission_before_multipart_parsing(
     workspace_api,
     db,
@@ -556,15 +608,18 @@ def test_real_http_import_checks_permission_before_multipart_parsing(
     assert after == before
 
 
-def test_sticker_markdown_urn_round_trips_unchanged_through_message_http_api(
+def test_native_messages_require_active_stickers_for_new_references(
     workspace_api,
     db,
+    tmp_path: pathlib.Path,
+    monkeypatch,
 ) -> None:
+    monkeypatch.setenv(file_storage.ENV_STORAGE_PATH, str(tmp_path))
     stream_uuid = conftest.seed_user_stream(
         db,
         workspace_api.project_id,
         workspace_api.user_uuid,
-        "Sticker Markdown round-trip",
+        "Sticker availability",
     )
     topic_uuid = conftest.seed_stream_topic(
         db,
@@ -574,20 +629,88 @@ def test_sticker_markdown_urn_round_trips_unchanged_through_message_http_api(
         "general",
         is_default=True,
     )
-    sticker_uuid = sys_uuid.uuid4()
-    content = f"![sticker](urn:sticker:{sticker_uuid})"
-
-    created = workspace_api.post(
-        "/v1/messenger/messages/",
-        json={
+    client_id = sys_uuid.uuid4()
+    data = client_id.bytes
+    item = _manifest_item(
+        client_id,
+        data,
+        format="png",
+        title="Message sticker",
+        category="sticker",
+        tags=[],
+    )
+    archive = _archive([item], {str(item["file"]): data})
+    try:
+        imported = workspace_api.post(
+            f"{UNIFIED_ROOT}/actions/import_archive/invoke",
+            permissions=(MANAGE_PERMISSION,),
+            files={"archive": ("stickers.zip", io.BytesIO(archive), "application/zip")},
+        )
+        assert imported.status_code == 200, imported.text
+        sticker_uuid = imported.json()["items"][0]["sticker_uuid"]
+        content = f"![sticker](urn:sticker:{sticker_uuid})"
+        messages = "/v1/messenger/messages/"
+        payload = {"kind": "markdown", "content": content}
+        body = {
+            "uuid": str(sys_uuid.uuid4()),
             "stream_uuid": stream_uuid,
             "topic_uuid": topic_uuid,
-            "payload": {"kind": "markdown", "content": content},
-        },
-    )
-    assert created.status_code == 201, created.text
-    assert created.json()["payload"] == {"kind": "markdown", "content": content}
+            "payload": payload,
+        }
+        created = workspace_api.post(messages, json=body)
+        assert created.status_code == 201, created.text
+        assert created.json()["payload"] == payload
+        message_path = messages + created.json()["uuid"]
 
-    loaded = workspace_api.get(f"/v1/messenger/messages/{created.json()['uuid']}")
-    assert loaded.status_code == 200, loaded.text
-    assert loaded.json()["payload"] == {"kind": "markdown", "content": content}
+        hidden = workspace_api.put(
+            f"{UNIFIED_ROOT}/{sticker_uuid}",
+            permissions=(MANAGE_PERMISSION,),
+            json={"active": False},
+        )
+        assert hidden.status_code == 200, hidden.text
+        loaded = workspace_api.get(message_path)
+        assert loaded.status_code == 200, loaded.text
+        assert loaded.json()["payload"] == payload
+        downloaded = workspace_api.get(
+            f"{UNIFIED_ROOT}/{sticker_uuid}/actions/download"
+        )
+        assert downloaded.status_code == 200, downloaded.text
+        assert downloaded.content == data
+
+        retry = workspace_api.post(messages, json=body)
+        assert retry.status_code == 201, retry.text
+        assert retry.json()["uuid"] == created.json()["uuid"]
+        assert retry.json()["payload"] == payload
+        new_body = {**body, "uuid": str(sys_uuid.uuid4())}
+        rejected = workspace_api.post(messages, json=new_body)
+        assert rejected.status_code == 400, rejected.text
+        snapshot = base64.urlsafe_b64encode(content.encode()).decode()
+        forwarded = {
+            "kind": "markdown",
+            "content": f"[Forward](urn:forward:{created.json()['uuid']}?snapshot={snapshot})",
+        }
+        rejected_forward = workspace_api.post(
+            messages, json={**new_body, "payload": forwarded}
+        )
+        assert rejected_forward.status_code == 400, rejected_forward.text
+
+        literal = {"kind": "markdown", "content": f"urn:sticker:{sticker_uuid}"}
+        plain = workspace_api.post(messages, json={**new_body, "payload": literal})
+        assert plain.status_code == 201, plain.text
+        plain_path = messages + plain.json()["uuid"]
+        rejected_edit = workspace_api.put(plain_path, json={"payload": payload})
+        assert rejected_edit.status_code == 400, rejected_edit.text
+        assert workspace_api.get(plain_path).json()["payload"] == literal
+
+        duplicated = {"kind": "markdown", "content": f"{content}\n{content}"}
+        rejected_duplicate = workspace_api.put(
+            message_path, json={"payload": duplicated}
+        )
+        assert rejected_duplicate.status_code == 400, rejected_duplicate.text
+
+        retained = {"kind": "markdown", "content": f"Edited {content}"}
+        edited = workspace_api.put(message_path, json={"payload": retained})
+        assert edited.status_code == 200, edited.text
+        assert edited.json()["payload"] == retained
+    finally:
+        _delete_imported_stickers(db, [str(item["sha256"])])

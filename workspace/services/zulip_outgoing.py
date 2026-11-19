@@ -5,6 +5,7 @@
 
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import math
@@ -19,7 +20,7 @@ from psycopg import abc as pg_abc
 from psycopg import conninfo, rows
 from psycopg.types import json as pg_json
 
-from workspace.bridges.zulip import outgoing_operations
+from workspace.bridges.zulip import outgoing_operations, signed_uploads
 from workspace.common import database
 
 
@@ -227,13 +228,28 @@ class Database:
 class Http:
     """A shared connector grows on demand and closes idle connections."""
 
-    def __init__(self, connections: int = 128, keepalive: float = 15) -> None:
+    def __init__(
+        self,
+        connections: int = 128,
+        keepalive: float = 15,
+        signed_upload_origins: signed_uploads.Origins | None = None,
+    ) -> None:
         self.connector = aiohttp.TCPConnector(
             limit=connections,
             limit_per_host=connections,
             keepalive_timeout=keepalive,
             socket_factory=self.create_socket,
         )
+        self.signed_connectors: dict[signed_uploads.Origin, aiohttp.TCPConnector] = {}
+        for origin, networks in (signed_upload_origins or {}).items():
+            resolver = signed_uploads.StorageResolver(origin[2], networks)
+            self.signed_connectors[origin] = aiohttp.TCPConnector(
+                limit=connections,
+                limit_per_host=connections,
+                keepalive_timeout=keepalive,
+                resolver=resolver,
+                socket_factory=functools.partial(self.create_signed_socket, resolver),
+            )
         self.sessions: dict[str, tuple[dict, aiohttp.ClientSession]] = {}
 
     @staticmethod
@@ -251,10 +267,21 @@ class Http:
         )
         return connection
 
+    def create_signed_socket(
+        self, resolver: signed_uploads.StorageResolver, address: tuple
+    ) -> socket.socket:
+        # aiohttp skips DNS resolution for numeric hosts.
+        host, port = address[4][:2]
+        if not resolver.allows(host, port):
+            raise signed_uploads.AddressDenied()
+        return self.create_socket(address)
+
     async def close(self) -> None:
         for _, session in self.sessions.values():
             await session.close()
         await self.connector.close()
+        for connector in self.signed_connectors.values():
+            await connector.close()
 
     async def session(self, account: dict) -> aiohttp.ClientSession:
         key = str(account["uuid"])
@@ -334,33 +361,41 @@ class Http:
         attachment = await self.request(account, "GET", path)
         try:
             signed_url = yarl.URL(attachment["url"], encoded=True)
-            if (
-                signed_url.scheme not in ("http", "https")
-                or not signed_url.raw_host
-                or signed_url.raw_user is not None
-                or signed_url.raw_password is not None
-                or signed_url.raw_fragment
-            ):
-                raise ValueError("Invalid signed upload URL")
+            origin = signed_uploads.origin(signed_url)
         except (KeyError, TypeError, ValueError):
             raise aiohttp.ClientPayloadError(
                 "Invalid Zulip signed upload URL"
             ) from None
 
-        # The URL is already signed. Keep its encoding and use a session
-        # without the Zulip account's Authorization header.
-        async with aiohttp.ClientSession(
-            connector=self.connector,
-            connector_owner=False,
-            timeout=timeout,
-            cookie_jar=aiohttp.DummyCookieJar(),
-        ) as storage:
-            async with storage.get(signed_url, allow_redirects=False) as response:
-                if response.status >= 300:
-                    raise outgoing_operations.ApiError(
-                        response.status, {"msg": "Signed upload download failed"}, "GET"
-                    )
-                return await response.read(), response.content_type
+        connector = self.signed_connectors.get(origin)
+        if connector is None:
+            raise outgoing_operations.ApiError(
+                403, {"msg": "Signed upload origin is not allowed"}, "GET"
+            )
+
+        # Keep the signed URL encoding. The separate pool validates connection
+        # addresses and has no Zulip credentials.
+        try:
+            async with aiohttp.ClientSession(
+                connector=connector,
+                connector_owner=False,
+                timeout=timeout,
+                cookie_jar=aiohttp.DummyCookieJar(),
+            ) as storage:
+                async with storage.get(signed_url, allow_redirects=False) as response:
+                    if response.status >= 300:
+                        raise outgoing_operations.ApiError(
+                            response.status,
+                            {"msg": "Signed upload download failed"},
+                            "GET",
+                        )
+                    return await response.read(), response.content_type
+        except aiohttp.ClientConnectorError as error:
+            if not isinstance(error.os_error, signed_uploads.AddressDenied):
+                raise
+            raise outgoing_operations.ApiError(
+                403, {"msg": str(error.os_error)}, "GET"
+            ) from None
 
 
 class ZulipOutgoingService:
@@ -373,10 +408,12 @@ class ZulipOutgoingService:
         connections: int = 128,
         dependency_delay: float = 1,
         poll_interval: float = 1,
+        signed_upload_origins: signed_uploads.Origins | None = None,
     ) -> None:
         self.db = Database(db_url, io_timeout=database_io_timeout)
         self.concurrency = concurrency
         self.connections = connections
+        self.signed_upload_origins = signed_upload_origins
         self.dependency_delay = max(1, dependency_delay)
         self.poll_interval = poll_interval
         self.ready = asyncio.Event()
@@ -385,7 +422,9 @@ class ZulipOutgoingService:
 
     async def run(self) -> None:
         await self.db.open()
-        self.http = Http(self.connections)
+        self.http = Http(
+            self.connections, signed_upload_origins=self.signed_upload_origins
+        )
         self.operations = outgoing_operations.Operations(self.db, self.http)
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
