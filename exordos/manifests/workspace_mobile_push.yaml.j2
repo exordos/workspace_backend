@@ -1,5 +1,3 @@
-# Keep Jinja directives in YAML comments for `exordos build --element`.
-# {% set use_realm_domain = managed_realm | default(false) | string | lower == 'true' %}
 # Native Workspace producer for direct Firebase delivery through local Notification.
 name: workspace_mobile_push
 description: Native Workspace mobile push producer
@@ -14,20 +12,12 @@ requirements:
     from_version: "2.0.3-dev"
   notification_firebase:
     from_version: "1.0.0"
-# {% if use_realm_domain %}
-  ecosystem_realm:
-    from_version: "0.0.0"
-# {% endif %}
 
 imports:
   backend_node:
     element: "$workspace"
     kind: resource
     link: "$core.compute.nodes.$workspace_backend"
-  installation_domain:
-    element: "{{ '$ecosystem_realm' if use_realm_domain else '$core' }}"
-    kind: resource
-    link: "{{ '$core.vs.variables.$realm_domain' if use_realm_domain else '$core.dns.domains.$public_domain' }}"
   firebase_provider:
     element: "$notification_firebase"
     kind: resource
@@ -53,12 +43,25 @@ resources:
       setter:
         kind: selector
         selector_strategy: latest
+    notification_host:
+      name: workspace_mobile_push_notification_host
+      description: Hostname of the HTTPS ingress for this installation's Notification API
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      setter:
+        kind: selector
+        selector_strategy: latest
 
   $core.vs.values:
     organization_uuid:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       variable: $core.vs.variables.$organization_uuid:uuid
       value: $self:uuid
+    notification_host:
+      name: Default Workspace Notification host
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      variable: $core.vs.variables.$notification_host:uuid
+      read_only: true
+      value: "exordos.com"
 
   $exordos_notification.types.email.event_types:
     notification_topic_update:
@@ -170,7 +173,7 @@ resources:
           f"
           [mobile_push]
           organization_uuid = {$core.vs.variables.$organization_uuid:value}
-          notification_endpoint = https://{$workspace_mobile_push.imports.$installation_domain:{{ 'value' if use_realm_domain else 'name' }}}/api/notification
+          notification_endpoint = https://{$core.vs.variables.$notification_host:value}/api/notification
           "
 
   $core.em.services:

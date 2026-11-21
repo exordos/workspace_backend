@@ -268,39 +268,29 @@ def test_manifest_owns_direct_firebase_event_contract():
     assert "public_notification_gateway" not in resources["$core.config.configs"]
 
 
-@pytest.mark.parametrize(
-    ("manifest_vars", "element", "link", "field"),
-    [
-        ({}, "core", "$core.dns.domains.$public_domain", "name"),
-        (
-            {"managed_realm": "true"},
-            "ecosystem_realm",
-            "$core.vs.variables.$realm_domain",
-            "value",
-        ),
-    ],
-)
-def test_manifest_routes_to_notification_over_installation_https(
-    manifest_vars, element, link, field
-):
+def test_manifest_routes_to_notification_over_configurable_https():
     template = ROOT / "exordos/manifests/workspace_mobile_push.yaml.j2"
     source = template.read_text()
     # The CLI selects --element by loading the source before rendering Jinja.
     assert yaml.safe_load(source)["name"] == "workspace_mobile_push"
-    manifest = yaml.safe_load(jinja2.Template(source).render(**manifest_vars))
+    manifest = yaml.safe_load(jinja2.Template(source).render())
     assert "notification_node" not in manifest["imports"]
-    assert manifest["imports"]["installation_domain"] == {
-        "element": f"${element}",
-        "kind": "resource",
-        "link": link,
+    assert "installation_domain" not in manifest["imports"]
+    assert "ecosystem_realm" not in manifest["requirements"]
+    resources = manifest["resources"]
+    host = resources["$core.vs.variables"]["notification_host"]
+    assert host["name"] == "workspace_mobile_push_notification_host"
+    assert host["setter"] == {
+        "kind": "selector",
+        "selector_strategy": "latest",
     }
-    assert ("ecosystem_realm" in manifest["requirements"]) == (
-        element == "ecosystem_realm"
-    )
-    configs = manifest["resources"]["$core.config.configs"]
+    default_host = resources["$core.vs.values"]["notification_host"]
+    assert default_host["variable"] == "$core.vs.variables.$notification_host:uuid"
+    assert default_host["value"] == "exordos.com"
+    assert default_host["read_only"] is True
+    configs = resources["$core.config.configs"]
     assert (
-        "notification_endpoint = https://"
-        f"{{$workspace_mobile_push.imports.$installation_domain:{field}}}"
+        "notification_endpoint = https://{$core.vs.variables.$notification_host:value}"
         "/api/notification" in configs["notification_endpoint"]["body"]["content"]
     )
 

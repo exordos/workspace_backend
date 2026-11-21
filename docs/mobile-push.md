@@ -49,12 +49,14 @@ at `/api/notification/v1/events/`. No relay Notification instance is needed.
 This protects the connection from Workspace to the ingress; the ingress's
 upstream connection to Notification is still HTTP.
 
-The producer imports the installation's exported
-`$core.dns.domains.$public_domain` DNS resource. For a managed Realm, build
-the producer with `--manifest-var managed_realm=true` and install a version
-of `ecosystem_realm` that exports its existing `$core.vs.variables.$realm_domain`
-variable. The manifest uses the complete Realm hostname from that variable,
-not the parent DNS zone. There is no hardcoded host or internal HTTP fallback.
+The connector's Core Values Store variable
+`workspace_mobile_push_notification_host` defaults to `exordos.com`. For a
+different installation, including a test Realm, add and select a value for
+that variable before sending push events. Enter only the hostname of that
+installation's trusted Notification ingress, without a scheme, port, or path.
+Use the complete Realm hostname, not its parent DNS zone. Core renders
+`https://<host>/api/notification` into the managed Workspace configuration;
+no DNS resource export, Realm-specific build, or HTTP fallback is needed.
 
 The template passes `device_uuid`, `registration_token`, the encrypted
 `payload` string and Android `priority` to the Firebase transport. Firebase
