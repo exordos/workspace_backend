@@ -243,6 +243,7 @@ def test_manifest_owns_direct_firebase_event_contract():
     template = ROOT / "exordos/manifests/workspace_mobile_push.yaml.j2"
     manifest = yaml.safe_load(jinja2.Template(template.read_text()).render())
     assert set(manifest["requirements"]) == {
+        "core",
         "workspace",
         "exordos_notification",
         "notification_firebase",
@@ -274,7 +275,6 @@ def test_manifest_routes_to_notification_over_configurable_https():
     # The CLI selects --element by loading the source before rendering Jinja.
     assert yaml.safe_load(source)["name"] == "workspace_mobile_push"
     manifest = yaml.safe_load(jinja2.Template(source).render())
-    assert "notification_node" not in manifest["imports"]
     assert "installation_domain" not in manifest["imports"]
     assert "ecosystem_realm" not in manifest["requirements"]
     resources = manifest["resources"]
@@ -289,10 +289,54 @@ def test_manifest_routes_to_notification_over_configurable_https():
     assert default_host["value"] == "exordos.com"
     assert default_host["read_only"] is True
     configs = resources["$core.config.configs"]
+    assert configs["notification_endpoint"]["target"] == {
+        "kind": "node",
+        "node": "$workspace_mobile_push.imports.$backend_node:uuid",
+    }
     assert (
         "notification_endpoint = https://{$core.vs.variables.$notification_host:value}"
         "/api/notification" in configs["notification_endpoint"]["body"]["content"]
     )
+
+
+def test_mobile_push_manifest_delivers_core_secret_only_to_notification():
+    template = ROOT / "exordos/manifests/workspace_mobile_push.yaml.j2"
+    manifest = yaml.safe_load(jinja2.Template(template.read_text()).render())
+    resources = manifest["resources"]
+    assert manifest["imports"]["notification_node"] == {
+        "element": "$exordos_notification",
+        "kind": "resource",
+        "link": "$core.compute.nodes.$notification_cp",
+    }
+
+    secret = resources["$core.secret.secrets"]["firebase_service_account"]
+    assert secret["name"] == "notification-firebase-service-account"
+    assert secret["constructor"] == {"kind": "plain"}
+    assert "value" not in secret
+    assert "default_value" not in secret
+
+    configs = resources["$core.config.configs"]
+    credential = configs["firebase_service_account_file"]
+    assert credential["project_id"] == secret["project_id"]
+    assert credential["target"] == {
+        "kind": "node",
+        "node": "$workspace_mobile_push.imports.$notification_node:uuid",
+    }
+    assert (
+        credential["path"] == "/etc/exordos_notification/firebase-service-account.json"
+    )
+    assert (credential["owner"], credential["group"], credential["mode"]) == (
+        "root",
+        "root",
+        "0600",
+    )
+    link = "$core.secret.secrets.$firebase_service_account:value"
+    assert credential["body"] == {"kind": "text", "content": link}
+    assert yaml.safe_dump(manifest).count(link) == 1
+    assert credential["on_change"] == {
+        "kind": "shell",
+        "command": "systemctl try-restart exordos-notification-mail-agent.service",
+    }
 
 
 def test_push_preparation_and_delivery_have_independent_managed_services():

@@ -6,6 +6,8 @@ version: "{{ version | default('1.0.0') }}"
 api_version: v1
 
 requirements:
+  core:
+    from_version: "0.4.3"
   workspace:
     from_version: "1.3.2-dev"
   exordos_notification:
@@ -18,6 +20,10 @@ imports:
     element: "$workspace"
     kind: resource
     link: "$core.compute.nodes.$workspace_backend"
+  notification_node:
+    element: "$exordos_notification"
+    kind: resource
+    link: "$core.compute.nodes.$notification_cp"
   firebase_provider:
     element: "$notification_firebase"
     kind: resource
@@ -138,7 +144,32 @@ resources:
       auto_renew: true
       expiration_delta: 604800
 
+  $core.secret.secrets:
+    firebase_service_account:
+      name: notification-firebase-service-account
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      # The operator sets the value once via Core Secrets, never in the manifest.
+      constructor:
+        kind: plain
+
   $core.config.configs:
+    firebase_service_account_file:
+      name: notification-firebase-service-account-file
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      path: /etc/exordos_notification/firebase-service-account.json
+      owner: root
+      group: root
+      mode: "0600"
+      target:
+        kind: node
+        node: $workspace_mobile_push.imports.$notification_node:uuid
+      body:
+        kind: text
+        content: $core.secret.secrets.$firebase_service_account:value
+      on_change:
+        kind: shell
+        command: systemctl try-restart exordos-notification-mail-agent.service
+
     authentication:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       path: /etc/workspace/workspace.conf.d/91-mobile-push-token.conf
