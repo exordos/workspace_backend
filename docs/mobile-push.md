@@ -39,9 +39,9 @@ have their device data cleared and are not retried.
 
 ## Direct Notification topology
 
-Install `workspace_mobile_push` after `workspace`, `exordos_notification` and
-`notification_firebase`. The producer element owns the fixed
-`notification_topic_update` event type, its Firebase Android template, the
+On Core 0.4.3 or later, install `workspace_mobile_push` after `workspace`,
+`exordos_notification` and `notification_firebase`. The producer element owns
+the fixed `notification_topic_update` event type, its Firebase Android template, the
 restricted IAM sender identity and the rotating token. It imports only the
 shared Firebase provider from `notification_firebase` and sends directly to
 the same installation's Notification API through its existing HTTPS ingress
@@ -59,9 +59,24 @@ Use the complete Realm hostname, not its parent DNS zone. Core renders
 no DNS resource export, Realm-specific build, or HTTP fallback is needed.
 
 The template passes `device_uuid`, `registration_token`, the encrypted
-`payload` string and Android `priority` to the Firebase transport. Firebase
-credentials remain only on the Notification node at
-`/etc/exordos_notification/firebase-service-account.json` with mode `0600`.
+`payload` string and Android `priority` to the Firebase transport.
+
+The same `workspace_mobile_push` element declares the Core Secret
+`notification-firebase-service-account` and its file delivery. No separate
+credentials element is needed. Before sending push events, set the secret's
+`value` to the service-account JSON via the Core Secrets API and wait for the
+managed config to be active. The manifest never defines a value or default, so
+reapplying it does not overwrite the operator's value. Core delivers the file
+to the Notification node at `/etc/exordos_notification/firebase-service-account.json`
+as `root:root` with mode `0600`. Core can re-deliver it when the node is
+replaced. A changed file restarts only the running Notification delivery worker
+to discard its cached Google session.
+
+Before setting the value, verify that only trusted operators have
+`secret.secret.read` and `config.config.read` in the system project. The former
+can expose the secret value, and the latter can expose the delivered config's
+body. Do not pass credential values in command arguments or print API responses.
+
 The Workspace node receives only its platform-managed Notification bearer
 token. Core renders it as `[mobile_push] notification_token` in the private
 oslo.config drop-in `/etc/workspace/workspace.conf.d/91-mobile-push-token.conf`
