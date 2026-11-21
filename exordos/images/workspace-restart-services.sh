@@ -25,7 +25,15 @@ SERVICE_NAMES=(
     workspace-zulip-outgoing
     workspace-messenger-worker
     workspace-messenger-events
+    workspace-push-handler
+    workspace-push-sender
 )
+
+case "$*" in
+    "") ;;
+    --push-sender) SERVICE_NAMES=(workspace-push-sender) ;;
+    *) echo "Usage: $0 [--push-sender]" >&2; exit 2 ;;
+esac
 
 for service_name in "${SERVICE_NAMES[@]}"; do
     pattern="(^|[ /])${service_name}([[:space:]]|$)"

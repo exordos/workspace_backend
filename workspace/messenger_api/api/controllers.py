@@ -119,6 +119,22 @@ class ObjectJSONPacker(ContractJSONPacker):
         return ra_packers.BaseResourcePacker.unpack(self, body)
 
 
+class WorkspaceStreamJSONPacker(ContractJSONPacker):
+    """Accept the legacy native source object still sent by Workspace clients."""
+
+    def unpack(self, value: typing.Any) -> typing.Any:
+        body = ra_packers.JSONPacker(None, self._req).unpack(value)
+        if not isinstance(body, dict):
+            raise ra_exc.ValidationErrorException()
+        source = body.pop("source", None)
+        if source is not None and (
+            source != {"kind": "native"}
+            or body.get("source_name", "native") != "native"
+        ):
+            raise ra_exc.ValidationErrorException()
+        return ra_packers.BaseResourcePacker.unpack(self, body)
+
+
 class ContractMultipartPacker(ra_packers.MultipartPacker):
     pack_resource = ContractJSONPacker.pack_resource
 
@@ -388,6 +404,11 @@ class PushDeviceController(ra_controllers.BaseResourceController):
             filters={"uuid": dm_filters.EQ(uuid)},
             session=session,
         )
+        if device is not None and (
+            device.project_id != project_id or device.user_uuid != user_uuid
+        ):
+            raise ra_exc.ResourceNotFoundError(resource="PushDevice", path=str(uuid))
+        candidate.validate_registration_key()
         if device is None:
             candidate.insert(session=session)
             device = self.model.objects.get_one(
@@ -395,11 +416,6 @@ class PushDeviceController(ra_controllers.BaseResourceController):
                 session=session,
             )
             return self._response(device), 201, {}
-        if device.project_id != project_id or device.user_uuid != user_uuid:
-            raise ra_exc.ResourceNotFoundError(
-                resource="PushDevice",
-                path=str(uuid),
-            )
         device.update_dm(
             values={
                 "transport": candidate.transport,
@@ -757,6 +773,7 @@ WorkspaceFileController.download.openapi_schema = oa_utils.Schema(
 
 class WorkspaceStreamController(StoreResourceController):
     resource_name = "streams"
+    __packer__ = WorkspaceStreamJSONPacker
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.WorkspaceUserStream,
         hidden_fields=["private_index"],

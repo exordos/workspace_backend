@@ -1,0 +1,214 @@
+# Native Workspace producer for direct Firebase delivery through local Notification.
+name: workspace_mobile_push
+description: Native Workspace mobile push producer
+schema_version: 1
+version: "{{ version | default('1.0.0') }}"
+api_version: v1
+
+requirements:
+  workspace:
+    from_version: "1.3.2-dev"
+  exordos_notification:
+    from_version: "2.0.3-dev"
+  notification_firebase:
+    from_version: "1.0.0"
+
+imports:
+  backend_node:
+    element: "$workspace"
+    kind: resource
+    link: "$core.compute.nodes.$workspace_backend"
+  firebase_provider:
+    element: "$notification_firebase"
+    kind: resource
+    link: "$exordos_notification.types.email.providers.$firebase"
+  event_type_read:
+    element: "$exordos_notification"
+    kind: resource
+    link: "$core.iam.permissions.$event_type_read"
+  iam_default_client_uuid:
+    element: "$core"
+    kind: resource
+    link: "$core.vs.variables.$iam_default_client_uuid"
+  core_local_domain:
+    element: "$core"
+    kind: resource
+    link: "$core.dns.domains.$local_domain"
+
+resources:
+  $core.vs.variables:
+    organization_uuid:
+      name: workspace_mobile_push_organization_uuid
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      setter:
+        kind: selector
+        selector_strategy: latest
+    notification_host:
+      name: workspace_mobile_push_notification_host
+      description: Hostname of the HTTPS ingress for this installation's Notification API
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      setter:
+        kind: selector
+        selector_strategy: latest
+
+  $core.vs.values:
+    organization_uuid:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      variable: $core.vs.variables.$organization_uuid:uuid
+      value: $self:uuid
+    notification_host:
+      name: Default Workspace Notification host
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      variable: $core.vs.variables.$notification_host:uuid
+      read_only: true
+      value: "exordos.com"
+
+  $exordos_notification.types.email.event_types:
+    notification_topic_update:
+      uuid: "aba6e448-3b72-51ef-b0c6-d2e3be17efe7"
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: notification_topic_update
+      description: Encrypted Workspace topic snapshot for one mobile device
+      status: ACTIVE
+
+  $exordos_notification.types.email.templates:
+    notification_topic_update:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: "Workspace Android topic update"
+      status: ACTIVE
+      provider: $workspace_mobile_push.imports.$firebase_provider:uuid
+      event_type: $exordos_notification.types.email.event_types.$notification_topic_update:uuid
+      is_default: true
+      params: {}
+      content:
+        kind: firebase_android
+        device_uuid: "{% raw %}{{ device_uuid }}{% endraw %}"
+        registration_token: "{% raw %}{{ registration_token }}{% endraw %}"
+        data:
+          payload: "{% raw %}{{ payload }}{% endraw %}"
+        priority: "{% raw %}{{ priority | default('normal') }}{% endraw %}"
+
+  $core.iam.permissions:
+    topic_update_create:
+      name: exordos_notification.event_type_aba6e448-3b72-51ef-b0c6-d2e3be17efe7.create
+    topic_update_read:
+      name: exordos_notification.event_type_aba6e448-3b72-51ef-b0c6-d2e3be17efe7.read
+
+  $core.iam.roles:
+    push_sender:
+      name: workspace-mobile-push-sender
+      project_id: null
+
+  $core.iam.permissionbinding:
+    topic_update_create:
+      role: $core.iam.roles.$push_sender:uuid
+      permission: $core.iam.permissions.$topic_update_create:uuid
+      project_id: null
+    topic_update_read:
+      role: $core.iam.roles.$push_sender:uuid
+      permission: $core.iam.permissions.$topic_update_read:uuid
+      project_id: null
+    event_type_read:
+      role: $core.iam.roles.$push_sender:uuid
+      permission: $workspace_mobile_push.imports.$event_type_read:uuid
+      project_id: null
+
+  $core.iam.users:
+    push_sender:
+      username: workspace-mobile-push-sender
+      first_name: Workspace
+      last_name: Push
+      email: noreply+workspace-push@exordos.com
+      type: service
+      password: unused-by-a-service-account
+
+  $core.iam.rolebinding:
+    push_sender:
+      role: $core.iam.roles.$push_sender:uuid
+      user: $core.iam.users.$push_sender:uuid
+      project: null
+
+  $core.iam.tokens:
+    push_sender:
+      name: workspace-mobile-push-sender
+      user: $core.iam.users.$push_sender:uuid
+      iam_client: $workspace_mobile_push.imports.$iam_default_client_uuid:value
+      issuer: f"http://core.{$workspace_mobile_push.imports.$core_local_domain:name}/api/core/v1/iam/clients/{$workspace_mobile_push.imports.$iam_default_client_uuid:value}"
+      scope: ""
+      auto_renew: true
+      expiration_delta: 604800
+
+  $core.config.configs:
+    authentication:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      path: /etc/workspace/workspace.conf.d/91-mobile-push-token.conf
+      mode: "0600"
+      on_change:
+        kind: shell
+        command: /usr/local/bin/workspace-restart-services --push-sender
+      target:
+        kind: node
+        node: $workspace_mobile_push.imports.$backend_node:uuid
+      body:
+        kind: text
+        content: |
+          f"
+          [mobile_push]
+          notification_token = {$core.iam.tokens.$push_sender:access_token}
+          "
+
+    notification_endpoint:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      path: /etc/workspace/workspace.conf.d/90-mobile-push.conf
+      mode: "0600"
+      target:
+        kind: node
+        node: $workspace_mobile_push.imports.$backend_node:uuid
+      on_change:
+        kind: shell
+        command: /usr/local/bin/workspace-restart-services
+      body:
+        kind: text
+        content: |
+          f"
+          [mobile_push]
+          organization_uuid = {$core.vs.variables.$organization_uuid:value}
+          notification_endpoint = https://{$core.vs.variables.$notification_host:value}/api/notification
+          "
+
+  $core.em.services:
+    push_handler:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace-push-handler
+      path: /usr/bin/workspace-push-handler --config-file /etc/workspace/workspace.conf --config-dir /etc/workspace/workspace.conf.d
+      user: root
+      target:
+        kind: node
+        node: $workspace_mobile_push.imports.$backend_node:uuid
+      service_type:
+        kind: simple
+        count: 1
+      target_status: enabled
+      before:
+        - kind: shell
+          command: /usr/local/bin/workspace-bootstrap
+    push_sender:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace-push-sender
+      path: /usr/bin/workspace-push-sender --config-file /etc/workspace/workspace.conf --config-dir /etc/workspace/workspace.conf.d
+      user: root
+      target:
+        kind: node
+        node: $workspace_mobile_push.imports.$backend_node:uuid
+      service_type:
+        kind: simple
+        count: 1
+      target_status: enabled
+      before:
+        - kind: shell
+          command: /usr/local/bin/workspace-bootstrap
+
+exports:
+  organization_uuid:
+    link: "$core.vs.variables.$organization_uuid"
+    kind: resource
