@@ -268,11 +268,12 @@ def test_backend_iam_uses_the_same_verified_core_proxy():
 def test_mobile_push_dependencies_use_core_versions_instead_of_pep440():
     import re
 
-    manifest = _read("exordos/manifests/workspace_mobile_push.yaml.j2")
-    versions = re.findall(r'from_version:\s*"([^"]+)"', manifest)
-    assert versions
-    for version in versions:
-        assert re.fullmatch(r"\d+\.\d+\.\d+(?:-.+)?", version)
+    for mode in ("direct", "mesh"):
+        manifest = _read(f"exordos/manifests/workspace_{mode}_firebase_push.yaml.j2")
+        versions = re.findall(r'from_version:\s*"([^"]+)"', manifest)
+        assert versions
+        for version in versions:
+            assert re.fullmatch(r"\d+\.\d+\.\d+(?:-.+)?", version)
 
 
 def test_backend_bootstrap_has_no_secondary_storage_gate():

@@ -37,56 +37,77 @@ legacy single-device events to the current format without changing their
 UUID or ciphertext. Already terminal events and unsupported legacy batches
 have their device data cleared and are not retried.
 
-## Direct Notification topology
+## Install a push transport
 
-On Core 0.4.3 or later, install `workspace_mobile_push` after `workspace`,
-`exordos_notification` and `notification_firebase`. The producer element owns
-the fixed `notification_topic_update` event type, its Firebase Android template, the
-restricted IAM sender identity and the rotating token. It imports only the
-shared Firebase provider from `notification_firebase` and sends directly to
-the same installation's Notification API through its existing HTTPS ingress
-at `/api/notification/v1/events/`. No relay Notification instance is needed.
-This protects the connection from Workspace to the ingress; the ingress's
-upstream connection to Notification is still HTTP.
+Install Workspace 3.2.1 or later and a local Exordos Notification. Choose one
+Workspace push Element. Both Elements own the same Workspace event type and
+sender services, so switch between them by uninstalling the current Element
+before installing the replacement.
 
-The connector's Core Values Store variable
-`workspace_mobile_push_notification_host` defaults to `exordos.com`. For a
-different installation, including a test Realm, add and select a value for
-that variable before sending push events. Enter only the hostname of that
-installation's trusted Notification ingress, without a scheme, port, or path.
-Use the complete Realm hostname, not its parent DNS zone. Core renders
-`https://<host>/api/notification` into the managed Workspace configuration;
-no DNS resource export, Realm-specific build, or HTTP fallback is needed.
+| Element | Delivery |
+| --- | --- |
+| `workspace_direct_firebase_push` | Local Notification sends to Firebase. |
+| `workspace_mesh_firebase_push` | Local Notification forwards to a separate Notification that sends to Firebase. |
 
-The template passes `device_uuid`, `registration_token`, the encrypted
-`payload` string and Android `priority` to the Firebase transport.
+Both Elements use the local Notification API at `/api/notification/v1/events/`.
+Select `workspace_mobile_push_notification_host` in Core Values Store and enter
+the trusted local Notification ingress hostname, without a scheme, port or path.
+Core uses HTTPS from Workspace to that ingress. The default ingress may connect
+to its Notification node over HTTP on the installation network.
 
-The same `workspace_mobile_push` element declares the Core Secret
-`notification-firebase-service-account` and its file delivery. No separate
-credentials element is needed. Before sending push events, set the secret's
-`value` to the service-account JSON via the Core Secrets API and wait for the
-managed config to be active. The manifest never defines a value or default, so
-reapplying it does not overwrite the operator's value. Core delivers the file
-to the Notification node at `/etc/exordos_notification/firebase-service-account.json`
-as `root:root` with mode `0600`. Core can re-deliver it when the node is
-replaced. A changed file restarts only the running Notification delivery worker
-to discard its cached Google session.
+The Workspace sender receives a rotating Core IAM token for the local
+Notification. Only that token is written to the Workspace node. Both Elements
+use the same backend and Android event format.
 
-Before setting the value, verify that only trusted operators have
-`secret.secret.read` and `config.config.read` in the system project. The former
-can expose the secret value, and the latter can expose the delivered config's
-body. Do not pass credential values in command arguments or print API responses.
+### Direct delivery
 
-The Workspace node receives only its platform-managed Notification bearer
-token. Core renders it as `[mobile_push] notification_token` in the private
-oslo.config drop-in `/etc/workspace/workspace.conf.d/91-mobile-push-token.conf`
-with mode `0600`. When the token changes, the config hook restarts only
-`workspace-push-sender` so it reads the new token at startup. The API and
-the handler can still queue events when the sender has no token.
+Install `notification_firebase` with the local Notification and then install
+`workspace_direct_firebase_push`. Set the Core Secret
+`notification-firebase-service-account` to the Firebase service-account JSON
+for the Android app's project. Core writes the credential to
+`/etc/exordos_notification/firebase-service-account.json` on the local
+Notification node as `root:root` with mode `0600`.
 
-An `ACTIVE` Notification event proves only that FCM accepted the request. Full
-acceptance must also verify receipt, HPKE decryption, notification display and
-navigation on a physical device.
+### Mesh delivery
+
+Install a Notification build that supports the `notification_relay` provider,
+then install `workspace_mesh_firebase_push`. On the receiving installation,
+create a dedicated Firebase event type, default Android Firebase template and
+IAM identity for this forwarding installation. Grant that identity create and
+read permissions for its dedicated event type. The [Notification relay
+documentation](https://github.com/exordos/exordos_notification/blob/master/docs/push-relay.md)
+describes the receiving template and credentials.
+
+Set the local Core Secret `workspace-mesh-upstream` to the receiving
+Notification connection JSON. It contains `notification_endpoint`,
+`iam_endpoint`, `event_type_uuid`, `project_uuid`, and an `access_token`
+or `refresh_token` issued by the receiving Core. Use distinct local and
+receiving Notification installations. Core writes this secret to
+`/etc/exordos_notification/workspace-mesh-upstream.json` on the local
+Notification node with mode `0600`. The receiving Notification holds the
+Firebase service-account credential.
+
+The local Notification forwards the encrypted payload and polls the receiving
+event's status. A permanent `registration_token_inactive` response reaches
+Workspace for the original device. A pending upstream event remains pending
+locally and retains its original UUID across retries.
+
+For either Element, reserve `secret.secret.read` and `config.config.read` in the
+system project for trusted operators. When the generated credential file
+changes, Core restarts the Notification delivery worker.
+
+### Switch from an existing push Element
+
+Allow pending deliveries to finish. Record the selected
+`workspace_mobile_push_organization_uuid` and local Notification host before
+uninstalling the old `workspace_mobile_push` Element. Install one of the new
+Elements and set these values again before enabling delivery. Preserve the
+organization UUID so the app continues to match encrypted events to its
+existing connection. Keep the Workspace database and its device registrations.
+Provision the chosen transport's credential before testing delivery.
+
+An `ACTIVE` Notification event means Firebase accepted the send. Verify
+receipt, decryption, notification display, and navigation on a physical device.
 
 ## Tests
 

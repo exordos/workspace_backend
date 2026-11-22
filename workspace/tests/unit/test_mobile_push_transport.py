@@ -201,8 +201,9 @@ def test_shared_sdk_sender_does_not_log_an_echoed_provider_error(
     event.save.assert_called_once_with()
 
 
-def test_managed_token_config_renews_and_restarts_only_the_push_sender(tmp_path):
-    template = ROOT / "exordos/manifests/workspace_mobile_push.yaml.j2"
+@pytest.mark.parametrize("mode", ("direct", "mesh"))
+def test_managed_token_config_renews_and_restarts_only_the_push_sender(tmp_path, mode):
+    template = ROOT / f"exordos/manifests/workspace_{mode}_firebase_push.yaml.j2"
     manifest = yaml.safe_load(jinja2.Template(template.read_text()).render())
     resources = manifest["resources"]
     token = resources["$core.iam.tokens"]["push_sender"]
@@ -240,7 +241,7 @@ def test_managed_token_config_renews_and_restarts_only_the_push_sender(tmp_path)
 
 
 def test_manifest_owns_direct_firebase_event_contract():
-    template = ROOT / "exordos/manifests/workspace_mobile_push.yaml.j2"
+    template = ROOT / "exordos/manifests/workspace_direct_firebase_push.yaml.j2"
     manifest = yaml.safe_load(jinja2.Template(template.read_text()).render())
     assert set(manifest["requirements"]) == {
         "core",
@@ -257,7 +258,7 @@ def test_manifest_owns_direct_firebase_event_contract():
     ]
     assert event_type["uuid"] == "aba6e448-3b72-51ef-b0c6-d2e3be17efe7"
     assert template["provider"] == (
-        "$workspace_mobile_push.imports.$firebase_provider:uuid"
+        "$workspace_direct_firebase_push.imports.$firebase_provider:uuid"
     )
     assert template["content"] == {
         "kind": "firebase_android",
@@ -269,11 +270,12 @@ def test_manifest_owns_direct_firebase_event_contract():
     assert "public_notification_gateway" not in resources["$core.config.configs"]
 
 
-def test_manifest_routes_to_notification_over_configurable_https():
-    template = ROOT / "exordos/manifests/workspace_mobile_push.yaml.j2"
+@pytest.mark.parametrize("mode", ("direct", "mesh"))
+def test_manifest_routes_to_notification_over_configurable_https(mode):
+    template = ROOT / f"exordos/manifests/workspace_{mode}_firebase_push.yaml.j2"
     source = template.read_text()
     # The CLI selects --element by loading the source before rendering Jinja.
-    assert yaml.safe_load(source)["name"] == "workspace_mobile_push"
+    assert yaml.safe_load(source)["name"] == f"workspace_{mode}_firebase_push"
     manifest = yaml.safe_load(jinja2.Template(source).render())
     assert "installation_domain" not in manifest["imports"]
     assert "ecosystem_realm" not in manifest["requirements"]
@@ -284,14 +286,11 @@ def test_manifest_routes_to_notification_over_configurable_https():
         "kind": "selector",
         "selector_strategy": "latest",
     }
-    default_host = resources["$core.vs.values"]["notification_host"]
-    assert default_host["variable"] == "$core.vs.variables.$notification_host:uuid"
-    assert default_host["value"] == "exordos.com"
-    assert default_host["read_only"] is True
+    assert "notification_host" not in resources["$core.vs.values"]
     configs = resources["$core.config.configs"]
     assert configs["notification_endpoint"]["target"] == {
         "kind": "node",
-        "node": "$workspace_mobile_push.imports.$backend_node:uuid",
+        "node": f"$workspace_{mode}_firebase_push.imports.$backend_node:uuid",
     }
     assert (
         "notification_endpoint = https://{$core.vs.variables.$notification_host:value}"
@@ -300,7 +299,7 @@ def test_manifest_routes_to_notification_over_configurable_https():
 
 
 def test_mobile_push_manifest_delivers_core_secret_only_to_notification():
-    template = ROOT / "exordos/manifests/workspace_mobile_push.yaml.j2"
+    template = ROOT / "exordos/manifests/workspace_direct_firebase_push.yaml.j2"
     manifest = yaml.safe_load(jinja2.Template(template.read_text()).render())
     resources = manifest["resources"]
     assert manifest["imports"]["notification_node"] == {
@@ -320,7 +319,7 @@ def test_mobile_push_manifest_delivers_core_secret_only_to_notification():
     assert credential["project_id"] == secret["project_id"]
     assert credential["target"] == {
         "kind": "node",
-        "node": "$workspace_mobile_push.imports.$notification_node:uuid",
+        "node": "$workspace_direct_firebase_push.imports.$notification_node:uuid",
     }
     assert (
         credential["path"] == "/etc/exordos_notification/firebase-service-account.json"
@@ -339,10 +338,13 @@ def test_mobile_push_manifest_delivers_core_secret_only_to_notification():
     }
 
 
-def test_push_preparation_and_delivery_have_independent_managed_services():
+@pytest.mark.parametrize("mode", ("direct", "mesh"))
+def test_push_preparation_and_delivery_have_independent_managed_services(mode):
     manifest = yaml.safe_load(
         jinja2.Template(
-            (ROOT / "exordos/manifests/workspace_mobile_push.yaml.j2").read_text()
+            (
+                ROOT / f"exordos/manifests/workspace_{mode}_firebase_push.yaml.j2"
+            ).read_text()
         ).render()
     )
     services = manifest["resources"]["$core.em.services"]
@@ -389,4 +391,54 @@ def test_mobile_push_element_is_available_to_the_standard_builder():
     config = yaml.safe_load(config_path.read_text())
 
     manifests = [element["manifest"] for element in config["build"]["elements"]]
-    assert "manifests/workspace_mobile_push.yaml.j2" in manifests
+    assert "manifests/workspace_direct_firebase_push.yaml.j2" in manifests
+    assert "manifests/workspace_mesh_firebase_push.yaml.j2" in manifests
+
+
+def test_mesh_configures_local_relay_with_upstream_secret_only_on_notification():
+    template = ROOT / "exordos/manifests/workspace_mesh_firebase_push.yaml.j2"
+    manifest = yaml.safe_load(jinja2.Template(template.read_text()).render())
+    assert set(manifest["requirements"]) == {
+        "core",
+        "workspace",
+        "exordos_notification",
+    }
+    resources = manifest["resources"]
+    assert resources["$exordos_notification.types.email.providers"][
+        "notification_relay"
+    ]["protocol"] == {"kind": "notification_relay"}
+    event_type = resources["$exordos_notification.types.email.event_types"][
+        "notification_topic_update"
+    ]
+    assert event_type["uuid"] == "aba6e448-3b72-51ef-b0c6-d2e3be17efe7"
+    template = resources["$exordos_notification.types.email.templates"][
+        "notification_topic_update"
+    ]
+    assert template["content"] == {"kind": "notification_relay"}
+    assert (
+        template["event_type"]
+        == "$exordos_notification.types.email.event_types.$notification_topic_update:uuid"
+    )
+    assert template["is_default"] is True
+    secret = resources["$core.secret.secrets"]["mesh_upstream"]
+    assert secret["name"] == "workspace-mesh-upstream"
+    assert secret["constructor"] == {"kind": "plain"}
+    assert "value" not in secret
+    config = resources["$core.config.configs"]["mesh_upstream_file"]
+    assert config["path"] == "/etc/exordos_notification/workspace-mesh-upstream.json"
+    assert (config["owner"], config["group"], config["mode"]) == (
+        "root",
+        "root",
+        "0600",
+    )
+    assert (
+        config["target"]["node"]
+        == "$workspace_mesh_firebase_push.imports.$notification_node:uuid"
+    )
+    link = "$core.secret.secrets.$mesh_upstream:value"
+    assert config["body"] == {"kind": "text", "content": link}
+    assert yaml.safe_dump(manifest).count(link) == 1
+    assert config["on_change"] == {
+        "kind": "shell",
+        "command": "systemctl try-restart exordos-notification-mail-agent.service",
+    }

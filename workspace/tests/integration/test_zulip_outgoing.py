@@ -2255,20 +2255,26 @@ def test_ambiguous_send_retries_after_restart_and_releases_quote_chain(
             await service.dispatch()
             await asyncio.gather(*list(service.tasks.values()))
             await asyncio.sleep(0)
-            await service.db.sql(
-                "UPDATE zulip_outgoing_intents SET next_attempt_at=now()"
+            ready = await service.db.sql(
+                "UPDATE zulip_outgoing_intents SET next_attempt_at=now() RETURNING next_attempt_at"
             )
             await service.dispatch()
             await asyncio.gather(*list(service.tasks.values()))
             await asyncio.sleep(0)
-            retry = await service.db.sql(
-                "SELECT status,request,next_attempt_at>now()+interval '0.8 seconds' AS deferred "
+            (retry,) = await service.db.sql(
+                "SELECT status,request,next_attempt_at,now() AS checked_at "
                 "FROM zulip_outgoing_intents WHERE entity_type='message' AND id="
                 "(SELECT min(id) FROM zulip_outgoing_intents)"
             )
-            assert retry[0] == {"status": "new", "request": None, "deferred": True}
-            await service.dispatch()
-            assert not service.tasks
+            assert retry["status"] == "new"
+            assert retry["request"] is None
+            # The runner may pause after the database schedules the retry.
+            delay = datetime.timedelta(seconds=1)
+            assert (
+                ready[0]["next_attempt_at"] + delay
+                <= retry["next_attempt_at"]
+                <= retry["checked_at"] + delay
+            )
             assert len(server.messages) == 1
             messages, events, next_id = server.messages, server.events, server.next_id
 

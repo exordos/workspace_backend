@@ -1,6 +1,6 @@
-# Native Workspace producer for direct Firebase delivery through local Notification.
-name: workspace_mobile_push
-description: Native Workspace mobile push producer
+# Local Notification forwards Workspace push to a separate Firebase sender.
+name: workspace_mesh_firebase_push
+description: Forward Workspace push through the local Notification relay
 schema_version: 1
 version: "{{ version | default('1.0.0') }}"
 api_version: v1
@@ -9,11 +9,9 @@ requirements:
   core:
     from_version: "0.4.3"
   workspace:
-    from_version: "1.3.2-dev"
+    from_version: "3.2.1"
   exordos_notification:
-    from_version: "2.0.3-dev"
-  notification_firebase:
-    from_version: "1.0.0"
+    from_version: "2.0.4-dev"
 
 imports:
   backend_node:
@@ -24,10 +22,6 @@ imports:
     element: "$exordos_notification"
     kind: resource
     link: "$core.compute.nodes.$notification_cp"
-  firebase_provider:
-    element: "$notification_firebase"
-    kind: resource
-    link: "$exordos_notification.types.email.providers.$firebase"
   event_type_read:
     element: "$exordos_notification"
     kind: resource
@@ -62,12 +56,13 @@ resources:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       variable: $core.vs.variables.$organization_uuid:uuid
       value: $self:uuid
-    notification_host:
-      name: Default Workspace Notification host
+
+  $exordos_notification.types.email.providers:
+    notification_relay:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
-      variable: $core.vs.variables.$notification_host:uuid
-      read_only: true
-      value: "exordos.com"
+      name: Workspace mesh upstream
+      protocol:
+        kind: notification_relay
 
   $exordos_notification.types.email.event_types:
     notification_topic_update:
@@ -82,17 +77,12 @@ resources:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       name: "Workspace Android topic update"
       status: ACTIVE
-      provider: $workspace_mobile_push.imports.$firebase_provider:uuid
+      provider: $exordos_notification.types.email.providers.$notification_relay:uuid
       event_type: $exordos_notification.types.email.event_types.$notification_topic_update:uuid
       is_default: true
       params: {}
       content:
-        kind: firebase_android
-        device_uuid: "{% raw %}{{ device_uuid }}{% endraw %}"
-        registration_token: "{% raw %}{{ registration_token }}{% endraw %}"
-        data:
-          payload: "{% raw %}{{ payload }}{% endraw %}"
-        priority: "{% raw %}{{ priority | default('normal') }}{% endraw %}"
+        kind: notification_relay
 
   $core.iam.permissions:
     topic_update_create:
@@ -116,7 +106,7 @@ resources:
       project_id: null
     event_type_read:
       role: $core.iam.roles.$push_sender:uuid
-      permission: $workspace_mobile_push.imports.$event_type_read:uuid
+      permission: $workspace_mesh_firebase_push.imports.$event_type_read:uuid
       project_id: null
 
   $core.iam.users:
@@ -138,34 +128,34 @@ resources:
     push_sender:
       name: workspace-mobile-push-sender
       user: $core.iam.users.$push_sender:uuid
-      iam_client: $workspace_mobile_push.imports.$iam_default_client_uuid:value
-      issuer: f"http://core.{$workspace_mobile_push.imports.$core_local_domain:name}/api/core/v1/iam/clients/{$workspace_mobile_push.imports.$iam_default_client_uuid:value}"
+      iam_client: $workspace_mesh_firebase_push.imports.$iam_default_client_uuid:value
+      issuer: f"http://core.{$workspace_mesh_firebase_push.imports.$core_local_domain:name}/api/core/v1/iam/clients/{$workspace_mesh_firebase_push.imports.$iam_default_client_uuid:value}"
       scope: ""
       auto_renew: true
       expiration_delta: 604800
 
   $core.secret.secrets:
-    firebase_service_account:
-      name: notification-firebase-service-account
+    mesh_upstream:
+      name: workspace-mesh-upstream
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
-      # The operator sets the value once via Core Secrets, never in the manifest.
+      # Core Secrets supplies the receiver URL, event type and IAM token bundle.
       constructor:
         kind: plain
 
   $core.config.configs:
-    firebase_service_account_file:
-      name: notification-firebase-service-account-file
+    mesh_upstream_file:
+      name: workspace-mesh-upstream-file
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
-      path: /etc/exordos_notification/firebase-service-account.json
+      path: /etc/exordos_notification/workspace-mesh-upstream.json
       owner: root
       group: root
       mode: "0600"
       target:
         kind: node
-        node: $workspace_mobile_push.imports.$notification_node:uuid
+        node: $workspace_mesh_firebase_push.imports.$notification_node:uuid
       body:
         kind: text
-        content: $core.secret.secrets.$firebase_service_account:value
+        content: $core.secret.secrets.$mesh_upstream:value
       on_change:
         kind: shell
         command: systemctl try-restart exordos-notification-mail-agent.service
@@ -179,7 +169,7 @@ resources:
         command: /usr/local/bin/workspace-restart-services --push-sender
       target:
         kind: node
-        node: $workspace_mobile_push.imports.$backend_node:uuid
+        node: $workspace_mesh_firebase_push.imports.$backend_node:uuid
       body:
         kind: text
         content: |
@@ -194,7 +184,7 @@ resources:
       mode: "0600"
       target:
         kind: node
-        node: $workspace_mobile_push.imports.$backend_node:uuid
+        node: $workspace_mesh_firebase_push.imports.$backend_node:uuid
       on_change:
         kind: shell
         command: /usr/local/bin/workspace-restart-services
@@ -215,7 +205,7 @@ resources:
       user: root
       target:
         kind: node
-        node: $workspace_mobile_push.imports.$backend_node:uuid
+        node: $workspace_mesh_firebase_push.imports.$backend_node:uuid
       service_type:
         kind: simple
         count: 1
@@ -230,7 +220,7 @@ resources:
       user: root
       target:
         kind: node
-        node: $workspace_mobile_push.imports.$backend_node:uuid
+        node: $workspace_mesh_firebase_push.imports.$backend_node:uuid
       service_type:
         kind: simple
         count: 1
