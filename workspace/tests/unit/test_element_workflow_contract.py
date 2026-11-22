@@ -5,7 +5,6 @@
 
 import pathlib
 
-
 PROJECT_ROOT = pathlib.Path(__file__).parents[3]
 
 
@@ -35,9 +34,11 @@ def test_element_packages_only_the_backend_source():
 def test_mobile_push_manifest_uses_the_element_repository_path():
     build_config = (PROJECT_ROOT / "exordos/exordos.yaml").read_text()
 
-    assert "manifest: manifests/workspace_mobile_push.yaml.j2" in build_config
-    assert (PROJECT_ROOT / "exordos/manifests/workspace_mobile_push.yaml.j2").exists()
-    assert "manifest: manifests/mobile_push.yaml.j2" not in build_config
+    for mode in ("direct", "mesh"):
+        manifest = f"manifests/workspace_{mode}_firebase_push.yaml.j2"
+        assert f"manifest: {manifest}" in build_config
+        assert (PROJECT_ROOT / "exordos" / manifest).exists()
+    assert "manifest: manifests/workspace_mobile_push.yaml.j2" not in build_config
 
 
 def test_repository_has_no_python_package_publication_workflow():
