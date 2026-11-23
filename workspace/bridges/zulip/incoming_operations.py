@@ -1447,6 +1447,18 @@ class Operations:
             return {"event": event, "personal": True}
         if kind == "ensure_dependency":
             return await self.prepare_dependency(account, event["dependency"])
+        if kind == "stream" and event["op"] == "delete":
+            # This event also represents loss of metadata access and may have
+            # been queued before the account regained access to the channel.
+            catalog = await self.http.request(
+                account,
+                "GET",
+                "/streams",
+                {"include_all": True, "exclude_archived": False},
+            )
+            prepared["channel_visibility"] = {
+                str(channel["stream_id"]): channel for channel in catalog["streams"]
+            }
         message_ids = []
         if kind == "message":
             if "_shared_key" in event:
@@ -4031,9 +4043,13 @@ class Operations:
         elif kind == "subscription":
             await self.subscription(connection, account, event)
         elif kind == "stream":
-            for item in event.get("streams", [event]):
+            items = event.get("streams", [event])
+            identifiers = (
+                event.get("stream_ids") if event["op"] == "delete" else None
+            ) or [item["stream_id"] for item in items]
+            for identifier_at_source in identifiers:
                 identifier = await self.identity(
-                    account, "stream", item["stream_id"], connection=connection
+                    account, "stream", identifier_at_source, connection=connection
                 )
                 existing = await rows(
                     connection,
@@ -4044,7 +4060,12 @@ class Operations:
                     continue
                 stream = existing[0]
                 if event["op"] == "delete":
-                    await self.delete_stream(connection, account, stream)
+                    await self.reconcile_stream_visibility(
+                        connection,
+                        account,
+                        stream,
+                        prepared["channel_visibility"].get(str(identifier_at_source)),
+                    )
                 elif event["op"] == "update" and event["property"] in (
                     "name",
                     "description",
@@ -4055,7 +4076,7 @@ class Operations:
                         connection,
                         account,
                         {
-                            "stream_id": item["stream_id"],
+                            "stream_id": identifier_at_source,
                             "name": stream["name"],
                             event["property"]: event["value"],
                         },
@@ -4167,13 +4188,47 @@ class Operations:
                     active=operation == "peer_add",
                 )
 
-    async def delete_stream(
-        self, connection: typing.Any, account: dict, stream: dict
+    async def reconcile_stream_visibility(
+        self,
+        connection: typing.Any,
+        account: dict,
+        stream: dict,
+        source_stream: dict | None,
     ) -> None:
-        await connection.execute(
-            "DELETE FROM messenger_streams WHERE project_id=%s AND uuid=%s",
-            (account["project_id"], stream["uuid"]),
+        if source_stream is not None:
+            archived = source_stream.get("is_archived", stream["is_archived"])
+            if archived != stream["is_archived"]:
+                await self.stream(
+                    connection,
+                    account,
+                    {
+                        "stream_id": source_stream["stream_id"],
+                        "name": stream["name"],
+                        "is_archived": archived,
+                    },
+                    subscribe=False,
+                )
+            return
+        user = account["owner_user_uuid"]
+        remote_user = account["external_account_id"]
+        bindings = await rows(
+            connection,
+            SELECT_BINDING_SQL,
+            (account["project_id"], stream["uuid"], user),
         )
+        if not bindings:
+            return
+        binding = bindings[0]
+        if (
+            binding["active"]
+            and binding["source_name"] == "zulip"
+            and binding["provider_uuid"] == account["provider_uuid"]
+            and binding["provider_identity"]
+            == f"{stream['provider_identity']}:{remote_user}"
+        ):
+            await self.bind(
+                connection, account, stream, user, remote_user, active=False
+            )
 
     async def attachment(
         self, connection: typing.Any, account: dict, event: dict

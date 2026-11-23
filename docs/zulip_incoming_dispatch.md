@@ -59,3 +59,12 @@ in force for every persistent class. No message-only priority is introduced.
 `test_zulip_transient_events.py` covers atomic cursor rollback, duplicate source
 delivery, unknown types and fresh-message API visibility beside 3,000 **ready**
 transients, with bounded cleanup still leaving old audit work behind.
+
+## Zulip channel visibility
+
+Zulip sends `stream/delete` when a linked account loses access to channel
+metadata. Before applying the event, the bridge checks the receiving account's
+current channel list, including archives. If the channel is absent, the bridge
+deactivates only the matching Zulip membership in Workspace. If the channel is
+visible, the bridge retains the membership and reconciles its archive flag when
+Zulip supplies one. Other members retain the shared channel and its history.

@@ -1091,6 +1091,77 @@ def peer_account(incoming, identifier=8):
     return linked, (api, db, data, http, url)
 
 
+def test_channel_visibility_loss_preserves_other_members_history_and_delivery(incoming):
+    api, _db, _account, http, _url = incoming
+    linked, peer = peer_account(incoming)
+    subscription = {
+        "type": "subscription",
+        "op": "add",
+        "subscriptions": [{"stream_id": 42, "name": "Channel"}],
+    }
+    lost_visibility = {
+        "type": "stream",
+        "op": "delete",
+        "streams": [{"stream_id": 42}],
+        "stream_ids": [42],
+    }
+    try:
+        apply(incoming, subscription)
+        apply(peer, subscription)
+        apply(incoming, event("Before access changed"))
+        drain()
+        original = api.get(
+            "/v1/messenger/messages/", user=linked.owner_user_uuid
+        ).json()
+        assert len(original) == 1
+        stream = "/v1/messenger/streams/" + original[0]["stream_uuid"]
+
+        channel = http.request.return_value["stream"]
+        http.request.return_value = {"streams": []}
+        apply(incoming, lost_visibility, lost_visibility)
+        drain()
+
+        assert api.get(stream, user=linked.owner_user_uuid).status_code == 200
+        assert api.get(stream).status_code == 404
+        assert api.get("/v1/messenger/messages/").json() == []
+        retained = api.get(
+            "/v1/messenger/messages/", user=linked.owner_user_uuid
+        ).json()
+        assert [item["uuid"] for item in retained] == [original[0]["uuid"]]
+
+        http.request.return_value = {"stream": channel}
+        apply(peer, event("After access changed", identifier=102))
+        drain()
+        received = api.get(
+            "/v1/messenger/messages/", user=linked.owner_user_uuid
+        ).json()
+        assert {item["payload"]["content"] for item in received} == {
+            "Before access changed",
+            "After access changed",
+        }
+        assert api.get("/v1/messenger/messages/").json() == []
+    finally:
+        linked.delete()
+
+
+@pytest.mark.parametrize("archived", [False, True])
+def test_channel_delete_event_preserves_membership_if_still_visible(incoming, archived):
+    api, _db, _account, http, _url = incoming
+    apply(incoming, event())
+    original = api.get("/v1/messenger/messages/").json()[0]
+    channel = http.request.return_value["stream"]
+    http.request.return_value = {"streams": [{**channel, "is_archived": archived}]}
+
+    apply(incoming, {"type": "stream", "op": "delete", "stream_ids": [42]})
+
+    stream = api.get("/v1/messenger/streams/" + original["stream_uuid"])
+    assert stream.status_code == 200
+    assert stream.json()["is_archived"] is archived
+    assert [item["uuid"] for item in api.get("/v1/messenger/messages/").json()] == [
+        original["uuid"],
+    ]
+
+
 @pytest.mark.parametrize("attachment", [False, True])
 def test_first_message_initializes_current_members_and_keeps_personal_flags(
     incoming, attachment, monkeypatch, tmp_path
