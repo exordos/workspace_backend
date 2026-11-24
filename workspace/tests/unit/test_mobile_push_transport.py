@@ -8,6 +8,7 @@ import logging
 import os
 import pathlib
 import shlex
+import ssl
 import subprocess
 import threading
 from unittest import mock
@@ -18,6 +19,7 @@ from gcl_sdk.events.services import senders
 import jinja2
 from oslo_config import cfg
 import pytest
+import requests
 import yaml
 
 from workspace.common import config
@@ -31,7 +33,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[3]
 
 
 @pytest.fixture
-def notification_http():
+def notification_http(request, tmp_path):
     received = []
     redirect = []
 
@@ -60,9 +62,27 @@ def notification_http():
             pass
 
     server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    scheme = "http"
+    if getattr(request, "param", None) == "tls":
+        ca = tmp_path / "notification-ca.pem"
+        key = tmp_path / "notification-key.pem"
+        subprocess.run(
+            [
+                "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                "-days", "1", "-subj", "/CN=localhost",
+                "-addext", "subjectAltName=IP:127.0.0.1",
+                "-out", ca, "-keyout", key,
+            ],
+            check=True,
+            capture_output=True,
+        )
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(ca, key)
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+        scheme = "https"
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    endpoint = f"http://127.0.0.1:{server.server_port}"
+    endpoint = f"{scheme}://127.0.0.1:{server.server_port}"
     client = push_events.PushEventHttpClient(endpoint, "synthetic-core-token")
     try:
         yield endpoint, client, redirect, received
@@ -114,6 +134,39 @@ def test_notification_client_keeps_ingress_prefix(notification_http):
     assert [path for path, _, _ in received] == [
         "/api/notification/v1/events/",
         f"/api/notification/v1/events/{event_id}",
+    ]
+
+
+@pytest.mark.parametrize("notification_http", ("tls",), indirect=True)
+def test_sender_uses_the_provisioned_notification_trust_bundle(
+    notification_http, monkeypatch, tmp_path
+):
+    endpoint, default_client, _, received = notification_http
+    event_id = str(uuid.uuid4())
+    with pytest.raises(requests.exceptions.SSLError):
+        default_client.send_event_body({"uuid": event_id})
+    assert not received
+    system_ca = tmp_path / "other-ca.pem"
+    system_ca.write_text("Unrelated system trust")
+    monkeypatch.setenv("REQUESTS_CA_BUNDLE", str(system_ca))
+
+    conf = cfg.ConfigOpts()
+    conf.register_opts(mobile_push_opts.OPTS, mobile_push_opts.DOMAIN)
+    for name, value in {
+        "organization_uuid": str(uuid.uuid4()),
+        "notification_endpoint": endpoint,
+        "notification_token": "synthetic-core-token",
+        "apns_notification_token": "synthetic-apns-token",
+        "notification_ca_file": str(tmp_path / "notification-ca.pem"),
+    }.items():
+        conf.set_override(name, value, group=mobile_push_opts.DOMAIN)
+    monkeypatch.setattr(cfg, "CONF", conf)
+    client = push_events.WorkspacePushSender()._notification_client
+    client.send_event_body({"uuid": event_id})
+    assert client.get_apns_event(event_id)["uuid"] == event_id
+    assert [header for _, header, _ in received] == [
+        "Bearer synthetic-core-token",
+        "Bearer synthetic-apns-token",
     ]
 
 
@@ -342,6 +395,7 @@ def test_manifest_owns_direct_firebase_event_contract():
         "core",
         "workspace",
         "exordos_notification",
+        "notification_api_https",
     }
     resources = manifest["resources"]
     event_type = resources["$exordos_notification.types.email.event_types"][
@@ -365,30 +419,33 @@ def test_manifest_owns_direct_firebase_event_contract():
 
 
 @pytest.mark.parametrize("mode", ("direct", "mesh"))
-def test_manifest_routes_to_notification_over_configurable_https(mode):
-    template = ROOT / f"exordos/manifests/workspace_{mode}_firebase_push.yaml.j2"
+def test_manifest_imports_the_local_notification_https_route(mode):
+    element = f"workspace_{mode}_firebase_push"
+    template = ROOT / f"exordos/manifests/{element}.yaml.j2"
     source = template.read_text()
     # The CLI selects --element by loading the source before rendering Jinja.
-    assert yaml.safe_load(source)["name"] == f"workspace_{mode}_firebase_push"
+    assert yaml.safe_load(source)["name"] == element
     manifest = yaml.safe_load(jinja2.Template(source).render())
-    assert "installation_domain" not in manifest["imports"]
-    assert "ecosystem_realm" not in manifest["requirements"]
+    assert "notification_api_https" in manifest["requirements"]
+    for key in ("notification_api_domain", "notification_api_trust_pem"):
+        assert manifest["imports"][key] == {
+            "element": "$notification_api_https",
+            "kind": "resource",
+            "link": f"$core.vs.variables.${key}",
+        }
     resources = manifest["resources"]
-    host = resources["$core.vs.variables"]["notification_host"]
-    assert host["name"] == "workspace_mobile_push_notification_host"
-    assert host["setter"] == {
-        "kind": "selector",
-        "selector_strategy": "latest",
-    }
-    assert "notification_host" not in resources["$core.vs.values"]
+    assert "notification_host" not in resources["$core.vs.variables"]
     configs = resources["$core.config.configs"]
-    assert configs["notification_endpoint"]["target"] == {
-        "kind": "node",
-        "node": f"$workspace_{mode}_firebase_push.imports.$backend_node:uuid",
-    }
+    backend = {"kind": "node", "node": f"${element}.imports.$backend_node:uuid"}
+    assert configs["notification_endpoint"]["target"] == backend
+    assert configs["notification_api_trust"]["target"] == backend
     assert (
-        "notification_endpoint = https://{$core.vs.variables.$notification_host:value}"
-        "/api/notification" in configs["notification_endpoint"]["body"]["content"]
+        f"notification_endpoint = https://{{${element}.imports."
+        "$notification_api_domain:value}/api/notification"
+        in configs["notification_endpoint"]["body"]["content"]
+    )
+    assert configs["notification_api_trust"]["body"]["content"] == (
+        f"${element}.imports.$notification_api_trust_pem:value"
     )
 
 
@@ -496,6 +553,7 @@ def test_mesh_configures_local_relay_with_upstream_secret_only_on_notification()
         "core",
         "workspace",
         "exordos_notification",
+        "notification_api_https",
     }
     resources = manifest["resources"]
     assert resources["$exordos_notification.types.email.providers"][

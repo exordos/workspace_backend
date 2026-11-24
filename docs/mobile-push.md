@@ -49,11 +49,10 @@ before installing the replacement.
 | `workspace_direct_firebase_push` | Local Notification sends to Firebase. |
 | `workspace_mesh_firebase_push` | Local Notification forwards to a separate Notification that sends to Firebase. |
 
-Both Elements use the local Notification API at `/api/notification/v1/events/`.
-Select `workspace_mobile_push_notification_host` in Core Values Store and enter
-the trusted local Notification ingress hostname, without a scheme, port or path.
-Core uses HTTPS from Workspace to that ingress. The default ingress may connect
-to its Notification node over HTTP on the installation network.
+Both Elements depend on `notification_api_https`. They use its exported
+domain and trust bundle for the local Notification API at
+`/api/notification/v1/events/`. Configure the TLS certificate for that
+element. No Workspace hostname setting is needed.
 
 The Workspace sender receives a rotating Core IAM token for the local
 Notification. Only that token is written to the Workspace node. Both Elements
@@ -80,8 +79,9 @@ provider on the receiver and provision the Firebase project credentials there.
 Set the local Core Secret `workspace-mesh-upstream` to the receiving
 Notification connection JSON. It contains `notification_endpoint`,
 `iam_endpoint`, `event_type_uuid`, `project_uuid`, and an `access_token`
-or `refresh_token` issued by the receiving Core. Use distinct local and
-receiving Notification installations. Core writes this secret to
+or `refresh_token` issued by the receiving Core. Include `tls_trust_pem` with
+the remote Notification and IAM trust certificates when either uses a private
+or self-signed CA. Use distinct local and receiving Notification installations. Core writes this secret to
 `/etc/exordos_notification/workspace-mesh-upstream.json` on the local
 Notification node with mode `0600`. The receiving Notification holds the
 Firebase service-account credential.
@@ -98,9 +98,9 @@ changes, Core restarts the Notification delivery worker.
 ### Switch from an existing push Element
 
 Allow pending deliveries to finish. Record the selected
-`workspace_mobile_push_organization_uuid` and local Notification host before
-uninstalling the old `workspace_mobile_push` Element. Install one of the new
-Elements and set these values again before enabling delivery. Preserve the
+`workspace_mobile_push_organization_uuid` before uninstalling the old
+`workspace_mobile_push` Element. Install one of the new Elements and set the
+installation UUID before enabling delivery. Preserve the
 organization UUID so the app continues to match encrypted events to its
 existing connection. Keep the Workspace database and its device registrations.
 Provision the chosen transport's credential before testing delivery.
@@ -129,8 +129,9 @@ For mesh, grant the forwarding IAM identity the receiver's APNs event create
 and read permissions. Set the local `workspace-apns-mesh-upstream` Core Secret
 to the receiver's `notification_endpoint`, `iam_endpoint`, `event_type_uuid`,
 `project_uuid` and either an `access_token` or a `refresh_token` from the
-receiving Core. This connection secret stays on the forwarding Notification
-node. The Apple credential stays on the receiving node. Both routes use the
+receiving Core. Use `tls_trust_pem` as for Firebase mesh when the receiver or
+its IAM uses a private or self-signed CA. This connection secret stays on the
+forwarding Notification node. The Apple credential stays on the receiving node. Both routes use the
 same app bundle ID and encrypted payload.
 
 The iOS app uses the same

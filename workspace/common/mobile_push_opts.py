@@ -11,6 +11,11 @@ OPTS = [
         help="Local Notification base URL; unset disables pushes",
     ),
     cfg.StrOpt(
+        "notification-ca-file",
+        default="",
+        help="CA bundle for HTTPS connections to the local Notification API",
+    ),
+    cfg.StrOpt(
         "notification-token",
         default="",
         secret=True,
