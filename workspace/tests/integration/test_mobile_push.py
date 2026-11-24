@@ -366,10 +366,10 @@ def test_retiring_one_device_keeps_the_other_encrypted_delivery(api, workspace_a
     )
 
 
-@pytest.mark.parametrize("refresh", [False, True])
-def test_apns_fanout_and_inactive_registration_feedback(
-    api, workspace_api, db, refresh
-):
+@pytest.mark.parametrize(
+    "change", ["none", "refresh_before_send", "refresh_in_flight", "rotate_public_key"]
+)
+def test_apns_fanout_and_inactive_registration_feedback(api, workspace_api, db, change):
     cfg.CONF.set_override("apns_enabled", True, group=mobile_push_opts.DOMAIN)
     cfg.CONF.set_override(
         "apns_notification_token", "synthetic-apns-iam", group=mobile_push_opts.DOMAIN
@@ -393,11 +393,23 @@ def test_apns_fanout_and_inactive_registration_feedback(
         )
         assert registered.status_code == 201, registered.text
 
+        if change in ("refresh_before_send", "rotate_public_key"):
+            prepare_deliveries()
+            if change == "rotate_public_key":
+                key = x25519.X25519PrivateKey.generate().public_key()
+                encryption["public_key"] = (
+                    base64.urlsafe_b64encode(key.public_bytes_raw()).rstrip(b"=").decode()
+                )
+            refreshed = workspace_api.put(
+                f"/v1/push_devices/{iphone}", user=peer, json=registration
+            )
+            assert refreshed.status_code == 200, refreshed.text
+
         client = mock.Mock()
         client.get_event.return_value = {"status": "ACTIVE"}
 
         def apns_result(event_uuid):
-            if refresh:
+            if change == "refresh_in_flight":
                 renewed = workspace_api.put(
                     f"/v1/push_devices/{iphone}", user=peer, json=registration
                 )
@@ -421,6 +433,14 @@ def test_apns_fanout_and_inactive_registration_feedback(
             ].event_data.body
             for call in client.send_event.call_args_list
         }
+        if change == "rotate_public_key":
+            assert sent.keys() == {str(android)}
+            client.get_apns_event.assert_not_called()
+            assert db.execute(
+                "SELECT count(*) FROM m_workspace_push_devices WHERE uuid=%s", (iphone,)
+            ).fetchone() == (1,)
+            return
+
         assert sent.keys() == {str(android), str(iphone)}
         event = sent[str(iphone)]
         params = event["event_params"]
@@ -435,7 +455,7 @@ def test_apns_fanout_and_inactive_registration_feedback(
         client.get_apns_event.assert_called_once_with(event["uuid"])
         assert db.execute(
             "SELECT count(*) FROM m_workspace_push_devices WHERE uuid=%s", (iphone,)
-        ).fetchone() == (int(refresh),)
+        ).fetchone() == (int(change != "none"),)
     finally:
         cfg.CONF.clear_override("apns_enabled", group=mobile_push_opts.DOMAIN)
         cfg.CONF.clear_override(

@@ -189,6 +189,7 @@ def test_apns_event_uses_own_token_for_submission_and_status(notification_http):
                     "priority": "high",
                 },
                 "_registration_updated_at": "internal",
+                "_registration_public_key": "synthetic-public-key",
             }
         ),
     )
@@ -200,6 +201,7 @@ def test_apns_event_uses_own_token_for_submission_and_status(notification_http):
     assert [header for _, header, _ in received] == ["Bearer synthetic-apns"] * 2
     posted = json.loads(received[0][2])
     assert "_registration_updated_at" not in posted
+    assert "_registration_public_key" not in posted
     assert json.loads(posted["event_params"]["payload"]) == {
         "aps": {
             "content-available": 1,
