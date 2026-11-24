@@ -2,6 +2,7 @@
 # Licensed under the Apache License, Version 2.0 (the "License").
 from oslo_config import cfg
 
+
 DOMAIN = "mobile_push"
 OPTS = [
     cfg.StrOpt("organization-uuid", help="Stable UUID of this Workspace installation"),

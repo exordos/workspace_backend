@@ -9,20 +9,21 @@ import typing
 import uuid as sys_uuid
 
 import bazooka
-import requests
 from gcl_sdk.events import clients as event_clients
 from gcl_sdk.events.dm import models as event_models
 from gcl_sdk.events.services import senders as event_senders
 from oslo_config import cfg
+import requests
 from restalchemy.common import contexts
 from restalchemy.dm import filters as dm_filters
 from restalchemy.storage.sql import sessions
 
 from workspace.common import mobile_push_opts
 from workspace.messenger_api import push_notifications
-from workspace.messenger_api.dm import schema
-from workspace.messenger_api.dm import push_events as event_payloads
 from workspace.messenger_api.dm import push_devices
+from workspace.messenger_api.dm import push_events as event_payloads
+from workspace.messenger_api.dm import schema
+
 
 LOG = logging.getLogger(__name__)
 RETENTION_SECONDS = 3600

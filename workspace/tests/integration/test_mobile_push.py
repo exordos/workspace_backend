@@ -2,13 +2,13 @@
 # Licensed under the Apache License, Version 2.0 (the "License").
 import base64
 import json
-import uuid as sys_uuid
 from unittest import mock
+import uuid as sys_uuid
 
-import pytest
-import psycopg
 from cryptography.hazmat.primitives.asymmetric import x25519
 from oslo_config import cfg
+import psycopg
+import pytest
 from restalchemy.common import contexts
 
 from workspace.common import mobile_push_opts
@@ -18,7 +18,8 @@ from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.api import store_factory
 from workspace.services import push_notifications as push_handler
 from workspace.tests.integration import conftest
-from workspace.tests.integration import test_key_announcements, test_messenger_v2
+from workspace.tests.integration import test_key_announcements
+from workspace.tests.integration import test_messenger_v2
 
 
 def prepare_deliveries():

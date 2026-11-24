@@ -21,13 +21,13 @@ import uuid as sys_uuid
 from restalchemy.api import routes as ra_routes
 import webob
 
-from workspace.workspace_api.api import app
-from workspace.workspace_api.api import routes as workspace_routes
+from workspace.messenger_api import events
 from workspace.messenger_api.api import controllers
 from workspace.messenger_api.api import middlewares
 from workspace.messenger_api.api import routes
 from workspace.messenger_api.dm import models
-from workspace.messenger_api import events
+from workspace.workspace_api.api import app
+from workspace.workspace_api.api import routes as workspace_routes
 
 
 ROUTE_MANIFEST = {
