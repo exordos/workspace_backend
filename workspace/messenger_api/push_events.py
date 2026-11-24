@@ -156,11 +156,20 @@ class PushEventHttpClient(event_clients.HttpEventClient):
         if isinstance(event.event_data, event_payloads.WorkspaceTopicSignal):
             raise PushDeliveryError("Topic signal has not been encrypted")
         if isinstance(event.event_data, event_payloads.WorkspacePushEventPayload):
-            return {
+            body = {
                 key: value
                 for key, value in event.event_data.body.items()
                 if key not in ("_membership_generation", "_registration_updated_at")
             }
+            if _is_apns(body):
+                params = body["event_params"]
+                body["event_params"] = dict(
+                    params,
+                    payload=push_notifications.apns_payload(
+                        params["payload"], params["priority"]
+                    ),
+                )
+            return body
         return super()._build_event_body(event)
 
     def send_event(self, event: event_models.Event) -> event_models.Event:

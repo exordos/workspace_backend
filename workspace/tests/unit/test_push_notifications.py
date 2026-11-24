@@ -9,6 +9,7 @@ import pathlib
 import uuid as sys_uuid
 from unittest import mock
 
+import pytest
 from cryptography.hazmat.primitives.asymmetric import x25519
 from restalchemy.storage.sql import migrations
 
@@ -115,7 +116,8 @@ def test_associated_data_binds_action_route_recipient_and_key():
     )
 
 
-def test_apns_snapshot_fits_provider_limit_with_json_escaped_previews():
+@pytest.mark.parametrize("priority", ["high", "normal"])
+def test_apns_snapshot_fits_provider_limit_with_json_escaped_previews(priority):
     user, project = sys_uuid.uuid4(), sys_uuid.uuid4()
     key = x25519.X25519PrivateKey.generate()
     device = push_devices.PushDevice(
@@ -157,17 +159,17 @@ def test_apns_snapshot_fits_provider_limit_with_json_escaped_previews():
             "epoch_generation": str(sys_uuid.uuid4()),
             "created_at": "2026-01-01T12:34:56.123456+00:00",
         },
-        priority="high",
+        priority=priority,
     )
-    payload = {
-        "aps": {
-            "content-available": 1,
-            "alert": {"loc-key": "WORKSPACE_PUSH_NEW_MESSAGE"},
-            "sound": "default",
-        },
-        "workspace": json.loads(event["event_params"]["payload"]),
-    }
-    assert len(json.dumps(payload, separators=(",", ":")).encode()) <= 4096
+    params = event["event_params"]
+    body = push_notifications.apns_payload(params["payload"], params["priority"])
+    payload = json.loads(body)
+    aps = {"content-available": 1}
+    if priority == "high":
+        aps.update(alert={"loc-key": "WORKSPACE_PUSH_NEW_MESSAGE"}, sound="default")
+    assert payload["aps"] == aps
+    assert payload["workspace"]["content"]["kind"] == "encrypted"
+    assert len(body.encode()) <= 4096
 
 
 def test_wire_fixture_matches_python_producer():
