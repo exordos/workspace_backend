@@ -24,6 +24,14 @@ EVENT_TYPES = {
     for kind in (MESSAGE_CREATE, MESSAGE_CANCELLED, TOPIC_UPDATE, APNS_TOPIC_UPDATE)
 }
 HPKE_INFO = b"workspace-mobile-push"
+# Leave room for Base64 expansion, HPKE and the fixed APNs/Workspace envelope.
+APNS_PLAINTEXT_LIMIT = 2_000
+APNS_PREVIEW_LIMITS = {
+    "stream_name": 128,
+    "topic_name": 128,
+    "sender_name": 64,
+    "text": 192,
+}
 ROUTE_FIELDS = (
     "organization_uuid",
     "project_uuid",
@@ -31,6 +39,10 @@ ROUTE_FIELDS = (
     "topic_uuid",
     "message_uuid",
 )
+
+
+def _compact_json(data: dict[str, typing.Any]) -> str:
+    return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
 
 def associated_data(
@@ -92,25 +104,19 @@ def build_event(
             ).hexdigest(),
         )
         event["_registration_updated_at"] = device.updated_at.isoformat()
-        # The APNs envelope includes APS metadata within its 4 KiB limit.
-        # Bound its encrypted preview even if every byte needs JSON escaping.
         content = dict(
             content,
             **{
                 field: content[field].encode()[:limit].decode(errors="ignore")
-                for field, limit in (
-                    ("stream_name", 128),
-                    ("topic_name", 128),
-                    ("sender_name", 64),
-                    ("text", 192),
-                )
+                for field, limit in APNS_PREVIEW_LIMITS.items()
             },
         )
-    plaintext = json.dumps(
-        content,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
+    plaintext = _compact_json(content).encode("utf-8")
+    if apns_environment and len(plaintext) > APNS_PLAINTEXT_LIMIT:
+        # JSON escapes can expand a preview past the budget. Keep the unread
+        # counters and message route so the alert can still open the topic.
+        without_preview = dict(content, **dict.fromkeys(APNS_PREVIEW_LIMITS, ""))
+        plaintext = _compact_json(without_preview).encode("utf-8")
     encryption = device.encryption
     public_key = base64.urlsafe_b64decode(encryption.public_key + "=")
     try:
@@ -144,9 +150,5 @@ def build_event(
             .decode("ascii"),
         },
     }
-    event["event_params"]["payload"] = json.dumps(
-        payload,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
+    event["event_params"]["payload"] = _compact_json(payload)
     return event

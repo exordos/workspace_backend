@@ -3,6 +3,7 @@
 # not use this file except in compliance with the License.
 
 import base64
+import datetime
 import json
 import pathlib
 import uuid as sys_uuid
@@ -112,6 +113,61 @@ def test_associated_data_binds_action_route_recipient_and_key():
         push_notifications.EVENT_TYPES[push_notifications.MESSAGE_CREATE]
         != (push_notifications.EVENT_TYPES[push_notifications.MESSAGE_CANCELLED])
     )
+
+
+def test_apns_snapshot_fits_provider_limit_with_json_escaped_previews():
+    user, project = sys_uuid.uuid4(), sys_uuid.uuid4()
+    key = x25519.X25519PrivateKey.generate()
+    device = push_devices.PushDevice(
+        uuid=sys_uuid.uuid4(),
+        project_id=project,
+        user_uuid=user,
+        transport="apns",
+        platform="ios",
+        registration_token="ab" * 32,
+        updated_at=datetime.datetime.now(datetime.timezone.utc),
+        encryption=push_devices.PushDeviceHPKEEncryption(
+            algorithm=push_devices.HPKE_ALGORITHM,
+            key_uuid=sys_uuid.uuid4(),
+            public_key=base64.urlsafe_b64encode(key.public_key().public_bytes_raw())[
+                :-1
+            ].decode(),
+        ),
+    )
+    event = push_notifications.build_event(
+        event_uuid=sys_uuid.uuid4(),
+        kind=push_notifications.TOPIC_UPDATE,
+        organization_uuid=sys_uuid.uuid4(),
+        project_uuid=project,
+        stream_uuid=sys_uuid.uuid4(),
+        topic_uuid=sys_uuid.uuid4(),
+        message_uuid=sys_uuid.uuid4(),
+        user_uuid=user,
+        device=device,
+        content={
+            "kind": "topic",
+            "stream_name": "\x01" * 256,
+            "topic_name": "\x01" * 256,
+            "sender_name": "\x01" * 128,
+            "text": "\x01" * 768,
+            "unread_count": 1,
+            "active_unread_count": 1,
+            "passive_unread_count": 0,
+            "epoch_version": 2**63 - 1,
+            "epoch_generation": str(sys_uuid.uuid4()),
+            "created_at": "2026-01-01T12:34:56.123456+00:00",
+        },
+        priority="high",
+    )
+    payload = {
+        "aps": {
+            "content-available": 1,
+            "alert": {"loc-key": "WORKSPACE_PUSH_NEW_MESSAGE"},
+            "sound": "default",
+        },
+        "workspace": json.loads(event["event_params"]["payload"]),
+    }
+    assert len(json.dumps(payload, separators=(",", ":")).encode()) <= 4096
 
 
 def test_wire_fixture_matches_python_producer():
