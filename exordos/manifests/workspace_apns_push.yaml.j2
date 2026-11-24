@@ -12,16 +12,22 @@ requirements:
     from_version: "3.2.3"
   exordos_notification:
     from_version: "2.0.4-dev"
+  workspace_apns_receiver:
+    from_version: "1.0.0"
 
 imports:
   backend_node:
     element: "$workspace"
     kind: resource
     link: "$core.compute.nodes.$workspace_backend"
-  notification_node:
-    element: "$exordos_notification"
+  topic_update_create:
+    element: "$workspace_apns_receiver"
     kind: resource
-    link: "$core.compute.nodes.$notification_cp"
+    link: "$core.iam.permissions.$topic_update_create"
+  topic_update_read:
+    element: "$workspace_apns_receiver"
+    kind: resource
+    link: "$core.iam.permissions.$topic_update_read"
   event_type_read:
     element: "$exordos_notification"
     kind: resource
@@ -36,41 +42,6 @@ imports:
     link: "$core.dns.domains.$local_domain"
 
 resources:
-  $exordos_notification.types.email.providers:
-    apns:
-      project_id: "12345678-c625-4fee-81d5-f691897b8142"
-      name: workspace-apns
-      description: Apple Push Notification service for Exordos Workspace
-      protocol:
-        kind: apns
-        topic: com.exordos.workspace
-
-  $exordos_notification.types.email.event_types:
-    notification_apns_topic_update:
-      uuid: "7e5ec373-6d60-5c40-a362-3f72ee88f905"
-      project_id: "12345678-c625-4fee-81d5-f691897b8142"
-      name: notification_apns_topic_update
-      description: Encrypted Workspace topic snapshot for one iOS device
-      status: ACTIVE
-
-  $exordos_notification.types.email.templates:
-    notification_apns_topic_update:
-      project_id: "12345678-c625-4fee-81d5-f691897b8142"
-      name: "Workspace iOS topic update"
-      status: ACTIVE
-      provider: $exordos_notification.types.email.providers.$apns:uuid
-      event_type: $exordos_notification.types.email.event_types.$notification_apns_topic_update:uuid
-      is_default: true
-      params: {}
-      content:
-        kind: apns
-
-  $core.iam.permissions:
-    topic_update_create:
-      name: exordos_notification.event_type_7e5ec373-6d60-5c40-a362-3f72ee88f905.create
-    topic_update_read:
-      name: exordos_notification.event_type_7e5ec373-6d60-5c40-a362-3f72ee88f905.read
-
   $core.iam.roles:
     push_sender:
       name: workspace-apns-push-sender
@@ -79,11 +50,11 @@ resources:
   $core.iam.permissionbinding:
     topic_update_create:
       role: $core.iam.roles.$push_sender:uuid
-      permission: $core.iam.permissions.$topic_update_create:uuid
+      permission: $workspace_apns_push.imports.$topic_update_create:uuid
       project_id: null
     topic_update_read:
       role: $core.iam.roles.$push_sender:uuid
-      permission: $core.iam.permissions.$topic_update_read:uuid
+      permission: $workspace_apns_push.imports.$topic_update_read:uuid
       project_id: null
     event_type_read:
       role: $core.iam.roles.$push_sender:uuid
@@ -115,31 +86,7 @@ resources:
       auto_renew: true
       expiration_delta: 604800
 
-  $core.secret.secrets:
-    apns_credentials:
-      name: notification-apns-credentials
-      project_id: "12345678-c625-4fee-81d5-f691897b8142"
-      constructor:
-        kind: plain
-
   $core.config.configs:
-    apns_credentials:
-      name: notification-apns-credentials-file
-      project_id: "12345678-c625-4fee-81d5-f691897b8142"
-      path: /etc/exordos_notification/apns-credentials.json
-      owner: root
-      group: root
-      mode: "0600"
-      target:
-        kind: node
-        node: $workspace_apns_push.imports.$notification_node:uuid
-      body:
-        kind: text
-        content: $core.secret.secrets.$apns_credentials:value
-      on_change:
-        kind: shell
-        command: systemctl try-restart exordos-notification-mail-agent.service
-
     enable_apns:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       path: /etc/workspace/workspace.conf.d/92-mobile-apns.conf

@@ -110,18 +110,30 @@ receipt, decryption, notification display, and navigation on a physical device.
 
 ### Add iOS delivery
 
-Keep the existing direct or mesh Firebase connector active for the common
-push handler, sender, installation UUID and HTTPS endpoint. With APNs-capable
-Workspace and Notification builds, install `workspace_apns_push`. This
-element configures the Workspace app's APNs provider on the local Notification
-and adds a separate event type, template and scoped Core IAM token. iOS delivery goes directly from the local Notification to
-APNs in both topologies. Android still uses its selected connector.
+Keep the existing Workspace push connector active for the shared handler,
+sender, installation UUID and HTTPS endpoint. Select a separate connector for
+the iOS route. Android retains its chosen route.
 
-Set the `notification-apns-credentials` value in Core Secrets. Use a JSON
-object keyed by `sandbox`, `production`, or both. Each configured environment
-needs its Apple `team_id`, `key_id`, and PEM `private_key`. The element places
-the credential on the local Notification node and restarts its delivery worker
-when the secret changes. The iOS app uses the same
+| Element | Delivery |
+| --- | --- |
+| `workspace_apns_push` | Local Notification sends to Apple. Install `workspace_apns_receiver` on this installation first. |
+| `workspace_mesh_apns_push` | Local Notification forwards to a distinct Notification over HTTPS. Install `workspace_apns_receiver` on the receiving installation. |
+
+Set `notification-apns-credentials` in Core Secrets on the receiving
+installation. Its JSON object is keyed by `sandbox`, `production`, or both.
+Each environment needs its Apple `team_id`, `key_id`, and PEM `private_key`.
+Core writes the credential as a root-only file on the receiving Notification
+node and restarts its delivery worker when the secret changes.
+
+For mesh, grant the forwarding IAM identity the receiver's APNs event create
+and read permissions. Set the local `workspace-apns-mesh-upstream` Core Secret
+to the receiver's `notification_endpoint`, `iam_endpoint`, `event_type_uuid`,
+`project_uuid` and either an `access_token` or a `refresh_token` from the
+receiving Core. This connection secret stays on the forwarding Notification
+node. The Apple credential stays on the receiving node. Both routes use the
+same app bundle ID and encrypted payload.
+
+The iOS app uses the same
 device registration endpoint and HPKE wire format. It registers platform
 `ios` with transport `apns_sandbox` for a development-signed app or
 `apns` for distribution. The token is the lowercase hexadecimal APNs
