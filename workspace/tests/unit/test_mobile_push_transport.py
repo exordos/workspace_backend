@@ -322,7 +322,6 @@ def test_manifest_owns_direct_firebase_event_contract():
         "core",
         "workspace",
         "exordos_notification",
-        "notification_firebase",
     }
     resources = manifest["resources"]
     event_type = resources["$exordos_notification.types.email.event_types"][
@@ -332,9 +331,9 @@ def test_manifest_owns_direct_firebase_event_contract():
         "notification_topic_update"
     ]
     assert event_type["uuid"] == "aba6e448-3b72-51ef-b0c6-d2e3be17efe7"
-    assert template["provider"] == (
-        "$workspace_direct_firebase_push.imports.$firebase_provider:uuid"
-    )
+    provider = resources["$exordos_notification.types.email.providers"]["firebase"]
+    assert provider["protocol"] == {"kind": "firebase", "ttl_seconds": 3600}
+    assert template["provider"] == "$exordos_notification.types.email.providers.$firebase:uuid"
     assert template["content"] == {
         "kind": "firebase_android",
         "device_uuid": "{{ device_uuid }}",
