@@ -61,8 +61,8 @@ use the same backend and Android event format.
 
 ### Direct delivery
 
-Install `notification_firebase` with the local Notification and then install
-`workspace_direct_firebase_push`. Set the Core Secret
+Install `workspace_direct_firebase_push` with a Firebase-capable Notification
+build. The Workspace element creates the Firebase provider. Set the Core Secret
 `notification-firebase-service-account` to the Firebase service-account JSON
 for the Android app's project. Core writes the credential to
 `/etc/exordos_notification/firebase-service-account.json` on the local
@@ -74,9 +74,8 @@ Install a Notification build that supports the `notification_relay` provider,
 then install `workspace_mesh_firebase_push`. On the receiving installation,
 create a dedicated Firebase event type, default Android Firebase template and
 IAM identity for this forwarding installation. Grant that identity create and
-read permissions for its dedicated event type. The [Notification relay
-documentation](https://github.com/exordos/exordos_notification/blob/master/docs/push-relay.md)
-describes the receiving template and credentials.
+read permissions for its dedicated event type. Use a separate Firebase
+provider on the receiver and provision the Firebase project credentials there.
 
 Set the local Core Secret `workspace-mesh-upstream` to the receiving
 Notification connection JSON. It contains `notification_endpoint`,

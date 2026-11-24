@@ -11,9 +11,7 @@ requirements:
   workspace:
     from_version: "3.2.1"
   exordos_notification:
-    from_version: "2.0.3-dev"
-  notification_firebase:
-    from_version: "1.0.0"
+    from_version: "2.0.4-dev"
 
 imports:
   backend_node:
@@ -24,10 +22,6 @@ imports:
     element: "$exordos_notification"
     kind: resource
     link: "$core.compute.nodes.$notification_cp"
-  firebase_provider:
-    element: "$notification_firebase"
-    kind: resource
-    link: "$exordos_notification.types.email.providers.$firebase"
   event_type_read:
     element: "$exordos_notification"
     kind: resource
@@ -63,6 +57,15 @@ resources:
       variable: $core.vs.variables.$organization_uuid:uuid
       value: $self:uuid
 
+  $exordos_notification.types.email.providers:
+    firebase:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace-firebase
+      description: Firebase Cloud Messaging for Exordos Workspace
+      protocol:
+        kind: firebase
+        ttl_seconds: 3600
+
   $exordos_notification.types.email.event_types:
     notification_topic_update:
       uuid: "aba6e448-3b72-51ef-b0c6-d2e3be17efe7"
@@ -76,7 +79,7 @@ resources:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       name: "Workspace Android topic update"
       status: ACTIVE
-      provider: $workspace_direct_firebase_push.imports.$firebase_provider:uuid
+      provider: $exordos_notification.types.email.providers.$firebase:uuid
       event_type: $exordos_notification.types.email.event_types.$notification_topic_update:uuid
       is_default: true
       params: {}
