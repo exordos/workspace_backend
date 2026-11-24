@@ -196,7 +196,11 @@ def _is_apns(body: dict[str, typing.Any]) -> bool:
     return "apns_environment" in body["event_params"]
 
 
-def _registration_matches(device, body, payload) -> bool:
+def _registration_matches(
+    device: push_devices.PushDevice,
+    body: dict[str, typing.Any],
+    payload: dict[str, typing.Any],
+) -> bool:
     params = body["event_params"]
     if (
         device.registration_token != params["registration_token"]
