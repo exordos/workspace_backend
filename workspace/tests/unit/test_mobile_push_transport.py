@@ -156,23 +156,41 @@ def test_apns_event_uses_own_token_for_submission_and_status(notification_http):
     assert event.event_data.body["event_params"]["payload"] == snapshot
 
 
-def test_apns_companion_uses_a_separate_event_and_existing_sender():
-    template = ROOT / "exordos/manifests/workspace_apns_push.yaml.j2"
-    resources = yaml.safe_load(jinja2.Template(template.read_text()).render())[
-        "resources"
-    ]
+@pytest.mark.parametrize("mode", ("direct", "mesh"))
+def test_apns_companion_uses_a_separate_event_and_existing_sender(mode):
+    connector, endpoint = {
+        "direct": ("workspace_apns_push", "workspace_apns_receiver"),
+        "mesh": ("workspace_mesh_apns_push", "workspace_mesh_apns_push"),
+    }[mode]
+    directory = ROOT / "exordos/manifests"
+    source = directory / f"{endpoint}.yaml.j2"
+    delivery = yaml.safe_load(jinja2.Template(source.read_text()).render())["resources"]
     event_name = push_notifications.APNS_TOPIC_UPDATE
-    event = resources["$exordos_notification.types.email.event_types"][event_name]
+    event = delivery["$exordos_notification.types.email.event_types"][event_name]
     event_id = str(push_notifications.EVENT_TYPES[event_name])
     assert event["uuid"] == event_id
-    assert resources["$exordos_notification.types.email.templates"][event_name][
-        "content"
-    ] == {"kind": "apns"}
-    permissions = resources["$core.iam.permissions"]
+    template = delivery["$exordos_notification.types.email.templates"][event_name]
+    assert template["content"] == {"kind": "apns"}
+    providers = delivery["$exordos_notification.types.email.providers"]
+    if mode == "direct":
+        assert providers["apns"]["protocol"]["kind"] == "apns"
+        assert template["provider"] == "$exordos_notification.types.email.providers.$apns:uuid"
+    else:
+        assert providers["apns_relay"]["protocol"] == {
+            "kind": "notification_relay",
+            "transport": "apns",
+        }
+        assert template["provider"] == (
+            "$exordos_notification.types.email.providers.$apns_relay:uuid"
+        )
+        assert "apns_credentials" not in delivery["$core.secret.secrets"]
+    permissions = delivery["$core.iam.permissions"]
     assert {item["name"] for item in permissions.values()} == {
         f"exordos_notification.event_type_{event_id}.{action}"
         for action in ("create", "read")
     }
+    source = directory / f"{connector}.yaml.j2"
+    resources = yaml.safe_load(jinja2.Template(source.read_text()).render())["resources"]
     assert (
         "apns_notification_token"
         in resources["$core.config.configs"]["authentication"]["body"]["content"]
