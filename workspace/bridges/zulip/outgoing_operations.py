@@ -250,10 +250,10 @@ SELECT_VISIBLE_FILE_SQL = """
     LIMIT 1
 """
 
-SELECT_ACTIVE_STICKERS_SQL = """
+SELECT_STICKERS_SQL = """
     SELECT uuid, format, size_bytes, sha256, media_object_id
     FROM m_workspace_stickers
-    WHERE uuid = ANY(%s::uuid[]) AND active AND NOT blocked
+    WHERE uuid = ANY(%s::uuid[])
 """
 
 SELECT_VISIBLE_STREAM_SQL = """
@@ -1021,7 +1021,7 @@ class Operations:
     async def _sticker_uploads(
         self, intent: dict, account: dict, sticker_ids: list[str]
     ) -> dict[str, str]:
-        rows = await self.db.sql(SELECT_ACTIVE_STICKERS_SQL, (sticker_ids,))
+        rows = await self.db.sql(SELECT_STICKERS_SQL, (sticker_ids,))
         if not rows:
             return {}
         # The send or edit request is persisted only after conversion. On a

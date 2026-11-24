@@ -67,7 +67,7 @@ def _delete_stickers(connection: psycopg.Connection) -> None:
     connection.commit()
 
 
-def test_real_postgres_import_created_mixed_and_hidden_blocked_duplicates(
+def test_real_postgres_import_created_and_duplicates(
     _database: None,
     tmp_path: pathlib.Path,
 ) -> None:
@@ -110,27 +110,6 @@ def test_real_postgres_import_created_mixed_and_hidden_blocked_duplicates(
             "duplicate",
             "duplicate",
         ]
-
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "UPDATE m_workspace_stickers SET active = FALSE WHERE sha256 = %s",
-                (hashlib.sha256(first_data).hexdigest(),),
-            )
-            cursor.execute(
-                "UPDATE m_workspace_stickers SET active = FALSE, blocked = TRUE "
-                "WHERE sha256 = %s",
-                (hashlib.sha256(second_data).hexdigest(),),
-            )
-        connection.commit()
-        hidden_duplicate = sticker_import.import_archive(
-            archive,
-            connection,
-            repository,
-            storage,
-        )
-        connection.commit()
-        assert hidden_duplicate.created == 0
-        assert hidden_duplicate.duplicates == 2
     finally:
         _delete_stickers(connection)
         connection.close()

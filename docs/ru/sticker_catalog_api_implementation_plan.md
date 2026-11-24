@@ -16,7 +16,7 @@
 - карточки каталога, поисковые поля и избранное хранятся в PostgreSQL;
 - аутентифицированный пользователь может получать каталог, искать, разрешать список UUID и работать со своим глобальным избранным;
 - уполномоченный администратор может импортировать ZIP-архив, редактировать карточки и безвозвратно удалять стикеры;
-- скрытые стикеры продолжают разрешаться для истории, а заблокированные не отдают медиа;
+- история сохраняет ссылки на удалённые стикеры и отображает `Стикер недоступен`;
 - публичный контракт не раскрывает bucket, S3 key и параметры доступа;
 - сообщения продолжают использовать Markdown и `urn:sticker:<sticker_uuid>` без отдельного `payload.kind`.
 
@@ -75,18 +75,18 @@
 | `D-01` | Стабильная пагинация списка, поиска и избранного | `page_marker` — opaque base64url без padding с canonical JSON `{v, sort, filters_sha256, values}`. `values` — полная sort tuple; UUID — последний элемент. Сортировка однозначно выбирается по `q` и `favorite`: без `q`, `favorite=false` — `created_at DESC, uuid DESC`; без `q`, `favorite=true` — `favorite_created_at DESC, uuid DESC`; с `q`, `favorite=false` — `rank DESC, updated_at DESC, uuid DESC`; с `q`, `favorite=true` — `rank DESC, favorite_created_at DESC, uuid DESC`. Fingerprint включает canonical `uuid`: dedupe и lexicographic sort, максимум 100 UUID; pagination с uuid разрешена. Маркер другой сортировки/фильтров даёт 400. |
 | `D-02` | Технические лимиты текстовых полей и метаданных | `title` — 200 символов Unicode, `alt_text` — 500, один tag — 64, не более 64 tags, общий размер tags — 4096 байт UTF-8, `q` — 200, `page_limit` — от 1 до 100 (по умолчанию 50), повторяемый `uuid` — не более 100 значений. `width` и `height` — необязательные поля; при наличии положительное целое, при отсутствии `NULL`. Это техническая проверка формы, а не проверка содержимого. |
 | `D-03` | Ответ при невалидном атомарном импорте | Весь запрос отвечает стандартной ошибкой RestAlchemy `400` (`ValidationErrorException`); постоянные записи и объекты не создаются. Успех — `200` JSON с `created`, `duplicates`, `items`; поля `rejected` нет. |
-| `D-04` | Повторный импорт SHA заблокированного или скрытого стикера | Уникальный SHA возвращает существующий `sticker_uuid` как `duplicate`; копия не создаётся и состояние автоматически не меняется. |
+| `D-04` | Повторный импорт существующего SHA | Импорт возвращает существующий `sticker_uuid` со статусом `duplicate`. |
 | `D-05` | Условное обновление каталога | ETag — quoted SHA-256 стабильного UTF-8 JSON тела страницы (с учётом текущего пользователя и всех фильтров); `Cache-Control: private, no-cache`; совпавший `If-None-Match` даёт `304` с ETag и без тела. |
 | `D-06` | Кэш медиа | GET download использует URL без версионного query-параметра и возвращает байты через backend с `ETag: "<sha256>"`, `Cache-Control: private, no-cache`, `Content-Type`, выведенным из сохранённого `format`; клиент выполняет revalidation, а совпавший `If-None-Match` даёт `304` только после проверки доступности. Редирект не используется и object id не раскрывается. |
 | `D-07` | Заявленные метаданные медиафайла в MVP | `format` допускается только как `gif`, `webp` или `png`, а расширение должно ему соответствовать; сервер не декодирует байты медиафайла и не проверяет его содержимое. `width` и `height` — необязательные метаданные из manifest; при наличии положительное целое, при отсутствии `NULL`, без сравнения с байтами. SHA-256 считает сервер потоково. Реальный формат и визуальная пригодность проверяются администратором до импорта; проверка содержимого изображения — отдельное будущее усиление. |
 | `D-08` | Разрешение администратора | Runtime проверяет точное имя из IAM introspection: `workspace.sticker_catalog.manage`. Manifest объявляет permission в `$core.iam.permissions`, отдельную административную роль и `$core.iam.permissionbinding` по схеме `project_id: null`, без implicit user assignment. |
 | `D-09` | Граница транзакции PostgreSQL и S3 | RestAlchemy открывает одну request session и делает `commit()` при любом нормальном возврате WSGI response, включая response со статусом 500; S3 не участвует в транзакции. Импорт делает preflight → upload новых объектов → DB rows. Известная ошибка SQL до подтверждённой финальной фиксации требует `session.rollback()` и удаления только объектов текущей попытки. Только при неопределённом исходе финальной фиксации автоматическое удаление запрещено: retry по SHA безопасен и завершается отдельной orphan-repair проверкой. |
-| `D-10` | Чтение скрытого стикера | Обычный GET и list/search возвращают только `active=true, blocked=false`; batch resolve возвращает hidden (`active=false, blocked=false`) для истории; download разрешён для active и hidden, но blocked отвечает безопасным `404` без чтения storage. |
+| `D-10` | Чтение отсутствующего стикера | Пакетное получение опускает удалённые и неизвестные UUID. Скачивание возвращает `404` без обращения к хранилищу. |
 | `D-11` | `id` против `uuid` в публичном JSON | Публичная карточка сохраняет поле `id` со значением sticker UUID. В БД и маршрутах используется `uuid`; import result использует `sticker_uuid`. Числовые IDs и `media_object_id` наружу не выдаются. |
 | `D-12` | Идентичность storage | В строке хранится только `media_object_id`; доступ идёт через единый `sticker_storage` adapter. Production — настроенный S3, local backend только для development/tests; bucket и object key не входят в DTO, error и logs. |
 | `D-13` | Одинаковый SHA внутри одного ZIP | Первый элемент с SHA создаёт одну запись; каждый последующий такой SHA получает тот же `sticker_uuid` и `status: duplicate`, независимо от порядка ZIP. |
-| `D-14` | Favorite после hide/block | Favorite row сохраняется при hide/block. `favorite=true` возвращает только видимые элементы; после unhide/unblock ранее сохранённое favorite снова появляется. Star запрещён для hidden/blocked, unstar идемпотентен. |
-| `D-15` | Административный hard delete | `DELETE /stickers/{uuid}` требует `workspace.sticker_catalog.manage`, удаляет корневую строку и каскадно favorites, возвращает `204`. Исторический UUID перестаёт разрешаться: UI показывает generic-заглушку `Стикер недоступен`, bridge выводит `Sticker unavailable` и не выпускает raw URN. Deleted, missing и blocked состояния снаружи не различаются. Повторный импорт тех же байтов после committed delete создаёт новый UUID. |
+| `D-14` | Избранное после удаления | Удаление стикера каскадно удаляет все его связи с избранным. |
+| `D-15` | Административный hard delete | `DELETE /stickers/{uuid}` требует `workspace.sticker_catalog.manage`, удаляет корневую строку и каскадно favorites, возвращает `204`. Исторический UUID перестаёт разрешаться: UI показывает `Стикер недоступен`. Входящий bridge сохраняет проверенный URN, исходящий отправляет `Sticker unavailable`. Повторный импорт тех же байтов после committed delete создаёт новый UUID. |
 | `D-16` | Конкурентность и cleanup delete | Delete и import используют один advisory transaction lock по SHA. В той же PostgreSQL transaction delete создаёт durable cleanup task; основной Messenger worker идемпотентно удаляет storage object после commit и повторяет failed задачи с backoff до completed. Rollback cleanup migration допускается только после завершения всех pending/running/failed задач. |
 
 ### 4.1. Доказанные RestAlchemy и runtime conventions
@@ -156,8 +156,7 @@ HTTP list/get
 
 ```text
 GET action download
-  -> проверка active/blocked с учётом режима разрешения
-  -> чтение media_object_id из PostgreSQL
+  -> поиск UUID и media_object_id в PostgreSQL
   -> sticker storage
   -> local/S3 bytes
 ```
@@ -224,7 +223,7 @@ multipart archive
 - зафиксировать границу `D-07`: MVP не использует Pillow или иной декодер изображений, не проверяет сигнатуру файла/фактический формат и не меняет файлы зависимостей;
 - учитывать фактический момент commit RestAlchemy в S3 compensation strategy;
 - зафиксировать cache headers и `ETag` behavior;
-- закрыть различия `id`/`uuid`, storage identity, duplicate SHA внутри архива и favorite после hide/block.
+- закрыть различия `id`/`uuid`, storage identity, duplicate SHA внутри архива и каскадное удаление избранного.
 
 **Артефакты:** таблица решений `D-01`–`D-16`, API fixtures и контрактные тесты IAM, метаданных и жизненного цикла транзакции RestAlchemy.
 
@@ -240,7 +239,7 @@ multipart archive
 - `m_workspace_sticker_favorites` с первичным ключом `(user_uuid, sticker_uuid)`;
 - внешний ключ favorite → sticker с `ON DELETE CASCADE`;
 - без внешнего ключа `user_uuid` на проектно-зависимую строку пользователя;
-- ограничения CHECK для category, format, допускающих `NULL` `width`/`height` и положительных значений при наличии, а также состояния `active/blocked`;
+- ограничения CHECK для category, format, допускающих `NULL` `width`/`height` и положительных значений при наличии;
 - UNIQUE для `sha256`;
 - GIN по `tags`;
 - `pg_trgm` GIN по `search_text`;
@@ -293,8 +292,7 @@ multipart archive
 
 - интерфейс репозитория, принимающий текущую `session` и `user_uuid`;
 - list/search с `q`, `favorite`, повторяемым `uuid`, `category`, `format`;
-- get active item;
-- batch resolve, допускающий hidden и исключающий blocked media;
+- получение стикера по UUID и пакетное получение существующих записей;
 - вычисление `is_favorite` одним запросом, без N+1;
 - устойчивое ранжирование: exact tag, title exact/prefix, partial text, trigram;
 - непрозрачный курсор, связанный с запросом, фильтрами и сортировкой;
@@ -303,7 +301,7 @@ multipart archive
 
 **Не делать:** HTTP parsing, S3 и ZIP.
 
-**Проверка:** integration tests PostgreSQL проверяют порядок, границы страниц без пропусков/дубликатов, русский и английский поиск, `ё/е`, опечатку, комбинацию фильтров, favorite order, hidden/blocked и два конкурентных действия star/import.
+**Проверка:** integration tests PostgreSQL проверяют порядок, границы страниц без пропусков/дубликатов, русский и английский поиск, `ё/е`, опечатку, комбинацию фильтров, favorite order и два конкурентных действия star/import.
 
 ### 7.6. Публичное чтение каталога и скачивание
 
@@ -312,14 +310,13 @@ multipart archive
 **Ответственность:**
 
 - прикладные handlers list/get/batch resolve;
-- download handler с проверкой состояния до обращения к storage;
+- download handler с проверкой наличия записи до обращения к storage;
 - JSON точно по разделу 7 ТЗ;
 - `is_favorite` для текущего IAM user;
 - `ETag`, `If-None-Match`, cache headers и заголовки media response;
-- одинаковое безопасное внешнее поведение для отсутствующего и недоступного blocked объекта;
-- скрытая карточка доступна только batch resolve для истории, а её download разрешён при `blocked=false`.
+- одинаковый `404` для удалённого или неизвестного UUID.
 
-**Проверка:** controller/service tests покрывают 200, 304, pagination headers, 404/безопасный отказ, hidden, blocked, отсутствие S3 key и отсутствие чтения storage для заблокированного элемента.
+**Проверка:** controller/service tests покрывают 200, 304, pagination headers, 404/безопасный отказ, отсутствие S3 key и отсутствие чтения storage для отсутствующей записи.
 
 ### 7.7. Глобальное избранное
 
@@ -329,12 +326,12 @@ multipart archive
 
 - идемпотентные операции star/unstar;
 - user_uuid берётся только из IAM context;
-- запрет добавления hidden/blocked/несуществующего стикера;
+- запрет добавления несуществующего стикера;
 - точная сортировка `favorite=true`: без `q` — `favorite_created_at DESC, uuid DESC`, с `q` — `rank DESC, favorite_created_at DESC, uuid DESC`;
 - одинаковое избранное для одного пользователя в разных проектах;
 - отсутствие возможности передать user_uuid другого пользователя.
 
-**Проверка:** unit/integration tests повторного star/unstar, двух пользователей, двух проектов одного пользователя, скрытия после добавления и конкурентного star.
+**Проверка:** unit/integration tests повторного star/unstar, двух пользователей, двух проектов одного пользователя и конкурентного star.
 
 ### 7.8. Административное редактирование и удаление
 
@@ -344,16 +341,15 @@ multipart archive
 
 - permission gate `workspace.sticker_catalog.manage`;
 - объявление permission в `exordos/manifests/workspace.yaml.j2` и явная привязка только к согласованной административной роли;
-- изменение только `title`, `alt_text`, `emoji`, `tags`, `category`, `active`, `blocked`;
+- изменение только `title`, `alt_text`, `emoji`, `tags`, `category`;
 - пересборка `search_text` при каждом релевантном изменении;
-- DB constraint и проверка допустимого значения для несовместимого `active=true, blocked=true`;
 - запрет изменения UUID, media, format, размеров, SHA и object id;
 - `DELETE` под тем же permission: SHA lock, удаление корневой строки с DB cascade favorites и атомарная постановка cleanup task;
 - идемпотентная post-commit очистка storage основным Messenger worker без удаления S3 внутри request transaction;
 - historical unresolved UUID отображается consumer-side заглушкой, raw URN не отправляется bridge наружу;
 - повторный импорт committed-deleted SHA создаёт новый UUID.
 
-**Проверка:** сценарии без permission, с permission, unknown/read-only fields, повторного обновления, hide/unhide, block/unblock, каскада favorites, rollback/commit boundary, cleanup retry и гонки delete/import.
+**Проверка:** сценарии без permission, с permission, unknown/read-only fields, повторного обновления, каскада favorites, rollback/commit boundary, cleanup retry и гонки delete/import.
 
 ### 7.9. Безопасный разбор и валидация ZIP
 
@@ -454,7 +450,7 @@ multipart archive
 
 - схема, доменные операции и HTTP API соответствуют ТЗ и OpenAPI;
 - valid import проходит end to end, а failure paths не оставляют видимых строк или незапланированных объектов;
-- hidden/blocked, pagination и authorization semantics подтверждаются тестами;
+- пакетное получение, pagination и authorization semantics подтверждаются тестами;
 - известные ограничения задокументированы, а замечания высокой критичности по security и authorization закрыты;
 - ручные S3/runtime проверки учитываются отдельно от автоматизированных проверок.
 
@@ -494,7 +490,7 @@ multipart archive
 - local save/read/delete;
 - mocked S3 save/read/delete;
 - partial upload cleanup;
-- blocked download не обращается к S3;
+- download отсутствующего стикера не обращается к S3;
 - immutable object behavior.
 
 ### Регрессия
@@ -526,10 +522,6 @@ multipart archive
 ### Формат по расширению может быть подделан
 
 Контроль MVP: сверять manifest, согласованность расширения и заявленного `format`, положительность `width`/`height` при наличии и потоковый SHA-256. Реальный формат и визуальная пригодность проверяются администратором; проверка содержимого изображения остаётся будущим усилением.
-
-### Дубликат заблокированного файла может обойти модерацию
-
-Контроль: UNIQUE SHA и правило `D-04`; импорт не меняет состояние существующего стикера.
 
 ### Персональный `is_favorite` может попасть в общий кэш
 
@@ -579,8 +571,8 @@ Deploy the backend API and native Zulip v5 workers together before enabling stic
 3. Повторный импорт возвращает duplicate и не создаёт вторую запись.
 4. Обычный пользователь получает страницы каталога, ищет по title/alt/tags и не видит внутренних storage-полей.
 5. Один и тот же пользователь видит одно избранное во всех проектах, другой пользователь — только своё.
-6. Hidden не появляется в каталоге, но разрешается для истории; blocked не отдаёт медиа.
-7. Администратор меняет разрешённые поля, а поиск и доступность обновляются согласованно.
+6. Удалённые и неизвестные UUID отсутствуют в пакетном ответе, а download возвращает `404`.
+7. Администратор меняет метаданные, а поиск учитывает изменения.
 8. Администратор удаляет стикер; строка и favorites исчезают атомарно, historical UUID получает безопасную заглушку, а durable worker очищает storage после commit.
 9. Ошибочный архив не создаёт строк; проверенные storage/SQL failure paths не оставляют незапланированные объекты.
 10. OpenAPI, миграции, focused tests, полный suite, Ruff, mypy и `git diff --check` проходят.

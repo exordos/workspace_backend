@@ -29,8 +29,7 @@
 Сервер должен позволять уполномоченному администратору:
 
 - импортировать подготовленный набор стикеров;
-- изменять название, альтернативный текст, теги и состояние стикера;
-- скрывать или полностью блокировать стикер;
+- изменять метаданные карточки стикера;
 - безвозвратно удалять стикер из каталога отдельной административной операцией.
 
 ## 2. Принятые решения
@@ -118,7 +117,6 @@ S3-совместимое хранилище содержит бинарные �
 - административный импорт подготовленного архива;
 - административное редактирование данных карточки стикера;
 - административное физическое удаление записи с каскадным удалением избранного и фоновой очисткой медиа;
-- скрытие и полная блокировка стикеров;
 - хранение одного медиафайла на стикер без серверного сжатия и создания уменьшенных версий;
 - проверка структуры архива, заявленного формата, размера и контрольной суммы медиафайла; реальный формат и визуальную пригодность до импорта проверяет администратор;
 - точная сортировка избранного: без `q` — `favorite_created_at DESC, uuid DESC`, с `q` — `rank DESC, favorite_created_at DESC, uuid DESC`.
@@ -180,14 +178,12 @@ stickers/{sticker_uuid}/media.{расширение}
 | `size_bytes` | BIGINT | Размер медиафайла |
 | `sha256` | TEXT | Контрольная сумма медиафайла |
 | `media_object_id` | TEXT | Внутренний ключ медиафайла в хранилище |
-| `active` | BOOLEAN | Доступность стикера в каталоге и для новых отправок |
-| `blocked` | BOOLEAN | Полный запрет выдачи и отображения медиафайла |
 | `created_at` | TIMESTAMPTZ | Время создания записи |
 | `updated_at` | TIMESTAMPTZ | Время последнего изменения |
 
 Массивы смайлов и тегов хранятся непосредственно в строке стикера. Отдельные таблицы для них в первой версии не создаются.
 
-База данных ограничивает `category` значениями `gif` и `sticker`, а также запрещает сочетание `active = true` и `blocked = true`.
+База данных ограничивает `category` значениями `gif` и `sticker`.
 
 #### Разница между `uuid` и `media_object_id`
 
@@ -222,41 +218,9 @@ media_object_id: stickers/7ec10000-0000-0000-0000-00000000009a/media.gif
 
 Поле `project_id` отсутствует намеренно.
 
-## 5. Доступность и блокировка стикера
+## 5. Модерация стикеров
 
-В первой версии используются два логических признака: `active` и `blocked`.
-
-### Видимый стикер
-
-```text
-active = true
-blocked = false
-```
-
-Стикер отображается в каталоге, участвует в поиске, может добавляться в избранное и использоваться в новых сообщениях.
-
-### Скрытый стикер
-
-```text
-active = false
-blocked = false
-```
-
-Стикер не отображается в общем каталоге и поиске, не может добавляться в избранное и использоваться в новых сообщениях. При этом он продолжает разрешаться по `sticker_uuid` для уже существующих сообщений, чтобы история не ломалась.
-
-### Заблокированный стикер
-
-```text
-blocked = true
-```
-
-Стикер не отображается в каталоге, не участвует в поиске и не возвращает медиафайл даже для старых сообщений. Клиент показывает безопасную заглушку.
-
-Блокировка является обратимой. Администратор может использовать её как временную меру на время проверки жалобы или оставить бессрочно. Причина блокировки в первой версии не хранится; при появлении требований к журналу модерации для неё добавляются отдельные поля или отдельная таблица.
-
-База данных должна запрещать сочетание `active = true` и `blocked = true`.
-
-Скрытие или блокировка остаются обратимыми инструментами модерации. Отдельный hard delete применяется, когда администратор осознанно принимает необратимое удаление: запись каталога и связанные строки избранного удаляются, а старый `sticker_uuid` перестаёт разрешаться.
+Администратор удаляет стикер через `DELETE` (см. раздел 6.5).
 
 ## 6. Контракт API
 
@@ -289,13 +253,11 @@ GET /api/workspace/v1/messenger/stickers/
 | `page_limit` | Размер страницы |
 | `page_marker` | Маркер следующей страницы |
 
-Обычный список и поиск возвращают только стикеры с `active = true` и `blocked = false`.
-
 `page_limit` принимает целое от 1 до 100, значение по умолчанию — 50. `q` ограничен 200 Unicode code points. Повторяемый `uuid` допускает не более 100 значений. Неизвестные параметры и нарушение лимитов получают стандартную ошибку RestAlchemy `400`.
 
 Сортировка однозначно выбирается по `q` и `favorite`: без `q`, `favorite=false` — `created_at DESC, uuid DESC`; без `q`, `favorite=true` — `favorite_created_at DESC, uuid DESC`; с `q`, `favorite=false` — `rank DESC, updated_at DESC, uuid DESC`; с `q`, `favorite=true` — `rank DESC, favorite_created_at DESC, uuid DESC`. `page_marker` — opaque base64url без padding с canonical JSON-полями `v`, `sort`, `filters_sha256`, `values`. `values` содержит полную sort tuple. `filters_sha256` — SHA-256 canonical JSON параметров `q`, `favorite`, `category`, `format`, canonicalized `uuid` и сортировки. UUID dedupe-ится и сортируется лексикографически перед fingerprint; допускается pagination с максимумом 100 UUID. Несовпадение fingerprint или версии маркера даёт `400`.
 
-Пакетное разрешение по `uuid` может возвращать скрытые стикеры с `active = false`, чтобы старые сообщения продолжали отображаться. Заблокированные стикеры не возвращаются как доступные медиа.
+Пакетное получение по `uuid` возвращает существующие стикеры. Удалённые и неизвестные UUID отсутствуют в ответе.
 
 ```http
 GET /api/workspace/v1/messenger/stickers/{sticker_uuid}
@@ -307,7 +269,7 @@ GET /api/workspace/v1/messenger/stickers/{sticker_uuid}
 GET /api/workspace/v1/messenger/stickers/{sticker_uuid}/actions/download
 ```
 
-Возвращает необработанные байты медиафайла. Это GET-действие RestAlchemy, поэтому суффикс `/invoke` не используется. URL download не содержит версионного query-параметра вроде `?v=2`. Сервер при каждом использовании ответа обязан revalidate доступность стикера до обращения к storage. Доступный объект отвечает с `ETag: "<sha256>"` и `Cache-Control: private, no-cache`; совпавший `If-None-Match` даёт `304` только после проверки, что стикер всё ещё не заблокирован и не удалён. Внутренний ключ S3 клиенту не раскрывается.
+Возвращает необработанные байты медиафайла. Это GET-действие RestAlchemy, поэтому суффикс `/invoke` не используется. URL download не содержит версионного query-параметра вроде `?v=2`. Сервер при каждом использовании ответа обязан revalidate доступность стикера до обращения к storage. Доступный объект отвечает с `ETag: "<sha256>"` и `Cache-Control: private, no-cache`; совпавший `If-None-Match` даёт `304` только после проверки, что запись стикера существует. Внутренний ключ S3 клиенту не раскрывается.
 
 ### 6.2. Избранное
 
@@ -388,9 +350,7 @@ PUT /api/workspace/v1/messenger/stickers/{sticker_uuid}
 - `alt_text`;
 - `emoji`;
 - `tags`;
-- `category`;
-- `active`;
-- `blocked`.
+- `category`.
 
 Замена медиафайла через эту операцию не допускается.
 
@@ -402,7 +362,7 @@ DELETE /api/workspace/v1/messenger/stickers/{sticker_uuid}
 
 Операция требует разрешения `workspace.sticker_catalog.manage` и при успехе возвращает `204` без тела. В request transaction backend берёт тот же advisory lock по SHA-256, что и импорт, удаляет корневую строку `m_workspace_stickers`, каскадно удаляет связанные строки избранного и атомарно ставит задачу в `messenger_sticker_cleanup_tasks` для `media_object_id`. Основной Messenger worker удаляет физический объект после commit, идемпотентно; состояния задачи `pending`, `running` и `failed` повторяются с backoff до `completed`. Rollback миграции cleanup queue блокируется, пока существует хотя бы одна незавершённая задача.
 
-После committed delete UUID отсутствует в list/get/batch/download. Старые сообщения с `urn:sticker:<uuid>` не переписываются: UI показывает безопасную заглушку `Стикер недоступен`, а bridge выводит `Sticker unavailable` и не должен передавать raw URN во внешний текст. Одинаковая generic-заглушка используется для deleted, missing и blocked состояний, чтобы consumer не различал причины недоступности. Повторный импорт тех же байтов после committed delete создаёт новый стикер с новым UUID.
+После committed delete UUID отсутствует в list/get/batch/download. Старые сообщения с `urn:sticker:<uuid>` не переписываются: UI показывает `Стикер недоступен`. Входящий bridge сохраняет проверенный URN, исходящий отправляет `Sticker unavailable`. Повторный импорт тех же байтов после committed delete создаёт новый стикер с новым UUID.
 
 ### 6.6. Статусы и ошибки
 
@@ -412,7 +372,7 @@ DELETE /api/workspace/v1/messenger/stickers/{sticker_uuid}
 - `400` — `ValidationErrorException` RestAlchemy для неверного JSON/multipart, лимитов, фильтров и cursor fingerprint.
 - `401` — IAM middleware может отклонить недействительный bearer token в OAuth-формате `{ "error": "invalid_token", "error_description": "..." }`; этот ответ не является `RestAlchemyError` и не дублируется как operation-level response в текущем OpenAPI.
 - `403` — отсутствует `workspace.sticker_catalog.manage` для import/PUT/DELETE.
-- `404` — отсутствующий или заблокированный ресурс; для blocked storage не читается.
+- `404` — отсутствующий ресурс. Для удалённого или неизвестного UUID хранилище не читается.
 - `405` — штатный `UnsupportedHttpMethod` RestAlchemy.
 - `409` — только если конкретный DB unique-конфликт не обработан как идемпотентный duplicate.
 
@@ -479,11 +439,9 @@ DELETE /api/workspace/v1/messenger/stickers/{sticker_uuid}
 
 Технические лимиты: `title` — 200 символов Unicode, `alt_text` — 500, один tag — 64, не более 64 tags, суммарный размер tags — 4096 байт UTF-8, `q` — 200, `page_limit` — от 1 до 100 (по умолчанию 50), `uuid` — не более 100 значений. `width`/`height` могут отсутствовать или иметь значение положительного целого; это проверка формы, а не содержимого и не закрытый словарь.
 
-Идентификаторы решений: `D-01` — маркер и кортеж сортировки из следующего абзаца; `D-02` — перечисленные лимиты; `D-03` — атомарный `400` без `rejected` в успехе; `D-04` — duplicate по SHA без смены состояния; `D-05` — персональный ETag JSON; `D-06` — revalidating cache медиа; `D-07` — заявленные `format` и расширение, необязательные допускающие `NULL` `width`/`height`, потоковый SHA-256 и отсутствие проверки содержимого изображения в MVP; `D-08` — permission `workspace.sticker_catalog.manage` из IAM; `D-09` — транзакция запроса и компенсация S3; `D-10` — hidden только для batch/history; `D-11` — публичный `id`, внутренний `uuid`; `D-12` — storage через `media_object_id`; `D-13` — один UUID на одинаковый SHA внутри ZIP; `D-14` — строка favorite сохраняется при hide/block; `D-15` — административный hard delete с заглушкой для истории и новым UUID при повторном импорте; `D-16` — SHA advisory lock и durable post-commit cleanup через основной Messenger worker.
+Идентификаторы решений: `D-01` — маркер и кортеж сортировки из следующего абзаца; `D-02` — перечисленные лимиты; `D-03` — атомарный `400` без `rejected` в успехе; `D-04` — duplicate по существующему SHA; `D-05` — персональный ETag JSON; `D-06` — revalidating cache медиа; `D-07` — заявленные `format` и расширение, необязательные допускающие `NULL` `width`/`height`, потоковый SHA-256 и отсутствие проверки содержимого изображения в MVP; `D-08` — permission `workspace.sticker_catalog.manage` из IAM; `D-09` — транзакция запроса и компенсация S3; `D-10` — пропуск неизвестных UUID при пакетном получении; `D-11` — публичный `id`, внутренний `uuid`; `D-12` — storage через `media_object_id`; `D-13` — один UUID на одинаковый SHA внутри ZIP; `D-14` — каскадное удаление избранного вместе со стикером; `D-15` — административный hard delete с заглушкой для истории и новым UUID при повторном импорте; `D-16` — SHA advisory lock и durable post-commit cleanup через основной Messenger worker.
 
 Маркер страницы кодируется как base64url без padding от canonical JSON `{ "v": 1, "sort": "...", "filters_sha256": "...", "values": [...] }`. `values` содержит полную sort tuple, последний элемент — UUID. Fingerprint считается от canonical JSON параметров `q`, `favorite`, `category`, `format`, dedupe+lexicographically sorted `uuid` и сортировки. Маркер с другим fingerprint или версией отвечает `400`.
-
-Состояния имеют точную семантику: list/search и item GET показывают только `active=true, blocked=false`; batch resolve также возвращает hidden (`active=false, blocked=false`); download разрешён active и hidden, но blocked отвечает безопасным `404` без обращения к storage. Favorite row не удаляется при hide/block, но фильтр `favorite=true` возвращает только видимое; после unhide/unblock связь снова видна. Star для hidden/blocked запрещён, unstar идемпотентен.
 
 В MVP сервер не декодирует GIF/WebP/PNG, не анализирует бинарное содержимое и не сравнивает `width`/`height` с байтами медиафайла. Он принимает только согласованные заявленные `format` и расширение, проверяет форму необязательных метаданных, потоково считает SHA-256 и выполняет все проверки безопасности ZIP. Визуальная пригодность и реальный формат — ответственность администратора до импорта; полноценная проверка содержимого изображения отложена в отдельное будущее усиление.
 
@@ -638,7 +596,7 @@ workspace-stickers-003-of-003.zip
 
 ## 10. Кэширование и доставка
 
-- Медиафайлы являются неизменяемыми, но их доступность изменяема. Download возвращает `ETag: "<sha256>"`, `Cache-Control: private, no-cache` и фактический `Content-Type`; совпавший `If-None-Match` даёт `304` только после повторной проверки строки каталога и состояния `blocked`.
+- Медиафайлы неизменяемы. Download возвращает `ETag: "<sha256>"`, `Cache-Control: private, no-cache` и фактический `Content-Type`; совпавший `If-None-Match` даёт `304` только после проверки наличия строки каталога.
 - JSON списка возвращается с `ETag: "<sha256 стабильного UTF-8 JSON тела с учётом user_uuid и параметров>"` и `Cache-Control: private, no-cache`; совпавший `If-None-Match` даёт `304` без тела.
 - Элементы каталога загружаются постранично.
 - Ответ списка остаётся стандартным JSON-массивом RestAlchemy; `X-Pagination-Limit` содержит фактический лимит, а `X-Pagination-Marker` — opaque `page_marker` только при наличии следующей страницы.
@@ -670,11 +628,11 @@ workspace-stickers-003-of-003.zip
 }
 ```
 
-URN содержит только `sticker_uuid` и имеет строгую форму `urn:sticker:<uuid>` без query suffix. Идентификатор устойчив до административного hard delete. Клиент распознаёт такое содержимое как стикер, получает актуальные данные из каталога и отображает специализированное представление вместо обычного Markdown-блока. Если UUID не разрешается из-за deleted, missing или blocked состояния, UI показывает generic-заглушку `Стикер недоступен`; bridge выводит `Sticker unavailable` и не выпускает raw `urn:sticker:...` во внешний текст.
+URN содержит только `sticker_uuid` и имеет строгую форму `urn:sticker:<uuid>` без query suffix. Идентификатор устойчив до административного hard delete. Клиент распознаёт такое содержимое как стикер, получает актуальные данные из каталога и отображает специализированное представление вместо обычного Markdown-блока. Для удалённого или неизвестного UUID UI показывает `Стикер недоступен`. Исходящий bridge передаёт `Sticker unavailable` в Zulip.
 
-Сообщение не сохраняет S3 key или временный URL. Скрытие, блокировка, удаление или перенос медиафайла поэтому не требуют изменения уже отправленных сообщений; недоступность отображается consumer-side заглушкой.
+Создание и редактирование сообщений сохраняют Markdown без проверки ссылок по каталогу. Уже отправленные сообщения сохраняют исходное содержимое после удаления стикера.
 
-The native Zulip v5 workers upload sticker media and mark the link with `workspace-sticker:v1:<uuid>`. Incoming messages and history restore the sticker only after checking the authenticated upload against the catalog size and SHA-256. Deploy the API and these workers together before enabling sticker sends and deletion in the UI.
+The native Zulip v5 workers upload sticker media and mark the link with `workspace-sticker:v1:<uuid>`. Incoming messages and history preserve the sticker URN after verifying the authenticated upload size and SHA-256 against the catalog or cleanup queue. Deploy the API and these workers together before enabling sticker sends and deletion in the UI.
 
 ## 13. Соответствие текущей архитектуре
 
@@ -704,6 +662,11 @@ The native Zulip v5 workers upload sticker media and mark the link with `workspa
 3. Какой operational retention нужен для строк `messenger_sticker_cleanup_tasks` в состоянии `completed`? Pruning не входит в текущую реализацию и не должен удалять незавершённые задачи.
 
 ## 15. История решений
+
+### Версия 1.3
+
+- Единственная операция модерации — удаление стикера через `DELETE`.
+- Создание и редактирование сообщений сохраняют ссылки на отсутствующие UUID.
 
 ### Версия 1.2
 

@@ -346,118 +346,17 @@ def test_real_http_catalog_full_flow_through_unified_mount(
         )
         assert repeated_unstar.status_code == 200, repeated_unstar.text
 
-        assert (
-            workspace_api.post(
-                f"{UNIFIED_ROOT}/{first_uuid}/actions/star/invoke"
-            ).status_code
-            == 200
-        )
-        hidden = workspace_api.put(
-            f"{UNIFIED_ROOT}/{first_uuid}",
-            permissions=(MANAGE_PERMISSION,),
-            json={"active": False},
-        )
-        assert hidden.status_code == 200, hidden.text
-        assert hidden.json()["is_favorite"] is True
-        assert workspace_api.get(f"{UNIFIED_ROOT}/{first_uuid}").status_code == 404
-        hidden_search = workspace_api.get(
-            f"{UNIFIED_ROOT}/",
-            params={"q": token},
-        )
-        assert hidden_search.status_code == 200
-        assert [card["id"] for card in hidden_search.json()] == [second_uuid]
-        hidden_favorites = workspace_api.get(
-            f"{UNIFIED_ROOT}/",
-            params={"favorite": "true"},
-        )
-        assert hidden_favorites.status_code == 200
-        assert hidden_favorites.json() == []
-        hidden_batch = workspace_api.get(
-            f"{UNIFIED_ROOT}/",
-            params=uuid_params,
-        )
-        assert hidden_batch.status_code == 200, hidden_batch.text
-        assert {card["id"] for card in hidden_batch.json()} == {
-            first_uuid,
-            second_uuid,
-        }
-        assert (
-            workspace_api.get(f"{UNIFIED_ROOT}/{first_uuid}/actions/download").content
-            == first_data
-        )
-        assert (
-            workspace_api.post(
-                f"{UNIFIED_ROOT}/{first_uuid}/actions/star/invoke"
-            ).status_code
-            == 404
-        )
-
-        unhidden = workspace_api.put(
-            f"{UNIFIED_ROOT}/{first_uuid}",
-            permissions=(MANAGE_PERMISSION,),
-            json={"active": True},
-        )
-        assert unhidden.status_code == 200, unhidden.text
-        assert unhidden.json()["is_favorite"] is True
-        restored_favorite = workspace_api.get(
-            f"{UNIFIED_ROOT}/",
-            params={"favorite": "true"},
-        )
-        assert [card["id"] for card in restored_favorite.json()] == [first_uuid]
-
-        blocked = workspace_api.put(
-            f"{UNIFIED_ROOT}/{first_uuid}",
-            permissions=(MANAGE_PERMISSION,),
-            json={"active": False, "blocked": True},
-        )
-        assert blocked.status_code == 200, blocked.text
-        assert blocked.json()["is_favorite"] is True
-        blocked_batch = workspace_api.get(
-            f"{UNIFIED_ROOT}/",
-            params=uuid_params,
-        )
-        assert [card["id"] for card in blocked_batch.json()] == [second_uuid]
-
-        class StorageReadSentinel:
-            def __init__(self) -> None:
-                self.calls: list[str] = []
-
-            def read(self, media_object_id: str) -> bytes:
-                self.calls.append(media_object_id)
-                raise AssertionError("blocked media must not be read")
-
-        storage_sentinel = StorageReadSentinel()
-        monkeypatch.setattr(
-            sticker_storage,
-            "get_sticker_storage",
-            lambda: storage_sentinel,
-        )
-        blocked_download = workspace_api.get(
-            f"{UNIFIED_ROOT}/{first_uuid}/actions/download",
-            headers={"If-None-Match": downloaded.headers["ETag"]},
-        )
-        assert blocked_download.status_code == 404, blocked_download.text
-        assert storage_sentinel.calls == []
-        for secret in ("media_object_id", "sha256", "size_bytes", str(tmp_path)):
-            assert secret not in blocked_download.text
-        assert (
-            workspace_api.post(
-                f"{UNIFIED_ROOT}/{first_uuid}/actions/unstar/invoke"
-            ).status_code
-            == 200
-        )
-
-        with db.cursor() as cursor:
-            cursor.execute(
-                "DELETE FROM m_workspace_stickers WHERE uuid = %s",
-                (first_uuid,),
+        for field in ("active", "blocked"):
+            removed_field = workspace_api.put(
+                f"{UNIFIED_ROOT}/{first_uuid}",
+                permissions=(MANAGE_PERMISSION,),
+                json={field: False},
             )
-        absent_download = workspace_api.get(
-            f"{UNIFIED_ROOT}/{first_uuid}/actions/download"
-        )
-        assert absent_download.status_code == blocked_download.status_code == 404
-        assert absent_download.json() == blocked_download.json()
-        assert storage_sentinel.calls == []
+            assert removed_field.status_code == 400, removed_field.text
+            removed_filter = workspace_api.get(
+                f"{UNIFIED_ROOT}/", params={field: "false"}
+            )
+            assert removed_filter.status_code == 400, removed_filter.text
     finally:
         _delete_imported_stickers(db, digests)
 
@@ -493,6 +392,11 @@ def test_real_http_admin_delete_is_atomic_and_hides_storage_identity(
         ).status_code
         == 200
     )
+
+    download_path = f"{UNIFIED_ROOT}/{sticker_uuid}/actions/download"
+    downloaded = workspace_api.get(download_path)
+    assert downloaded.status_code == 200, downloaded.text
+    assert downloaded.content == data
 
     forbidden = workspace_api.delete(f"{UNIFIED_ROOT}/{sticker_uuid}")
     assert forbidden.status_code == 403, forbidden.text
@@ -531,6 +435,26 @@ def test_real_http_admin_delete_is_atomic_and_hides_storage_identity(
         (sticker_uuid,),
     ).fetchone()
     assert task == ("pending", 0)
+
+    def unexpected_storage_read():
+        pytest.fail("Missing stickers must not access storage")
+
+    monkeypatch.setattr(sticker_storage, "get_sticker_storage", unexpected_storage_read)
+    unknown_uuid = str(sys_uuid.uuid4())
+    for missing_uuid in (sticker_uuid, unknown_uuid):
+        assert workspace_api.get(f"{UNIFIED_ROOT}/{missing_uuid}").status_code == 404
+        unavailable = workspace_api.get(
+            f"{UNIFIED_ROOT}/{missing_uuid}/actions/download",
+            headers={"If-None-Match": downloaded.headers["ETag"]},
+        )
+        assert unavailable.status_code == 404, unavailable.text
+        for secret in ("media_object_id", "sha256", "size_bytes", str(tmp_path)):
+            assert secret not in unavailable.text
+    batch = workspace_api.get(
+        f"{UNIFIED_ROOT}/", params=[("uuid", sticker_uuid), ("uuid", unknown_uuid)]
+    )
+    assert batch.status_code == 200, batch.text
+    assert batch.json() == []
 
     missing = workspace_api.delete(
         f"{UNIFIED_ROOT}/{sticker_uuid}",
@@ -614,7 +538,7 @@ def test_real_http_import_checks_permission_before_multipart_parsing(
     assert after == before
 
 
-def test_native_messages_require_active_stickers_for_new_references(
+def test_native_messages_preserve_deleted_and_unknown_sticker_references(
     workspace_api,
     db,
     tmp_path: pathlib.Path,
@@ -668,76 +592,41 @@ def test_native_messages_require_active_stickers_for_new_references(
         assert created.json()["payload"] == payload
         message_path = messages + created.json()["uuid"]
 
-        hidden = workspace_api.put(
+        deleted = workspace_api.delete(
             f"{UNIFIED_ROOT}/{sticker_uuid}",
             permissions=(MANAGE_PERMISSION,),
-            json={"active": False},
         )
-        assert hidden.status_code == 200, hidden.text
+        assert deleted.status_code == 204, deleted.text
         loaded = workspace_api.get(message_path)
         assert loaded.status_code == 200, loaded.text
         assert loaded.json()["payload"] == payload
-        downloaded = workspace_api.get(
-            f"{UNIFIED_ROOT}/{sticker_uuid}/actions/download"
-        )
-        assert downloaded.status_code == 200, downloaded.text
-        assert downloaded.content == data
 
         retry = workspace_api.post(messages, json=body)
         assert retry.status_code == 201, retry.text
         assert retry.json()["uuid"] == created.json()["uuid"]
         assert retry.json()["payload"] == payload
-        new_body = {**body, "uuid": str(sys_uuid.uuid4())}
-        rejected = workspace_api.post(messages, json=new_body)
-        assert rejected.status_code == 400, rejected.text
-        snapshot = base64.urlsafe_b64encode(content.encode()).decode()
+
+        unknown = f"![sticker](urn:sticker:{sys_uuid.uuid4()})"
+        unresolved = {"kind": "markdown", "content": f"{content} {unknown}"}
+        new_message = workspace_api.post(
+            messages,
+            json={**body, "uuid": str(sys_uuid.uuid4()), "payload": unresolved},
+        )
+        assert new_message.status_code == 201, new_message.text
+        assert new_message.json()["payload"] == unresolved
+
+        snapshot = base64.urlsafe_b64encode(unresolved["content"].encode()).decode()
         forwarded = {
             "kind": "markdown",
             "content": f"[Forward](urn:forward:{created.json()['uuid']}?snapshot={snapshot})",
         }
-        rejected_forward = workspace_api.post(
-            messages, json={**new_body, "payload": forwarded}
-        )
-        assert rejected_forward.status_code == 400, rejected_forward.text
-
-        for example in (
-            f"`{content}`",
-            f"```markdown\n{content}\n```",
-            f"~~~~\n{content}",
-            f"> ```markdown\n> {content}\n> ````",
-        ):
-            literal = {"kind": "markdown", "content": example}
-            plain = workspace_api.post(
-                messages,
-                json={**body, "uuid": str(sys_uuid.uuid4()), "payload": literal},
-            )
-            assert plain.status_code == 201, plain.text
-            plain_path = messages + plain.json()["uuid"]
-            rejected_edit = workspace_api.put(plain_path, json={"payload": payload})
-            assert rejected_edit.status_code == 400, rejected_edit.text
-            assert workspace_api.get(plain_path).json()["payload"] == literal
-
-        for example in (
-            f"```spoiler Details\n{content}\n```",
-            f"Unmatched ` {content}",
-            f"Unmatched `\n# {content}\nLater `",
-            f"> > ```markdown\n> > example\n> {content}",
-        ):
-            rendered = {"kind": "markdown", "content": example}
-            rejected_rendered = workspace_api.post(
-                messages, json={**new_body, "payload": rendered}
-            )
-            assert rejected_rendered.status_code == 400, rejected_rendered.text
-
-        duplicated = {"kind": "markdown", "content": f"{content}\n{content}"}
-        rejected_duplicate = workspace_api.put(
-            message_path, json={"payload": duplicated}
-        )
-        assert rejected_duplicate.status_code == 400, rejected_duplicate.text
-
-        retained = {"kind": "markdown", "content": f"Edited {content}"}
-        edited = workspace_api.put(message_path, json={"payload": retained})
+        edited = workspace_api.put(message_path, json={"payload": forwarded})
         assert edited.status_code == 200, edited.text
-        assert edited.json()["payload"] == retained
+        assert edited.json()["payload"] == forwarded
+        assert workspace_api.get(message_path).json()["payload"] == forwarded
     finally:
         _delete_imported_stickers(db, [str(item["sha256"])])
+        db.execute(
+            "DELETE FROM messenger_sticker_cleanup_tasks WHERE sha256 = %s",
+            (item["sha256"],),
+        )

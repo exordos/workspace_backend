@@ -23,8 +23,6 @@ def _row(
     alt_text: str = "Кот",
     tags: list[str] | None = None,
     search_text: str | None = None,
-    active: bool = True,
-    blocked: bool = False,
     timestamp: datetime.datetime | None = None,
     updated_timestamp: datetime.datetime | None = None,
 ) -> tuple[object, ...]:
@@ -43,8 +41,6 @@ def _row(
         1,
         sha,
         "internal-object",
-        active,
-        blocked,
         timestamp,
         updated_timestamp,
     )
@@ -75,8 +71,6 @@ def _model(
         size_bytes=1,
         sha256=sha,
         media_object_id="internal-object",
-        active=True,
-        blocked=False,
     )
 
 
@@ -84,15 +78,16 @@ def _model(
 def test_concurrent_partial_updates_keep_search_text_consistent(db) -> None:
     repository = sticker_repository.StickerRepository()
     sticker_uuid = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
     sha256 = sys_uuid.uuid4().hex * 2
     with db.cursor() as cursor:
         cursor.execute(
             """
             INSERT INTO m_workspace_stickers
               (uuid,title,alt_text,emoji,tags,search_text,category,format,
-               size_bytes,sha256,media_object_id,active,blocked)
+               size_bytes,sha256,media_object_id)
             VALUES (%s,'Old title','Old alt','{}',ARRAY['old'],
-                    'old title old alt old','sticker','png',1,%s,%s,TRUE,FALSE)
+                    'old title old alt old','sticker','png',1,%s,%s)
             """,
             (sticker_uuid, sha256, f"stickers/{sticker_uuid}/media.png"),
         )
@@ -129,6 +124,7 @@ def test_concurrent_partial_updates_keep_search_text_consistent(db) -> None:
                     pause_after_lock=pause_after_lock,
                     signal_start=signal_start,
                 ),
+                user_uuid,
                 sticker_uuid,
                 fields,
             )
@@ -191,9 +187,9 @@ def test_delete_cascades_favorite_and_atomically_enqueues_cleanup() -> None:
             """
             INSERT INTO m_workspace_stickers
               (uuid,title,alt_text,emoji,tags,search_text,category,format,
-               size_bytes,sha256,media_object_id,active,blocked)
+               size_bytes,sha256,media_object_id)
             VALUES (%s,'Delete','Delete','{}','{}','delete','sticker','png',
-                    1,%s,%s,TRUE,FALSE)
+                    1,%s,%s)
             """,
             (sticker_uuid, sha256, f"stickers/{sticker_uuid}/media.png"),
         )
@@ -221,7 +217,13 @@ def test_delete_cascades_favorite_and_atomically_enqueues_cleanup() -> None:
             == 0
         )
 
+        observer.execute("SET lock_timeout = '100ms'")
+        with pytest.raises(psycopg.errors.LockNotAvailable):
+            repository.star(observer, user_uuid, sticker_uuid)
+        observer.execute("RESET lock_timeout")
         connection.commit()
+        with pytest.raises(sticker_repository.StickerNotFoundError):
+            repository.star(observer, user_uuid, sticker_uuid)
         assert (
             observer.execute(
                 "SELECT COUNT(*) AS count FROM m_workspace_stickers WHERE uuid = %s",
@@ -260,7 +262,7 @@ def test_delete_cascades_favorite_and_atomically_enqueues_cleanup() -> None:
 
 
 @pytest.mark.usefixtures("_database")
-def test_repository_visibility_favorite_and_keyset(db) -> None:
+def test_repository_favorite_and_keyset(db) -> None:
     repository = sticker_repository.StickerRepository()
     db.row_factory = psycopg.rows.dict_row
     user_uuid = sys_uuid.uuid4()
@@ -348,8 +350,8 @@ def test_repository_visibility_favorite_and_keyset(db) -> None:
                 """
                 INSERT INTO m_workspace_stickers
                   (uuid,title,alt_text,emoji,tags,search_text,category,format,
-                   size_bytes,sha256,media_object_id,active,blocked,created_at,updated_at)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                   size_bytes,sha256,media_object_id,created_at,updated_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """,
                 values,
             )
@@ -487,11 +489,12 @@ def test_repository_visibility_favorite_and_keyset(db) -> None:
         assert [item.uuid for item in english_page.items] == [english]
 
         updated_text = repository.update(
-            db, third, {"title": "Ёж", "tags": ["ЛИСА", "лиса"]}
+            db, user_uuid, third, {"title": "Ёж", "tags": ["ЛИСА", "лиса"]}
         )
         assert updated_text is not None
+        assert updated_text.is_favorite
         assert updated_text.sticker.search_text == "еж кот лиса"
-        unchanged = repository.update(db, third, {})
+        unchanged = repository.update(db, user_uuid, third, {})
         assert unchanged is not None
         assert unchanged.sticker.updated_at == updated_text.sticker.updated_at
         assert [
@@ -510,61 +513,6 @@ def test_repository_visibility_favorite_and_keyset(db) -> None:
                 sticker_catalog.build_list_query(q="еж"),
             ).items
         ] == [third]
-
-        hidden = repository.update(db, first, {"active": False})
-        assert hidden is not None
-        assert hidden.sticker.active is False
-        assert repository.get_active(db, user_uuid, first) is None
-        with pytest.raises(sticker_repository.StickerNotVisibleError):
-            repository.star(db, user_uuid, first)
-        with db.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT COUNT(*) FROM m_workspace_sticker_favorites
-                 WHERE user_uuid = %s AND sticker_uuid = %s
-                """,
-                (user_uuid, first),
-            )
-            assert cursor.fetchone()["count"] == 1
-        blocked = repository.update(db, second, {"active": False, "blocked": True})
-        assert blocked is not None
-        assert blocked.sticker.blocked is True
-        with pytest.raises(sticker_repository.StickerRepositoryValidationError):
-            repository.update(db, third, {"active": True, "blocked": True})
-        assert repository.get_active(db, user_uuid, second) is None
-        normal_after_hide = repository.list_stickers(
-            db, user_uuid, sticker_catalog.build_list_query()
-        )
-        assert first not in {item.uuid for item in normal_after_hide.items}
-        assert second not in {item.uuid for item in normal_after_hide.items}
-        with pytest.raises(sticker_repository.StickerNotVisibleError):
-            repository.star(db, user_uuid, second)
-        with db.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT COUNT(*) FROM m_workspace_sticker_favorites
-                 WHERE user_uuid = %s AND sticker_uuid = %s
-                """,
-                (user_uuid, second),
-            )
-            assert cursor.fetchone()["count"] == 1
-        resolved = repository.resolve_batch(db, user_uuid, sticker_uuids)
-        assert first in {item.uuid for item in resolved}
-        assert second not in {item.uuid for item in resolved}
-
-        restored_first = repository.update(db, first, {"active": True})
-        restored_second = repository.update(
-            db, second, {"active": True, "blocked": False}
-        )
-        assert restored_first is not None and restored_first.sticker.active is True
-        assert restored_second is not None and restored_second.sticker.blocked is False
-        assert repository.get_active(db, user_uuid, first) is not None
-        restored_favorites = repository.list_stickers(
-            db,
-            user_uuid,
-            sticker_catalog.build_list_query(favorite=True),
-        )
-        assert {item.uuid for item in restored_favorites.items} >= {first, second}
 
         def star_from_new_connection(_: int) -> bool:
             connection = psycopg.connect(
@@ -637,8 +585,8 @@ def test_search_treats_like_metacharacters_as_literal_text(db, text) -> None:
                 """
                 INSERT INTO m_workspace_stickers
                   (uuid,title,alt_text,emoji,tags,search_text,category,format,
-                   size_bytes,sha256,media_object_id,active,blocked,created_at,updated_at)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                   size_bytes,sha256,media_object_id,created_at,updated_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """,
                 _row(
                     sticker_uuid,

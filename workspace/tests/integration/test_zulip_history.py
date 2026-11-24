@@ -1158,8 +1158,9 @@ def test_history_sticker_restoration_tracks_catalog_without_copying_an_attachmen
         incoming_tests.apply(
             incoming, incoming_tests.event(f"![ordinary]({path})", 100)
         )
-    source = f"Before ![workspace-sticker:v1:{sticker}]({path}) after."
-    messages = {101: message(101, source)}
+    provider_reference = f"![workspace-sticker:v1:{sticker}]({path})"
+    reference = f"![sticker](urn:sticker:{sticker})"
+    messages = {101: message(101, f"Before {provider_reference} after.")}
     downloads = mock.AsyncMock(return_value=(data, "image/png"))
 
     async def run():
@@ -1181,18 +1182,7 @@ def test_history_sticker_restoration_tracks_catalog_without_copying_an_attachmen
 
     request(db, account)
     asyncio.run(run())
-    assert snapshot() == f"Before ![sticker](urn:sticker:{sticker}) after."
-    assert downloads.await_count == 1
-
-    hidden = api.put(
-        f"/v1/messenger/stickers/{sticker}",
-        permissions=("workspace.sticker_catalog.manage",),
-        json={"active": False},
-    )
-    assert hidden.status_code == 200, hidden.text
-    request(db, account)
-    asyncio.run(run())
-    assert snapshot() == f"Before ![sticker](urn:sticker:{sticker}) after."
+    assert snapshot() == f"Before {reference} after."
     assert downloads.await_count == 1
 
     deleted = api.delete(
@@ -1200,9 +1190,17 @@ def test_history_sticker_restoration_tracks_catalog_without_copying_an_attachmen
         permissions=("workspace.sticker_catalog.manage",),
     )
     assert deleted.status_code == 204, deleted.text
+    assert snapshot() == f"Before {reference} after."
     request(db, account)
     asyncio.run(run())
-    assert snapshot() == "Before **Sticker unavailable** after."
+    assert snapshot() == f"Before {reference} after."
+    assert downloads.await_count == 1
+
+    messages[101]["content"] = f"Edited {provider_reference} after."
+    messages[101]["last_edit_timestamp"] = messages[101]["timestamp"] + 1
+    request(db, account)
+    asyncio.run(run())
+    assert snapshot() == f"Edited {reference} after."
     assert downloads.await_count == 2
 
 

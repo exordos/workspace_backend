@@ -34,8 +34,6 @@ CREATE TABLE m_workspace_stickers (
     size_bytes BIGINT NOT NULL,
     sha256 TEXT NOT NULL UNIQUE,
     media_object_id TEXT NOT NULL,
-    active BOOLEAN NOT NULL DEFAULT TRUE,
-    blocked BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT m_workspace_stickers_category_check
@@ -47,9 +45,7 @@ CREATE TABLE m_workspace_stickers (
     CONSTRAINT m_workspace_stickers_height_check
         CHECK (height IS NULL OR height > 0),
     CONSTRAINT m_workspace_stickers_size_bytes_check
-        CHECK (size_bytes > 0),
-    CONSTRAINT m_workspace_stickers_active_blocked_check
-        CHECK (NOT (active AND blocked))
+        CHECK (size_bytes > 0)
 );
 
 CREATE TABLE m_workspace_sticker_favorites (

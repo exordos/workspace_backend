@@ -46,8 +46,6 @@ _STICKER_COLUMNS = (
     "size_bytes",
     "sha256",
     "media_object_id",
-    "active",
-    "blocked",
     "created_at",
     "updated_at",
 )
@@ -60,8 +58,8 @@ class StickerRepositoryValidationError(ra_exc.ValidationErrorException):
     code = 400
 
 
-class StickerNotVisibleError(ra_exc.RestAlchemyException):
-    """A hidden or blocked sticker cannot be used by a new operation."""
+class StickerNotFoundError(ra_exc.RestAlchemyException):
+    """A sticker is missing from the catalog."""
 
     message = "Sticker is not available"
     code = 404
@@ -268,7 +266,7 @@ class StickerRepository:
         user_uuid: sys_uuid.UUID,
         list_query: sticker_models.StickerListQuery,
     ) -> StickerPage:
-        """List visible rows and compute favorite state in the same query."""
+        """List stickers and compute favorite state in the same query."""
 
         query = self._query(list_query)
         marker_values: tuple[typing.Any, ...] | None = None
@@ -372,40 +370,34 @@ class StickerRepository:
             """.format(tag_match=tag_match)
             rank_params = [query.q, query.q, like_query, like_query, query.q]
 
-        where = ["s.blocked = FALSE"]
-        uuid_batch = bool(query.uuids and not query.q and not query.favorite)
-        if not uuid_batch:
-            where.insert(0, "s.active = TRUE")
-        where.extend((query.category and "s.category = %s",) if query.category else ())
-        where.extend((query.format and "s.format = %s",) if query.format else ())
+        where = []
+        if query.category:
+            where.append("s.category = %s")
+        if query.format:
+            where.append("s.format = %s")
         if query.uuids:
             where.append("s.uuid = ANY(%s::uuid[])")
-        if query.favorite:
-            where.append("favorite.sticker_uuid IS NOT NULL")
         if query.q:
-            candidate_where = [
-                part.replace("s.", "candidate.")
-                for part in where
-                if "favorite." not in part
-            ]
-            candidate_where_sql = " AND ".join(candidate_where)
+            candidate_where = "".join(
+                part.replace("s.", "candidate.") + " AND " for part in where
+            )
             candidate_from = """(
                 SELECT candidate.*
                   FROM m_workspace_stickers AS candidate
-                 WHERE {where} AND candidate.tags @> ARRAY[%s]::text[]
+                 WHERE {where}candidate.tags @> ARRAY[%s]::text[]
                 UNION
                 SELECT candidate.*
                   FROM m_workspace_stickers AS candidate
-                 WHERE {where} AND candidate.tags @> ARRAY[%s]::text[]
+                 WHERE {where}candidate.tags @> ARRAY[%s]::text[]
                 UNION
                 SELECT candidate.*
                   FROM m_workspace_stickers AS candidate
-                 WHERE {where} AND candidate.search_text LIKE '%%' || %s || '%%' ESCAPE '!'
+                 WHERE {where}candidate.search_text LIKE '%%' || %s || '%%' ESCAPE '!'
                 UNION
                 SELECT candidate.*
                   FROM m_workspace_stickers AS candidate
-                 WHERE {where} AND candidate.search_text %% %s
-            ) AS s""".format(where=candidate_where_sql)
+                 WHERE {where}candidate.search_text %% %s
+            ) AS s""".format(where=candidate_where)
             for value in (
                 query.q,
                 query.tag_query,
@@ -419,15 +411,9 @@ class StickerRepository:
                 if query.uuids:
                     candidate_params.append(list(query.uuids))
                 candidate_params.append(value)
-            where = [
-                part
-                for part in where
-                if not (
-                    part.startswith("s.category")
-                    or part.startswith("s.format")
-                    or part.startswith("s.uuid")
-                )
-            ]
+            where.clear()
+        if query.favorite:
+            where.append("favorite.sticker_uuid IS NOT NULL")
         outer_where = ""
         marker_params: list[typing.Any] = []
         if marker_values is not None:
@@ -491,7 +477,7 @@ class StickerRepository:
                 LEFT JOIN m_workspace_sticker_favorites AS favorite
                   ON favorite.sticker_uuid = s.uuid
                  AND favorite.user_uuid = %s
-               WHERE {where}
+               {where}
             )
             SELECT * FROM ranked
             {outer_where}
@@ -501,7 +487,7 @@ class StickerRepository:
             columns=columns,
             rank=query_rank,
             candidate_from=candidate_from,
-            where=" AND ".join(part for part in where if part),
+            where="WHERE " + " AND ".join(where) if where else "",
             outer_where=outer_where,
             order=order,
         )
@@ -520,34 +506,13 @@ class StickerRepository:
         params.append(query.page_limit + 1)
         return statement, tuple(params)
 
-    def get_active(
+    def get(
         self,
         session: typing.Any,
         user_uuid: sys_uuid.UUID,
         sticker_uuid: sys_uuid.UUID,
     ) -> StickerRecord | None:
-        """Get one visible row, including its favorite state."""
-
-        rows = session.execute(
-            """
-            SELECT s.*, favorite.created_at AS favorite_created_at,
-                   favorite.sticker_uuid IS NOT NULL AS is_favorite
-              FROM m_workspace_stickers AS s
-              LEFT JOIN m_workspace_sticker_favorites AS favorite
-                ON favorite.sticker_uuid = s.uuid AND favorite.user_uuid = %s
-             WHERE s.uuid = %s AND s.active = TRUE AND s.blocked = FALSE
-            """,
-            (user_uuid, sticker_uuid),
-        ).fetchall()
-        return self._record_from_row(rows[0]) if rows else None
-
-    def get_any(
-        self,
-        session: typing.Any,
-        user_uuid: sys_uuid.UUID,
-        sticker_uuid: sys_uuid.UUID,
-    ) -> StickerRecord | None:
-        """Get any row, including hidden/blocked admin records and favorite state."""
+        """Get one sticker, including its favorite state."""
 
         rows = session.execute(
             """
@@ -561,63 +526,6 @@ class StickerRepository:
             (user_uuid, sticker_uuid),
         ).fetchall()
         return self._record_from_row(rows[0]) if rows else None
-
-    def resolve_batch(
-        self,
-        session: typing.Any,
-        user_uuid: sys_uuid.UUID,
-        sticker_uuids: typing.Iterable[sys_uuid.UUID] | None = None,
-        *,
-        uuids: typing.Iterable[sys_uuid.UUID] | None = None,
-    ) -> typing.List[StickerRecord]:
-        """Resolve history references while excluding blocked rows."""
-
-        if sticker_uuids is None:
-            sticker_uuids = uuids or ()
-        elif uuids is not None:
-            raise StickerRepositoryValidationError()
-        try:
-            raw_uuids = list(sticker_uuids)
-            if len(raw_uuids) > sticker_models.MAX_UUID_FILTER_COUNT:
-                raise ValueError("too many sticker UUIDs")
-            canonical = [
-                sys_uuid.UUID(value)
-                for value in sorted({str(value) for value in raw_uuids})
-            ]
-        except (TypeError, ValueError):
-            raise StickerRepositoryValidationError() from None
-        if not canonical:
-            return []
-        rows = session.execute(
-            """
-            SELECT s.*, favorite.created_at AS favorite_created_at,
-                   favorite.sticker_uuid IS NOT NULL AS is_favorite
-              FROM m_workspace_stickers AS s
-              LEFT JOIN m_workspace_sticker_favorites AS favorite
-                ON favorite.sticker_uuid = s.uuid AND favorite.user_uuid = %s
-             WHERE s.uuid = ANY(%s::uuid[]) AND s.blocked = FALSE
-             ORDER BY s.uuid
-            """,
-            (user_uuid, list(canonical)),
-        ).fetchall()
-        return [self._record_from_row(row) for row in rows]
-
-    def require_active_for_message(
-        self, session: typing.Any, sticker_uuids: set[str]
-    ) -> None:
-        """Keep newly referenced stickers available until the message is committed."""
-        if not sticker_uuids:
-            return
-        rows = session.execute(
-            """
-            SELECT uuid FROM m_workspace_stickers
-            WHERE uuid = ANY(%s::uuid[]) AND active AND NOT blocked
-            ORDER BY uuid FOR SHARE
-            """,
-            (list(sticker_uuids),),
-        ).fetchall()
-        if len(rows) != len(sticker_uuids):
-            raise StickerRepositoryValidationError()
 
     def find_duplicates(
         self,
@@ -663,9 +571,8 @@ class StickerRepository:
                 """
                 INSERT INTO m_workspace_stickers
                   (uuid, title, alt_text, emoji, tags, search_text, category,
-                   format, width, height, size_bytes, sha256, media_object_id,
-                   active, blocked)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   format, width, height, size_bytes, sha256, media_object_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (sha256) DO NOTHING
                 """,
                 (
@@ -682,8 +589,6 @@ class StickerRepository:
                     sticker.size_bytes,
                     sticker.sha256,
                     sticker.media_object_id,
-                    sticker.active,
-                    sticker.blocked,
                 ),
             )
         return self.find_duplicates(session, [sticker.sha256 for sticker in values])
@@ -691,6 +596,7 @@ class StickerRepository:
     def update(
         self,
         session: typing.Any,
+        user_uuid: sys_uuid.UUID,
         sticker_uuid: sys_uuid.UUID,
         fields: dict[str, typing.Any],
     ) -> StickerRecord | None:
@@ -699,6 +605,8 @@ class StickerRepository:
         unknown = set(fields).difference(sticker_models.STICKER_ADMIN_MUTABLE_FIELDS)
         if unknown:
             raise StickerRepositoryValidationError()
+        if not fields:
+            return self.get(session, user_uuid, sticker_uuid)
         current_rows = session.execute(
             "SELECT * FROM m_workspace_stickers WHERE uuid = %s FOR UPDATE",
             (sticker_uuid,),
@@ -724,8 +632,6 @@ class StickerRepository:
             candidate.validate()
         except (TypeError, ValueError):
             raise StickerRepositoryValidationError() from None
-        if not update_fields:
-            return self._record_from_row(current)
         assignments = []
         params: list[typing.Any] = []
         allowed_columns = (
@@ -735,23 +641,26 @@ class StickerRepository:
             "tags",
             "search_text",
             "category",
-            "active",
-            "blocked",
         )
         for column in allowed_columns:
             if column in update_fields:
                 assignments.append("%s = %%s" % column)
                 params.append(update_fields[column])
-        params.append(sticker_uuid)
-        session.execute(
-            "UPDATE m_workspace_stickers SET %s, updated_at = CURRENT_TIMESTAMP "
-            "WHERE uuid = %%s" % ", ".join(assignments),
+        params.extend((sticker_uuid, user_uuid))
+        updated = session.execute(
+            """
+            UPDATE m_workspace_stickers AS sticker
+               SET %s, updated_at = CURRENT_TIMESTAMP
+             WHERE sticker.uuid = %%s
+            RETURNING sticker.*, EXISTS (
+                SELECT 1 FROM m_workspace_sticker_favorites
+                WHERE sticker_uuid = sticker.uuid AND user_uuid = %%s
+            ) AS is_favorite
+            """
+            % ", ".join(assignments),
             tuple(params),
-        )
-        updated_rows = session.execute(
-            "SELECT * FROM m_workspace_stickers WHERE uuid = %s", (sticker_uuid,)
-        ).fetchall()
-        return self._record_from_row(updated_rows[0]) if updated_rows else None
+        ).fetchone()
+        return self._record_from_row(updated)
 
     def delete(
         self,
@@ -790,26 +699,23 @@ class StickerRepository:
         user_uuid: sys_uuid.UUID,
         sticker_uuid: sys_uuid.UUID,
     ) -> bool:
-        """Idempotently star a visible sticker."""
+        """Idempotently star an existing sticker."""
 
-        visible = session.execute(
+        existing = session.execute(
             """
-            SELECT 1 FROM m_workspace_stickers
-             WHERE uuid = %s AND active = TRUE AND blocked = FALSE
+            WITH sticker AS (
+                SELECT uuid FROM m_workspace_stickers WHERE uuid = %s FOR KEY SHARE
+            ), starred AS (
+                INSERT INTO m_workspace_sticker_favorites (user_uuid, sticker_uuid)
+                SELECT %s, uuid FROM sticker
+                ON CONFLICT (user_uuid, sticker_uuid) DO NOTHING
+            )
+            SELECT uuid FROM sticker
             """,
-            (sticker_uuid,),
-        ).fetchall()
-        if not visible:
-            raise StickerNotVisibleError()
-        session.execute(
-            """
-            INSERT INTO m_workspace_sticker_favorites (user_uuid, sticker_uuid)
-            SELECT %s, uuid FROM m_workspace_stickers
-             WHERE uuid = %s AND active = TRUE AND blocked = FALSE
-            ON CONFLICT (user_uuid, sticker_uuid) DO NOTHING
-            """,
-            (user_uuid, sticker_uuid),
-        )
+            (sticker_uuid, user_uuid),
+        ).fetchone()
+        if existing is None:
+            raise StickerNotFoundError()
         return True
 
     def unstar(

@@ -228,13 +228,13 @@ def public_card_dict(card: sticker_models.StickerCard) -> dict[str, object]:
     }
 
 
-def _public_record(record: typing.Any) -> dict[str, object]:
+def _public_record(record: "sticker_repository.StickerRecord") -> dict[str, object]:
     return public_card_dict(
         build_public_card(record.sticker, is_favorite=record.is_favorite)
     )
 
 
-def _stable_json_bytes(value: object) -> bytes:
+def json_bytes(value: object) -> bytes:
     return json.dumps(
         value,
         ensure_ascii=False,
@@ -258,7 +258,7 @@ def list_public_stickers(
     """Build one private, stable JSON catalog page for the current user."""
 
     page = repository.list_stickers(session, user_uuid, query)
-    body = _stable_json_bytes([_public_record(record) for record in page.items])
+    body = json_bytes([_public_record(record) for record in page.items])
     etag = _etag(body)
     headers = {
         "Cache-Control": "private, no-cache",
@@ -279,7 +279,7 @@ def get_public_sticker(
     repository: typing.Any,
     sticker_uuid: sys_uuid.UUID,
 ) -> dict[str, object]:
-    record = repository.get_active(session, user_uuid, sticker_uuid)
+    record = repository.get(session, user_uuid, sticker_uuid)
     if record is None:
         raise ra_exc.ResourceNotFoundError(
             resource="Sticker",
@@ -289,23 +289,13 @@ def get_public_sticker(
 
 
 def download_sticker(
-    session: typing.Any,
-    user_uuid: sys_uuid.UUID,
-    repository: typing.Any,
-    storage: typing.Any,
-    sticker_uuid: sys_uuid.UUID,
+    sticker: sticker_models.Sticker,
+    storage: sticker_storage.StickerStorage,
     *,
     if_none_match: str | None = None,
 ) -> StickerHttpResponse:
-    """Read media only after the catalog row is known to be downloadable."""
+    """Serve media for a sticker loaded by the action route."""
 
-    records = repository.resolve_batch(session, user_uuid, [sticker_uuid])
-    if not records or records[0].sticker.blocked:
-        raise ra_exc.ResourceNotFoundError(
-            resource="Sticker",
-            path=str(sticker_uuid),
-        )
-    sticker = records[0].sticker
     etag = '"%s"' % sticker.sha256
     cache_headers = {
         "Cache-Control": "private, no-cache",
@@ -318,7 +308,7 @@ def download_sticker(
     except sticker_storage.StickerStorageNotFoundError:
         raise ra_exc.ResourceNotFoundError(
             resource="Sticker",
-            path=str(sticker_uuid),
+            path=str(sticker.uuid),
         ) from None
     return StickerHttpResponse(
         body=body,
@@ -330,54 +320,26 @@ def download_sticker(
     )
 
 
-def star_sticker(
-    session: typing.Any,
-    user_uuid: sys_uuid.UUID,
-    repository: typing.Any,
-    sticker_uuid: sys_uuid.UUID,
-) -> None:
-    """Idempotently add one visible sticker to the current user's favorites."""
-
-    repository.star(session, user_uuid, sticker_uuid)
-
-
-def unstar_sticker(
-    session: typing.Any,
-    user_uuid: sys_uuid.UUID,
-    repository: typing.Any,
-    sticker_uuid: sys_uuid.UUID,
-) -> None:
-    """Idempotently remove one sticker from the current user's favorites."""
-
-    repository.unstar(session, user_uuid, sticker_uuid)
-
-
 def update_sticker(
     session: typing.Any,
     user_uuid: sys_uuid.UUID,
     repository: typing.Any,
     sticker_uuid: sys_uuid.UUID,
     values: dict[str, typing.Any],
-) -> "sticker_repository.StickerRecord":
+) -> dict[str, object]:
     """Update only catalog metadata; media identity remains immutable."""
 
     if not isinstance(values, dict) or not values:
         raise ra_exc.ValidationErrorException()
     if set(values).difference(sticker_models.STICKER_ADMIN_MUTABLE_FIELDS):
         raise ra_exc.ValidationErrorException()
-    updated = repository.update(session, sticker_uuid, values)
-    if updated is None:
-        raise ra_exc.ResourceNotFoundError(
-            resource="Sticker",
-            path=str(sticker_uuid),
-        )
-    record = repository.get_any(session, user_uuid, sticker_uuid)
+    record = repository.update(session, user_uuid, sticker_uuid, values)
     if record is None:
         raise ra_exc.ResourceNotFoundError(
             resource="Sticker",
             path=str(sticker_uuid),
         )
-    return record
+    return _public_record(record)
 
 
 def delete_sticker(

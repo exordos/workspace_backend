@@ -39,8 +39,6 @@ def test_representative_search_volume_uses_tag_and_trigram_indexes(
             1,
             "%064x" % index,
             "performance/%s" % index,
-            True,
-            False,
             timestamp,
             timestamp,
         )
@@ -52,8 +50,8 @@ def test_representative_search_volume_uses_tag_and_trigram_indexes(
                 """
                 INSERT INTO m_workspace_stickers
                   (uuid,title,alt_text,emoji,tags,search_text,category,format,
-                   size_bytes,sha256,media_object_id,active,blocked,created_at,updated_at)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                   size_bytes,sha256,media_object_id,created_at,updated_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """,
                 rows,
             )

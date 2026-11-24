@@ -1223,7 +1223,7 @@ def test_sticker_marks_require_a_verification_for_the_specific_attachment():
         context,
     )
     assert incoming["content"] == (
-        f"**Sticker unavailable** then ![{label}](urn:image:{file_uuid})"
+        f"![sticker](urn:sticker:{sticker_uuid}) then ![{label}](urn:image:{file_uuid})"
     )
 
 

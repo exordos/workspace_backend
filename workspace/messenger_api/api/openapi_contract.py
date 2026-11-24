@@ -1284,10 +1284,6 @@ def add_sticker_catalog_contract(
                             "tags",
                             "category",
                         }
-                    }
-                    | {
-                        "active": {"type": "boolean"},
-                        "blocked": {"type": "boolean"},
                     },
                 }
             ),

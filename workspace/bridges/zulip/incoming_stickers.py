@@ -13,11 +13,11 @@ from workspace.messenger_api.dm import base
 
 
 SELECT_CATALOG_SQL = """
-    SELECT uuid, size_bytes, sha256, NOT blocked AS available
+    SELECT uuid, size_bytes, sha256
     FROM m_workspace_stickers
     WHERE uuid=ANY(%s::uuid[])
     UNION ALL
-    SELECT sticker_uuid, size_bytes, sha256, false
+    SELECT sticker_uuid, size_bytes, sha256
     FROM messenger_sticker_cleanup_tasks
     WHERE sticker_uuid=ANY(%s::uuid[])
 """
@@ -105,7 +105,7 @@ async def verify(
     data, _ = result
     digest = hashlib.sha256(data).hexdigest()
     return {
-        identifier: row["available"]
+        identifier: True
         for identifier, row in candidates.items()
         if row["size_bytes"] == len(data) and row["sha256"] == digest
     }, result

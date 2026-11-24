@@ -48,7 +48,7 @@ def _request(path="/", method="GET", permissions=()):
     return request
 
 
-def _sticker(*, active=True, blocked=False):
+def _sticker():
     return stickers.Sticker(
         uuid=STICKER_UUID,
         title="Да",
@@ -63,8 +63,6 @@ def _sticker(*, active=True, blocked=False):
         size_bytes=5,
         sha256="a" * 64,
         media_object_id="stickers/private/media.gif",
-        active=active,
-        blocked=blocked,
     )
 
 
@@ -194,25 +192,25 @@ def test_list_preserves_json_bytes_etag_and_pagination_through_framework(monkeyp
         assert response.headers[name] == value
 
 
-def test_uuid_batch_route_serializes_hidden_record_and_requests_blocked_filtering(
+def test_uuid_batch_route_omits_missing_stickers(
     monkeypatch,
 ):
-    hidden_uuid = STICKER_UUID
-    blocked_uuid = sys_uuid.UUID("20000000-0000-0000-0000-000000000002")
-    hidden = _sticker(active=False, blocked=False)
+    existing_uuid = STICKER_UUID
+    missing_uuid = sys_uuid.UUID("20000000-0000-0000-0000-000000000002")
+    existing = _sticker()
 
     class Repository:
         def list_stickers(self, session, user_uuid, query):
             assert session is expected_session
             assert user_uuid == USER_UUID
-            assert query.uuids == [hidden_uuid, blocked_uuid]
+            assert query.uuids == [existing_uuid, missing_uuid]
             return sticker_repository.StickerPage(
-                [sticker_repository.StickerRecord(hidden, is_favorite=False)]
+                [sticker_repository.StickerRecord(existing, is_favorite=False)]
             )
 
     expected_session = object()
     request = _request(
-        f"/v1/messenger/stickers/?uuid={hidden_uuid}&uuid={blocked_uuid}",
+        f"/v1/messenger/stickers/?uuid={existing_uuid}&uuid={missing_uuid}",
     )
     controller = sticker_controllers.StickerController(request)
     monkeypatch.setattr(controller, "_session", lambda: expected_session)
@@ -220,11 +218,11 @@ def test_uuid_batch_route_serializes_hidden_record_and_requests_blocked_filterin
 
     response = controller.do_collection()
 
-    assert [item["id"] for item in response.json] == [str(hidden_uuid)]
+    assert [item["id"] for item in response.json] == [str(existing_uuid)]
     assert response.json[0]["media"]["url"] == (
-        f"/api/workspace/v1/messenger/stickers/{hidden_uuid}/actions/download"
+        f"/api/workspace/v1/messenger/stickers/{existing_uuid}/actions/download"
     )
-    assert str(blocked_uuid) not in response.text
+    assert str(missing_uuid) not in response.text
 
 
 def test_item_get_uses_standard_hook_and_returns_public_allowlist(monkeypatch):
@@ -276,16 +274,13 @@ def test_admin_update_checks_permission_before_body_and_returns_public_allowlist
     )
     authorized.body = json.dumps({"title": "Новое название"}).encode()
     controller = sticker_controllers.StickerController(authorized)
-    monkeypatch.setattr(controller, "_session", lambda: object())
-    monkeypatch.setattr(controller, "_repository", lambda: object())
-    monkeypatch.setattr(
-        sticker_catalog,
-        "update_sticker",
-        lambda *args: sticker_repository.StickerRecord(
-            _sticker(active=False, blocked=True),
-            is_favorite=True,
-        ),
+    session = object()
+    repository = mock.Mock(spec=["update"])
+    repository.update.return_value = sticker_repository.StickerRecord(
+        _sticker(), is_favorite=True
     )
+    monkeypatch.setattr(controller, "_session", lambda: session)
+    monkeypatch.setattr(controller, "_repository", lambda: repository)
 
     response = controller.do_resource(str(STICKER_UUID))
     payload = response.json
@@ -302,6 +297,9 @@ def test_admin_update_checks_permission_before_body_and_returns_public_allowlist
     }
     assert set(payload["media"]) == {"format", "height", "url"}
     assert payload["is_favorite"] is True
+    repository.update.assert_called_once_with(
+        session, USER_UUID, STICKER_UUID, {"title": "Новое название"}
+    )
     assert "media_object_id" not in response.text
     assert "private" not in response.text
 
@@ -343,7 +341,6 @@ def test_admin_delete_checks_permission_and_enqueues_cleanup(monkeypatch):
         {"title": 123},
         {"tags": "ab"},
         {"tags": ["valid", 123]},
-        {"active": "false"},
         {"category": 123},
     ],
 )
@@ -415,13 +412,8 @@ def test_admin_update_rejects_unknown_and_read_only_fields_before_service(
     assert invalid.value.code in {400, 403}
 
 
-@pytest.mark.parametrize("active,blocked", [(False, False), (False, True)])
-def test_item_action_preload_uses_persisted_sticker_not_public_visibility(
-    monkeypatch,
-    active,
-    blocked,
-):
-    expected = _sticker(active=active, blocked=blocked)
+def test_item_action_preload_uses_persisted_sticker(monkeypatch):
+    expected = _sticker()
     get_one = mock.Mock(return_value=expected)
     monkeypatch.setattr(
         stickers.Sticker,
@@ -469,9 +461,8 @@ def test_download_action_preserves_raw_binary_response(monkeypatch):
     request = _request()
     request.headers["If-None-Match"] = '"previous"'
     controller = sticker_controllers.StickerController(request)
-    monkeypatch.setattr(controller, "_session", lambda: object())
-    monkeypatch.setattr(controller, "_repository", lambda: object())
-    monkeypatch.setattr(controller, "_storage", lambda: object())
+    sticker, storage = _sticker(), object()
+    monkeypatch.setattr(controller, "_storage", lambda: storage)
     calls = []
 
     def download_sticker(*args, **kwargs):
@@ -492,13 +483,13 @@ def test_download_action_preserves_raw_binary_response(monkeypatch):
         download_sticker,
     )
 
-    response = controller.download._get(controller, _sticker())
+    response = controller.download._get(controller, sticker)
 
     assert response.body == b"GIF89a"
     assert response.content_type == "image/gif"
     assert response.headers["ETag"] == '"hash"'
     assert response.headers["Cache-Control"] == "private, no-cache"
-    assert calls[0][1] == {"if_none_match": '"previous"'}
+    assert calls == [((sticker, storage), {"if_none_match": '"previous"'})]
 
 
 def test_collection_import_permission_precedes_multipart_access():
@@ -737,7 +728,7 @@ def test_openapi_exposes_exact_public_sticker_contract():
     assert delete["x-required-permission"] == "workspace.sticker_catalog.manage"
     assert set(
         update["requestBody"]["content"]["application/json"]["schema"]["properties"]
-    ) == {"title", "alt_text", "emoji", "tags", "category", "active", "blocked"}
+    ) == {"title", "alt_text", "emoji", "tags", "category"}
     import_operation = paths[f"{root}stickers/actions/import_archive/invoke"]["post"]
     multipart = import_operation["requestBody"]["content"]
     assert set(multipart) == {"multipart/form-data"}

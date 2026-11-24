@@ -92,8 +92,6 @@ def test_sticker_catalog_migration_round_trip_schema_constraints_indexes_and_gra
             ("m_workspace_stickers", "size_bytes", "NO", None),
             ("m_workspace_stickers", "sha256", "NO", None),
             ("m_workspace_stickers", "media_object_id", "NO", None),
-            ("m_workspace_stickers", "active", "NO", "true"),
-            ("m_workspace_stickers", "blocked", "NO", "false"),
             (
                 "m_workspace_stickers",
                 "created_at",
@@ -134,11 +132,6 @@ def test_sticker_catalog_migration_round_trip_schema_constraints_indexes_and_gra
                     "FOREIGN KEY (sticker_uuid) REFERENCES "
                     "m_workspace_stickers(uuid) ON DELETE CASCADE"
                 ),
-            ),
-            (
-                "m_workspace_stickers_active_blocked_check",
-                "c",
-                "CHECK ((NOT (active AND blocked)))",
             ),
             (
                 "m_workspace_stickers_category_check",
@@ -259,11 +252,10 @@ def test_sticker_catalog_migration_round_trip_schema_constraints_indexes_and_gra
             (str(sys_uuid.uuid4()), str(sticker_uuid)),
         )
         cursor.execute(
-            "SELECT category, width, height, active, blocked "
-            "FROM m_workspace_stickers WHERE uuid = %s",
+            "SELECT category, width, height FROM m_workspace_stickers WHERE uuid = %s",
             (str(sticker_uuid),),
         )
-        assert cursor.fetchone() == ("sticker", None, None, True, False)
+        assert cursor.fetchone() == ("sticker", None, None)
 
         with pytest.raises(psycopg.errors.UniqueViolation):
             cursor.execute(
@@ -301,16 +293,6 @@ def test_sticker_catalog_migration_round_trip_schema_constraints_indexes_and_gra
                     f"UPDATE m_workspace_stickers SET {column} = 0 WHERE uuid = %s",
                     (str(sticker_uuid),),
                 )
-        with pytest.raises(psycopg.errors.CheckViolation):
-            cursor.execute(
-                """
-                INSERT INTO m_workspace_stickers (
-                    title, alt_text, emoji, tags, search_text, format,
-                    size_bytes, sha256, media_object_id, active, blocked
-                ) VALUES ('x', 'x', '{}', '{}', 'x', 'png', 1, %s, 'x', TRUE, TRUE)
-                """,
-                ("g" * 64,),
-            )
         cursor.execute(
             "DELETE FROM m_workspace_stickers WHERE uuid = %s", (str(sticker_uuid),)
         )

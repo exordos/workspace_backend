@@ -604,7 +604,7 @@ def test_sticker_import_verifies_bytes_and_preserves_per_link_meaning(
     )
 
 
-def test_deleted_sticker_placeholder_keeps_surrounding_text(
+def test_deleted_sticker_reference_keeps_surrounding_text(
     incoming, tmp_path, monkeypatch
 ):
     api, db, account, http, _url = incoming
@@ -634,7 +634,7 @@ def test_deleted_sticker_placeholder_keeps_surrounding_text(
     assert len(files) == 1 and files[0][0] == spoof
     content = api.get("/v1/messenger/messages/").json()[0]["payload"]["content"]
     assert content == (
-        "Before **Sticker unavailable** after. "
+        f"Before ![sticker](urn:sticker:{sticker}) after. "
         f"![workspace-sticker:v1:{sticker}](urn:image:{files[0][1]})"
     )
 

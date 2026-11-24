@@ -939,7 +939,7 @@ def test_sticker_send_recovers_lost_upload_response_and_edit_hides_unavailable_s
     api, account, _, message, *_ = outgoing
     monkeypatch.setenv("WORKSPACE_FILE_STORAGE_PATH", str(tmp_path))
     sticker_uuid = uuid.uuid4()
-    blocked_uuid = uuid.uuid4()
+    unknown_uuid = uuid.uuid4()
     media = b"sticker bytes"
     digest = hashlib.sha256(media).hexdigest()
     object_id = (
@@ -951,17 +951,15 @@ def test_sticker_send_recovers_lost_upload_response_and_edit_hides_unavailable_s
         """
         INSERT INTO m_workspace_stickers (
             uuid, title, alt_text, emoji, tags, search_text, format,
-            size_bytes, sha256, media_object_id, active, blocked
-        ) VALUES
-            (%s, 'Sticker', '', '{}', '{}', '', 'png', %s, %s, %s, true, false),
-            (%s, 'Other sticker', '', '{}', '{}', '', 'png', 1, 'other', 'unused', true, false)
+            size_bytes, sha256, media_object_id
+        ) VALUES (%s, 'Sticker', '', '{}', '{}', '', 'png', %s, %s, %s)
         """,
-        (sticker_uuid, len(media), digest, object_id, blocked_uuid),
+        (sticker_uuid, len(media), digest, object_id),
     )
     reference = f"![sticker](urn:sticker:{sticker_uuid})"
-    blocked_reference = f"![sticker](urn:sticker:{blocked_uuid})"
+    unknown_reference = f"![sticker](urn:sticker:{unknown_uuid})"
     message["content"] = (
-        f"before {reference} again {reference} after {blocked_reference}"
+        f"before {reference} again {reference} after {unknown_reference}"
     )
     public = create(outgoing)
 
@@ -970,10 +968,6 @@ def test_sticker_send_recovers_lost_upload_response_and_edit_hides_unavailable_s
             service,
             server,
         ):
-            await service.db.sql(
-                "UPDATE m_workspace_stickers SET active=false, blocked=true WHERE uuid=%s",
-                (blocked_uuid,),
-            )
             server.lose_upload_response = True
             await drain(service)
             assert len(server.attachments) == len(server.messages) == 1
@@ -999,7 +993,7 @@ def test_sticker_send_recovers_lost_upload_response_and_edit_hides_unavailable_s
                 json={
                     "payload": {
                         "kind": "markdown",
-                        "content": f"edited {reference} {blocked_reference}",
+                        "content": f"edited {reference} {unknown_reference}",
                     },
                 },
             )
@@ -1014,8 +1008,8 @@ def test_sticker_send_recovers_lost_upload_response_and_edit_hides_unavailable_s
         asyncio.run(run())
     finally:
         db.execute(
-            "DELETE FROM m_workspace_stickers WHERE uuid=ANY(%s)",
-            ([sticker_uuid, blocked_uuid],),
+            "DELETE FROM m_workspace_stickers WHERE uuid=%s",
+            (sticker_uuid,),
         )
 
 

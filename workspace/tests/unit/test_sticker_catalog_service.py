@@ -24,8 +24,6 @@ SHA256 = hashlib.sha256(b"media").hexdigest()
 
 def _record(
     *,
-    active: bool = True,
-    blocked: bool = False,
     is_favorite: bool = True,
     media_object_id: str = "stickers/moved/media.gif",
 ) -> sticker_repository.StickerRecord:
@@ -45,8 +43,6 @@ def _record(
             size_bytes=5,
             sha256=SHA256,
             media_object_id=media_object_id,
-            active=active,
-            blocked=blocked,
             created_at=now,
             updated_at=now,
         ),
@@ -55,18 +51,13 @@ def _record(
 
 
 class _Repository:
-    def __init__(self, *, resolved=None, page=None):
-        self.resolved = list(resolved or [])
+    def __init__(self, *, page=None):
         self.page = page or sticker_repository.StickerPage([])
         self.calls = []
 
     def list_stickers(self, session, user_uuid, query):
         self.calls.append(("list", session, user_uuid, query))
         return self.page
-
-    def resolve_batch(self, session, user_uuid, sticker_uuids):
-        self.calls.append(("resolve", session, user_uuid, list(sticker_uuids)))
-        return self.resolved
 
 
 class _Storage:
@@ -169,23 +160,10 @@ def test_list_matching_if_none_match_returns_304_without_body():
     assert "X-Pagination-Marker" not in cached.headers
 
 
-@pytest.mark.parametrize("available", [False, True])
-def test_download_checks_database_before_storage_and_uses_stored_object_id(available):
-    record = _record(active=False)
-    repository = _Repository(resolved=[record] if available else [])
+def test_download_uses_stored_object_id():
     storage = _Storage()
 
-    if not available:
-        with pytest.raises(ra_exc.ResourceNotFoundError):
-            sticker_catalog.download_sticker(
-                object(), USER_UUID, repository, storage, STICKER_UUID
-            )
-        assert storage.calls == []
-        return
-
-    response = sticker_catalog.download_sticker(
-        object(), USER_UUID, repository, storage, STICKER_UUID
-    )
+    response = sticker_catalog.download_sticker(_record().sticker, storage)
     assert storage.calls == ["stickers/moved/media.gif"]
     assert response.body == b"media"
     assert response.status == 200
@@ -196,16 +174,12 @@ def test_download_checks_database_before_storage_and_uses_stored_object_id(avail
     }
 
 
-def test_download_matching_if_none_match_revalidates_before_storage_read():
-    repository = _Repository(resolved=[_record(active=False)])
+def test_download_matching_if_none_match_avoids_storage_read():
     storage = _Storage()
 
     response = sticker_catalog.download_sticker(
-        object(),
-        USER_UUID,
-        repository,
+        _record().sticker,
         storage,
-        STICKER_UUID,
         if_none_match=f'"{SHA256}"',
     )
 
@@ -220,33 +194,11 @@ def test_download_matching_if_none_match_revalidates_before_storage_read():
     assert storage.calls == []
 
 
-def test_download_never_reads_storage_for_blocked_record():
-    storage = _Storage()
-
-    with pytest.raises(ra_exc.ResourceNotFoundError):
-        sticker_catalog.download_sticker(
-            object(),
-            USER_UUID,
-            _Repository(resolved=[_record(active=False, blocked=True)]),
-            storage,
-            STICKER_UUID,
-            if_none_match=f'"{SHA256}"',
-        )
-
-    assert storage.calls == []
-
-
 def test_download_maps_missing_storage_object_to_safe_not_found():
     storage = _Storage(error=sticker_storage.StickerStorageNotFoundError())
 
     with pytest.raises(ra_exc.ResourceNotFoundError) as error:
-        sticker_catalog.download_sticker(
-            object(),
-            USER_UUID,
-            _Repository(resolved=[_record()]),
-            storage,
-            STICKER_UUID,
-        )
+        sticker_catalog.download_sticker(_record().sticker, storage)
 
     assert "stickers/moved" not in str(error.value)
 

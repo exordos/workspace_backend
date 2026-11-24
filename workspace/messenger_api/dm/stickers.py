@@ -46,7 +46,7 @@ STICKER_FILE_PATH_TYPE = types.String(
     max_length=MAX_FILE_PATH_LENGTH,
 )
 STICKER_ADMIN_MUTABLE_FIELDS = frozenset(
-    {"title", "alt_text", "emoji", "tags", "category", "active", "blocked"}
+    {"title", "alt_text", "emoji", "tags", "category"}
 )
 STICKER_INTERNAL_FIELDS = frozenset(
     {
@@ -210,12 +210,8 @@ class Sticker(
         required=True,
         read_only=True,
     )
-    active = properties.property(_StrictBoolean(), default=True)
-    blocked = properties.property(_StrictBoolean(), default=False)
 
     def validate(self) -> None:
-        if self.active and self.blocked:
-            raise ValueError("active and blocked cannot both be true")
         if type(self.width) is bool or type(self.height) is bool:
             raise ValueError("width and height must be positive integers")
         if not re.fullmatch(r"[0-9a-f]{64}", self.sha256):

@@ -263,56 +263,13 @@ def _url_target(token: str) -> str:
 
 _LINKS = r"\\[^\n]|!?\[|<?https?://[^\s<>`]+>?|/user_uploads/[^\s<>`]+"
 _LINK_TOKENS = re.compile(_LINKS)
-_FENCE_LINE = r"^ {0,3}(?:`{3,}[^`\n]*|~{3,}[^\n]*)\n"
-_QUOTE_MARKER = r" {0,3}>[ \t]?"
-_BLOCKQUOTE_PREFIX = rf"^(?:{_QUOTE_MARKER})+"
-_INLINE_CODE_BOUNDARY = (
-    rf"{_FENCE_LINE}|{_BLOCKQUOTE_PREFIX}|\n[ \t]*\n"
-    r"|^ {0,3}(?:#{1,6}(?:[ \t]|$)|(?:[-+*]|1[.)])[ \t]+)"
-)
-_RENDERED_LINK_TOKENS = re.compile(
-    rf"(?P<fence>{_FENCE_LINE})|(?P<code>`+)"
-    rf"|(?P<quote>(?:{_BLOCKQUOTE_PREFIX}[^\n]*(?:\n|$))+)|{_LINKS}",
-    re.MULTILINE,
-)
 
 
-def _message_links(
-    text: str, *, skip_code: bool = False
-) -> collections.abc.Iterator[tuple[str, bool, str | None]]:
-    tokens = _RENDERED_LINK_TOKENS if skip_code else _LINK_TOKENS
+def _message_links(text: str) -> collections.abc.Iterator[tuple[str, bool, str | None]]:
     position = 0
-    while match := tokens.search(text, position):
+    while match := _LINK_TOKENS.search(text, position):
         position = match.end()
         token = match[0]
-        if match.lastgroup == "fence":
-            block = _fenced(text, match.start(), allow_unclosed=True)
-            if block is not None:
-                info, body, position = block
-                if info.lower() == "quote" or re.match(
-                    r"spoiler(?:[ \t]|$)", info, re.I
-                ):
-                    yield from _message_links(body, skip_code=True)
-            continue
-        if match.lastgroup == "quote":
-            # Strip the shared nesting only. Outdents end inner code fences.
-            depth = min(
-                prefix[0].count(">")
-                for prefix in re.finditer(_BLOCKQUOTE_PREFIX, token, re.MULTILINE)
-            )
-            body = re.sub(
-                rf"^(?:{_QUOTE_MARKER}){{{depth}}}", "", token, flags=re.MULTILINE
-            )
-            yield from _message_links(body, skip_code=True)
-            continue
-        if match.lastgroup == "code":
-            end = re.compile(
-                rf"{_INLINE_CODE_BOUNDARY}|(?P<close>(?<!`){token}(?!`))",
-                re.MULTILINE,
-            ).search(text, position)
-            if end is not None and end.lastgroup == "close":
-                position = end.end()
-            continue
         if token.startswith("\\"):
             continue
         if token in ("[", "!["):
@@ -324,11 +281,9 @@ def _message_links(
             yield _url_target(token), False, None
 
 
-def workspace_references(
-    text: str, *, skip_code: bool = False
-) -> collections.abc.Iterator[tuple[str, str, str]]:
+def workspace_references(text: str) -> collections.abc.Iterator[tuple[str, str, str]]:
     """Yield parsed Workspace links; malformed references remain ordinary text."""
-    for target, _image, _label in _message_links(text, skip_code=skip_code):
+    for target, _image, _label in _message_links(text):
         reference = _workspace_reference(target)
         if reference is not None:
             yield reference
@@ -385,18 +340,6 @@ def workspace_reference_text(text: str) -> str:
     return "\n".join(contents)
 
 
-def workspace_sticker_references(text: str) -> collections.abc.Iterator[str]:
-    """Yield rendered sticker links, including those in quotes and forwards."""
-    contents = [text]
-    for content in contents:
-        content = content.replace("\r\n", "\n").replace("\r", "\n")
-        for kind, identifier, query in workspace_references(content, skip_code=True):
-            if kind == "sticker":
-                yield identifier
-            else:
-                contents.extend(_reference_contents(kind, query))
-
-
 def get_workspace_files(payload: dict, *, include_quotes: bool = False) -> list[str]:
     """Return this message's file URNs in occurrence order, excluding quotes."""
     text = message_payloads.markdown_content(payload)
@@ -409,9 +352,7 @@ def get_workspace_files(payload: dict, *, include_quotes: bool = False) -> list[
     ]
 
 
-def _fenced(
-    text: str, start: int, *, allow_unclosed: bool = False
-) -> tuple[str, str, int] | None:
+def _fenced(text: str, start: int) -> tuple[str, str, int] | None:
     opening = _FENCE.match(text, start)
     if opening is None:
         return None
@@ -422,8 +363,6 @@ def _fenced(
         re.MULTILINE,
     )
     if closing is None:
-        if allow_unclosed:
-            return opening["info"].strip(), text[opening.end() :], len(text)
         return None
     body = text[opening.end() : opening.end() + closing.start()].removesuffix("\n")
     return opening["info"].strip(), body, opening.end() + closing.end()
@@ -518,10 +457,9 @@ class _ZulipToWorkspace:
         if identifier is None:
             return None
         verified = self.context.get("stickers", {}).get(target, {}).get(identifier)
+        # Older prepared batches store False for verified deleted stickers.
         if verified is None:
             return None
-        if not verified:
-            return STICKER_UNAVAILABLE
         return _markdown_link("sticker", f"urn:sticker:{identifier}", image=True)
 
     def block_notice(self, description: str, source: str) -> str:

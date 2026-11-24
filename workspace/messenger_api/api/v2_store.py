@@ -5,7 +5,6 @@
 
 """Messenger v2 store behind the unchanged Workspace v1 HTTP contract."""
 
-import collections
 import contextlib
 import json
 import typing
@@ -16,11 +15,9 @@ from restalchemy.common import exceptions as ra_exceptions
 from restalchemy.dm import filters as dm_filters
 from restalchemy.storage.sql import filters as sql_filters
 
-from workspace.bridges.zulip import message_conversion
 from workspace.messenger_api import message_flags
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api import exceptions as messenger_exceptions
-from workspace.messenger_api import sticker_repository
 from workspace.messenger_api.api import outgoing
 from workspace.messenger_api.api import poll_reads
 from workspace.messenger_api.api import poll_store
@@ -95,17 +92,6 @@ def _public(row: typing.Any, resource: str) -> dict[str, typing.Any]:
     if not values:
         raise ra_exceptions.ResourceNotFoundError(resource=resource, path=str(row.uuid))
     return values[0]
-
-
-def _sticker_references(payload: dict[str, typing.Any]) -> collections.Counter[str]:
-    content = message_payloads.markdown_content(payload)
-    lower_content = content.lower()
-    if not any(
-        prefix in lower_content
-        for prefix in ("urn:sticker:", "urn:forward:", "urn:quote:")
-    ):
-        return collections.Counter()
-    return collections.Counter(message_conversion.workspace_sticker_references(content))
 
 
 class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
@@ -1008,9 +994,6 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             or existing_canonical["provider_uuid"] != stream.provider_uuid
         ):
             raise ra_exceptions.ValidationErrorException()
-        sticker_repository.StickerRepository().require_active_for_message(
-            session, set(_sticker_references(canonical_payload))
-        )
         now = session.execute("SELECT NOW() AS value", ()).fetchone()["value"]
         if existing_canonical is None:
             inserted = session.execute(
@@ -1141,28 +1124,6 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             raise ra_exceptions.ValidationErrorException()
         canonical_payload = resource_projection.simple(values["payload"])
         message.validate_payload_update(canonical_payload, session)
-        sticker_references = _sticker_references(canonical_payload)
-        if sticker_references:
-            current = session.execute(
-                """
-                SELECT content_uuid FROM messenger_messages
-                WHERE project_id = %s AND uuid = %s
-                FOR NO KEY UPDATE
-                """,
-                (self.project_uuid, message.canonical_message_uuid),
-            ).fetchone()
-            if current is None:
-                raise ra_exceptions.ResourceNotFoundError(
-                    resource="messages", path=str(message_uuid)
-                )
-            # Fetch the payload after taking the row lock to see any prior edit.
-            current_payload = session.execute(
-                "SELECT workspace_content FROM messenger_message_contents WHERE uuid = %s",
-                (current["content_uuid"],),
-            ).fetchone()["workspace_content"]
-            sticker_repository.StickerRepository().require_active_for_message(
-                session, set(sticker_references - _sticker_references(current_payload))
-            )
         payload = json.dumps(canonical_payload)
         changed = session.execute(
             """

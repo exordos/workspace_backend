@@ -3,7 +3,6 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
-import json
 import typing
 import uuid as sys_uuid
 
@@ -29,31 +28,6 @@ from workspace.messenger_api.dm import stickers
 _QUERY_PARAMETERS = frozenset(
     ("q", "favorite", "uuid", "category", "format", "page_limit", "page_marker")
 )
-
-
-def _json_bytes(value: object) -> bytes:
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-
-
-def _json_response(value: object, status: int = 200) -> webob.Response:
-    return webob.Response(
-        body=_json_bytes(value),
-        status=status,
-        headers={"Content-Type": "application/json; charset=UTF-8"},
-    )
-
-
-def _http_response(result: sticker_catalog.StickerHttpResponse) -> webob.Response:
-    return webob.Response(
-        body=result.body,
-        status=result.status,
-        headerlist=list(result.headers.items()),
-    )
 
 
 class StickerJSONPackerPreEncoded(ra_packers.JSONPackerPreEncoded):
@@ -108,7 +82,7 @@ class StickerController(ra_controllers.BaseResourceController):
         content_type: typing.Any,
         resource_type: typing.Any = None,
     ) -> typing.Any:
-        if self.request.method in {"PUT", "DELETE"}:
+        if self.request.method == "PUT":
             permission_guards.require_iam_permission(
                 self.get_context(),
                 sticker_catalog.STICKER_CATALOG_MANAGE_PERMISSION,
@@ -161,7 +135,7 @@ class StickerController(ra_controllers.BaseResourceController):
 
     def get(self, uuid: object, **kwargs: typing.Any) -> bytes:
         del kwargs
-        return _json_bytes(
+        return sticker_catalog.json_bytes(
             sticker_catalog.get_public_sticker(
                 self._session(),
                 self._user_uuid(),
@@ -171,19 +145,13 @@ class StickerController(ra_controllers.BaseResourceController):
         )
 
     def update(self, uuid: object, **kwargs: typing.Any) -> bytes:
-        updated = sticker_catalog.update_sticker(
-            self._session(),
-            self._user_uuid(),
-            self._repository(),
-            typing.cast(sys_uuid.UUID, uuid),
-            kwargs,
-        )
-        return _json_bytes(
-            sticker_catalog.public_card_dict(
-                sticker_catalog.build_public_card(
-                    updated.sticker,
-                    is_favorite=updated.is_favorite,
-                )
+        return sticker_catalog.json_bytes(
+            sticker_catalog.update_sticker(
+                self._session(),
+                self._user_uuid(),
+                self._repository(),
+                typing.cast(sys_uuid.UUID, uuid),
+                kwargs,
             )
         )
 
@@ -239,14 +207,15 @@ class StickerController(ra_controllers.BaseResourceController):
     ) -> webob.Response:
         del args, kwargs
         result = sticker_catalog.download_sticker(
-            self._session(),
-            self._user_uuid(),
-            self._repository(),
+            resource,
             self._storage(),
-            resource.uuid,
             if_none_match=self.request.headers.get("If-None-Match"),
         )
-        return _http_response(result)
+        return webob.Response(
+            body=result.body,
+            status=result.status,
+            headerlist=list(result.headers.items()),
+        )
 
     @ra_actions.post
     def star(
@@ -256,9 +225,7 @@ class StickerController(ra_controllers.BaseResourceController):
         **kwargs: typing.Any,
     ) -> webob.Response:
         del args, kwargs
-        sticker_catalog.star_sticker(
-            self._session(), self._user_uuid(), self._repository(), resource.uuid
-        )
+        self._repository().star(self._session(), self._user_uuid(), resource.uuid)
         return webob.Response(status=200)
 
     @ra_actions.post
@@ -269,9 +236,7 @@ class StickerController(ra_controllers.BaseResourceController):
         **kwargs: typing.Any,
     ) -> webob.Response:
         del args, kwargs
-        sticker_catalog.unstar_sticker(
-            self._session(), self._user_uuid(), self._repository(), resource.uuid
-        )
+        self._repository().unstar(self._session(), self._user_uuid(), resource.uuid)
         return webob.Response(status=200)
 
     @ra_actions.post
@@ -298,4 +263,7 @@ class StickerController(ra_controllers.BaseResourceController):
             )
         except sticker_import.StickerImportValidationError:
             raise ra_exceptions.ValidationErrorException() from None
-        return _json_response(result.to_simple_type())
+        return webob.Response(
+            body=sticker_catalog.json_bytes(result.to_simple_type()),
+            headers={"Content-Type": "application/json; charset=UTF-8"},
+        )
