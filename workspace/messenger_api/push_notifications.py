@@ -104,6 +104,7 @@ def build_event(
             ).hexdigest(),
         )
         event["_registration_updated_at"] = device.updated_at.isoformat()
+        event["_registration_public_key"] = device.encryption.public_key
         content = dict(
             content,
             **{

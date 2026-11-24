@@ -170,7 +170,11 @@ class PushEventHttpClient(event_clients.HttpEventClient):
             body = {
                 key: value
                 for key, value in event.event_data.body.items()
-                if key not in ("_membership_generation", "_registration_updated_at")
+                if key not in (
+                    "_membership_generation",
+                    "_registration_public_key",
+                    "_registration_updated_at",
+                )
             }
             if _is_apns(body):
                 params = body["event_params"]
@@ -228,8 +232,15 @@ def _registration_matches(
     ):
         return False
     if _is_apns(body):
+        public_key = body.get("_registration_public_key")
+        if public_key is None:
+            # Older queued snapshots only carry the registration timestamp.
+            same_key = device.updated_at.isoformat() == body["_registration_updated_at"]
+        else:
+            same_key = device.encryption.public_key == public_key
         return (
-            push_devices.APNS_ENVIRONMENTS.get(device.transport)
+            same_key
+            and push_devices.APNS_ENVIRONMENTS.get(device.transport)
             == params["apns_environment"]
         )
     return device.transport == push_devices.PushDeviceTransport.FCM.value
