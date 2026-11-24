@@ -9,7 +9,6 @@ import re
 import typing
 
 from cryptography.hazmat.primitives.asymmetric import x25519
-
 from restalchemy.common import exceptions as ra_exc
 from restalchemy.dm import models
 from restalchemy.dm import properties

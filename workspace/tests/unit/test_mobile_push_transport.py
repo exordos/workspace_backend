@@ -10,20 +10,22 @@ import pathlib
 import shlex
 import subprocess
 import threading
-import uuid
 from unittest import mock
+import uuid
 
+from gcl_sdk.events.dm import models as sdk_models
+from gcl_sdk.events.services import senders
 import jinja2
+from oslo_config import cfg
 import pytest
 import yaml
-from gcl_sdk.events.services import senders
-from gcl_sdk.events.dm import models as sdk_models
-from oslo_config import cfg
 
-from workspace.common import config, mobile_push_opts
+from workspace.common import config
+from workspace.common import mobile_push_opts
 from workspace.messenger_api import push_events
 from workspace.messenger_api import push_notifications
 from workspace.messenger_api.dm import push_events as event_payloads
+
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 

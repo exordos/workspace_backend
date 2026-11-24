@@ -21,12 +21,11 @@ import re
 import time
 import typing
 
+from gcl_iam import middlewares as iam_middlewares
+from oslo_config import cfg
+from restalchemy.api import middlewares
 import webob
 
-from gcl_iam import middlewares as iam_middlewares
-from restalchemy.api import middlewares
-
-from oslo_config import cfg
 from workspace.common import mobile_push_opts
 from workspace.messenger_api import exceptions as messenger_exceptions
 from workspace.messenger_api.api import versions

@@ -6,11 +6,11 @@ import base64
 import datetime
 import json
 import pathlib
-import uuid as sys_uuid
 from unittest import mock
+import uuid as sys_uuid
 
-import pytest
 from cryptography.hazmat.primitives.asymmetric import x25519
+import pytest
 from restalchemy.storage.sql import migrations
 
 from workspace.messenger_api import push_hpke as hpke
