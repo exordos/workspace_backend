@@ -152,3 +152,11 @@ def build_event(
     }
     event["event_params"]["payload"] = _compact_json(payload)
     return event
+
+
+def apns_payload(snapshot: str, priority: str) -> str:
+    # The system can display the fallback without decrypting the preview.
+    aps = {"content-available": 1}
+    if priority == "high":
+        aps.update(alert={"loc-key": "WORKSPACE_PUSH_NEW_MESSAGE"}, sound="default")
+    return _compact_json({"aps": aps, "workspace": json.loads(snapshot)})

@@ -121,13 +121,18 @@ def test_apns_event_uses_own_token_for_submission_and_status(notification_http):
         endpoint, "synthetic-fcm", "synthetic-apns"
     )
     event_id = uuid.uuid4()
+    snapshot = '{"content":{"ciphertext":"synthetic"}}'
     event = sdk_models.Event(
         uuid=event_id,
         event_type=sdk_models.UserEvent(uuid=uuid.uuid4(), user_id=uuid.uuid4()),
         event_data=event_payloads.WorkspacePushEventPayload(
             body={
                 "uuid": str(event_id),
-                "event_params": {"apns_environment": "sandbox"},
+                "event_params": {
+                    "apns_environment": "sandbox",
+                    "payload": snapshot,
+                    "priority": "high",
+                },
                 "_registration_updated_at": "internal",
             }
         ),
@@ -138,7 +143,17 @@ def test_apns_event_uses_own_token_for_submission_and_status(notification_http):
     client.send_event(event)
     assert client.get_apns_event(str(event_id))["uuid"] == str(event_id)
     assert [header for _, header, _ in received] == ["Bearer synthetic-apns"] * 2
-    assert "_registration_updated_at" not in json.loads(received[0][2])
+    posted = json.loads(received[0][2])
+    assert "_registration_updated_at" not in posted
+    assert json.loads(posted["event_params"]["payload"]) == {
+        "aps": {
+            "content-available": 1,
+            "alert": {"loc-key": "WORKSPACE_PUSH_NEW_MESSAGE"},
+            "sound": "default",
+        },
+        "workspace": json.loads(snapshot),
+    }
+    assert event.event_data.body["event_params"]["payload"] == snapshot
 
 
 def test_apns_companion_uses_a_separate_event_and_existing_sender():

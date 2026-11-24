@@ -113,15 +113,16 @@ receipt, decryption, notification display, and navigation on a physical device.
 
 Keep the existing direct or mesh Firebase connector active for the common
 push handler, sender, installation UUID and HTTPS endpoint. With APNs-capable
-Workspace and Notification builds, install `notification_apns` on the local
-Notification and then install `workspace_apns_push`. The companion element
-adds a separate event type, template and scoped Core IAM token and uses the
-existing services. iOS delivery goes directly from the local Notification to
+Workspace and Notification builds, install `workspace_apns_push`. This
+element configures the Workspace app's APNs provider on the local Notification
+and adds a separate event type, template and scoped Core IAM token. iOS delivery goes directly from the local Notification to
 APNs in both topologies. Android still uses its selected connector.
 
-Provision `notification-apns-credentials` on Notification as described in
-the [APNs transport documentation](https://github.com/exordos/exordos_notification/blob/master/docs/apns.md).
-The Apple credential is confined to Notification. The iOS app uses the same
+Set the `notification-apns-credentials` value in Core Secrets. Use a JSON
+object keyed by `sandbox`, `production`, or both. Each configured environment
+needs its Apple `team_id`, `key_id`, and PEM `private_key`. The element places
+the credential on the local Notification node and restarts its delivery worker
+when the secret changes. The iOS app uses the same
 device registration endpoint and HPKE wire format. It registers platform
 `ios` with transport `apns_sandbox` for a development-signed app or
 `apns` for distribution. The token is the lowercase hexadecimal APNs
