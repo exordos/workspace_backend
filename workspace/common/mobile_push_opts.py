@@ -15,6 +15,17 @@ OPTS = [
         secret=True,
         help="Platform-managed bearer token used by the push sender",
     ),
+    cfg.BoolOpt(
+        "apns-enabled",
+        default=False,
+        help="Enable native Workspace push to iOS devices",
+    ),
+    cfg.StrOpt(
+        "apns-notification-token",
+        default="",
+        secret=True,
+        help="Platform-managed bearer token scoped to Workspace APNs events",
+    ),
 ]
 cfg.CONF.register_opts(OPTS, DOMAIN)
 
@@ -22,3 +33,7 @@ cfg.CONF.register_opts(OPTS, DOMAIN)
 def enabled() -> bool:
     options = cfg.CONF[DOMAIN]
     return bool(options.organization_uuid and options.notification_endpoint)
+
+
+def apns_enabled() -> bool:
+    return enabled() and cfg.CONF[DOMAIN].apns_enabled

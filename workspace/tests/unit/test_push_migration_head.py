@@ -14,8 +14,10 @@ def test_sdk_push_migration_follows_current_master_without_rebase_joins():
     head = engine.get_latest_migration()
     steps = engine.get_all_migrations()
     sdk = "0306-Use-SDK-events-for-native-mobile-push-537aee.py"
-    assert head == "0307-Convert-legacy-mobile-push-device-arrays-5057f9.py"
-    assert steps[head]["depends"] == [sdk]
+    legacy = "0307-Convert-legacy-mobile-push-device-arrays-5057f9.py"
+    assert head == "0308-Register-APNs-push-devices-71fa20.py"
+    assert steps[head]["depends"] == [legacy]
+    assert steps[legacy]["depends"] == [sdk]
     assert steps[sdk]["depends"] == ["0305-Add-stream-key-sharing-policy-58fcbc.py"]
     assert not any(
         "Join-" in name and ("mobile-push" in name or "native-mobile" in name)

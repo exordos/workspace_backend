@@ -17,10 +17,12 @@ import jinja2
 import pytest
 import yaml
 from gcl_sdk.events.services import senders
+from gcl_sdk.events.dm import models as sdk_models
 from oslo_config import cfg
 
 from workspace.common import config, mobile_push_opts
 from workspace.messenger_api import push_events
+from workspace.messenger_api import push_notifications
 from workspace.messenger_api.dm import push_events as event_payloads
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
@@ -113,6 +115,63 @@ def test_notification_client_keeps_ingress_prefix(notification_http):
     ]
 
 
+def test_apns_event_uses_own_token_for_submission_and_status(notification_http):
+    endpoint, _, _, received = notification_http
+    client = push_events.PushEventHttpClient(
+        endpoint, "synthetic-fcm", "synthetic-apns"
+    )
+    event_id = uuid.uuid4()
+    event = sdk_models.Event(
+        uuid=event_id,
+        event_type=sdk_models.UserEvent(uuid=uuid.uuid4(), user_id=uuid.uuid4()),
+        event_data=event_payloads.WorkspacePushEventPayload(
+            body={
+                "uuid": str(event_id),
+                "event_params": {"apns_environment": "sandbox"},
+                "_registration_updated_at": "internal",
+            }
+        ),
+    )
+    with pytest.raises(push_events.PushDeliveryError, match="APNs IAM token"):
+        push_events.PushEventHttpClient(endpoint, "synthetic-fcm").send_event(event)
+    assert not received
+    client.send_event(event)
+    assert client.get_apns_event(str(event_id))["uuid"] == str(event_id)
+    assert [header for _, header, _ in received] == ["Bearer synthetic-apns"] * 2
+    assert "_registration_updated_at" not in json.loads(received[0][2])
+
+
+def test_apns_companion_uses_a_separate_event_and_existing_sender():
+    template = ROOT / "exordos/manifests/workspace_apns_push.yaml.j2"
+    resources = yaml.safe_load(jinja2.Template(template.read_text()).render())[
+        "resources"
+    ]
+    event_name = push_notifications.APNS_TOPIC_UPDATE
+    event = resources["$exordos_notification.types.email.event_types"][event_name]
+    event_id = str(push_notifications.EVENT_TYPES[event_name])
+    assert event["uuid"] == event_id
+    assert resources["$exordos_notification.types.email.templates"][event_name][
+        "content"
+    ] == {"kind": "apns"}
+    permissions = resources["$core.iam.permissions"]
+    assert {item["name"] for item in permissions.values()} == {
+        f"exordos_notification.event_type_{event_id}.{action}"
+        for action in ("create", "read")
+    }
+    assert (
+        "apns_notification_token"
+        in resources["$core.config.configs"]["authentication"]["body"]["content"]
+    )
+    assert resources["$core.config.configs"]["authentication"]["on_change"][
+        "command"
+    ].endswith(" --push-sender")
+    assert (
+        "apns_enabled = true"
+        in resources["$core.config.configs"]["enable_apns"]["body"]["content"]
+    )
+    assert "$core.em.services" not in resources
+
+
 def test_sender_reads_managed_token_at_startup_and_redacts_it(
     notification_http, caplog, monkeypatch, tmp_path
 ):
@@ -182,6 +241,7 @@ def test_shared_sdk_sender_does_not_log_an_echoed_provider_error(
     body = {
         "uuid": str(uuid.uuid4()),
         "_test_error_status": 500,
+        "event_params": {},
         "devices": [{"registration_token": "synthetic-device-token"}],
         "content": "synthetic-encrypted-snapshot",
     }

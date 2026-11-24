@@ -3,6 +3,7 @@
 # not use this file except in compliance with the License.
 
 import base64
+import hashlib
 import json
 import logging
 import typing
@@ -17,9 +18,10 @@ LOG = logging.getLogger(__name__)
 MESSAGE_CREATE = "notification_message_create"
 MESSAGE_CANCELLED = "notification_message_cancel"
 TOPIC_UPDATE = "notification_topic_update"
+APNS_TOPIC_UPDATE = "notification_apns_topic_update"
 EVENT_TYPES = {
     kind: sys_uuid.uuid5(sys_uuid.NAMESPACE_URL, f"urn:exordos:notification:{kind}")
-    for kind in (MESSAGE_CREATE, MESSAGE_CANCELLED, TOPIC_UPDATE)
+    for kind in (MESSAGE_CREATE, MESSAGE_CANCELLED, TOPIC_UPDATE, APNS_TOPIC_UPDATE)
 }
 HPKE_INFO = b"workspace-mobile-push"
 ROUTE_FIELDS = (
@@ -63,10 +65,12 @@ def build_event(
     priority: str = "normal",
 ) -> dict[str, typing.Any] | None:
     """Prepare an opaque, self-contained event before it leaves Workspace."""
+    apns_environment = push_devices.APNS_ENVIRONMENTS.get(device.transport)
+    event_type = APNS_TOPIC_UPDATE if apns_environment else kind
     event: dict[str, typing.Any] = {
         "uuid": str(event_uuid),
         "project_id": str(project_uuid),
-        "event_type": f"/v1/event_types/{EVENT_TYPES[kind]}",
+        "event_type": f"/v1/event_types/{EVENT_TYPES[event_type]}",
         "exchange": {"kind": "User", "user_uuid": str(user_uuid)},
         "event_params": {
             "kind": kind,
@@ -80,6 +84,28 @@ def build_event(
             "priority": priority,
         },
     }
+    if apns_environment:
+        event["event_params"].update(
+            apns_environment=apns_environment,
+            apns_collapse_id=hashlib.sha256(
+                f"{device.uuid}:{topic_uuid}".encode()
+            ).hexdigest(),
+        )
+        event["_registration_updated_at"] = device.updated_at.isoformat()
+        # The APNs envelope includes APS metadata within its 4 KiB limit.
+        # Bound its encrypted preview even if every byte needs JSON escaping.
+        content = dict(
+            content,
+            **{
+                field: content[field].encode()[:limit].decode(errors="ignore")
+                for field, limit in (
+                    ("stream_name", 128),
+                    ("topic_name", 128),
+                    ("sender_name", 64),
+                    ("text", 192),
+                )
+            },
+        )
     plaintext = json.dumps(
         content,
         ensure_ascii=False,

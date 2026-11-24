@@ -1,4 +1,4 @@
-# Native encrypted Android push
+# Native encrypted Workspace push
 
 Workspace registers one FCM token and one HPKE public key per authenticated
 user, project and device through `PUT /api/workspace/v1/push_devices/{uuid}`.
@@ -108,6 +108,30 @@ Provision the chosen transport's credential before testing delivery.
 
 An `ACTIVE` Notification event means Firebase accepted the send. Verify
 receipt, decryption, notification display, and navigation on a physical device.
+
+### Add iOS delivery
+
+Keep the existing direct or mesh Firebase connector active for the common
+push handler, sender, installation UUID and HTTPS endpoint. With APNs-capable
+Workspace and Notification builds, install `notification_apns` on the local
+Notification and then install `workspace_apns_push`. The companion element
+adds a separate event type, template and scoped Core IAM token and uses the
+existing services. iOS delivery goes directly from the local Notification to
+APNs in both topologies. Android still uses its selected connector.
+
+Provision `notification-apns-credentials` on Notification as described in
+the [APNs transport documentation](https://github.com/exordos/exordos_notification/blob/master/docs/apns.md).
+The Apple credential is confined to Notification. The iOS app uses the same
+device registration endpoint and HPKE wire format. It registers platform
+`ios` with transport `apns_sandbox` for a development-signed app or
+`apns` for distribution. The token is the lowercase hexadecimal APNs
+address. Discovery uses `apns_push_notifications_enabled` from server settings.
+For APNs, the delivery snapshot includes the environment and registration
+timestamp, so a delayed invalidation cannot remove a fresh registration.
+
+Verify a normal alert and an authenticated tap-through on the target iPhone.
+Test read-state updates while the app is active. iOS schedules those updates
+according to its background delivery policies.
 
 ## Tests
 

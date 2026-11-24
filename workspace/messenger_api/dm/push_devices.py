@@ -5,6 +5,7 @@
 
 import base64
 import enum
+import re
 import typing
 
 from cryptography.hazmat.primitives.asymmetric import x25519
@@ -26,6 +27,14 @@ X25519_PUBLIC_KEY_BYTES = 32
 
 class PushDeviceTransport(str, enum.Enum):
     FCM = "fcm"
+    APNS = "apns"
+    APNS_SANDBOX = "apns_sandbox"
+
+
+APNS_ENVIRONMENTS = {
+    PushDeviceTransport.APNS.value: "production",
+    PushDeviceTransport.APNS_SANDBOX.value: "sandbox",
+}
 
 
 class PushDevicePlatform(str, enum.Enum):
@@ -114,3 +123,11 @@ class PushDevice(
             x25519.X25519PrivateKey.generate().exchange(public_key)
         except ValueError:
             raise ra_exc.ValidationErrorException() from None
+
+    def validate_registration(self) -> None:
+        if self.transport in APNS_ENVIRONMENTS and (
+            self.platform != PushDevicePlatform.IOS.value
+            or not re.fullmatch(r"(?:[0-9a-f]{2})+", self.registration_token)
+        ):
+            raise ra_exc.ValidationErrorException()
+        self.validate_registration_key()

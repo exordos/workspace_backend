@@ -31,15 +31,26 @@ RETENTION_SECONDS = 3600
 def _devices(
     session: sessions.PgSQLSession, project_id: sys_uuid.UUID, user_uuid: sys_uuid.UUID
 ) -> list[push_devices.PushDevice]:
-    return push_devices.PushDevice.objects.get_all(
-        filters={
-            "project_id": dm_filters.EQ(project_id),
-            "user_uuid": dm_filters.EQ(user_uuid),
-            "platform": dm_filters.EQ("android"),
-            "transport": dm_filters.EQ("fcm"),
-        },
+    owner = {
+        "project_id": dm_filters.EQ(project_id),
+        "user_uuid": dm_filters.EQ(user_uuid),
+    }
+    devices = push_devices.PushDevice.objects.get_all(
+        filters=dict(
+            owner, platform=dm_filters.EQ("android"), transport=dm_filters.EQ("fcm")
+        ),
         session=session,
     )
+    if mobile_push_opts.apns_enabled():
+        devices += push_devices.PushDevice.objects.get_all(
+            filters=dict(
+                owner,
+                platform=dm_filters.EQ("ios"),
+                transport=dm_filters.In(tuple(push_devices.APNS_ENVIRONMENTS)),
+            ),
+            session=session,
+        )
+    return devices
 
 
 def _insert(
@@ -50,7 +61,7 @@ def _insert(
     stored = event_models.Event(
         uuid=sys_uuid.UUID(event["uuid"]),
         event_type=event_models.UserEvent(
-            uuid=push_notifications.EVENT_TYPES[push_notifications.TOPIC_UPDATE],
+            uuid=sys_uuid.UUID(event["event_type"].rsplit("/", 1)[1]),
             user_id=user_uuid,
         ),
         event_data=event_payloads.WorkspacePushEventPayload(body=event),
@@ -128,7 +139,7 @@ class PushDeliveryError(RuntimeError):
 class PushEventHttpClient(event_clients.HttpEventClient):
     """Use SDK transport with the prepared Workspace payload and managed token."""
 
-    def __init__(self, endpoint: str, token: str) -> None:
+    def __init__(self, endpoint: str, token: str, apns_token: str = "") -> None:
         super().__init__(
             event_type_mapping={},
             endpoint=endpoint.rstrip("/"),
@@ -136,6 +147,9 @@ class PushEventHttpClient(event_clients.HttpEventClient):
             auth_token=token,
             project_id=None,
             http_client=NotificationHttpClient(default_timeout=10),
+        )
+        self._apns_client = (
+            PushEventHttpClient(endpoint, apns_token) if apns_token else None
         )
 
     def _build_event_body(self, event: event_models.Event) -> dict[str, typing.Any]:
@@ -145,11 +159,20 @@ class PushEventHttpClient(event_clients.HttpEventClient):
             return {
                 key: value
                 for key, value in event.event_data.body.items()
-                if key != "_membership_generation"
+                if key not in ("_membership_generation", "_registration_updated_at")
             }
         return super()._build_event_body(event)
 
     def send_event(self, event: event_models.Event) -> event_models.Event:
+        if isinstance(
+            event.event_data, event_payloads.WorkspacePushEventPayload
+        ) and _is_apns(event.event_data.body):
+            if self._apns_client is None:
+                raise PushDeliveryError("APNs IAM token is unavailable")
+            return self._apns_client._submit_event(event)
+        return self._submit_event(event)
+
+    def _submit_event(self, event: event_models.Event) -> event_models.Event:
         try:
             return super().send_event(event)
         except Exception:
@@ -162,6 +185,30 @@ class PushEventHttpClient(event_clients.HttpEventClient):
             raise
         except Exception:
             raise PushDeliveryError("Notification result request failed") from None
+
+    def get_apns_event(self, event_uuid: str) -> dict[str, typing.Any]:
+        if self._apns_client is None:
+            raise PushDeliveryError("APNs delivery is disabled")
+        return self._apns_client.get_event(event_uuid)
+
+
+def _is_apns(body: dict[str, typing.Any]) -> bool:
+    return "apns_environment" in body["event_params"]
+
+
+def _registration_matches(device, body, payload) -> bool:
+    params = body["event_params"]
+    if (
+        device.registration_token != params["registration_token"]
+        or str(device.encryption.key_uuid) != payload["content"]["key_uuid"]
+    ):
+        return False
+    if _is_apns(body):
+        return (
+            push_devices.APNS_ENVIRONMENTS.get(device.transport)
+            == params["apns_environment"]
+        )
+    return device.transport == push_devices.PushDeviceTransport.FCM.value
 
 
 def _clear_delivery(event: event_models.Event) -> None:
@@ -182,6 +229,8 @@ def _suppression_reason(body: dict[str, typing.Any]) -> str | None:
     params = body["event_params"]
     if not params["payload"]:
         return "device_registration_changed"
+    if _is_apns(body) and not mobile_push_opts.apns_enabled():
+        return "apns_disabled"
     return None
 
 
@@ -194,6 +243,7 @@ class WorkspacePushSender(event_senders.EventSenderService):
             notification_client=PushEventHttpClient(
                 options.notification_endpoint,
                 options.notification_token,
+                options.apns_notification_token,
             ),
             enabled=mobile_push_opts.enabled() and bool(options.notification_token),
             **kwargs,
@@ -244,9 +294,10 @@ class WorkspacePushSender(event_senders.EventSenderService):
                 if reason is None
                 else None
             )
-            if current is None or payload is None or (
-                current.registration_token != params["registration_token"]
-                or str(current.encryption.key_uuid) != payload["content"]["key_uuid"]
+            if (
+                current is None
+                or payload is None
+                or not _registration_matches(current, body, payload)
             ):
                 reason = "device_registration_changed"
         if reason is not None:
@@ -264,6 +315,8 @@ class WorkspacePushSender(event_senders.EventSenderService):
                 "status": "ERROR",
                 "errors": [{"code": reason, "permanent": True}],
             }
+        if _is_apns(event.event_data.body):
+            return self._notification_client.get_apns_event(str(event.uuid))
         return self._notification_client.get_event(str(event.uuid))
 
     def _apply_event_status(
@@ -291,11 +344,16 @@ class WorkspacePushSender(event_senders.EventSenderService):
                         "user_uuid": dm_filters.EQ(body["exchange"]["user_uuid"]),
                     },
                     session=session,
+                    locked=True,
                 )
-                if device is not None and (
-                    device.registration_token == params["registration_token"]
-                    and str(device.encryption.key_uuid)
-                    == payload["content"]["key_uuid"]
+                if (
+                    device is not None
+                    and _registration_matches(device, body, payload)
+                    and (
+                        not _is_apns(body)
+                        or device.updated_at.isoformat()
+                        == body["_registration_updated_at"]
+                    )
                 ):
                     device.delete(session=session)
         terminal = result["status"] == "ACTIVE" or (
