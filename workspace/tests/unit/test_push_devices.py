@@ -70,7 +70,11 @@ def test_hpke_registration_rejects_unknown_kind():
 
 
 def test_push_device_transport_and_platform_enums_match_supported_clients():
-    assert [value.value for value in push_devices.PushDeviceTransport] == ["fcm"]
+    assert [value.value for value in push_devices.PushDeviceTransport] == [
+        "fcm",
+        "apns",
+        "apns_sandbox",
+    ]
     assert [value.value for value in push_devices.PushDevicePlatform] == [
         "android",
         "ios",

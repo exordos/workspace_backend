@@ -43,4 +43,5 @@ build:
         - path: artifacts/preview-1.jpg
     - manifest: manifests/workspace_direct_firebase_push.yaml.j2
     - manifest: manifests/workspace_mesh_firebase_push.yaml.j2
+    - manifest: manifests/workspace_apns_push.yaml.j2
     - manifest: manifests/workspace_projection_pg_backup.yaml.j2

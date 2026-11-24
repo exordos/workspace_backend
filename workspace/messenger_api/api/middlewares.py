@@ -73,6 +73,7 @@ def build_server_settings(req: typing.Any) -> dict[str, typing.Any]:
             "openid connect": False,
         },
         "push_notifications_enabled": mobile_push_opts.enabled(),
+        "apns_push_notifications_enabled": mobile_push_opts.apns_enabled(),
         "organization_uuid": cfg.CONF.mobile_push.organization_uuid,
         "email_auth_enabled": True,
         "require_email_format_usernames": True,

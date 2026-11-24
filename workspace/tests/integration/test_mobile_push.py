@@ -13,6 +13,7 @@ from restalchemy.common import contexts
 
 from workspace.common import mobile_push_opts
 from workspace.messenger_api import push_events
+from workspace.messenger_api import push_notifications
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.api import store_factory
 from workspace.services import push_notifications as push_handler
@@ -362,6 +363,83 @@ def test_retiring_one_device_keeps_the_other_encrypted_delivery(api, workspace_a
         json.loads(submitted["event_params"]["payload"])["content"]["kind"]
         == "encrypted"
     )
+
+
+@pytest.mark.parametrize("refresh", [False, True])
+def test_apns_fanout_and_inactive_registration_feedback(
+    api, workspace_api, db, refresh
+):
+    cfg.CONF.set_override("apns_enabled", True, group=mobile_push_opts.DOMAIN)
+    cfg.CONF.set_override(
+        "apns_notification_token", "synthetic-apns-iam", group=mobile_push_opts.DOMAIN
+    )
+    try:
+        _, peer, android, message = prepared_message(
+            api, workspace_api, db, prepare_push=False
+        )
+        encryption = db.execute(
+            "SELECT encryption FROM m_workspace_push_devices WHERE uuid=%s", (android,)
+        ).fetchone()[0]
+        iphone = sys_uuid.uuid4()
+        registration = {
+            "transport": "apns_sandbox",
+            "platform": "ios",
+            "registration_token": "ab" * 32,
+            "encryption": encryption,
+        }
+        registered = workspace_api.put(
+            f"/v1/push_devices/{iphone}", user=peer, json=registration
+        )
+        assert registered.status_code == 201, registered.text
+
+        client = mock.Mock()
+        client.get_event.return_value = {"status": "ACTIVE"}
+
+        def apns_result(event_uuid):
+            if refresh:
+                renewed = workspace_api.put(
+                    f"/v1/push_devices/{iphone}", user=peer, json=registration
+                )
+                assert renewed.status_code == 200, renewed.text
+            return {
+                "status": "ERROR",
+                "errors": [
+                    {
+                        "code": "registration_token_inactive",
+                        "device_uuid": str(iphone),
+                        "permanent": True,
+                    }
+                ],
+            }
+
+        client.get_apns_event.side_effect = apns_result
+        _run_sender(client)
+        sent = {
+            call.args[0].event_data.body["event_params"]["device_uuid"]: call.args[
+                0
+            ].event_data.body
+            for call in client.send_event.call_args_list
+        }
+        assert sent.keys() == {str(android), str(iphone)}
+        event = sent[str(iphone)]
+        params = event["event_params"]
+        assert event["event_type"].endswith(
+            str(push_notifications.EVENT_TYPES[push_notifications.APNS_TOPIC_UPDATE])
+        )
+        assert params["apns_environment"] == "sandbox"
+        assert params["priority"] == "high"
+        assert params["message_uuid"] == message["uuid"]
+        assert "private push preview" not in params["payload"]
+        assert "apns_environment" not in sent[str(android)]["event_params"]
+        client.get_apns_event.assert_called_once_with(event["uuid"])
+        assert db.execute(
+            "SELECT count(*) FROM m_workspace_push_devices WHERE uuid=%s", (iphone,)
+        ).fetchone() == (int(refresh),)
+    finally:
+        cfg.CONF.clear_override("apns_enabled", group=mobile_push_opts.DOMAIN)
+        cfg.CONF.clear_override(
+            "apns_notification_token", group=mobile_push_opts.DOMAIN
+        )
 
 
 @pytest.mark.parametrize("level", ["INFO", "DEBUG"])

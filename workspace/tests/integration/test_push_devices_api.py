@@ -6,6 +6,8 @@
 import base64
 import uuid as sys_uuid
 
+import pytest
+
 from workspace.messenger_api.dm import push_devices
 
 
@@ -28,6 +30,26 @@ def _payload(key_uuid, public_key, token="fcm-registration-token"):
             "public_key": public_key,
         },
     }
+
+
+@pytest.mark.parametrize(
+    "transport,platform,token,status",
+    [
+        ("apns", "ios", "ab" * 32, 201),
+        ("apns_sandbox", "ios", "ab" * 32, 201),
+        ("apns", "android", "ab" * 32, 400),
+        ("apns", "ios", "odd123f", 400),
+    ],
+)
+def test_apns_registration(workspace_api, transport, platform, token, status):
+    device = sys_uuid.uuid4()
+    payload = _payload(sys_uuid.uuid4(), _public_key(bytes(range(32))), token)
+    payload.update(transport=transport, platform=platform)
+    response = workspace_api.put(f"{PUSH_DEVICES}{device}", json=payload)
+    assert response.status_code == status, response.text
+    if status == 201:
+        assert response.json()["transport"] == transport
+        assert workspace_api.delete(f"{PUSH_DEVICES}{device}").status_code == 204
 
 
 def test_push_device_put_rotate_and_delete_are_scoped(
@@ -82,9 +104,7 @@ def test_push_device_put_rotate_and_delete_are_scoped(
     assert rotated_resource["encryption"]["key_uuid"] == str(
         replacement_key_uuid,
     )
-    assert rotated_resource["registration_token"] == (
-        "rotated-fcm-registration-token"
-    )
+    assert rotated_resource["registration_token"] == ("rotated-fcm-registration-token")
     assert rotated_resource["encryption"]["public_key"] == replacement_public_key
     with db.cursor() as cursor:
         cursor.execute(

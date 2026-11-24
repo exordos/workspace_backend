@@ -403,12 +403,13 @@ class PushDeviceController(ra_controllers.BaseResourceController):
         device = self.model.objects.get_one_or_none(
             filters={"uuid": dm_filters.EQ(uuid)},
             session=session,
+            locked=True,
         )
         if device is not None and (
             device.project_id != project_id or device.user_uuid != user_uuid
         ):
             raise ra_exc.ResourceNotFoundError(resource="PushDevice", path=str(uuid))
-        candidate.validate_registration_key()
+        candidate.validate_registration()
         if device is None:
             candidate.insert(session=session)
             device = self.model.objects.get_one(
@@ -424,7 +425,10 @@ class PushDeviceController(ra_controllers.BaseResourceController):
                 "encryption": candidate.encryption,
             },
         )
-        device.update(session=session)
+        # APNs can reissue the same token. Record even an identical registration.
+        device.update(
+            session=session, force=candidate.transport in push_devices.APNS_ENVIRONMENTS
+        )
         return self._response(device), 200, {}
 
     @oa_utils.extend_schema(
