@@ -125,8 +125,14 @@ class NotificationHttpSession(bazooka.Client.SESSION):
 class NotificationHttpClient(bazooka.Client):
     SESSION = NotificationHttpSession
 
+    def __init__(self, ca_file: str = "") -> None:
+        super().__init__(default_timeout=10)
+        self._ca_file = ca_file
+
     def request(self, method: str, url: str, **kwargs: typing.Any) -> requests.Response:
         kwargs["allow_redirects"] = False
+        if self._ca_file:
+            kwargs["verify"] = self._ca_file
         response = super().request(method, url, **kwargs)
         if 300 <= response.status_code < 400:
             raise ValueError("notification_redirect")
@@ -140,17 +146,21 @@ class PushDeliveryError(RuntimeError):
 class PushEventHttpClient(event_clients.HttpEventClient):
     """Use SDK transport with the prepared Workspace payload and managed token."""
 
-    def __init__(self, endpoint: str, token: str, apns_token: str = "") -> None:
+    def __init__(
+        self, endpoint: str, token: str, apns_token: str = "", *, ca_file: str = ""
+    ) -> None:
         super().__init__(
             event_type_mapping={},
             endpoint=endpoint.rstrip("/"),
             version="v1",
             auth_token=token,
             project_id=None,
-            http_client=NotificationHttpClient(default_timeout=10),
+            http_client=NotificationHttpClient(ca_file),
         )
         self._apns_client = (
-            PushEventHttpClient(endpoint, apns_token) if apns_token else None
+            PushEventHttpClient(endpoint, apns_token, ca_file=ca_file)
+            if apns_token
+            else None
         )
 
     def _build_event_body(self, event: event_models.Event) -> dict[str, typing.Any]:
@@ -258,6 +268,7 @@ class WorkspacePushSender(event_senders.EventSenderService):
                 options.notification_endpoint,
                 options.notification_token,
                 options.apns_notification_token,
+                ca_file=options.notification_ca_file,
             ),
             enabled=mobile_push_opts.enabled() and bool(options.notification_token),
             **kwargs,

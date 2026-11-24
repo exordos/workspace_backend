@@ -12,6 +12,8 @@ requirements:
     from_version: "3.2.1"
   exordos_notification:
     from_version: "2.0.4-dev"
+  notification_api_https:
+    from_version: "2.0.4-dev"
 
 imports:
   backend_node:
@@ -22,6 +24,14 @@ imports:
     element: "$exordos_notification"
     kind: resource
     link: "$core.compute.nodes.$notification_cp"
+  notification_api_domain:
+    element: "$notification_api_https"
+    kind: resource
+    link: "$core.vs.variables.$notification_api_domain"
+  notification_api_trust_pem:
+    element: "$notification_api_https"
+    kind: resource
+    link: "$core.vs.variables.$notification_api_trust_pem"
   event_type_read:
     element: "$exordos_notification"
     kind: resource
@@ -39,13 +49,6 @@ resources:
   $core.vs.variables:
     organization_uuid:
       name: workspace_mobile_push_organization_uuid
-      project_id: "12345678-c625-4fee-81d5-f691897b8142"
-      setter:
-        kind: selector
-        selector_strategy: latest
-    notification_host:
-      name: workspace_mobile_push_notification_host
-      description: Hostname of the HTTPS ingress for this installation's Notification API
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       setter:
         kind: selector
@@ -178,6 +181,20 @@ resources:
           notification_token = {$core.iam.tokens.$push_sender:access_token}
           "
 
+    notification_api_trust:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      path: /etc/workspace/notification-api-trust.pem
+      mode: "0644"
+      target:
+        kind: node
+        node: $workspace_mesh_firebase_push.imports.$backend_node:uuid
+      on_change:
+        kind: shell
+        command: /usr/local/bin/workspace-restart-services --push-sender
+      body:
+        kind: text
+        content: $workspace_mesh_firebase_push.imports.$notification_api_trust_pem:value
+
     notification_endpoint:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       path: /etc/workspace/workspace.conf.d/90-mobile-push.conf
@@ -194,7 +211,8 @@ resources:
           f"
           [mobile_push]
           organization_uuid = {$core.vs.variables.$organization_uuid:value}
-          notification_endpoint = https://{$core.vs.variables.$notification_host:value}/api/notification
+          notification_endpoint = https://{$workspace_mesh_firebase_push.imports.$notification_api_domain:value}/api/notification
+          notification_ca_file = /etc/workspace/notification-api-trust.pem
           "
 
   $core.em.services:
