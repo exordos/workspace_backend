@@ -10,9 +10,10 @@ from workspace.tests.integration import conftest
 
 MAIL_FOLDERS = "/v1/mail/folders/"
 MAIL_MESSAGES = "/v1/mail/messages/"
+MAIL_DRAFTS = "/v1/mail/drafts/"
 FILES = "/v1/messenger/files/"
 EVENTS = "/v1/events/"
-EXTERNAL_ACCOUNTS = "/v1/messenger/external_accounts/"
+EXTERNAL_ACCOUNTS = "/v1/external_accounts/"
 EXTERNAL_ACCOUNT_PERMISSIONS = tuple(
     f"workspace.external_account.{action}"
     for action in ("read", "create", "update", "delete")
@@ -22,7 +23,7 @@ EXTERNAL_ACCOUNT_PERMISSIONS = tuple(
 def _folder(api, **values):
     response = api.post(
         MAIL_FOLDERS,
-        json={"path": "Drafts", "name": "Drafts", **values},
+        json={"name": "Drafts", "kind": "drafts", **values},
     )
     assert response.status_code == 201, response.text
     return response.json()
@@ -30,12 +31,18 @@ def _folder(api, **values):
 
 def _message(api, folder_uuid, **values):
     response = api.post(
-        MAIL_MESSAGES,
+        MAIL_DRAFTS,
         json={
             "folder_uuid": folder_uuid,
             "to_addresses": ["recipient@example.test"],
             "subject": "Workspace mail",
-            "body_text": "Stored before transport.",
+            "payload": {
+                "kind": "multipart",
+                "parts": [
+                    {"kind": "text", "content": "Stored before transport."},
+                    {"kind": "html", "content": "<p>Stored before transport.</p>"},
+                ],
+            },
             **values,
         },
     )
@@ -45,35 +52,27 @@ def _message(api, folder_uuid, **values):
 
 def test_mail_draft_roundtrip_is_project_and_owner_scoped(workspace_api):
     draft_folder = _folder(workspace_api)
-    archive_folder = _folder(workspace_api, path="Archive", name="Archive")
     message = _message(workspace_api, draft_folder["uuid"])
 
     assert message["draft"] is True
     assert message["delivery_status"] == "draft"
     assert message.get("external_account_uuid") is None
-    assert message["source_name"] == "native"
 
     updated = workspace_api.put(
-        MAIL_MESSAGES + message["uuid"],
-        json={"subject": "Updated subject", "flagged": True},
+        MAIL_DRAFTS + message["uuid"],
+        json={"subject": "Updated subject"},
     )
     assert updated.status_code == 200, updated.text
     assert updated.json()["subject"] == "Updated subject"
-    assert updated.json()["flagged"] is True
-
-    moved = workspace_api.post(
-        MAIL_MESSAGES + message["uuid"] + "/actions/move/invoke",
-        json={"folder_uuid": archive_folder["uuid"]},
-    )
-    assert moved.status_code == 200, moved.text
-    assert moved.json()["folder_uuid"] == archive_folder["uuid"]
+    assert updated.json()["payload"] == message["payload"]
 
     other_user = sys_uuid.uuid4()
     assert (
-        workspace_api.get(MAIL_MESSAGES + message["uuid"], user=other_user).status_code
+        workspace_api.get(MAIL_DRAFTS + message["uuid"], user=other_user).status_code
         == 404
     )
-    assert workspace_api.get(MAIL_MESSAGES).json() == [moved.json()]
+    assert workspace_api.get(MAIL_MESSAGES).json() == []
+    assert workspace_api.get(MAIL_DRAFTS).json() == [updated.json()]
 
     events = workspace_api.get(EVENTS, params={"page_limit": 100})
     assert events.status_code == 200, events.text
@@ -84,10 +83,8 @@ def test_mail_draft_roundtrip_is_project_and_owner_scoped(workspace_api):
     ]
     assert mail_kinds == [
         "mail.folder.created",
-        "mail.folder.created",
-        "mail.message.created",
-        "mail.message.updated",
-        "mail.message.updated",
+        "mail.draft.created",
+        "mail.draft.updated",
     ]
 
 
@@ -102,11 +99,19 @@ def test_send_creates_one_durable_intent_in_the_request_transaction(
         json={
             "uuid": account_uuid,
             "provider": "mail",
-            "settings": {"email": "cassi@example.test"},
+            "settings": {"email": "cassi@example.test", "api_key": "fixture-only"},
             "status": "active",
         },
     )
     assert account.status_code == 201, account.text
+    assert account.json()["capabilities"] == ["mail"]
+    assert account.json()["settings"] == {"email": "cassi@example.test"}
+    alias = workspace_api.get(
+        "/v1/messenger/external_accounts/" + account_uuid,
+        permissions=EXTERNAL_ACCOUNT_PERMISSIONS,
+    )
+    assert alias.status_code == 200, alias.text
+    assert alias.json() == account.json()
     folder = _folder(workspace_api, external_account_uuid=account_uuid)
     message = _message(workspace_api, folder["uuid"])
     assert message["from_address"] == "cassi@example.test"
@@ -117,13 +122,16 @@ def test_send_creates_one_durable_intent_in_the_request_transaction(
     assert change_folder_account.status_code == 400, change_folder_account.text
 
     sent = workspace_api.post(
-        MAIL_MESSAGES + message["uuid"] + "/actions/send/invoke",
+        MAIL_DRAFTS + message["uuid"] + "/actions/send/invoke",
         json={},
     )
     assert sent.status_code == 200, sent.text
     assert sent.json()["draft"] is False
     assert sent.json()["delivery_status"] == "queued"
     assert sent.json().get("sent_at") is None
+    assert sent.json()["payload"] == message["payload"]
+    assert workspace_api.get(MAIL_DRAFTS + message["uuid"]).status_code == 404
+    assert workspace_api.get(MAIL_MESSAGES + message["uuid"]).json() == sent.json()
 
     with db.cursor() as cursor:
         cursor.execute(
@@ -139,12 +147,13 @@ def test_send_creates_one_durable_intent_in_the_request_transaction(
     assert intent[2] == "new"
     assert intent[3]["message_uuid"] == message["uuid"]
     assert intent[3]["to_addresses"] == ["recipient@example.test"]
+    assert intent[3]["payload"] == message["payload"]
 
     repeated = workspace_api.post(
-        MAIL_MESSAGES + message["uuid"] + "/actions/send/invoke",
+        MAIL_DRAFTS + message["uuid"] + "/actions/send/invoke",
         json={},
     )
-    assert repeated.status_code == 400, repeated.text
+    assert repeated.status_code == 404, repeated.text
     with db.cursor() as cursor:
         cursor.execute(
             "SELECT count(*) FROM mail_outgoing_intents WHERE message_uuid = %s",
@@ -170,12 +179,11 @@ def test_send_creates_one_durable_intent_in_the_request_transaction(
     senderless_folder = _folder(
         workspace_api,
         external_account_uuid=senderless_account_uuid,
-        path="Senderless",
         name="Senderless",
     )
     senderless_message = _message(workspace_api, senderless_folder["uuid"])
     senderless_send = workspace_api.post(
-        MAIL_MESSAGES + senderless_message["uuid"] + "/actions/send/invoke",
+        MAIL_DRAFTS + senderless_message["uuid"] + "/actions/send/invoke",
         json={},
     )
     assert senderless_send.status_code == 400, senderless_send.text
@@ -225,16 +233,15 @@ def test_owner_file_urn_is_private_and_can_be_attached_to_a_draft(
     other_folder_response = workspace_api.post(
         MAIL_FOLDERS,
         user=other_user,
-        json={"path": "Other drafts", "name": "Other drafts"},
+        json={"name": "Other drafts"},
     )
     assert other_folder_response.status_code == 201, other_folder_response.text
     other_folder = other_folder_response.json()
     forbidden = workspace_api.post(
-        MAIL_MESSAGES,
+        MAIL_DRAFTS,
         user=other_user,
         json={
             "folder_uuid": other_folder["uuid"],
-            "body_text": "No access",
             "attachment_urns": [file_urn],
         },
     )

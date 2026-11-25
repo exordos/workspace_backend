@@ -3,10 +3,9 @@
 This document describes the browser-facing API contract served by the unified
 `workspace-api` REST service and the companion `workspace-messenger-events`
 websocket service. Messenger resources, users, client service settings,
-push-device registrations, Mail-Ressourcen und REST events verwenden
-`workspace-api`. Calendar- und External-Users-Endpunkte gehören nicht zu diesem
-Release. Anbieter-neutrale externe Konten, Chat, Betrieb, Richtlinien, Gesundheit,
-und Brückeninstanzressourcen sind Teil derMessenger API.
+push-device registrations, Mail, Calendar, and REST events all use
+`workspace-api`. Mail and Calendar share Workspace external accounts and
+the existing realtime cursor.
 
 Native Messenger Ressourcen, Mitgliedschaft, Benutzerzustand, Ereignisse, Anbieter-Mapping,
 und die Klienten-Einstellungen sind kanonisch inPostgreSQL. Die vorhandenen Ursprungsfelder
@@ -268,13 +267,10 @@ Autoritative Momentaufnahmen vor dem Start eines neuen Cursors.
 | Methode | Weg | Beschreibung |
 | --- | --- | --- |
 | `GET` | `/api/workspace/v1/` | Liste der unter `/api/workspace/v1/` stehenden Strecken. |
-| `GET` | `/api/workspace/v1/mail/` | Mail-Routen auflisten. |
-| `GET`, `POST` | `/api/workspace/v1/mail/folders/` | Eigene Ordner auflisten oder einen erstellen. |
-| `GET`, `PUT`, `DELETE` | `/api/workspace/v1/mail/folders/{folder_uuid}` | Einen leeren eigenen Ordner lesen, ändern oder weich löschen. |
-| `GET`, `POST` | `/api/workspace/v1/mail/messages/` | Eigene Nachrichten auflisten oder einen Entwurf erstellen. |
-| `GET`, `PUT`, `DELETE` | `/api/workspace/v1/mail/messages/{message_uuid}` | Eine eigene Nachricht lesen, ändern oder weich löschen. |
-| `POST` | `/api/workspace/v1/mail/messages/{message_uuid}/actions/move/invoke` | Eine Nachricht zwischen eigenen Ordnern desselben Kontos verschieben. |
-| `POST` | `/api/workspace/v1/mail/messages/{message_uuid}/actions/send/invoke` | Einen Entwurf dauerhaft für eine externe Mail-Runtime einreihen. |
+| `GET` | `/api/workspace/v1/mail/` | See [Mail resources and actions](mail_api.md). |
+| `GET` | `/api/workspace/v1/calendar/` | See [Calendar resources and actions](calendar_api.md). |
+| `GET`, `POST` | `/api/workspace/v1/external_accounts/` | List or create external accounts. |
+| `GET`, `PUT`, `DELETE` | `/api/workspace/v1/external_accounts/{account_uuid}` | Read, update or delete an account. |
 | `GET` | `/api/workspace/v1/messenger/` | Liste der Messenger Strecken unter `/api/workspace/v1/messenger/`. |
 | `GET` | `/api/workspace/v1/messenger/server_settings` | Die Server-Einstellungen wie Zulip zurückgeben. |
 | `GET` | `/api/workspace/v1/messenger/server_settings/` | Das gleiche wie oben; Trailing Slash wird unterstützt. |

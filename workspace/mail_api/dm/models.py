@@ -4,10 +4,13 @@
 # you may not use this file except in compliance with the License.
 
 import enum
+
 from restalchemy.dm import models
 from restalchemy.dm import properties
 from restalchemy.dm import types
 from restalchemy.storage.sql import orm
+
+from workspace.mail_api.dm import payloads
 
 
 class MailSource(str, enum.Enum):
@@ -21,6 +24,9 @@ class MailDeliveryStatus(str, enum.Enum):
     SENT = "sent"
     RECEIVED = "received"
     FAILED = "failed"
+
+
+FOLDER_KINDS = ("inbox", "sent", "drafts", "trash", "spam", "archive", "custom")
 
 
 class MailFolder(
@@ -40,28 +46,12 @@ class MailFolder(
         types.AllowNone(types.UUID()),
         default=None,
     )
-    path = properties.property(
-        types.String(min_length=1, max_length=1024),
-        required=True,
-    )
     name = properties.property(
         types.String(min_length=1, max_length=256),
         required=True,
     )
-    delimiter = properties.property(
-        types.String(min_length=1, max_length=8),
-        default="/",
-    )
-    special_use = properties.property(
-        types.AllowNone(types.String(max_length=64)),
-        default=None,
-    )
+    kind = properties.property(types.Enum(list(FOLDER_KINDS)), default="custom")
     unread_count = properties.property(
-        types.Integer(min_value=0),
-        default=0,
-        read_only=True,
-    )
-    total_count = properties.property(
         types.Integer(min_value=0),
         default=0,
         read_only=True,
@@ -94,7 +84,7 @@ class MailMessage(
         "attachment_urns",
         "bcc_addresses",
         "cc_addresses",
-        "references",
+        "payload",
         "to_addresses",
     }
 
@@ -122,29 +112,16 @@ class MailMessage(
         types.TypedList(types.String(min_length=1, max_length=2048)),
         default=list,
     )
-    reply_to = properties.property(
-        types.AllowNone(types.String(max_length=2048)),
+    reply_to_uuid = properties.property(
+        types.AllowNone(types.UUID()),
         default=None,
     )
     subject = properties.property(types.String(max_length=2048), default="")
-    snippet = properties.property(types.String(max_length=4096), default="")
-    body_html = properties.property(types.AllowNone(types.String()), default=None)
-    body_text = properties.property(types.AllowNone(types.String()), default=None)
+    payload = properties.property(
+        payloads.PAYLOAD_TYPE, default=lambda: payloads.MultipartPayload(parts=[])
+    )
     attachment_urns = properties.property(
         types.TypedList(types.String(min_length=1, max_length=4096)),
-        default=list,
-    )
-    message_id = properties.property(
-        types.AllowNone(types.String(max_length=2048)),
-        default=None,
-        read_only=True,
-    )
-    in_reply_to = properties.property(
-        types.AllowNone(types.String(max_length=2048)),
-        default=None,
-    )
-    references = properties.property(
-        types.TypedList(types.String(min_length=1, max_length=2048)),
         default=list,
     )
     sent_at = properties.property(
@@ -152,13 +129,8 @@ class MailMessage(
         default=None,
         read_only=True,
     )
-    received_at = properties.property(
-        types.AllowNone(types.UTCDateTimeZ()),
-        default=None,
-        read_only=True,
-    )
-    seen = properties.property(types.Boolean(), default=False)
-    flagged = properties.property(types.Boolean(), default=False)
+    read = properties.property(types.Boolean(), default=False, read_only=True)
+    starred = properties.property(types.Boolean(), default=False, read_only=True)
     draft = properties.property(types.Boolean(), default=True, read_only=True)
     delivery_status = properties.property(
         types.Enum([status.value for status in MailDeliveryStatus]),
@@ -185,3 +157,10 @@ class MailMessage(
         default=False,
         read_only=True,
     )
+    trash_origin_uuid = properties.property(
+        types.AllowNone(types.UUID()), default=None, read_only=True
+    )
+
+
+class MailDraft(MailMessage):
+    pass

@@ -3,10 +3,9 @@
 This document describes the browser-facing API contract served by the unified
 `workspace-api` REST service and the companion `workspace-messenger-events`
 websocket service. Messenger resources, users, client service settings,
-push-device registrations, Mail resources и REST events используют
-`workspace-api`. Calendar и External Users endpoints не входят в этот release.
-Нейтральный внешний аккаунт, чат, операция, политика, здоровье,
-и ресурсы мостовых экземпляров являются частью Messenger API.
+push-device registrations, Mail, Calendar, and REST events all use
+`workspace-api`. Mail and Calendar share Workspace external accounts and
+the existing realtime cursor.
 
 Нативные Messenger ресурсы, членство, состояние пользователя, события, отображение поставщиков,
 и настройки клиента являются каноническими в PostgreSQL.
@@ -268,13 +267,10 @@ GET /api/workspace/v1/events/?epoch_version%3E=123&epoch_generation=781203&page_
 | Метод | Путь | Описание |
 | --- | --- | --- |
 | `GET` | `/api/workspace/v1/` | Перечислите маршруты ниже `/api/workspace/v1/`. |
-| `GET` | `/api/workspace/v1/mail/` | Перечислить маршруты Mail. |
-| `GET`, `POST` | `/api/workspace/v1/mail/folders/` | Получить свои папки или создать папку. |
-| `GET`, `PUT`, `DELETE` | `/api/workspace/v1/mail/folders/{folder_uuid}` | Прочитать, изменить или мягко удалить пустую свою папку. |
-| `GET`, `POST` | `/api/workspace/v1/mail/messages/` | Получить свои письма или создать черновик. |
-| `GET`, `PUT`, `DELETE` | `/api/workspace/v1/mail/messages/{message_uuid}` | Прочитать, изменить или мягко удалить своё письмо. |
-| `POST` | `/api/workspace/v1/mail/messages/{message_uuid}/actions/move/invoke` | Переместить письмо между своими папками одной учётной записи. |
-| `POST` | `/api/workspace/v1/mail/messages/{message_uuid}/actions/send/invoke` | Долговечно поставить черновик в очередь внешнего mail runtime. |
+| `GET` | `/api/workspace/v1/mail/` | See [Mail resources and actions](mail_api.md). |
+| `GET` | `/api/workspace/v1/calendar/` | See [Calendar resources and actions](calendar_api.md). |
+| `GET`, `POST` | `/api/workspace/v1/external_accounts/` | List or create external accounts. |
+| `GET`, `PUT`, `DELETE` | `/api/workspace/v1/external_accounts/{account_uuid}` | Read, update or delete an account. |
 | `GET` | `/api/workspace/v1/messenger/` | Перечислить маршруты Messenger ниже `/api/workspace/v1/messenger/`. |
 | `GET` | `/api/workspace/v1/messenger/server_settings` | Верните настройки сервера типа Zulip. |
 | `GET` | `/api/workspace/v1/messenger/server_settings/` | То же самое, что и выше; поддерживается запятая. |

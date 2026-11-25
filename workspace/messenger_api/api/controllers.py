@@ -1223,6 +1223,8 @@ class WorkspaceEpochController(StoreResourceController):
 
 class ExternalResourceController(ra_controllers.BaseResourceControllerPaginated):
     __generate_location_for__ = ()
+    _pagination_limit: int = 0
+    _has_more = False
 
     def _get_user_uuid(self) -> typing.Any:
         return self.get_context().user_uuid
@@ -1241,6 +1243,10 @@ class ExternalResourceController(ra_controllers.BaseResourceControllerPaginated)
     def _create_response(
         self, body: typing.Any, status: typing.Any, headers: typing.Any
     ) -> typing.Any:
+        if self._pagination_limit and isinstance(body, list):
+            headers[self._header_page_limit] = str(self._pagination_limit)
+            if self._has_more:
+                headers[self._header_page_marker] = str(body[-1].uuid)
         return ra_controllers.Controller._create_response(self, body, status, headers)
 
     def _owner_filters(self, filters: typing.Any) -> typing.Any:
@@ -1268,13 +1274,31 @@ class ExternalResourceController(ra_controllers.BaseResourceControllerPaginated)
         )
 
     def filter(self, filters: typing.Any, order_by: typing.Any = None) -> typing.Any:
-        return super().filter(self._owner_filters(filters), order_by=order_by)
+        scoped = self._owner_filters(filters)
+        limit = self._pagination_limit
+        if not limit:
+            return super().filter(scoped, order_by=order_by)
+        self._pagination_limit = limit + 1
+        try:
+            results = super().filter(scoped, order_by=order_by)
+        finally:
+            self._pagination_limit = limit
+        self._has_more = len(results) > limit
+        return results[:limit]
 
     def get(self, uuid: object, **kwargs: typing.Any) -> typing.Any:
         del kwargs
         return self.model.objects.get_one(
             filters=self._owner_filters({"uuid": dm_filters.EQ(uuid)}),
         )
+
+
+class ExternalAccountJSONPacker(ObjectJSONPacker):
+    def pack_resource(self, obj: typing.Any) -> typing.Any:
+        result = super().pack_resource(obj)
+        if "settings" in result:
+            result["settings"] = external_models.public_settings(result["settings"])
+        return result
 
 
 class ExternalAccountController(ExternalResourceController):
@@ -1294,8 +1318,16 @@ class ExternalAccountController(ExternalResourceController):
 
     def _owner_filters(self, filters: typing.Any) -> typing.Any:
         result = super()._owner_filters(filters)
+        result.pop("settings", None)
         result["project_id"] = dm_filters.EQ(self._get_project_id())
         return result
+
+    def get_packer(
+        self, content_type: typing.Any, resource_type: typing.Any = None,
+    ) -> typing.Any:
+        return ExternalAccountJSONPacker(
+            resource_type or self.get_resource(), request=self.request,
+        )
 
     def _require_permission(self, action: str) -> None:
         permissions = (
@@ -1314,6 +1346,8 @@ class ExternalAccountController(ExternalResourceController):
 
     def create(self, **kwargs: typing.Any) -> typing.Any:
         self._require_permission("workspace.external_account.create")
+        if "capabilities" in kwargs:
+            raise ra_exc.ValidationErrorException()
         return application_services.ExternalAccountApplicationService.create(
             contexts.Context().get_session(),
             application_services.ExternalAccountActor(
@@ -1325,6 +1359,8 @@ class ExternalAccountController(ExternalResourceController):
 
     def update(self, uuid: object, **kwargs: typing.Any) -> typing.Any:
         self._require_permission("workspace.external_account.update")
+        if "capabilities" in kwargs:
+            raise ra_exc.ValidationErrorException()
         session = contexts.Context().get_session()
         account = self.model.objects.get_one(
             filters=self._owner_filters({"uuid": dm_filters.EQ(uuid)}),

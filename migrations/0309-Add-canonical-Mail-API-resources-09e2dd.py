@@ -19,7 +19,7 @@ from restalchemy.storage.sql import migrations
 
 class MigrationStep(migrations.AbstractMigrationStep):
     def __init__(self):
-        self._depends = ["0287-Cache-successful-Zulip-history-blocks-c0769e.py"]
+        self._depends = ["0308-Register-APNs-push-devices-71fa20.py"]
 
     @property
     def migration_id(self):
@@ -38,15 +38,13 @@ class MigrationStep(migrations.AbstractMigrationStep):
                     REFERENCES m_workspace_users(uuid) ON DELETE CASCADE,
                 external_account_uuid UUID
                     REFERENCES m_external_accounts_v2(uuid) ON DELETE SET NULL,
-                path VARCHAR(1024) NOT NULL CHECK (length(path) >= 1),
                 name VARCHAR(256) NOT NULL CHECK (length(name) >= 1),
-                delimiter VARCHAR(8) NOT NULL DEFAULT '/'
-                    CHECK (length(delimiter) >= 1),
-                special_use VARCHAR(64),
+                kind TEXT NOT NULL DEFAULT 'custom'
+                    CHECK (kind IN (
+                        'inbox', 'sent', 'drafts', 'trash', 'spam', 'archive', 'custom'
+                    )),
                 unread_count INTEGER NOT NULL DEFAULT 0
                     CHECK (unread_count >= 0),
-                total_count INTEGER NOT NULL DEFAULT 0
-                    CHECK (total_count >= 0),
                 source_name VARCHAR(16) NOT NULL DEFAULT 'native'
                     CHECK (source_name IN ('native', 'provider')),
                 provider_identity VARCHAR(2048),
@@ -59,7 +57,7 @@ class MigrationStep(migrations.AbstractMigrationStep):
                 )
             );
 
-            CREATE UNIQUE INDEX m_mail_folders_owner_path_idx
+            CREATE UNIQUE INDEX m_mail_folders_owner_name_idx
                 ON m_mail_folders (
                     project_id,
                     owner_user_uuid,
@@ -67,9 +65,19 @@ class MigrationStep(migrations.AbstractMigrationStep):
                         external_account_uuid,
                         '00000000-0000-0000-0000-000000000000'::uuid
                     ),
-                    path
+                    name
                 )
                 WHERE NOT deleted;
+            CREATE UNIQUE INDEX m_mail_folders_owner_system_kind_idx
+                ON m_mail_folders (
+                    project_id, owner_user_uuid,
+                    COALESCE(
+                        external_account_uuid,
+                        '00000000-0000-0000-0000-000000000000'::uuid
+                    ),
+                    kind
+                )
+                WHERE NOT deleted AND kind <> 'custom';
             CREATE INDEX m_mail_folders_owner_updated_idx
                 ON m_mail_folders (
                     project_id, owner_user_uuid, updated_at DESC, uuid
@@ -92,21 +100,15 @@ class MigrationStep(migrations.AbstractMigrationStep):
                     CHECK (jsonb_typeof(cc_addresses) = 'array'),
                 bcc_addresses JSONB NOT NULL DEFAULT '[]'::jsonb
                     CHECK (jsonb_typeof(bcc_addresses) = 'array'),
-                reply_to VARCHAR(2048),
+                reply_to_uuid UUID,
                 subject VARCHAR(2048) NOT NULL DEFAULT '',
-                snippet VARCHAR(4096) NOT NULL DEFAULT '',
-                body_html TEXT,
-                body_text TEXT,
+                payload JSONB NOT NULL DEFAULT '{"kind":"multipart","parts":[]}'::jsonb,
                 attachment_urns JSONB NOT NULL DEFAULT '[]'::jsonb
                     CHECK (jsonb_typeof(attachment_urns) = 'array'),
-                message_id VARCHAR(2048),
-                in_reply_to VARCHAR(2048),
-                "references" JSONB NOT NULL DEFAULT '[]'::jsonb
-                    CHECK (jsonb_typeof("references") = 'array'),
                 sent_at TIMESTAMPTZ,
-                received_at TIMESTAMPTZ,
-                seen BOOLEAN NOT NULL DEFAULT FALSE,
-                flagged BOOLEAN NOT NULL DEFAULT FALSE,
+                read BOOLEAN NOT NULL DEFAULT FALSE,
+                starred BOOLEAN NOT NULL DEFAULT FALSE,
+                trash_origin_uuid UUID,
                 draft BOOLEAN NOT NULL DEFAULT TRUE,
                 delivery_status VARCHAR(16) NOT NULL DEFAULT 'draft'
                     CHECK (delivery_status IN (
@@ -142,6 +144,33 @@ class MigrationStep(migrations.AbstractMigrationStep):
                     external_account_uuid, provider_identity
                 )
                 WHERE provider_identity IS NOT NULL;
+
+            CREATE FUNCTION mail_refresh_folder_unreads()
+                RETURNS trigger LANGUAGE plpgsql AS $$
+            DECLARE
+                before_uuid UUID;
+                after_uuid UUID;
+            BEGIN
+                IF TG_OP <> 'INSERT' AND NOT OLD.deleted AND NOT OLD.draft AND NOT OLD.read THEN
+                    before_uuid := OLD.folder_uuid;
+                END IF;
+                IF TG_OP <> 'DELETE' AND NOT NEW.deleted AND NOT NEW.draft AND NOT NEW.read THEN
+                    after_uuid := NEW.folder_uuid;
+                END IF;
+                IF before_uuid IS DISTINCT FROM after_uuid THEN
+                    PERFORM uuid FROM m_mail_folders
+                        WHERE uuid IN (before_uuid, after_uuid) ORDER BY uuid FOR UPDATE;
+                    UPDATE m_mail_folders SET
+                        unread_count = unread_count
+                            + CASE WHEN uuid = after_uuid THEN 1 ELSE -1 END,
+                        updated_at = now()
+                        WHERE uuid IN (before_uuid, after_uuid);
+                END IF;
+                RETURN NULL;
+            END $$;
+            CREATE TRIGGER mail_refresh_folder_unreads
+                AFTER INSERT OR UPDATE OR DELETE ON m_mail_messages
+                FOR EACH ROW EXECUTE FUNCTION mail_refresh_folder_unreads();
 
             CREATE TABLE mail_outgoing_intents (
                 id BIGSERIAL PRIMARY KEY,
@@ -187,14 +216,14 @@ class MigrationStep(migrations.AbstractMigrationStep):
                         'stream_binding', 'topic', 'user', 'folder',
                         'folder_item', 'file', 'external_account',
                         'external_chat', 'external_operation',
-                        'mail_folder', 'mail_message'
+                        'mail_folder', 'mail_message', 'mail_draft'
                     ));
         """)
 
     def downgrade(self, session):
         session.execute("""
             DELETE FROM m_workspace_events
-            WHERE object_type IN ('mail_folder', 'mail_message');
+            WHERE object_type IN ('mail_folder', 'mail_message', 'mail_draft');
             ALTER TABLE m_workspace_events
                 DROP CONSTRAINT m_workspace_events_object_type_check,
                 ADD CONSTRAINT m_workspace_events_object_type_check
@@ -207,6 +236,7 @@ class MigrationStep(migrations.AbstractMigrationStep):
             DROP TABLE mail_outgoing_intents;
             DROP FUNCTION mail_outgoing_wakeup();
             DROP TABLE m_mail_messages;
+            DROP FUNCTION mail_refresh_folder_unreads();
             DROP TABLE m_mail_folders;
         """)
 

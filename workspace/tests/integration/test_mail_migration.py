@@ -6,8 +6,8 @@ import importlib.util
 from workspace.tests.integration import conftest
 
 
-def _load_mail_migration():
-    path = next(conftest.MIGRATIONS_DIR.glob("0288-Add-canonical-Mail-API-*.py"))
+def _load_migration(pattern):
+    path = next(conftest.MIGRATIONS_DIR.glob(pattern))
     spec = importlib.util.spec_from_file_location("mail_api_migration", path)
     migration = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(migration)
@@ -15,7 +15,9 @@ def _load_mail_migration():
 
 
 def test_mail_schema_migration_round_trip(db):
-    migration = _load_mail_migration()
+    migration = _load_migration("0309-Add-canonical-Mail-API-*.py")
+    successor = _load_migration("0310-Add-personal-Calendar-*.py")
+    successor.downgrade(db)
     migration.downgrade(db)
     try:
         assert db.execute(
@@ -39,6 +41,7 @@ def test_mail_schema_migration_round_trip(db):
         ).fetchone() == (None,)
     finally:
         migration.upgrade(db)
+        successor.upgrade(db)
 
     assert db.execute(
         """
@@ -60,6 +63,10 @@ def test_mail_schema_migration_round_trip(db):
     ).fetchone()[0]
     assert "mail_folder" in constraint
     assert "mail_message" in constraint
+    assert "calendar_event" in constraint
+    assert db.execute(
+        "SELECT to_regclass('m_workspace_calendars'), to_regclass('m_workspace_calendar_events')"
+    ).fetchone() == ("m_workspace_calendars", "m_workspace_calendar_events")
     assert db.execute(
         "SELECT to_regprocedure('mail_outgoing_wakeup()')"
     ).fetchone() == ("mail_outgoing_wakeup()",)

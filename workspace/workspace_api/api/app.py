@@ -51,8 +51,10 @@ class WorkspaceOpenApiPaths(openapi_structures.OpenApiPaths):
             for operation in operations.values():
                 if isinstance(operation, dict) and "responses" in operation:
                     operation["security"] = [{"bearerAuth": []}]
-                    if path == "/v1/messenger/me/" or path.startswith(
-                        "/v1/messenger/users/"
+                    if (
+                        path == "/v1/messenger/me/"
+                        or path.startswith("/v1/messenger/users/")
+                        or path.startswith("/v1/messenger/external_accounts/")
                     ):
                         operation["deprecated"] = True
         specification = openapi_contract.add_collection_pagination_contract(
@@ -75,6 +77,10 @@ class WorkspaceOpenApiPaths(openapi_structures.OpenApiPaths):
             components,
         )
         specification = openapi_contract.add_mail_contract(
+            specification,
+            components,
+        )
+        specification = openapi_contract.add_calendar_contract(
             specification,
             components,
         )

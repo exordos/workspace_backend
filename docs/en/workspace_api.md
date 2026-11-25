@@ -3,10 +3,9 @@
 This document describes the browser-facing API contract served by the unified
 `workspace-api` REST service and the companion `workspace-messenger-events`
 websocket service. Messenger resources, users, client service settings,
-push-device registrations, Mail resources, and REST events all use
-`workspace-api`. Calendar and External Users endpoints are not part of this
-release. Provider-neutral external account, chat, operation, policy, health,
-and bridge-instance resources are part of the Messenger API.
+push-device registrations, Mail, Calendar, and REST events all use
+`workspace-api`. Mail and Calendar share Workspace external accounts and
+the existing realtime cursor.
 
 Native Messenger resources, membership, user state, events, provider mappings,
 and client settings are canonical in PostgreSQL. The existing provenance fields
@@ -268,13 +267,10 @@ authoritative snapshots before starting a new cursor.
 | Method | Path | Description |
 | --- | --- | --- |
 | `GET` | `/api/workspace/v1/` | List routes below `/api/workspace/v1/`. |
-| `GET` | `/api/workspace/v1/mail/` | List Mail routes. |
-| `GET`, `POST` | `/api/workspace/v1/mail/folders/` | List owned folders or create one. |
-| `GET`, `PUT`, `DELETE` | `/api/workspace/v1/mail/folders/{folder_uuid}` | Read, update, or soft-delete an empty owned folder. |
-| `GET`, `POST` | `/api/workspace/v1/mail/messages/` | List owned messages or create a draft. |
-| `GET`, `PUT`, `DELETE` | `/api/workspace/v1/mail/messages/{message_uuid}` | Read, update, or soft-delete an owned message. |
-| `POST` | `/api/workspace/v1/mail/messages/{message_uuid}/actions/move/invoke` | Move a message between owned folders of the same account. |
-| `POST` | `/api/workspace/v1/mail/messages/{message_uuid}/actions/send/invoke` | Durably queue a draft for an external mail runtime. |
+| `GET` | `/api/workspace/v1/mail/` | See [Mail resources and actions](mail_api.md). |
+| `GET` | `/api/workspace/v1/calendar/` | See [Calendar resources and actions](calendar_api.md). |
+| `GET`, `POST` | `/api/workspace/v1/external_accounts/` | List or create external accounts. |
+| `GET`, `PUT`, `DELETE` | `/api/workspace/v1/external_accounts/{account_uuid}` | Read, update or delete an account. |
 | `GET` | `/api/workspace/v1/messenger/` | List Messenger routes below `/api/workspace/v1/messenger/`. |
 | `GET` | `/api/workspace/v1/messenger/server_settings` | Return Zulip-like server settings. |
 | `GET` | `/api/workspace/v1/messenger/server_settings/` | Same as above; trailing slash is supported. |

@@ -3,10 +3,9 @@
 This document describes the browser-facing API contract served by the unified
 `workspace-api` REST service and the companion `workspace-messenger-events`
 websocket service. Messenger resources, users, client service settings,
-push-device registrations、Mail resources 和 REST events 都使用
-`workspace-api`。Calendar 与 External Users endpoints 不在本 release 中。
-提供者中立的外部帐户,聊天,运营,政策,健康,
-桥接实例资源是 Messenger API 的一部分.
+push-device registrations, Mail, Calendar, and REST events all use
+`workspace-api`. Mail and Calendar share Workspace external accounts and
+the existing realtime cursor.
 
 美国人Messenger资源,会员,用户状态,事件,提供商映射
 客户端设置在 PostgreSQL 中是正规的.
@@ -268,13 +267,10 @@ GET /api/workspace/v1/events/?epoch_version%3E=123&epoch_generation=781203&page_
 | 方法 | 路径 | 描述 |
 | --- | --- | --- |
 | `GET` | `/api/workspace/v1/` | 下面列出 `/api/workspace/v1/` 的航线. |
-| `GET` | `/api/workspace/v1/mail/` | 列出 Mail 路由。 |
-| `GET`, `POST` | `/api/workspace/v1/mail/folders/` | 列出自有文件夹或创建文件夹。 |
-| `GET`, `PUT`, `DELETE` | `/api/workspace/v1/mail/folders/{folder_uuid}` | 读取、更新或软删除自有空文件夹。 |
-| `GET`, `POST` | `/api/workspace/v1/mail/messages/` | 列出自有邮件或创建草稿。 |
-| `GET`, `PUT`, `DELETE` | `/api/workspace/v1/mail/messages/{message_uuid}` | 读取、更新或软删除自有邮件。 |
-| `POST` | `/api/workspace/v1/mail/messages/{message_uuid}/actions/move/invoke` | 在同一账户的自有文件夹之间移动邮件。 |
-| `POST` | `/api/workspace/v1/mail/messages/{message_uuid}/actions/send/invoke` | 持久地为外部 Mail runtime 排队草稿。 |
+| `GET` | `/api/workspace/v1/mail/` | See [Mail resources and actions](mail_api.md). |
+| `GET` | `/api/workspace/v1/calendar/` | See [Calendar resources and actions](calendar_api.md). |
+| `GET`, `POST` | `/api/workspace/v1/external_accounts/` | List or create external accounts. |
+| `GET`, `PUT`, `DELETE` | `/api/workspace/v1/external_accounts/{account_uuid}` | Read, update or delete an account. |
 | `GET` | `/api/workspace/v1/messenger/` | 在 `/api/workspace/v1/messenger/` 下列列出 Messenger 航线. |
 | `GET` | `/api/workspace/v1/messenger/server_settings` | 返回类似 Zulip 的服务器设置. |
 | `GET` | `/api/workspace/v1/messenger/server_settings/` | 同上述相同;支持后面斜. |

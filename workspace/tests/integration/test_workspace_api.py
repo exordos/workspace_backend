@@ -9,12 +9,13 @@ def test_only_workspace_v1_contract_is_exposed(workspace_api):
     assert api.get("/v1/").status_code == 200
     assert api.get("/v1/messenger/").status_code == 200
     assert api.get("/v1/mail/").status_code == 200
-    assert api.get("/v1/calendar/").status_code >= 400
+    assert api.get("/v1/calendar/").status_code == 200
     assert api.get("/v1/providers/").status_code >= 400
     assert api.get("/v1/events/").status_code == 200
     assert api.get("/v1/epoch/").status_code == 200
     assert api.get("/v1/messages/").status_code >= 400
-    assert api.get("/v1/external_accounts/").status_code >= 400
+    permissions = ("workspace.external_account.read",)
+    assert api.get("/v1/external_accounts/", permissions=permissions).status_code == 200
     assert api.get("/v1/messenger/events/").status_code >= 400
 
 

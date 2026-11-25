@@ -48,6 +48,22 @@ class ExternalAccountStatus(str, enum.Enum):
     ERROR = "error"
 
 
+def public_settings(settings: dict[str, typing.Any]) -> dict[str, str]:
+    result = {}
+    email = settings.get("email")
+    if isinstance(email, str):
+        result["email"] = email
+    server_url = settings.get("server_url")
+    if isinstance(server_url, str):
+        endpoint = urllib.parse.urlsplit(server_url)
+        if endpoint.scheme in {"http", "https"} and endpoint.hostname:
+            host = endpoint.netloc.rsplit("@", 1)[-1]
+            result["server_url"] = endpoint._replace(
+                netloc=host, query="", fragment=""
+            ).geturl()
+    return result
+
+
 class ExternalAccount(
     models.ModelWithUUID,
     models.ModelWithProject,
@@ -77,6 +93,25 @@ class ExternalAccount(
         types.AllowNone(types.String()),
         default=None,
     )
+    capabilities = properties.property(
+        types.TypedList(types.Enum(["mail", "calendar", "messenger"])),
+        default=list,
+        read_only=True,
+    )
+
+    def _get_prepared_data(
+        self, properties: typing.Any = None
+    ) -> dict[str, typing.Any]:
+        data = super()._get_prepared_data(properties)
+        data.pop("capabilities", None)
+        return data
+
+    def _refresh_capabilities(self, session: typing.Any) -> None:
+        row = session.execute(
+            "SELECT capabilities FROM m_external_accounts_v2 WHERE uuid = %s",
+            (self.uuid,),
+        ).fetchone()
+        self.properties["capabilities"].set_value_force(row[0])
 
     @classmethod
     def restore_row(cls, row: typing.Any, pour: typing.Any = None) -> "ExternalAccount":
@@ -99,6 +134,7 @@ class ExternalAccount(
             elif self.provider_uuid is not None:
                 self._normalize_endpoint_host()
             super().insert(session=current_session)
+            self._refresh_capabilities(current_session)
             self._persisted_provider_uuid = self.provider_uuid
 
     def get_host(self) -> str:
@@ -119,6 +155,8 @@ class ExternalAccount(
                 if self.provider_uuid is None or hostname != self.get_host():
                     self._register_provider(session=current_session)
             super().update(session=current_session, force=force)
+            if self.properties["provider"].is_dirty():
+                self._refresh_capabilities(current_session)
             self._persisted_provider_uuid = self.provider_uuid
 
     def _normalize_endpoint_host(self) -> None:

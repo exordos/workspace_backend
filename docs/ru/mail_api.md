@@ -1,57 +1,56 @@
 # Workspace Mail API
 
-Это действующий браузерный контракт почты. Он расширяет единый сервис
-[`workspace-api`](workspace_api.md) в `/api/workspace/v1/mail/` и не создаёт
-второй публичный API-процесс.
+Mail uses the unified [`workspace-api`](workspace_api.md) service. Its resources
+belong to the active IAM project and current user.
 
-## Архитектура и границы
+## Resources and Actions
 
-- PostgreSQL является каноническим хранилищем для `m_mail_folders`,
-  `m_mail_messages` и `mail_outgoing_intents`.
-- Вложения переиспользуют файловое хранилище Workspace и задаются через
-  `urn:file:`; байты остаются в S3.
-- Почтовые ресурсы используют существующие IAM scope проекта и текущего
-  пользователя, долговечные события Workspace, REST backfill и WebSocket.
-- Отдельный почтовый runtime может забирать `mail_outgoing_intents` и
-  проецировать изменения провайдера в канонические таблицы. Этот runtime и
-  реальная SMTP/IMAP-доставка не входят в данное изменение backend.
-- `/api/workspace/v1/calendar/` и публичные provider-specific маршруты
-  по-прежнему отсутствуют.
-
-## Ресурсы и действия
-
-| Метод | Путь | Назначение |
+| Method | Path | Purpose |
 | --- | --- | --- |
-| `GET`, `POST` | `/api/workspace/v1/mail/folders/` | Получить свои папки или создать папку. |
-| `GET`, `PUT`, `DELETE` | `/api/workspace/v1/mail/folders/{folder_uuid}` | Прочитать, изменить или мягко удалить пустую свою папку. |
-| `GET`, `POST` | `/api/workspace/v1/mail/messages/` | Получить свои письма или создать локальный черновик. |
-| `GET`, `PUT`, `DELETE` | `/api/workspace/v1/mail/messages/{message_uuid}` | Прочитать, изменить или мягко удалить своё письмо. |
-| `POST` | `/api/workspace/v1/mail/messages/{message_uuid}/actions/move/invoke` | Переместить письмо между своими папками одной учётной записи. |
-| `POST` | `/api/workspace/v1/mail/messages/{message_uuid}/actions/send/invoke` | Атомарно поставить черновик в очередь и создать один долговечный intent. |
+| `GET`, `POST` | `/api/workspace/v1/mail/folders/` | List folders or create one. |
+| `GET`, `PUT`, `DELETE` | `/api/workspace/v1/mail/folders/{folder_uuid}` | Read, update or remove an empty folder. |
+| `GET`, `POST` | `/api/workspace/v1/mail/drafts/` | List or create drafts. |
+| `GET`, `PUT`, `DELETE` | `/api/workspace/v1/mail/drafts/{draft_uuid}` | Read, edit or delete a draft. |
+| `POST` | `/api/workspace/v1/mail/drafts/{draft_uuid}/actions/send/invoke` | Queue a draft as a message with the same UUID. |
+| `GET` | `/api/workspace/v1/mail/messages/` | List messages. |
+| `GET`, `DELETE` | `/api/workspace/v1/mail/messages/{message_uuid}` | Read or remove a message. |
 
-Сгенерированный OpenAPI Workspace является источником истины для полных схем
-полей, параметров фильтрации, HTTP-статусов и тел ответов.
+Message actions use `/api/workspace/v1/mail/messages/{message_uuid}/actions/<name>/invoke`.
+`read`, `unread`, `star`, and `unstar` set flags. `move` accepts `folder_uuid`
+within the same account. `trash` uses the account's `trash` folder and `restore`
+returns the message to its prior folder.
 
-## Черновик и отправка
+## Message Body
 
-1. Создать или выбрать папку. Если задан `external_account_uuid`, это должна
-   быть включённая учётная запись `mail` текущего пользователя в IAM-проекте.
-2. Создать письмо с `folder_uuid`; начальное состояние — `draft=true` и
-   `delivery_status=draft`.
-3. Изменить содержимое черновика или прикрепить видимые файлы Workspace.
-4. Вызвать `send`. В одной транзакции БД проверяются получатели, тело, учётная
-   запись и видимость вложений; создаётся строка `mail_outgoing_intents`;
-   выставляется `delivery_status=queued`; публикуется `mail.message.updated`.
-5. `sent_at` остаётся пустым до подтверждения доставки почтовым runtime.
-   Письмо в очереди нельзя удалить через публичный API.
+Addresses, subject, reply reference and attachment URNs are fields on the draft
+or message. `payload` contains a typed array of body parts.
 
-Действие отправки само по себе не доказывает внешнюю доставку. Пока почтовый
-runtime не сообщил конечный результат, подтверждена только долговечная
-постановка запроса в очередь.
+```json
+{
+  "subject": "Report",
+  "to_addresses": ["reader@example.com"],
+  "payload": {
+    "kind": "multipart",
+    "parts": [
+      {"kind": "text", "content": "The report is ready."},
+      {"kind": "html", "content": "<p>The report is ready.</p>"}
+    ]
+  }
+}
+```
 
-## Вложения
+A single body part uses the same array. Text and HTML can represent the same
+body in two formats. A draft may start with an empty `parts` array.
 
-Приватное почтовое вложение загружается существующим multipart endpoint:
+## Send and Attachments
+
+The send action checks the sender account, recipients and attachment visibility.
+It moves the draft into the message collection with `delivery_status=queued` and
+records one durable send intent in the same transaction. `sent_at` stays empty
+until a mail runtime confirms transport. The runtime is a separate integration.
+
+Upload files through the existing Workspace file endpoint. The draft stores the
+returned `urn:file:<file_uuid>` references in `attachment_urns`.
 
 ```text
 POST /api/workspace/v1/messenger/files/
@@ -61,29 +60,10 @@ file=<bytes>
 acl={"mode":"owner"}
 ```
 
-Возвращённый UUID используется как `urn:file:<file_uuid>` в `attachment_urns`.
-API принимает только файлы, видимые текущему IAM-пользователю в текущем
-проекте. `acl={"mode":"owner"}` создаёт приватный файл без stream; можно также
-ссылаться на существующие stream-visible и public файлы Workspace.
+## Realtime
 
-## События realtime
+Mail uses the shared `/api/workspace/v1/events/` and `/api/workspace/v1/events/ws`.
+Folder, draft and message changes use `mail.folder.*`, `mail.draft.*`, and
+`mail.message.*`. Queuing emits `mail.draft.deleted` and `mail.message.created`.
 
-| Kind | Тип объекта | Когда публикуется |
-| --- | --- | --- |
-| `mail.folder.created` | `mail_folder` | Создание папки. |
-| `mail.folder.updated` | `mail_folder` | Изменение метаданных папки. |
-| `mail.folder.deleted` | `mail_folder` | Мягкое удаление папки. |
-| `mail.message.created` | `mail_message` | Создание черновика или проекции письма. |
-| `mail.message.updated` | `mail_message` | Изменение содержимого, состояния, папки или очереди. |
-| `mail.message.deleted` | `mail_message` | Мягкое удаление письма. |
-
-Эти kind используют тот же cursor `/api/workspace/v1/events/` и stream
-`/api/workspace/v1/events/ws`, что и ресурсы Messenger.
-
-## Граница приёмки
-
-Приёмка backend включает upgrade/downgrade миграции, генерацию OpenAPI,
-изоляцию owner/project, видимость owner-файлов, идемпотентность долговечного
-intent и тесты событий. Она не подтверждает развёрнутый почтовый runtime,
-SMTP/IMAP-доступ, приёмку провайдером или наличие доставленной копии во внешней
-папке Sent.
+See [Calendar and external accounts](calendar_api.md) for account capabilities.

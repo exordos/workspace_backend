@@ -13,6 +13,7 @@ from restalchemy.dm import filters as dm_filters
 
 from workspace.mail_api import events
 from workspace.mail_api.dm import models
+from workspace.mail_api.dm import payloads
 from workspace.messenger_api.dm import external_models
 
 
@@ -27,14 +28,10 @@ MESSAGE_CONTENT_FIELDS = frozenset(
         "to_addresses",
         "cc_addresses",
         "bcc_addresses",
-        "reply_to",
+        "reply_to_uuid",
         "subject",
-        "snippet",
-        "body_html",
-        "body_text",
+        "payload",
         "attachment_urns",
-        "in_reply_to",
-        "references",
     }
 )
 
@@ -57,7 +54,7 @@ def _account(
             "uuid": dm_filters.EQ(account_uuid),
             "project_id": dm_filters.EQ(project_id),
             "owner_user_uuid": dm_filters.EQ(owner_user_uuid),
-            "provider": dm_filters.EQ("mail"),
+            "capabilities": dm_filters.ContainsAll(["mail"]),
             "disabled": dm_filters.EQ(False),
         },
         session=session,
@@ -69,6 +66,8 @@ def _folder(
     project_id: sys_uuid.UUID,
     owner_user_uuid: sys_uuid.UUID,
     folder_uuid: sys_uuid.UUID,
+    *,
+    locked: bool = False,
 ) -> models.MailFolder:
     return models.MailFolder.objects.get_one(
         filters={
@@ -78,6 +77,7 @@ def _folder(
             "deleted": dm_filters.EQ(False),
         },
         session=session,
+        locked=locked,
     )
 
 
@@ -88,14 +88,18 @@ def _message(
     message_uuid: sys_uuid.UUID,
     *,
     locked: bool = False,
+    draft: bool | None = None,
 ) -> models.MailMessage:
+    filters = {
+        "uuid": dm_filters.EQ(message_uuid),
+        "project_id": dm_filters.EQ(project_id),
+        "owner_user_uuid": dm_filters.EQ(owner_user_uuid),
+        "deleted": dm_filters.EQ(False),
+    }
+    if draft is not None:
+        filters["draft"] = dm_filters.EQ(draft)
     return models.MailMessage.objects.get_one(
-        filters={
-            "uuid": dm_filters.EQ(message_uuid),
-            "project_id": dm_filters.EQ(project_id),
-            "owner_user_uuid": dm_filters.EQ(owner_user_uuid),
-            "deleted": dm_filters.EQ(False),
-        },
+        filters=filters,
         session=session,
         locked=locked,
     )
@@ -166,7 +170,7 @@ def update_folder(
     folder: models.MailFolder,
     values: dict[str, typing.Any],
 ) -> models.MailFolder:
-    allowed = {"external_account_uuid", "path", "name", "delimiter", "special_use"}
+    allowed = {"external_account_uuid", "name", "kind"}
     if not values or set(values) - allowed:
         raise ra_exc.ValidationErrorException()
     if "external_account_uuid" in values:
@@ -223,6 +227,7 @@ def create_message(
         project_id,
         owner_user_uuid,
         values["folder_uuid"],
+        locked=True,
     )
     _validate_attachment_urns(
         session,
@@ -236,6 +241,7 @@ def create_message(
         owner_user_uuid,
         folder.external_account_uuid,
     )
+    _validate_reply(session, folder, values.get("reply_to_uuid"))
     sender = ""
     if account is not None:
         sender = account.settings.get("email") or ""
@@ -252,14 +258,12 @@ def create_message(
             "source_name": models.MailSource.NATIVE.value,
             "provider_identity": None,
             "sent_at": None,
-            "received_at": None,
-            "message_id": None,
             "deleted": False,
         }
     )
     message = models.MailMessage(**values)
     message.insert(session=session)
-    events.create_mail_event(message, events.MAIL_MESSAGE_CREATED_EVENT, session)
+    events.create_mail_event(message, events.MAIL_DRAFT_CREATED_EVENT, session)
     return message
 
 
@@ -268,10 +272,7 @@ def update_message(
     message: models.MailMessage,
     values: dict[str, typing.Any],
 ) -> models.MailMessage:
-    allowed = MESSAGE_CONTENT_FIELDS | {"seen", "flagged"}
-    if not values or set(values) - allowed:
-        raise ra_exc.ValidationErrorException()
-    if not message.draft and set(values).intersection(MESSAGE_CONTENT_FIELDS):
+    if not values or set(values) - MESSAGE_CONTENT_FIELDS or not message.draft:
         raise ra_exc.ValidationErrorException()
     if "attachment_urns" in values:
         _validate_attachment_urns(
@@ -280,10 +281,30 @@ def update_message(
             message.owner_user_uuid,
             values["attachment_urns"],
         )
+    if "reply_to_uuid" in values:
+        _validate_reply(session, message, values["reply_to_uuid"])
     message.update_dm(values=values)
     message.update(session=session)
-    events.create_mail_event(message, events.MAIL_MESSAGE_UPDATED_EVENT, session)
+    events.create_mail_event(message, events.MAIL_DRAFT_UPDATED_EVENT, session)
     return message
+
+
+def _validate_reply(
+    session: typing.Any,
+    resource: models.MailFolder | models.MailMessage,
+    reply_to_uuid: sys_uuid.UUID | None,
+) -> None:
+    if reply_to_uuid is None:
+        return
+    source = _message(
+        session,
+        resource.project_id,
+        resource.owner_user_uuid,
+        reply_to_uuid,
+        draft=False,
+    )
+    if source.external_account_uuid != resource.external_account_uuid:
+        raise ra_exc.ValidationErrorException()
 
 
 def move_message(
@@ -291,17 +312,72 @@ def move_message(
     message: models.MailMessage,
     folder_uuid: sys_uuid.UUID,
 ) -> models.MailMessage:
-    folder = _folder(
-        session,
-        message.project_id,
-        message.owner_user_uuid,
-        folder_uuid,
-    )
+    folders = {
+        uuid: _folder(
+            session, message.project_id, message.owner_user_uuid, uuid, locked=True
+        )
+        for uuid in sorted({message.folder_uuid, folder_uuid})
+    }
+    folder = folders[folder_uuid]
     if folder.external_account_uuid != message.external_account_uuid:
         raise ra_exc.ValidationErrorException()
+    if message.folder_uuid == folder.uuid:
+        return message
+    origin_uuid = None
+    if folder.kind == "trash":
+        origin_uuid = message.trash_origin_uuid or message.folder_uuid
+    _force_values(message, {"trash_origin_uuid": origin_uuid})
     message.update_dm(values={"folder_uuid": folder.uuid})
     message.update(session=session)
     events.create_mail_event(message, events.MAIL_MESSAGE_UPDATED_EVENT, session)
+    return message
+
+
+def set_message_flag(
+    session: typing.Any,
+    message: models.MailMessage,
+    name: str,
+    value: bool,
+) -> models.MailMessage:
+    if message[name] != value:
+        _force_values(message, {name: value})
+        message.update(session=session)
+        events.create_mail_event(message, events.MAIL_MESSAGE_UPDATED_EVENT, session)
+    return message
+
+
+def trash_message(
+    session: typing.Any,
+    message: models.MailMessage,
+) -> models.MailMessage:
+    if message.delivery_status == models.MailDeliveryStatus.QUEUED.value:
+        raise ra_exc.ValidationErrorException()
+    trash = models.MailFolder.objects.get_one(
+        filters={
+            "project_id": dm_filters.EQ(message.project_id),
+            "owner_user_uuid": dm_filters.EQ(message.owner_user_uuid),
+            "external_account_uuid": (
+                dm_filters.EQ(message.external_account_uuid)
+                if message.external_account_uuid is not None
+                else dm_filters.Is(None)
+            ),
+            "kind": dm_filters.EQ("trash"),
+            "deleted": dm_filters.EQ(False),
+        },
+        session=session,
+    )
+    if message.folder_uuid != trash.uuid:
+        move_message(session, message, trash.uuid)
+    return message
+
+
+def restore_message(
+    session: typing.Any,
+    message: models.MailMessage,
+) -> models.MailMessage:
+    original_folder = message.trash_origin_uuid
+    if original_folder is not None:
+        move_message(session, message, original_folder)
     return message
 
 
@@ -326,7 +402,7 @@ def send_message(
         raise ra_exc.ValidationErrorException()
     if not message.from_address:
         raise ra_exc.ValidationErrorException()
-    if message.body_text is None and message.body_html is None:
+    if not any(part.content.strip() for part in message.payload.parts):
         raise ra_exc.ValidationErrorException()
     account = _account(
         session,
@@ -337,6 +413,7 @@ def send_message(
     if (
         account is None
         or account.status != external_models.ExternalAccountStatus.ACTIVE.value
+        or message.from_address != account.settings.get("email")
     ):
         raise ra_exc.ValidationErrorException()
     _validate_attachment_urns(
@@ -351,13 +428,10 @@ def send_message(
         "to_addresses": message.to_addresses,
         "cc_addresses": message.cc_addresses,
         "bcc_addresses": message.bcc_addresses,
-        "reply_to": message.reply_to,
+        "reply_to_uuid": str(message.reply_to_uuid) if message.reply_to_uuid else None,
         "subject": message.subject,
-        "body_text": message.body_text,
-        "body_html": message.body_html,
+        "payload": payloads.PAYLOAD_TYPE.to_simple_type(message.payload),
         "attachment_urns": message.attachment_urns,
-        "in_reply_to": message.in_reply_to,
-        "references": message.references,
     }
     session.execute(
         """
@@ -376,12 +450,14 @@ def send_message(
         message,
         {
             "draft": False,
+            "read": True,
             "delivery_status": models.MailDeliveryStatus.QUEUED.value,
             "delivery_error": None,
         },
     )
     message.update(session=session)
-    events.create_mail_event(message, events.MAIL_MESSAGE_UPDATED_EVENT, session)
+    events.create_mail_event(message, events.MAIL_DRAFT_DELETED_EVENT, session)
+    events.create_mail_event(message, events.MAIL_MESSAGE_CREATED_EVENT, session)
     return message
 
 
@@ -390,7 +466,12 @@ def delete_message(session: typing.Any, message: models.MailMessage) -> None:
         raise ra_exc.ValidationErrorException()
     _force_values(message, {"deleted": True})
     message.update(session=session)
-    events.create_mail_event(message, events.MAIL_MESSAGE_DELETED_EVENT, session)
+    kind = (
+        events.MAIL_DRAFT_DELETED_EVENT
+        if message.draft
+        else events.MAIL_MESSAGE_DELETED_EVENT
+    )
+    events.create_mail_event(message, kind, session)
 
 
 get_folder = _folder

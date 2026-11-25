@@ -538,6 +538,42 @@ class MailMessageDeletedEventPayload(ExternalEventPayloadBase):
     KIND = "mail.message.deleted"
 
 
+class MailDraftCreatedEventPayload(ExternalEventPayloadBase):
+    KIND = "mail.draft.created"
+
+
+class MailDraftUpdatedEventPayload(ExternalEventPayloadBase):
+    KIND = "mail.draft.updated"
+
+
+class MailDraftDeletedEventPayload(ExternalEventPayloadBase):
+    KIND = "mail.draft.deleted"
+
+
+class CalendarCreatedEventPayload(ExternalEventPayloadBase):
+    KIND = "calendar.calendar.created"
+
+
+class CalendarUpdatedEventPayload(ExternalEventPayloadBase):
+    KIND = "calendar.calendar.updated"
+
+
+class CalendarDeletedEventPayload(ExternalEventPayloadBase):
+    KIND = "calendar.calendar.deleted"
+
+
+class CalendarEventCreatedEventPayload(ExternalEventPayloadBase):
+    KIND = "calendar.event.created"
+
+
+class CalendarEventUpdatedEventPayload(ExternalEventPayloadBase):
+    KIND = "calendar.event.updated"
+
+
+class CalendarEventDeletedEventPayload(ExternalEventPayloadBase):
+    KIND = "calendar.event.deleted"
+
+
 WORKSPACE_EVENT_PAYLOAD_TYPE = types_dynamic.KindModelSelectorType(
     types_dynamic.KindModelType(MessageCreatedEventPayload),
     types_dynamic.KindModelType(MessageUpdatedEventPayload),
@@ -575,4 +611,13 @@ WORKSPACE_EVENT_PAYLOAD_TYPE = types_dynamic.KindModelSelectorType(
     types_dynamic.KindModelType(MailMessageCreatedEventPayload),
     types_dynamic.KindModelType(MailMessageUpdatedEventPayload),
     types_dynamic.KindModelType(MailMessageDeletedEventPayload),
+    types_dynamic.KindModelType(MailDraftCreatedEventPayload),
+    types_dynamic.KindModelType(MailDraftUpdatedEventPayload),
+    types_dynamic.KindModelType(MailDraftDeletedEventPayload),
+    types_dynamic.KindModelType(CalendarCreatedEventPayload),
+    types_dynamic.KindModelType(CalendarUpdatedEventPayload),
+    types_dynamic.KindModelType(CalendarDeletedEventPayload),
+    types_dynamic.KindModelType(CalendarEventCreatedEventPayload),
+    types_dynamic.KindModelType(CalendarEventUpdatedEventPayload),
+    types_dynamic.KindModelType(CalendarEventDeletedEventPayload),
 )

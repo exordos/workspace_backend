@@ -5,7 +5,11 @@ import types
 import uuid as sys_uuid
 from unittest import mock
 
+import pytest
+from restalchemy.common import exceptions
+
 from workspace.mail_api import application_services
+from workspace.mail_api.dm import payloads
 
 
 def test_send_reloads_and_locks_draft_before_creating_intent(monkeypatch):
@@ -27,18 +31,24 @@ def test_send_reloads_and_locks_draft_before_creating_intent(monkeypatch):
         to_addresses=["recipient@example.test"],
         cc_addresses=[],
         bcc_addresses=[],
-        body_text="body",
-        body_html=None,
+        payload=payloads.MultipartPayload(
+            parts=[
+                payloads.TextPart(content="body"),
+                payloads.HtmlPart(content="<p>body</p>"),
+            ],
+        ),
         external_account_uuid=account_uuid,
         attachment_urns=[],
         from_address="sender@example.test",
-        reply_to=None,
+        reply_to_uuid=None,
         subject="subject",
-        in_reply_to=None,
-        references=[],
         update=mock.Mock(),
     )
-    account = types.SimpleNamespace(uuid=account_uuid, status="active")
+    account = types.SimpleNamespace(
+        uuid=account_uuid,
+        status="active",
+        settings={"email": locked_message.from_address},
+    )
     session = types.SimpleNamespace(execute=mock.Mock())
     reload_message = mock.Mock(return_value=locked_message)
     monkeypatch.setattr(application_services, "_message", reload_message)
@@ -64,3 +74,20 @@ def test_send_reloads_and_locks_draft_before_creating_intent(monkeypatch):
         locked=True,
     )
     session.execute.assert_called_once()
+    intent = session.execute.call_args.args[1][-1].obj
+    assert intent["payload"] == {
+        "kind": "multipart",
+        "parts": [
+            {"kind": "text", "content": "body"},
+            {"kind": "html", "content": "<p>body</p>"},
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    "part",
+    [{"kind": "unexpected"}, {"kind": "text", "content": "ok", "subject": "extra"}],
+)
+def test_mail_payload_rejects_unknown_parts_and_envelope_fields(part):
+    with pytest.raises(exceptions.ParseError):
+        payloads.PAYLOAD_TYPE.from_simple_type({"kind": "multipart", "parts": [part]})
