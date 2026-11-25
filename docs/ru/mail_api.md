@@ -48,7 +48,8 @@ body in two formats. A draft may start with an empty `parts` array.
 The send action checks the sender account, recipients and attachment visibility.
 It moves the draft into the message collection with `delivery_status=queued` and
 records one durable send intent in the same transaction. `sent_at` stays empty
-until a mail runtime confirms transport. The runtime is a separate integration.
+until a mail runtime confirms transport. For `imap_smtp` accounts, the runtime
+uses the SMTP server configured for the sender account.
 
 Upload files through the existing Workspace file endpoint. The draft stores the
 returned `urn:file:<file_uuid>` references in `attachment_urns`.
@@ -68,3 +69,35 @@ Folder, draft and message changes use `mail.folder.*`, `mail.draft.*`, and
 `mail.message.*`. Queuing emits `mail.draft.deleted` and `mail.message.created`.
 
 See [Calendar and external accounts](calendar_api.md) for account capabilities.
+
+## External Mail Accounts
+
+Use the external-accounts collection with the `imap_smtp` provider. The same
+Workspace user can connect multiple accounts. Each account owns its own folders,
+mailbox progress, and SMTP queue.
+
+```json
+{
+  "provider": "imap_smtp",
+  "settings": {
+    "email": "customer@example.org",
+    "imap": {"host": "imap.example.org", "port": 993, "tls": "implicit"},
+    "smtp": {"host": "smtp.example.org", "port": 587, "tls": "starttls"},
+    "password": "application-password"
+  }
+}
+```
+
+The optional `settings.username` defaults to `email`. Both protocols use the
+same login and password. Use `implicit` for TLS from the start of a connection,
+or `starttls` for a connection that requires a TLS upgrade before authentication.
+The endpoint must resolve to public IP addresses and present a trusted certificate.
+The worker imports incoming mail and attachments even when SMTP is unavailable.
+The account reports the SMTP error until sending becomes available again.
+IMAP synchronization accepts up to 512 folders and processes bounded batches.
+Messages larger than 16 MiB of raw mail data are skipped. Mail operations on
+the imported copy are local to Workspace.
+
+The password never appears in an API response or event. Disconnect with
+`{"disabled": true}` and reconnect with `disabled: false` plus a new
+`settings.password`. Pending outgoing mail must finish before disconnecting.

@@ -17,6 +17,7 @@ from workspace.calendar_api import models
 from workspace.common import account_capabilities
 from workspace.messenger_api.api import controllers as messenger_controllers
 from workspace.messenger_api.dm import external_models
+from workspace.services import groupware_caldav_write
 
 
 class CalendarResourceController(messenger_controllers.ExternalResourceController):
@@ -72,7 +73,7 @@ class CalendarController(CalendarResourceController):
         session = contexts.Context().get_session()
         account_uuid = kwargs.get("external_account_uuid")
         if account_uuid is not None:
-            external_models.ExternalAccount.objects.get_one(
+            account = external_models.ExternalAccount.objects.get_one(
                 filters=self._owner_filters(
                     {
                         "uuid": dm_filters.EQ(account_uuid),
@@ -84,6 +85,8 @@ class CalendarController(CalendarResourceController):
                 ),
                 session=session,
             )
+            if account.provider == "caldav":
+                raise exceptions.ValidationErrorException()
         calendar = models.Calendar(
             **kwargs,
             project_id=self._get_project_id(),
@@ -98,6 +101,8 @@ class CalendarController(CalendarResourceController):
         if calendar.read_only or kwargs.keys() != {"name"}:
             raise exceptions.ValidationErrorException()
         session = contexts.Context().get_session()
+        if groupware_caldav_write.binding(session, calendar.uuid) is not None:
+            raise exceptions.ValidationErrorException()
         calendar.update_dm(values=kwargs)
         calendar.update(session=session)
         self._emit(calendar, "updated", session)
@@ -108,6 +113,8 @@ class CalendarController(CalendarResourceController):
         if calendar.read_only:
             raise exceptions.ValidationErrorException()
         session = contexts.Context().get_session()
+        if groupware_caldav_write.binding(session, calendar.uuid) is not None:
+            raise exceptions.ValidationErrorException()
         if models.CalendarEvent.objects.get_all(
             filters=self._owner_filters(
                 {"calendar_uuid": dm_filters.EQ(calendar.uuid)}
@@ -168,14 +175,32 @@ class CalendarEventController(CalendarResourceController):
         ):
             raise exceptions.ValidationErrorException()
         session = contexts.Context().get_session()
-        self._writable_calendar(kwargs["calendar_uuid"], session)
+        calendar = self._writable_calendar(kwargs["calendar_uuid"], session)
         event = models.CalendarEvent(
             **kwargs,
             **models.event_times(kwargs["payload"]),
             owner_user_uuid=self._get_user_uuid(),
             project_id=self._get_project_id(),
         )
+        if (
+            "uuid" in kwargs
+            and groupware_caldav_write.binding(session, calendar.uuid) is not None
+        ):
+            existing = models.CalendarEvent.objects.get_one_or_none(
+                filters=self._owner_filters(
+                    {
+                        "uuid": dm_filters.EQ(event.uuid),
+                        "calendar_uuid": dm_filters.EQ(calendar.uuid),
+                    }
+                ),
+                session=session,
+            )
+            if existing is not None and models.EVENT_PAYLOAD_TYPE.to_simple_type(
+                existing.payload
+            ) == models.EVENT_PAYLOAD_TYPE.to_simple_type(event.payload):
+                return existing
         event.insert(session=session)
+        groupware_caldav_write.create(session, calendar, event)
         self._emit(event, "created", session)
         return event
 
@@ -184,18 +209,20 @@ class CalendarEventController(CalendarResourceController):
             raise exceptions.ValidationErrorException()
         event = self.get(uuid)
         session = contexts.Context().get_session()
-        self._writable_calendar(event.calendar_uuid, session)
+        calendar = self._writable_calendar(event.calendar_uuid, session)
         event.update_dm(values=kwargs)
         for field, value in models.event_times(event.payload).items():
             event.properties[field].set_value_force(value)
         event.update(session=session)
+        groupware_caldav_write.update(session, calendar, event)
         self._emit(event, "updated", session)
         return event
 
     def delete(self, uuid: object) -> None:
         event = self.get(uuid)
         session = contexts.Context().get_session()
-        self._writable_calendar(event.calendar_uuid, session)
+        calendar = self._writable_calendar(event.calendar_uuid, session)
+        groupware_caldav_write.delete(session, calendar, event)
         event.delete(session=session)
         self._emit(event, "deleted", session)
 
@@ -211,6 +238,11 @@ class CalendarEventController(CalendarResourceController):
         for uuid in sorted({resource.calendar_uuid, calendar_uuid}):
             self._writable_calendar(uuid, session)
         if resource.calendar_uuid != calendar_uuid:
+            if any(
+                groupware_caldav_write.binding(session, uuid) is not None
+                for uuid in (resource.calendar_uuid, calendar_uuid)
+            ):
+                raise exceptions.ValidationErrorException()
             resource.calendar_uuid = calendar_uuid
             resource.update(session=session)
             self._emit(resource, "updated", session)

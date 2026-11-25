@@ -17,6 +17,8 @@ def _load_migration(pattern):
 def test_mail_schema_migration_round_trip(db):
     migration = _load_migration("0309-Add-canonical-Mail-API-*.py")
     successor = _load_migration("0310-Add-personal-Calendar-*.py")
+    groupware = _load_migration("0311-Store-groupware-credentials-*.py")
+    groupware.downgrade(db)
     successor.downgrade(db)
     migration.downgrade(db)
     try:
@@ -24,9 +26,11 @@ def test_mail_schema_migration_round_trip(db):
             """
             SELECT to_regclass('m_mail_folders'),
                    to_regclass('m_mail_messages'),
-                   to_regclass('mail_outgoing_intents')
+                   to_regclass('mail_outgoing_intents'),
+                   to_regclass('groupware_mailbox_progress'),
+                   to_regclass('groupware_calendar_event_bindings')
             """
-        ).fetchone() == (None, None, None)
+        ).fetchone() == (None, None, None, None, None)
         constraint = db.execute(
             """
             SELECT pg_get_constraintdef(oid)
@@ -42,6 +46,7 @@ def test_mail_schema_migration_round_trip(db):
     finally:
         migration.upgrade(db)
         successor.upgrade(db)
+        groupware.upgrade(db)
 
     assert db.execute(
         """

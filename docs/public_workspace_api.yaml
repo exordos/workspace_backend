@@ -459,6 +459,11 @@ components:
               items: {}
           example:
             key: value
+          description: Provider-specific settings. IMAP/SMTP uses email, optional username, and imap/smtp objects with host, port, and tls (implicit or starttls). CalDAV uses an HTTPS url and username. Password is required to connect or reconnect and is never returned.
+          properties:
+            password:
+              type: string
+              writeOnly: true
         status:
           type: string
           enum:

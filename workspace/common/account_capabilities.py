@@ -5,6 +5,8 @@ _CAPABILITIES = {
     "zulip": ("messenger",),
     "mail": ("mail",),
     "calendar": ("calendar",),
+    "imap_smtp": ("mail",),
+    "caldav": ("calendar",),
     "google": ("mail", "calendar"),
     "microsoft": ("mail", "calendar"),
 }
