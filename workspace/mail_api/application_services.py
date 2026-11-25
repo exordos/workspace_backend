@@ -10,6 +10,8 @@ import uuid as sys_uuid
 from psycopg.types import json as pg_json
 from restalchemy.common import exceptions as ra_exc
 from restalchemy.dm import filters as dm_filters
+from restalchemy.storage import exceptions as storage_exc
+from restalchemy.storage.sql import utils as sql_utils
 
 from workspace.common import account_capabilities
 from workspace.mail_api import events
@@ -409,16 +411,26 @@ def restore_message(
     trash = _folder(
         session, message.project_id, message.owner_user_uuid, message.folder_uuid
     )
-    inbox = create_folder(
-        session,
-        message.project_id,
-        message.owner_user_uuid,
-        {
-            "external_account_uuid": message.external_account_uuid,
-            "name": "Inbox" if trash.name != "Inbox" else "Restored",
-            "kind": "inbox",
-        },
-    )
+    try:
+        with sql_utils.savepoint("mail_restore_inbox"):
+            inbox = create_folder(
+                session,
+                message.project_id,
+                message.owner_user_uuid,
+                {
+                    "external_account_uuid": message.external_account_uuid,
+                    "name": "Inbox" if trash.name != "Inbox" else "Restored",
+                    "kind": "inbox",
+                },
+            )
+    except storage_exc.ConflictRecords:
+        # A concurrent restore may have committed the Inbox while we inserted.
+        inbox = models.MailFolder.objects.get_one_or_none(
+            filters={**scope, "kind": dm_filters.EQ("inbox")},
+            session=session,
+        )
+        if inbox is None:
+            raise
     return move_message(session, message, inbox.uuid)
 
 

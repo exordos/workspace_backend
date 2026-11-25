@@ -1,9 +1,14 @@
 # Copyright 2026 Genesis Corporation.
 # Licensed under the Apache License, Version 2.0 (the "License").
 
+import concurrent.futures
 import io
+import threading
 import uuid as sys_uuid
 
+import webob
+
+from workspace.mail_api import application_services
 from workspace.messenger_api import file_storage
 from workspace.tests.integration import conftest
 
@@ -293,3 +298,63 @@ def test_move_and_restore_a_message_after_original_folder_was_deleted(
     destination = workspace_api.get(MAIL_FOLDERS + restored.json()["folder_uuid"])
     assert destination.status_code == 200, destination.text
     assert destination.json()["kind"] == "inbox"
+
+
+def test_concurrent_restores_reuse_one_fallback_inbox(workspace_api, db, monkeypatch):
+    api = workspace_api
+    origin = _folder(api, name="Original", kind="custom")
+    trash = _folder(api, name="Trash", kind="trash")
+    message_uuids = [_message(api, trash["uuid"])["uuid"] for _ in range(2)]
+    db.execute(
+        """
+        UPDATE m_mail_messages
+        SET draft = FALSE, delivery_status = 'received', trash_origin_uuid = %s
+        WHERE uuid = ANY(%s::uuid[])
+        """,
+        (origin["uuid"], message_uuids),
+    )
+    assert api.delete(MAIL_FOLDERS + origin["uuid"]).status_code == 204
+
+    create_folder = application_services.create_folder
+    both_need_inbox = threading.Barrier(2, timeout=8)
+
+    def create_fallback(*args, **kwargs):
+        both_need_inbox.wait()
+        return create_folder(*args, **kwargs)
+
+    monkeypatch.setattr(application_services, "create_folder", create_fallback)
+    application = conftest.build_test_wsgi_application()
+
+    def restore(message_uuid):
+        request = webob.Request.blank(
+            MAIL_MESSAGES + message_uuid + "/actions/restore/invoke",
+            method="POST",
+            content_type="application/json",
+            body=b"{}",
+            headers={
+                conftest.HEADER_PROJECT: api.project_id,
+                conftest.HEADER_USER: api.user_uuid,
+            },
+        )
+        return request.get_response(application)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(restore, message_uuids, timeout=15))
+
+    assert [result.status_code for result in results] == [200, 200]
+    inbox_uuid = results[0].json["folder_uuid"]
+    assert results[1].json["folder_uuid"] == inbox_uuid
+    assert [
+        item["uuid"] for item in api.get(MAIL_FOLDERS, params={"kind": "inbox"}).json()
+    ] == [inbox_uuid]
+    assert {
+        api.get(MAIL_MESSAGES + message_uuid).json()["folder_uuid"]
+        for message_uuid in message_uuids
+    } == {inbox_uuid}
+    inbox_creations = [
+        item
+        for item in api.get(EVENTS).json()
+        if item["payload"]["kind"] == "mail.folder.created"
+        and item["payload"]["uuid"] == inbox_uuid
+    ]
+    assert len(inbox_creations) == 1
