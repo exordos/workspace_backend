@@ -41,6 +41,7 @@ from workspace.messenger_api.dm import models
 from workspace.messenger_api.dm import polls
 from workspace.messenger_api.dm import push_devices
 from workspace.messenger_api.dm import v2_models
+from workspace.services import groupware_accounts
 
 
 LOG = logging.getLogger(__name__)
@@ -1298,7 +1299,11 @@ class ExternalAccountJSONPacker(ObjectJSONPacker):
     def pack_resource(self, obj: typing.Any) -> typing.Any:
         result = super().pack_resource(obj)
         if "settings" in result:
-            result["settings"] = external_models.public_settings(result["settings"])
+            provider = result.get("provider")
+            if groupware_accounts.is_groupware(provider):
+                result["settings"] = groupware_accounts.public_settings(provider, result["settings"])
+            else:
+                result["settings"] = external_models.public_settings(result["settings"])
         if "provider" in result:
             result["capabilities"] = account_capabilities.for_provider(result["provider"])
         return result
@@ -1370,6 +1375,7 @@ class ExternalAccountController(ExternalResourceController):
         account = self.model.objects.get_one(
             filters=self._owner_filters({"uuid": dm_filters.EQ(uuid)}),
             session=session,
+            locked=True,
         )
         return application_services.ExternalAccountApplicationService.update(
             session,

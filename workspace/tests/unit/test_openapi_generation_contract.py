@@ -268,15 +268,19 @@ def test_published_poll_state_schema_matches_the_generated_response():
         ).read_text()
     )
     assert (
-        _component_schema(published, "WorkspaceUserMessage_Get")["properties"][
-            "poll_state"
-        ]
-        == (
-            _component_schema(specification, "WorkspaceUserMessage_Get")["properties"][
-                "poll_state"
-            ]
-        )
+        _component_schema(published, "WorkspaceUserMessage_Get")["properties"]["poll_state"]
+        == _component_schema(specification, "WorkspaceUserMessage_Get")["properties"]["poll_state"]
     )
+
+
+def test_external_account_password_is_write_only_in_the_published_contract():
+    specification = _build_openapi(workspace_app)
+    published = yaml.safe_load(
+        (pathlib.Path(__file__).resolve().parents[3] / "docs/public_workspace_api.yaml").read_text()
+    )
+    generated = _component_schema(specification, "ExternalAccount_Get")["properties"]["settings"]
+    assert generated["properties"]["password"] == {"type": "string", "writeOnly": True}
+    assert _component_schema(published, "ExternalAccount_Get")["properties"]["settings"] == generated
 
 
 def _assert_all_local_references_resolve(specification):

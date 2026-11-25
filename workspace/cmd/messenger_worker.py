@@ -26,12 +26,14 @@ from workspace.common import config
 from workspace.common import database
 from workspace.common import mutation_journal_opts
 from workspace.common import file_storage_opts
+from workspace.common import groupware_opts
 from workspace.common import log as infra_log
 from workspace.common import messenger_worker_opts
 from workspace.common import messenger_reaction_opts
 from workspace.common import topic_summary_opts
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.api import store_factory
+from workspace.services import groupware_sync
 from workspace.services.messenger_workers import agents
 
 DOMAIN = messenger_worker_opts.DOMAIN
@@ -42,6 +44,7 @@ CONF = cfg.CONF
 ra_config_opts.register_posgresql_db_opts(CONF)
 mutation_journal_opts.register_opts(CONF)
 file_storage_opts.register_opts(CONF)
+groupware_opts.register_opts(CONF)
 messenger_worker_opts.register_opts(CONF)
 messenger_reaction_opts.register_opts(CONF)
 topic_summary_opts.register_opts(CONF)
@@ -60,7 +63,8 @@ def configure_worker_database() -> None:
 def build_worker_services() -> tuple[
     agents.MessengerWorkerAgent
     | agents.MessengerPublicationAgent
-    | agents.MessengerCounterAgent,
+    | agents.MessengerCounterAgent
+    | groupware_sync.GroupwareAgent,
     ...,
 ]:
     worker_count = (
@@ -121,6 +125,10 @@ def build_worker_services() -> tuple[
     counter = agents.MessengerCounterAgent(iter_min_period=0, iter_pause=0)
     counter.add_setup(configure_worker_database)
     services.append(counter)
+    if CONF[groupware_opts.DOMAIN].secret_encryption_key:
+        groupware = groupware_sync.GroupwareAgent(iter_min_period=1, iter_pause=0)
+        groupware.add_setup(configure_worker_database)
+        services.append(groupware)
     return tuple(services)
 
 

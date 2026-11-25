@@ -1026,7 +1026,16 @@ def _kind_schema(schema: dict[str, typing.Any], required: tuple[str, ...]) -> No
 
 def add_external_account_contract(
     specification: dict[str, typing.Any],
+    components: dict[str, typing.Any],
 ) -> dict[str, typing.Any]:
+    schemas = components["components"]["schemas"]
+    settings = _component_schema(schemas, "ExternalAccount_Get")["properties"]["settings"]
+    settings["description"] = (
+        "Provider-specific settings. IMAP/SMTP uses email, optional username, and imap/smtp "
+        "objects with host, port, and tls (implicit or starttls). CalDAV uses an HTTPS url and "
+        "username. Password is required to connect or reconnect and is never returned."
+    )
+    settings["properties"] = {"password": {"type": "string", "writeOnly": True}}
     for path in ("/v1/external_accounts/", "/v1/messenger/external_accounts/"):
         operation = specification["paths"][path]["get"]
         operation["parameters"] = [
