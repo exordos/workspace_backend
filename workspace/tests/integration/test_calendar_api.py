@@ -79,6 +79,7 @@ def test_unlinking_account_preserves_calendar_and_events(workspace_api):
         CALENDARS, json={"name": "Personal", "external_account_uuid": account_uuid}
     )
     assert calendar.status_code == 201, calendar.text
+    assert calendar.json()["external_account_uuid"] == account_uuid
     calendar_uuid = calendar.json()["uuid"]
     event = api.post(
         EVENTS,
@@ -97,5 +98,5 @@ def test_unlinking_account_preserves_calendar_and_events(workspace_api):
     assert deleted.status_code == 204, deleted.text
     kept = api.get(CALENDARS + calendar_uuid)
     assert kept.status_code == 200, kept.text
-    assert kept.json()["external_account_uuid"] is None
+    assert "external_account_uuid" not in kept.json()
     assert api.get(EVENTS + event.json()["uuid"]).json() == event.json()
