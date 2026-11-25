@@ -611,8 +611,78 @@ def test_workspace_openapi_exposes_messenger_and_rest_events():
         paths,
         "/v1/messenger/messages/{WorkspaceUserMessageUuid}",
     )
-    assert not any(path.startswith("/v1/mail/") for path in paths)
-    assert not any(path.startswith("/v1/calendar/") for path in paths)
+    assert "/v1/mail/folders/" in paths
+    assert "/v1/mail/messages/" in paths
+    mail_message = "/v1/mail/messages/{MailMessageUuid}"
+    send_path = "/v1/mail/drafts/{MailDraftUuid}/actions/send/invoke"
+    assert set(paths[send_path]) == {"post"}
+    assert set(paths["/v1/mail/messages/"]) == {"get"}
+    assert set(paths["/v1/mail/drafts/"]) == {"get", "post"}
+    for action in ("read", "unread", "star", "unstar", "trash", "restore"):
+        assert set(paths[f"{mail_message}/actions/{action}/invoke"]) == {"post"}
+    move = paths[f"{mail_message}/actions/move/invoke"]["post"]
+    move_schema = move["requestBody"]["content"]["application/json"]["schema"]
+    assert move_schema["required"] == ["folder_uuid"]
+    assert move_schema["additionalProperties"] is False
+    folder_create = _component_schema(specification, "MailFolder_Create")
+    assert folder_create["required"] == ["name"]
+    assert folder_create["additionalProperties"] is False
+    assert set(folder_create["properties"]) == {
+        "uuid",
+        "external_account_uuid",
+        "name",
+        "kind",
+    }
+    folder_update = _component_schema(specification, "MailFolder_Update")
+    assert "required" not in folder_update
+    assert folder_update["minProperties"] == 1
+    assert folder_update["additionalProperties"] is False
+    assert "uuid" not in folder_update["properties"]
+    create = _component_schema(specification, "MailDraft_Create")
+    assert create["required"] == ["folder_uuid"]
+    assert create["additionalProperties"] is False
+    assert set(create["properties"]) == {
+        "uuid",
+        "folder_uuid",
+        "from_address",
+        "to_addresses",
+        "cc_addresses",
+        "bcc_addresses",
+        "reply_to_uuid",
+        "subject",
+        "payload",
+        "attachment_urns",
+    }
+    multipart = create["properties"]["payload"]["oneOf"][0]
+    assert multipart["properties"]["kind"]["enum"] == ["multipart"]
+    assert multipart["required"] == ["kind", "parts"]
+    parts = multipart["properties"]["parts"]["items"]["oneOf"]
+    assert [part["properties"]["kind"]["enum"] for part in parts] == [["text"], ["html"]]
+    assert all(part["required"] == ["kind", "content"] for part in parts)
+    assert all(set(part["properties"]) == {"kind", "content"} for part in parts)
+    update = _component_schema(specification, "MailDraft_Update")
+    assert "required" not in update
+    assert update["minProperties"] == 1
+    assert update["additionalProperties"] is False
+    assert "folder_uuid" not in update["properties"]
+    calendar_root = "/v1/calendar"
+    assert set(paths[f"{calendar_root}/calendars/"]) == {"get", "post"}
+    event_collection = paths[f"{calendar_root}/events/"]
+    assert set(event_collection) == {"get", "post"}
+    assert set(paths[f"{calendar_root}/events/{{CalendarEventUuid}}/actions/move/invoke"]) == {"post"}
+    calendar = _component_schema(specification, "Calendar_Get")
+    assert "timezone" not in calendar["properties"]
+    calendar_event = _component_schema(specification, "CalendarEvent_Create")
+    event = calendar_event["properties"]["payload"]["oneOf"][0]
+    assert set(event["properties"]) == {
+        "kind", "title", "description", "location", "starts_at", "ends_at",
+    }
+    assert event["required"] == ["kind", "title", "starts_at", "ends_at"]
+    assert "starts_at" not in _component_schema(specification, "CalendarEvent_Get")["properties"]
+    assert paths["/v1/messenger/external_accounts/"]["get"]["deprecated"] is True
+    assert "/v1/external_accounts/" in paths
+    capabilities = _component_schema(specification, "ExternalAccount_Get")["properties"]["capabilities"]
+    assert capabilities["readOnly"] is True
     assert "/v1/providers/" not in paths
     push_device_path = "/v1/push_devices/{PushDeviceUuid}"
     assert set(paths[push_device_path]) == {"put", "delete"}
@@ -729,10 +799,15 @@ def test_workspace_openapi_exposes_messenger_and_rest_events():
         "WorkspaceEvent_Filter",
     )["properties"]
     assert event_properties["object_type"]["enum"] == [
+        "calendar",
+        "calendar_event",
         "external_account",
         "file",
         "folder",
         "folder_item",
+        "mail_draft",
+        "mail_folder",
+        "mail_message",
         "message",
         "message_reaction",
         "stream",

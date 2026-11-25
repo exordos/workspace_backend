@@ -31,6 +31,7 @@ are historical references from before migration `0186`.
 | Документ | Статус | Назначение |
 | --- | --- | --- |
 | [`workspace_api.md`](workspace_api.md) | **действующий контракт** | Канонический клиентский контракт Workspace/Messenger REST, Events и WebSocket: маршруты, JSON, статусы, фильтры, пагинация и граница runtime/OpenAPI. |
+| [`mail_api.md`](mail_api.md) | **действующий контракт; transport ожидается** | Публичные Mail-ресурсы, owner-private S3-вложения, долговечные send intents, события и граница приёмки внешней доставки. |
 | [`workspace_ui_realtime_integration.md`](workspace_ui_realtime_integration.md) | **действующий контракт** | REST-догрузка, epoch cursor и доставка/повтор WebSocket для Workspace UI. |
 | [`architecture.md`](architecture.md) | **historical reference** | Retired private bridge and provider API architecture. |
 | [`workspace_server_v2_decisions.md`](workspace_server_v2_decisions.md) | **historical reference** | Retired Provider API v2 and mTLS transport decisions. |

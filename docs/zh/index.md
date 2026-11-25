@@ -31,6 +31,7 @@ are historical references from before migration `0186`.
 | 文件 | 情况 | 职位 |
 | --- | --- | --- |
 |  [`workspace_api.md`](workspace_api.md)  | **现行合同** | 客户合同 Workspace/Messenger REST,事件和 WebSocket:路线, JSON,状态,过器,页面和边界 runtime/OpenAPI. |
+| [`mail_api.md`](mail_api.md) | **有效合同；transport 待实现** | 公开 Mail 资源、owner-private S3 附件、持久 send intents、事件和外部投递验收边界。 |
 |  [`workspace_ui_realtime_integration.md`](workspace_ui_realtime_integration.md)  | **现行合同** | REST-接收,Epoch 标和交付/重复 WebSocket Workspace UI. |
 |  [`architecture.md`](architecture.md)  | **historical reference** | Retired private bridge and provider API architecture. |
 |  [`workspace_server_v2_decisions.md`](workspace_server_v2_decisions.md)  | **historical reference** | Retired Provider API v2 and mTLS transport decisions. |

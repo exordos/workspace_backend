@@ -48,6 +48,23 @@ class ExternalAccountStatus(str, enum.Enum):
     ERROR = "error"
 
 
+def public_settings(settings: dict[str, typing.Any]) -> dict[str, str]:
+    result = {}
+    for field in ("email", "label"):
+        value = settings.get(field)
+        if isinstance(value, str):
+            result[field] = value
+    server_url = settings.get("server_url")
+    if isinstance(server_url, str):
+        endpoint = urllib.parse.urlsplit(server_url)
+        if endpoint.scheme in {"http", "https"} and endpoint.hostname:
+            host = endpoint.netloc.rsplit("@", 1)[-1]
+            result["server_url"] = endpoint._replace(
+                netloc=host, query="", fragment=""
+            ).geturl()
+    return result
+
+
 class ExternalAccount(
     models.ModelWithUUID,
     models.ModelWithProject,
@@ -77,7 +94,6 @@ class ExternalAccount(
         types.AllowNone(types.String()),
         default=None,
     )
-
     @classmethod
     def restore_row(cls, row: typing.Any, pour: typing.Any = None) -> "ExternalAccount":
         account = super().restore_row(row, pour=pour)

@@ -48,6 +48,11 @@ FOLDER_OBJECT_TYPE = "folder"
 FOLDER_ITEM_OBJECT_TYPE = "folder_item"
 FILE_OBJECT_TYPE = "file"
 EXTERNAL_ACCOUNT_OBJECT_TYPE = "external_account"
+MAIL_FOLDER_OBJECT_TYPE = "mail_folder"
+MAIL_MESSAGE_OBJECT_TYPE = "mail_message"
+MAIL_DRAFT_OBJECT_TYPE = "mail_draft"
+CALENDAR_OBJECT_TYPE = "calendar"
+CALENDAR_EVENT_OBJECT_TYPE = "calendar_event"
 
 
 class ProjectEventLockUnavailableError(RuntimeError):
@@ -88,6 +93,21 @@ FILE_DELETED_EVENT = event_payloads.FileDeletedEventPayload.KIND
 EXTERNAL_ACCOUNT_CREATED_EVENT = event_payloads.ExternalAccountCreatedEventPayload.KIND
 EXTERNAL_ACCOUNT_UPDATED_EVENT = event_payloads.ExternalAccountUpdatedEventPayload.KIND
 EXTERNAL_ACCOUNT_DELETED_EVENT = event_payloads.ExternalAccountDeletedEventPayload.KIND
+MAIL_FOLDER_CREATED_EVENT = event_payloads.MailFolderCreatedEventPayload.KIND
+MAIL_FOLDER_UPDATED_EVENT = event_payloads.MailFolderUpdatedEventPayload.KIND
+MAIL_FOLDER_DELETED_EVENT = event_payloads.MailFolderDeletedEventPayload.KIND
+MAIL_MESSAGE_CREATED_EVENT = event_payloads.MailMessageCreatedEventPayload.KIND
+MAIL_MESSAGE_UPDATED_EVENT = event_payloads.MailMessageUpdatedEventPayload.KIND
+MAIL_MESSAGE_DELETED_EVENT = event_payloads.MailMessageDeletedEventPayload.KIND
+MAIL_DRAFT_CREATED_EVENT = event_payloads.MailDraftCreatedEventPayload.KIND
+MAIL_DRAFT_UPDATED_EVENT = event_payloads.MailDraftUpdatedEventPayload.KIND
+MAIL_DRAFT_DELETED_EVENT = event_payloads.MailDraftDeletedEventPayload.KIND
+CALENDAR_CREATED_EVENT = event_payloads.CalendarCreatedEventPayload.KIND
+CALENDAR_UPDATED_EVENT = event_payloads.CalendarUpdatedEventPayload.KIND
+CALENDAR_DELETED_EVENT = event_payloads.CalendarDeletedEventPayload.KIND
+CALENDAR_EVENT_CREATED_EVENT = event_payloads.CalendarEventCreatedEventPayload.KIND
+CALENDAR_EVENT_UPDATED_EVENT = event_payloads.CalendarEventUpdatedEventPayload.KIND
+CALENDAR_EVENT_DELETED_EVENT = event_payloads.CalendarEventDeletedEventPayload.KIND
 EVENT_METADATA = {
     MESSAGE_CREATED_EVENT: (MESSAGE_OBJECT_TYPE, CREATED_ACTION),
     MESSAGE_UPDATED_EVENT: (MESSAGE_OBJECT_TYPE, UPDATED_ACTION),
@@ -137,6 +157,21 @@ EVENT_METADATA = {
     EXTERNAL_ACCOUNT_CREATED_EVENT: (EXTERNAL_ACCOUNT_OBJECT_TYPE, CREATED_ACTION),
     EXTERNAL_ACCOUNT_UPDATED_EVENT: (EXTERNAL_ACCOUNT_OBJECT_TYPE, UPDATED_ACTION),
     EXTERNAL_ACCOUNT_DELETED_EVENT: (EXTERNAL_ACCOUNT_OBJECT_TYPE, DELETED_ACTION),
+    MAIL_FOLDER_CREATED_EVENT: (MAIL_FOLDER_OBJECT_TYPE, CREATED_ACTION),
+    MAIL_FOLDER_UPDATED_EVENT: (MAIL_FOLDER_OBJECT_TYPE, UPDATED_ACTION),
+    MAIL_FOLDER_DELETED_EVENT: (MAIL_FOLDER_OBJECT_TYPE, DELETED_ACTION),
+    MAIL_MESSAGE_CREATED_EVENT: (MAIL_MESSAGE_OBJECT_TYPE, CREATED_ACTION),
+    MAIL_MESSAGE_UPDATED_EVENT: (MAIL_MESSAGE_OBJECT_TYPE, UPDATED_ACTION),
+    MAIL_MESSAGE_DELETED_EVENT: (MAIL_MESSAGE_OBJECT_TYPE, DELETED_ACTION),
+    MAIL_DRAFT_CREATED_EVENT: (MAIL_DRAFT_OBJECT_TYPE, CREATED_ACTION),
+    MAIL_DRAFT_UPDATED_EVENT: (MAIL_DRAFT_OBJECT_TYPE, UPDATED_ACTION),
+    MAIL_DRAFT_DELETED_EVENT: (MAIL_DRAFT_OBJECT_TYPE, DELETED_ACTION),
+    CALENDAR_CREATED_EVENT: (CALENDAR_OBJECT_TYPE, CREATED_ACTION),
+    CALENDAR_UPDATED_EVENT: (CALENDAR_OBJECT_TYPE, UPDATED_ACTION),
+    CALENDAR_DELETED_EVENT: (CALENDAR_OBJECT_TYPE, DELETED_ACTION),
+    CALENDAR_EVENT_CREATED_EVENT: (CALENDAR_EVENT_OBJECT_TYPE, CREATED_ACTION),
+    CALENDAR_EVENT_UPDATED_EVENT: (CALENDAR_EVENT_OBJECT_TYPE, UPDATED_ACTION),
+    CALENDAR_EVENT_DELETED_EVENT: (CALENDAR_EVENT_OBJECT_TYPE, DELETED_ACTION),
 }
 WORKSPACE_EVENT_RESOURCE = ra_resources.ResourceByRAModel(
     model_class=models.WorkspaceVisibleEvent,
@@ -188,7 +223,7 @@ def _model_to_event_payload_value(value: typing.Any) -> typing.Any:
 def _event_payload_value(name: str, value: object) -> object:
     if value is None:
         return None
-    if name in ("created_at", "updated_at", "last_ping_at"):
+    if name in ("created_at", "updated_at", "last_ping_at", "starts_at", "ends_at"):
         value = event_payloads.MESSAGE_EVENT_TIMESTAMP_TYPE.from_simple_type(value)
         return event_payloads.MESSAGE_EVENT_TIMESTAMP_TYPE.dump_value(value)
     if isinstance(value, sys_uuid.UUID):
@@ -1563,6 +1598,12 @@ def create_external_resource_event(
     hidden_fields: typing.Any = (),
     session: typing.Any = None,
 ) -> typing.Any:
+    if kind in {
+        EXTERNAL_ACCOUNT_CREATED_EVENT,
+        EXTERNAL_ACCOUNT_UPDATED_EVENT,
+        EXTERNAL_ACCOUNT_DELETED_EVENT,
+    }:
+        hidden_fields = (*hidden_fields, "settings")
     return _create_workspace_event(
         project_id=project_id,
         user_uuid=user_uuid,

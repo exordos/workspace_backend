@@ -3,10 +3,9 @@
 This document describes the browser-facing API contract served by the unified
 `workspace-api` REST service and the companion `workspace-messenger-events`
 websocket service. Messenger resources, users, client service settings,
-push-device registrations, and REST events all use `workspace-api`.
-Самостоятельные почтовые, календарные и внешние пользователи конечные точки не являются частью этого
-Нейтральный внешний аккаунт, чат, операция, политика, здоровье,
-и ресурсы мостовых экземпляров являются частью Messenger API.
+push-device registrations, Mail, Calendar, and REST events all use
+`workspace-api`. Mail and Calendar share Workspace external accounts and
+the existing realtime cursor.
 
 Нативные Messenger ресурсы, членство, состояние пользователя, события, отображение поставщиков,
 и настройки клиента являются каноническими в PostgreSQL.
@@ -18,6 +17,7 @@ push-device registrations, and REST events all use `workspace-api`.
 
 ```text
 Messenger REST API:  http://127.0.0.1:21084/v1/messenger
+Mail REST API:       http://127.0.0.1:21084/v1/mail
 Events WebSocket:    ws://127.0.0.1:21082/v1/events/ws
 Workspace REST API:  http://127.0.0.1:21084/v1
 Worker:              workspace-messenger-worker
@@ -33,13 +33,14 @@ Workspace OpenAPI:   http://127.0.0.1:21084/specifications/3.0.3
 ```text
 Workspace REST root: /api/workspace/v1/...
 Messenger REST:      /api/workspace/v1/messenger/...
+Mail REST:           /api/workspace/v1/mail/...
 Events REST:         /api/workspace/v1/events/...
 Events WebSocket:    /api/workspace/v1/events/ws?last_epoch_version=<number>&epoch_generation=<generation>
 OpenAPI spec:        /api/workspace/specifications/3.0.3
 ```
 
 All REST requests under `/api/workspace/`, including
-`/api/workspace/v1/messenger/`, are proxied to `workspace-api` on
+`/api/workspace/v1/messenger/` and `/api/workspace/v1/mail/`, are proxied to `workspace-api` on
 `127.0.0.1:21084` without changing the public URL structure. The exact nginx
 location `/api/workspace/v1/events/ws` is proxied to the websocket service
 endpoint `/v1/events/ws` on `127.0.0.1:21082`.
@@ -266,6 +267,10 @@ GET /api/workspace/v1/events/?epoch_version%3E=123&epoch_generation=781203&page_
 | Метод | Путь | Описание |
 | --- | --- | --- |
 | `GET` | `/api/workspace/v1/` | Перечислите маршруты ниже `/api/workspace/v1/`. |
+| `GET` | `/api/workspace/v1/mail/` | See [Mail resources and actions](mail_api.md). |
+| `GET` | `/api/workspace/v1/calendar/` | See [Calendar resources and actions](calendar_api.md). |
+| `GET`, `POST` | `/api/workspace/v1/external_accounts/` | List or create external accounts. |
+| `GET`, `PUT`, `DELETE` | `/api/workspace/v1/external_accounts/{account_uuid}` | Read, update or delete an account. |
 | `GET` | `/api/workspace/v1/messenger/` | Перечислить маршруты Messenger ниже `/api/workspace/v1/messenger/`. |
 | `GET` | `/api/workspace/v1/messenger/server_settings` | Верните настройки сервера типа Zulip. |
 | `GET` | `/api/workspace/v1/messenger/server_settings/` | То же самое, что и выше; поддерживается запятая. |
@@ -1756,7 +1761,7 @@ Nginx отклоняет многочастичные запросы больш�
 | `uuid` | UUID | Нет | Да, я знаю. | Идентификатор файла. |
 | `project_id` | UUID | Нет | Да, я знаю. | IAM объем проекта; скрыт в API ответах. |
 | `user_uuid` | UUID | Нет | Да, я знаю. | Владелец/uploader. |
-| `stream_uuid` | UUID или `null` | Да, я знаю. | Нет | Необходимо для создания JSON и многочастичных загрузок `stream_members`; пропущено для многочастичных загрузок с `acl.mode=public`. |
+| `stream_uuid` | UUID или `null` | Да, я знаю. | Нет | Необходимо для создания JSON и multipart-загрузок `stream_members`; не задаётся для multipart-загрузок с `acl.mode=owner` или `acl.mode=public`. |
 | `name` | Строка, максимум 255 | Да, я знаю. | Нет | Имя файла. |
 | `description` | Строка, максимум 255 | Нет | Нет | Описание файла; по умолчанию пустая строка. |
 | `content_type` | строка | Да, я знаю. | Нет | MIME тип контента. |
@@ -1806,10 +1811,11 @@ name=public-example.txt
 description=Authenticated Workspace-wide file
 ```
 
-Для многочастичных загрузок требуется `file` и должен быть определен один объем
-Если: либо `stream_uuid`, либо поле формы JSON
-`acl={"mode":"public"}`. Общественные загрузки отвергают `stream_uuid`; потоковые загрузки
-сохранить `stream_members` ACL. `name` по умолчанию для загруженного имени файла и
+Для multipart-загрузки требуется `file` и ровно один scope:
+`stream_uuid`, `acl={"mode":"owner"}` или
+`acl={"mode":"public"}`. Owner- и public-загрузки отвергают `stream_uuid`;
+stream-загрузки сохраняют `stream_members` ACL. Owner mode предназначен для
+приватных почтовых вложений. `name` по умолчанию равен имени загруженного файла,
 `description` по умолчанию на пустую строку.
 `content_type` из загруженной части, рассчитывает `size_bytes`, и пишет
 SHA-256 `hash`. Оба режима сохраняют то же двоичное плюс JSON лагера боковой и
