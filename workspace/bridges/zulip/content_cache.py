@@ -8,7 +8,7 @@ import json
 import typing
 import uuid
 
-CONVERTER_VERSION = 5
+CONVERTER_VERSION = 7
 
 LOOKUP_SQL = """
     SELECT contents.uuid,contents.workspace_content,contents.provider_content

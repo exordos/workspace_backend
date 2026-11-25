@@ -279,9 +279,13 @@ _CODE_TOKENS = re.compile(
     re.MULTILINE,
 )
 _HEADING = r" {0,3}#{1,6}(?=[ \t]|\r?\n|$)"
+_THEMATIC_BREAK = r" {0,3}(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})"
+_SETEXT_UNDERLINE = r" {0,3}(?:=+|-+)[ \t]*"
+_BLOCK_LINE = re.compile(rf"(?:{_HEADING}[^\r\n]*|{_THEMATIC_BREAK})")
 _CODE_BOUNDARY = (
     rf"{_CODE_FENCE}|^{_QUOTE_MARKER}|\n[ \t]*\r?\n"
     rf"|^{_HEADING}|^ {{0,3}}(?:[-+*]|1[.)])[ \t]+"
+    rf"|^(?:{_THEMATIC_BREAK}|{_SETEXT_UNDERLINE})\r?$"
 )
 _INDENTED_LINES = re.compile(r"(?:(?: {4}| {0,3}\t)[^\n]*(?:\n|$)|[ \t]*\r?\n)+")
 _CodeSpans = list[tuple[int, int]]
@@ -320,16 +324,39 @@ def _indented_code_start(text: str, match: re.Match[str], block_end: int) -> boo
     if start == 0 or start == block_end:
         return True
     previous_start = text.rfind("\n", 0, start - 1) + 1
-    previous = text[previous_start:start]
+    previous = text[previous_start:start].rstrip("\r\n")
     if previous.strip():
-        return re.match(_HEADING, previous) is not None
+        if _BLOCK_LINE.fullmatch(previous):
+            return True
+        if previous_start == block_end or not re.fullmatch(_SETEXT_UNDERLINE, previous):
+            return False
+        title_start = text.rfind("\n", 0, max(0, previous_start - 1)) + 1
+        title = text[title_start:previous_start].rstrip("\r\n")
+        return (
+            re.match(r" {0,3}[^ \t]", title) is not None
+            and _BLOCK_LINE.fullmatch(title) is None
+            and re.match(_QUOTE_MARKER, title) is None
+        )
 
-    before_blank = text[:previous_start].rstrip().rsplit("\n", 1)[-1]
-    item = re.match(_LIST_ITEM, before_blank)
-    if item is None:
-        return True
     width = len(match[0].expandtabs(4))
-    return not item.end() <= width < item.end() + 4
+    continuation_width = width
+    lazy_continuation = False
+    for line in reversed(text[:previous_start].splitlines()):
+        if _BLOCK_LINE.fullmatch(line):
+            break
+        if item := re.match(_LIST_ITEM, line):
+            return not (item.end() <= continuation_width and width < item.end() + 4)
+        if not line.strip():
+            if lazy_continuation:
+                break
+            continue
+        indentation = line[: len(line) - len(line.lstrip(" \t"))]
+        indentation_width = len(indentation.expandtabs(4))
+        if indentation_width < 2:
+            lazy_continuation = True
+        else:
+            continuation_width = min(continuation_width, indentation_width)
+    return True
 
 
 def _code_spans(text: str, marker: str, nesting: int = 0) -> _CodeSpans:

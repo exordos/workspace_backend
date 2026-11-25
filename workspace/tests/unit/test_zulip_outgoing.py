@@ -286,10 +286,20 @@ def test_sticker_storage_missing_is_not_a_transient_failure(
     http.request.assert_not_called()
 
 
-def test_sticker_example_does_not_upload_catalog_media(monkeypatch):
+@pytest.mark.parametrize(
+    ("example", "uploads"),
+    [
+        ("Example: `{link}`", 0),
+        ("***\n    {link}", 0),
+        ("`\n***\n{link}\n`", 1),
+    ],
+)
+def test_only_rendered_stickers_upload_catalog_media(monkeypatch, example, uploads):
     media = b"sticker"
     sticker = _sticker_content(media)
-    source = f"Example: `![sticker](urn:sticker:{sticker['uuid']})`"
+    reference = f"![sticker](urn:sticker:{sticker['uuid']})"
+    source = example.format(link=reference)
+    marker = f"![workspace-sticker:v1:{sticker['uuid']}](/user_uploads/1/a/sticker.png)"
     store = mock.Mock(read=mock.Mock(return_value=media))
     monkeypatch.setattr(sticker_storage, "get_sticker_storage", lambda: store)
     http = mock.Mock(
@@ -319,6 +329,8 @@ def test_sticker_example_does_not_upload_catalog_media(monkeypatch):
         )
     )
 
-    http.request.assert_not_awaited()
-    store.read.assert_not_called()
-    assert result == {"uuid": content_uuid, "provider_content": source}
+    assert http.request.await_count == store.read.call_count == uploads
+    assert result == {
+        "uuid": content_uuid,
+        "provider_content": source.replace(reference, marker) if uploads else source,
+    }
