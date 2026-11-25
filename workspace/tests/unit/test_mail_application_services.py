@@ -21,6 +21,7 @@ def test_send_reloads_and_locks_draft_before_creating_intent(monkeypatch):
         project_id=project_id,
         owner_user_uuid=owner_user_uuid,
         uuid=message_uuid,
+        external_account_uuid=account_uuid,
     )
     locked_message = types.SimpleNamespace(
         project_id=project_id,

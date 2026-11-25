@@ -26,6 +26,7 @@ from restalchemy.openapi import utils as oa_utils
 import webob
 from webob import multidict
 
+from workspace.common import account_capabilities
 from workspace.common import models as common_models
 from workspace.messenger_api import application_services
 from workspace.messenger_api import events as messenger_events
@@ -1298,6 +1299,8 @@ class ExternalAccountJSONPacker(ObjectJSONPacker):
         result = super().pack_resource(obj)
         if "settings" in result:
             result["settings"] = external_models.public_settings(result["settings"])
+        if "provider" in result:
+            result["capabilities"] = account_capabilities.for_provider(result["provider"])
         return result
 
 
@@ -1378,9 +1381,26 @@ class ExternalAccountController(ExternalResourceController):
 
     def delete(self, uuid: object) -> None:
         self._require_permission("workspace.external_account.delete")
-        account = super().get(uuid)
+        session = contexts.Context().get_session()
+        account = self.model.objects.get_one(
+            filters=self._owner_filters({"uuid": dm_filters.EQ(uuid)}),
+            session=session,
+            locked=True,
+        )
+        if "mail" in account_capabilities.for_provider(account.provider):
+            active_intent = session.execute(
+                """
+                SELECT 1 FROM mail_outgoing_intents
+                WHERE project_id = %s AND external_account_uuid = %s
+                  AND status IN ('new', 'checking')
+                LIMIT 1
+                """,
+                (account.project_id, account.uuid),
+            ).fetchone()
+            if active_intent is not None:
+                raise ra_exc.ValidationErrorException()
         application_services.ExternalAccountApplicationService.delete(
-            contexts.Context().get_session(),
+            session,
             application_services.ExternalAccountActor(
                 user_uuid=self._get_user_uuid(),
                 project_id=self._get_project_id(),

@@ -31,25 +31,13 @@ class MigrationStep(migrations.AbstractMigrationStep):
 
     def upgrade(self, session):
         session.execute("""
-            ALTER TABLE m_external_accounts_v2 ADD COLUMN capabilities TEXT[]
-                GENERATED ALWAYS AS (
-                    CASE provider
-                        WHEN 'zulip' THEN ARRAY['messenger']
-                        WHEN 'mail' THEN ARRAY['mail']
-                        WHEN 'calendar' THEN ARRAY['calendar']
-                        WHEN 'google' THEN ARRAY['mail', 'calendar']
-                        WHEN 'microsoft' THEN ARRAY['mail', 'calendar']
-                        ELSE ARRAY[]::text[]
-                    END
-                ) STORED;
-
             CREATE TABLE m_workspace_calendars (
                 uuid UUID PRIMARY KEY,
                 project_id UUID NOT NULL,
                 owner_user_uuid UUID NOT NULL
                     REFERENCES m_workspace_users(uuid) ON DELETE CASCADE,
                 external_account_uuid UUID
-                    REFERENCES m_external_accounts_v2(uuid) ON DELETE CASCADE,
+                    REFERENCES m_external_accounts_v2(uuid) ON DELETE SET NULL,
                 name VARCHAR(256) NOT NULL CHECK (length(name) > 0),
                 "primary" BOOLEAN NOT NULL DEFAULT FALSE,
                 read_only BOOLEAN NOT NULL DEFAULT FALSE,
@@ -110,7 +98,6 @@ class MigrationStep(migrations.AbstractMigrationStep):
                 );
             DROP TABLE m_workspace_calendar_events;
             DROP TABLE m_workspace_calendars;
-            ALTER TABLE m_external_accounts_v2 DROP COLUMN capabilities;
         """)
 
 

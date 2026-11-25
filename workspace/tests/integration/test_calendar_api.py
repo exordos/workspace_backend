@@ -60,3 +60,42 @@ def test_calendar_event_crud_filters_and_move_are_owner_scoped(workspace_api):
         "calendar.event.updated",
         "calendar.event.deleted",
     ]
+
+
+def test_unlinking_account_preserves_calendar_and_events(workspace_api):
+    api = workspace_api
+    accounts = "/v1/external_accounts/"
+    permissions = (
+        "workspace.external_account.create",
+        "workspace.external_account.delete",
+    )
+    account = api.post(
+        accounts, permissions=permissions, json={"provider": "google", "settings": {}}
+    )
+    assert account.status_code == 201, account.text
+    assert account.json()["capabilities"] == ["mail", "calendar"]
+    account_uuid = account.json()["uuid"]
+    calendar = api.post(
+        CALENDARS, json={"name": "Personal", "external_account_uuid": account_uuid}
+    )
+    assert calendar.status_code == 201, calendar.text
+    calendar_uuid = calendar.json()["uuid"]
+    event = api.post(
+        EVENTS,
+        json={
+            "calendar_uuid": calendar_uuid,
+            "payload": {
+                "kind": "event",
+                "title": "Review",
+                "starts_at": "2026-11-25T09:00:00Z",
+                "ends_at": "2026-11-25T10:00:00Z",
+            },
+        },
+    )
+    assert event.status_code == 201, event.text
+    deleted = api.delete(accounts + account_uuid, permissions=permissions)
+    assert deleted.status_code == 204, deleted.text
+    kept = api.get(CALENDARS + calendar_uuid)
+    assert kept.status_code == 200, kept.text
+    assert kept.json()["external_account_uuid"] is None
+    assert api.get(EVENTS + event.json()["uuid"]).json() == event.json()

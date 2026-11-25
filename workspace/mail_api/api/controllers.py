@@ -110,7 +110,10 @@ class MailMessageController(MailResourceController):
             self._get_user_uuid(),
             typing.cast(sys_uuid.UUID, uuid),
             draft=self.draft,
-            locked=self.request.method in ("POST", "PUT", "DELETE"),
+            locked=(
+                self.request.method in ("PUT", "DELETE")
+                or (self.request.method == "POST" and not self.draft)
+            ),
         )
 
     def delete(self, uuid: object) -> None:
@@ -123,8 +126,12 @@ class MailMessageController(MailResourceController):
     def move(self, resource: typing.Any, **kwargs: typing.Any) -> typing.Any:
         if set(kwargs) != {"folder_uuid"}:
             raise ra_exc.ValidationErrorException()
+        try:
+            folder_uuid = sys_uuid.UUID(kwargs["folder_uuid"])
+        except (AttributeError, TypeError, ValueError) as error:
+            raise ra_exc.ValidationErrorException() from error
         return application_services.move_message(
-            contexts.Context().get_session(), resource, kwargs["folder_uuid"]
+            contexts.Context().get_session(), resource, folder_uuid
         )
 
     @ra_actions.post

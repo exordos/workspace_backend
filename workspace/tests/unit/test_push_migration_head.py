@@ -30,7 +30,7 @@ def test_mail_and_calendar_migrations_extend_the_master_chain():
     engine = migrations.MigrationEngine(migrations_path=str(path))
     steps = engine.get_all_migrations()
     mail = "0309-Add-canonical-Mail-API-resources-09e2dd.py"
-    calendar = "0310-Add-personal-Calendar-and-external-account-capabilities-ecab4c.py"
+    calendar = "0310-Add-personal-Calendar-resources-ecab4c.py"
     assert steps[mail]["depends"] == ["0308-Register-APNs-push-devices-71fa20.py"]
     assert steps[calendar]["depends"] == [mail]
     pending = [engine.get_latest_migration()]

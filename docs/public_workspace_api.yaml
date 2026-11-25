@@ -477,14 +477,10 @@ components:
           items:
             type: string
             enum:
-            - calendar
             - mail
+            - calendar
             - messenger
-            example: mail
-          example:
-          - mail
           readOnly: true
-          default: []
       required:
       - project_id
       - provider
@@ -3478,22 +3474,6 @@ components:
         type: string
         example: any_string
         nullable: true
-    ExternalAccount_capabilities:
-      name: capabilities
-      in: query
-      schema:
-        type: array
-        items:
-          type: string
-          enum:
-          - calendar
-          - mail
-          - messenger
-          example: mail
-        example:
-        - mail
-        readOnly: true
-        default: []
     MailDraft_uuid:
       name: uuid
       in: query
@@ -7302,7 +7282,6 @@ paths:
           type: string
         example: name = "vm1"
         x-ra-filter-fields:
-        - capabilities
         - created_at
         - disabled
         - error_description
@@ -8582,7 +8561,6 @@ paths:
           type: string
         example: name = "vm1"
         x-ra-filter-fields:
-        - capabilities
         - created_at
         - disabled
         - error_description

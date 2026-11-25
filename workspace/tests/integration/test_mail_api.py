@@ -149,6 +149,12 @@ def test_send_creates_one_durable_intent_in_the_request_transaction(
     assert intent[3]["to_addresses"] == ["recipient@example.test"]
     assert intent[3]["payload"] == message["payload"]
 
+    account_delete = workspace_api.delete(
+        EXTERNAL_ACCOUNTS + account_uuid, permissions=EXTERNAL_ACCOUNT_PERMISSIONS
+    )
+    assert account_delete.status_code == 400, account_delete.text
+    assert workspace_api.get(MAIL_MESSAGES + message["uuid"]).json() == sent.json()
+
     repeated = workspace_api.post(
         MAIL_DRAFTS + message["uuid"] + "/actions/send/invoke",
         json={},
@@ -246,3 +252,30 @@ def test_owner_file_urn_is_private_and_can_be_attached_to_a_draft(
         },
     )
     assert forbidden.status_code == 400, forbidden.text
+
+
+def test_move_and_restore_a_message_after_original_folder_was_deleted(
+    workspace_api, db
+):
+    origin = _folder(workspace_api, name="Original", kind="custom")
+    inbox = _folder(workspace_api, name="Inbox", kind="inbox")
+    trash = _folder(workspace_api, name="Trash", kind="trash")
+    message = _message(workspace_api, inbox["uuid"])
+    db.execute(
+        """UPDATE m_mail_messages SET draft = FALSE, delivery_status = 'received'
+           WHERE uuid = %s""",
+        (message["uuid"],),
+    )
+    url = MAIL_MESSAGES + message["uuid"] + "/actions/"
+    moved = workspace_api.post(
+        url + "move/invoke", json={"folder_uuid": origin["uuid"]}
+    )
+    assert moved.status_code == 200, moved.text
+    assert moved.json()["folder_uuid"] == origin["uuid"]
+    trashed = workspace_api.post(url + "trash/invoke")
+    assert trashed.status_code == 200, trashed.text
+    assert trashed.json()["folder_uuid"] == trash["uuid"]
+    assert workspace_api.delete(MAIL_FOLDERS + origin["uuid"]).status_code == 204
+    restored = workspace_api.post(url + "restore/invoke")
+    assert restored.status_code == 200, restored.text
+    assert restored.json()["folder_uuid"] == inbox["uuid"]

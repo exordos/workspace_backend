@@ -11,6 +11,7 @@ from psycopg.types import json as pg_json
 from restalchemy.common import exceptions as ra_exc
 from restalchemy.dm import filters as dm_filters
 
+from workspace.common import account_capabilities
 from workspace.mail_api import events
 from workspace.mail_api.dm import models
 from workspace.mail_api.dm import payloads
@@ -46,6 +47,8 @@ def _account(
     project_id: sys_uuid.UUID,
     owner_user_uuid: sys_uuid.UUID,
     account_uuid: sys_uuid.UUID | None,
+    *,
+    locked: bool = False,
 ) -> external_models.ExternalAccount | None:
     if account_uuid is None:
         return None
@@ -54,10 +57,11 @@ def _account(
             "uuid": dm_filters.EQ(account_uuid),
             "project_id": dm_filters.EQ(project_id),
             "owner_user_uuid": dm_filters.EQ(owner_user_uuid),
-            "capabilities": dm_filters.ContainsAll(["mail"]),
+            "provider": dm_filters.In(account_capabilities.providers_with("mail")),
             "disabled": dm_filters.EQ(False),
         },
         session=session,
+        locked=locked,
     )
 
 
@@ -353,17 +357,7 @@ def trash_message(
     if message.delivery_status == models.MailDeliveryStatus.QUEUED.value:
         raise ra_exc.ValidationErrorException()
     trash = models.MailFolder.objects.get_one(
-        filters={
-            "project_id": dm_filters.EQ(message.project_id),
-            "owner_user_uuid": dm_filters.EQ(message.owner_user_uuid),
-            "external_account_uuid": (
-                dm_filters.EQ(message.external_account_uuid)
-                if message.external_account_uuid is not None
-                else dm_filters.Is(None)
-            ),
-            "kind": dm_filters.EQ("trash"),
-            "deleted": dm_filters.EQ(False),
-        },
+        filters={**_folder_scope(message), "kind": dm_filters.EQ("trash")},
         session=session,
     )
     if message.folder_uuid != trash.uuid:
@@ -371,20 +365,60 @@ def trash_message(
     return message
 
 
+def _folder_scope(message: models.MailMessage) -> dict[str, dm_filters.AbstractClause]:
+    account_uuid = message.external_account_uuid
+    return {
+        "project_id": dm_filters.EQ(message.project_id),
+        "owner_user_uuid": dm_filters.EQ(message.owner_user_uuid),
+        "external_account_uuid": (
+            dm_filters.Is(None) if account_uuid is None else dm_filters.EQ(account_uuid)
+        ),
+        "deleted": dm_filters.EQ(False),
+    }
+
+
 def restore_message(
     session: typing.Any,
     message: models.MailMessage,
 ) -> models.MailMessage:
-    original_folder = message.trash_origin_uuid
-    if original_folder is not None:
-        move_message(session, message, original_folder)
-    return message
+    if message.trash_origin_uuid is None:
+        return message
+    scope = _folder_scope(message)
+    original = models.MailFolder.objects.get_one_or_none(
+        filters={**scope, "uuid": dm_filters.EQ(message.trash_origin_uuid)},
+        session=session,
+    )
+    if original is not None:
+        return move_message(session, message, original.uuid)
+    inbox = models.MailFolder.objects.get_one_or_none(
+        filters={**scope, "kind": dm_filters.EQ("inbox")},
+        session=session,
+    )
+    if inbox is not None:
+        return move_message(session, message, inbox.uuid)
+    fallback = models.MailFolder.objects.get_all(
+        filters={**scope, "kind": dm_filters.NE("trash")},
+        order_by={"uuid": "asc"},
+        limit=1,
+        session=session,
+    )
+    if not fallback:
+        raise ra_exc.ValidationErrorException()
+    return move_message(session, message, fallback[0].uuid)
 
 
 def send_message(
     session: typing.Any,
     message: models.MailMessage,
 ) -> models.MailMessage:
+    # Use the same lock order as account deletion before its foreign-key checks.
+    account = _account(
+        session,
+        message.project_id,
+        message.owner_user_uuid,
+        message.external_account_uuid,
+        locked=True,
+    )
     message = _message(
         session,
         message.project_id,
@@ -404,14 +438,9 @@ def send_message(
         raise ra_exc.ValidationErrorException()
     if not any(part.content.strip() for part in message.payload.parts):
         raise ra_exc.ValidationErrorException()
-    account = _account(
-        session,
-        message.project_id,
-        message.owner_user_uuid,
-        message.external_account_uuid,
-    )
     if (
         account is None
+        or account.uuid != message.external_account_uuid
         or account.status != external_models.ExternalAccountStatus.ACTIVE.value
         or message.from_address != account.settings.get("email")
     ):

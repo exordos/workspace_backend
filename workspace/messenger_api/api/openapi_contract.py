@@ -258,6 +258,11 @@ def add_public_projection_contract(
     specification: dict[str, typing.Any],
 ) -> dict[str, typing.Any]:
     schemas = specification["components"]["schemas"]
+    _component_schema(schemas, "ExternalAccount_Get")["properties"]["capabilities"] = {
+        "type": "array",
+        "items": {"type": "string", "enum": ["mail", "calendar", "messenger"]},
+        "readOnly": True,
+    }
     # Draft persistence only supports markdown.
     draft = _component_schema(schemas, "WorkspaceDraft_Get")["properties"]
     draft["payload"] = copy.deepcopy(DRAFT_PAYLOAD_SCHEMA)

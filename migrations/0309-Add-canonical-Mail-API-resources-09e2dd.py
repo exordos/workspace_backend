@@ -178,8 +178,8 @@ class MigrationStep(migrations.AbstractMigrationStep):
                 project_id UUID NOT NULL,
                 message_uuid UUID NOT NULL
                     REFERENCES m_mail_messages(uuid) ON DELETE CASCADE,
-                external_account_uuid UUID NOT NULL
-                    REFERENCES m_external_accounts_v2(uuid) ON DELETE CASCADE,
+                external_account_uuid UUID
+                    REFERENCES m_external_accounts_v2(uuid) ON DELETE SET NULL,
                 payload JSONB NOT NULL,
                 status VARCHAR(16) NOT NULL DEFAULT 'new'
                     CHECK (status IN ('new', 'checking', 'done', 'error')),
@@ -188,7 +188,8 @@ class MigrationStep(migrations.AbstractMigrationStep):
                 next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                completed_at TIMESTAMPTZ
+                completed_at TIMESTAMPTZ,
+                CHECK (external_account_uuid IS NOT NULL OR status NOT IN ('new', 'checking'))
             );
 
             CREATE UNIQUE INDEX mail_outgoing_active_message_idx

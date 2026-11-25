@@ -14,6 +14,7 @@ from restalchemy.openapi import utils
 from webob import multidict
 
 from workspace.calendar_api import models
+from workspace.common import account_capabilities
 from workspace.messenger_api.api import controllers as messenger_controllers
 from workspace.messenger_api.dm import external_models
 
@@ -76,7 +77,9 @@ class CalendarController(CalendarResourceController):
                     {
                         "uuid": dm_filters.EQ(account_uuid),
                         "disabled": dm_filters.EQ(False),
-                        "capabilities": dm_filters.ContainsAll(["calendar"]),
+                        "provider": dm_filters.In(
+                            account_capabilities.providers_with("calendar")
+                        ),
                     }
                 ),
                 session=session,

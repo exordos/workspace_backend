@@ -26,7 +26,7 @@ def test_generic_account_crud_is_owner_scoped(api):
     assert body.get("error_description") is None
     assert body["settings"] == spec["settings"]
     assert "credential_present" not in body
-    assert "capabilities" not in body
+    assert body["capabilities"] == []
     assert "revision" not in body
     assert "ETag" not in created.headers
     path = root + account_uuid
