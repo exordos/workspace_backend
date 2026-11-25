@@ -35,6 +35,18 @@ def test_generic_account_crud_is_owner_scoped(api):
     assert "revision" not in read.json()
     assert "ETag" not in read.headers
     assert (
+        api.get(
+            root, params={"sort_key": "settings"}, permissions=permissions
+        ).status_code
+        == 400
+    )
+    assert (
+        api.get(
+            root, params={"q": 'settings = "{}"'}, permissions=permissions
+        ).status_code
+        == 400
+    )
+    assert (
         api.get(path, user=str(sys_uuid.uuid4()), permissions=permissions).status_code
         == 404
     )

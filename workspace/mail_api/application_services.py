@@ -329,6 +329,8 @@ def move_message(
         return message
     origin_uuid = None
     if folder.kind == "trash":
+        if message.delivery_status == models.MailDeliveryStatus.QUEUED.value:
+            raise ra_exc.ValidationErrorException()
         origin_uuid = message.trash_origin_uuid or message.folder_uuid
     _force_values(message, {"trash_origin_uuid": origin_uuid})
     message.update_dm(values={"folder_uuid": folder.uuid})
@@ -402,9 +404,22 @@ def restore_message(
         limit=1,
         session=session,
     )
-    if not fallback:
-        raise ra_exc.ValidationErrorException()
-    return move_message(session, message, fallback[0].uuid)
+    if fallback:
+        return move_message(session, message, fallback[0].uuid)
+    trash = _folder(
+        session, message.project_id, message.owner_user_uuid, message.folder_uuid
+    )
+    inbox = create_folder(
+        session,
+        message.project_id,
+        message.owner_user_uuid,
+        {
+            "external_account_uuid": message.external_account_uuid,
+            "name": "Inbox" if trash.name != "Inbox" else "Restored",
+            "kind": "inbox",
+        },
+    )
+    return move_message(session, message, inbox.uuid)
 
 
 def send_message(

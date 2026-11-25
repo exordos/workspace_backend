@@ -198,6 +198,9 @@ class MigrationStep(migrations.AbstractMigrationStep):
             CREATE INDEX mail_outgoing_ready_idx
                 ON mail_outgoing_intents(next_attempt_at, id)
                 WHERE status IN ('new', 'checking');
+            CREATE INDEX mail_outgoing_active_account_idx
+                ON mail_outgoing_intents(project_id, external_account_uuid)
+                WHERE status IN ('new', 'checking');
 
             CREATE FUNCTION mail_outgoing_wakeup()
                 RETURNS trigger LANGUAGE plpgsql AS $$

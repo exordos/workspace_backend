@@ -1024,6 +1024,18 @@ def _kind_schema(schema: dict[str, typing.Any], required: tuple[str, ...]) -> No
     schema.pop("example", None)
 
 
+def add_external_account_contract(
+    specification: dict[str, typing.Any],
+) -> dict[str, typing.Any]:
+    for path in ("/v1/external_accounts/", "/v1/messenger/external_accounts/"):
+        operation = specification["paths"][path]["get"]
+        operation["parameters"] = [
+            parameter for parameter in operation["parameters"]
+            if parameter.get("$ref") != "#/components/parameters/ExternalAccount_settings"
+        ]
+    return specification
+
+
 def add_mail_contract(
     specification: dict[str, typing.Any],
     components: dict[str, typing.Any],

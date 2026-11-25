@@ -18,7 +18,8 @@ belong to the active IAM project and current user.
 Message actions use `/api/workspace/v1/mail/messages/{message_uuid}/actions/<name>/invoke`.
 `read`, `unread`, `star`, and `unstar` set flags. `move` accepts `folder_uuid`
 within the same account. `trash` uses the account's `trash` folder and `restore`
-returns the message to its prior folder.
+returns the message to its prior folder, an available non-trash folder, or a new
+inbox if the account only has a trash folder.
 
 ## Message Body
 

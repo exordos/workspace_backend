@@ -115,6 +115,9 @@ def test_send_creates_one_durable_intent_in_the_request_transaction(
     folder = _folder(workspace_api, external_account_uuid=account_uuid)
     message = _message(workspace_api, folder["uuid"])
     assert message["from_address"] == "cassi@example.test"
+    assert workspace_api.post(
+        MAIL_DRAFTS + message["uuid"] + "/actions/trash/invoke"
+    ).status_code in (404, 501)
     change_folder_account = workspace_api.put(
         MAIL_FOLDERS + folder["uuid"],
         json={"external_account_uuid": None},
@@ -132,6 +135,16 @@ def test_send_creates_one_durable_intent_in_the_request_transaction(
     assert sent.json()["payload"] == message["payload"]
     assert workspace_api.get(MAIL_DRAFTS + message["uuid"]).status_code == 404
     assert workspace_api.get(MAIL_MESSAGES + message["uuid"]).json() == sent.json()
+    trash = _folder(
+        workspace_api, name="Trash", kind="trash", external_account_uuid=account_uuid
+    )
+    assert (
+        workspace_api.post(
+            MAIL_MESSAGES + message["uuid"] + "/actions/move/invoke",
+            json={"folder_uuid": trash["uuid"]},
+        ).status_code
+        == 400
+    )
 
     with db.cursor() as cursor:
         cursor.execute(
@@ -258,9 +271,8 @@ def test_move_and_restore_a_message_after_original_folder_was_deleted(
     workspace_api, db
 ):
     origin = _folder(workspace_api, name="Original", kind="custom")
-    inbox = _folder(workspace_api, name="Inbox", kind="inbox")
     trash = _folder(workspace_api, name="Trash", kind="trash")
-    message = _message(workspace_api, inbox["uuid"])
+    message = _message(workspace_api, trash["uuid"])
     db.execute(
         """UPDATE m_mail_messages SET draft = FALSE, delivery_status = 'received'
            WHERE uuid = %s""",
@@ -278,4 +290,6 @@ def test_move_and_restore_a_message_after_original_folder_was_deleted(
     assert workspace_api.delete(MAIL_FOLDERS + origin["uuid"]).status_code == 204
     restored = workspace_api.post(url + "restore/invoke")
     assert restored.status_code == 200, restored.text
-    assert restored.json()["folder_uuid"] == inbox["uuid"]
+    destination = workspace_api.get(MAIL_FOLDERS + restored.json()["folder_uuid"])
+    assert destination.status_code == 200, destination.text
+    assert destination.json()["kind"] == "inbox"

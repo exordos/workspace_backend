@@ -1321,9 +1321,11 @@ class ExternalAccountController(ExternalResourceController):
 
     def _owner_filters(self, filters: typing.Any) -> typing.Any:
         result = super()._owner_filters(filters)
-        result.pop("settings", None)
         result["project_id"] = dm_filters.EQ(self._get_project_id())
         return result
+
+    def _is_queryable_field(self, name: str) -> bool:
+        return name != "settings" and super()._is_queryable_field(name)
 
     def get_packer(
         self, content_type: typing.Any, resource_type: typing.Any = None,
@@ -1387,18 +1389,17 @@ class ExternalAccountController(ExternalResourceController):
             session=session,
             locked=True,
         )
-        if "mail" in account_capabilities.for_provider(account.provider):
-            active_intent = session.execute(
-                """
-                SELECT 1 FROM mail_outgoing_intents
-                WHERE project_id = %s AND external_account_uuid = %s
-                  AND status IN ('new', 'checking')
-                LIMIT 1
-                """,
-                (account.project_id, account.uuid),
-            ).fetchone()
-            if active_intent is not None:
-                raise ra_exc.ValidationErrorException()
+        active_intent = session.execute(
+            """
+            SELECT 1 FROM mail_outgoing_intents
+            WHERE project_id = %s AND external_account_uuid = %s
+              AND status IN ('new', 'checking')
+            LIMIT 1
+            """,
+            (account.project_id, account.uuid),
+        ).fetchone()
+        if active_intent is not None:
+            raise ra_exc.ValidationErrorException()
         application_services.ExternalAccountApplicationService.delete(
             session,
             application_services.ExternalAccountActor(
