@@ -1103,10 +1103,8 @@ class Operations:
         payload = intent["data"]["payload"]
         references = {
             (kind, identifier)
-            for kind, identifier, query in message_conversion.workspace_references(
-                message_conversion.workspace_reference_text(
-                    message_payloads.markdown_content(payload)
-                )
+            for kind, identifier, query in message_conversion.workspace_message_references(
+                message_payloads.markdown_content(payload)
             )
             if kind != "forward" or message_conversion.parse_snapshot(query) is not None
         }

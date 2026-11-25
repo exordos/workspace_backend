@@ -9,6 +9,7 @@ from unittest import mock
 
 import pytest
 
+from workspace.bridges.zulip import content_cache
 from workspace.bridges.zulip import outgoing_operations
 from workspace.messenger_api import sticker_storage
 
@@ -283,3 +284,41 @@ def test_sticker_storage_missing_is_not_a_transient_failure(
     else:
         assert asyncio.run(convert) is None
     http.request.assert_not_called()
+
+
+def test_sticker_example_does_not_upload_catalog_media(monkeypatch):
+    media = b"sticker"
+    sticker = _sticker_content(media)
+    source = f"Example: `![sticker](urn:sticker:{sticker['uuid']})`"
+    store = mock.Mock(read=mock.Mock(return_value=media))
+    monkeypatch.setattr(sticker_storage, "get_sticker_storage", lambda: store)
+    http = mock.Mock(
+        request=mock.AsyncMock(return_value={"uri": "/user_uploads/1/a/sticker.png"})
+    )
+    content_uuid = uuid.uuid4()
+
+    async def sql(statement, params):
+        if statement == outgoing_operations.SELECT_STICKERS_SQL:
+            return [sticker]
+        if statement == content_cache.RESOLVE_SQL:
+            return [{"uuid": content_uuid}]
+        return []
+
+    operations = outgoing_operations.Operations(mock.Mock(sql=sql), http)
+    result = asyncio.run(
+        operations.convert(
+            {
+                "uuid": uuid.uuid4(),
+                "attempts": 0,
+                "data": {"payload": {"kind": "markdown", "content": source}},
+            },
+            {
+                "provider_uuid": uuid.uuid4(),
+                "settings": {"server_url": "https://zulip.example.test"},
+            },
+        )
+    )
+
+    http.request.assert_not_awaited()
+    store.read.assert_not_called()
+    assert result == {"uuid": content_uuid, "provider_content": source}
