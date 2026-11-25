@@ -19,7 +19,7 @@ from restalchemy.storage.sql import migrations
 
 class MigrationStep(migrations.AbstractMigrationStep):
     def __init__(self):
-        self._depends = ["0306-Create-Workspace-sticker-catalog-823e61.py"]
+        self._depends = ["0309-Create-Workspace-sticker-catalog-823e61.py"]
 
     @property
     def migration_id(self):

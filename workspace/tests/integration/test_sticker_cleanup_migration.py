@@ -8,7 +8,7 @@ from restalchemy.storage.sql import migrations as ra_migrations
 from workspace.tests.integration import conftest
 
 
-MIGRATION_FILE = "0307-Add-sticker-storage-cleanup-queue-133bce.py"
+MIGRATION_FILE = "0310-Add-sticker-storage-cleanup-queue-133bce.py"
 MIGRATION_ID = "133bce49-a763-4a3c-ae29-14b4e01c9c2a"
 
 

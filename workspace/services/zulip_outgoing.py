@@ -20,7 +20,8 @@ from psycopg import abc as pg_abc
 from psycopg import conninfo, rows
 from psycopg.types import json as pg_json
 
-from workspace.bridges.zulip import outgoing_operations, signed_uploads
+from workspace.bridges.zulip import outgoing_operations
+from workspace.bridges.zulip import signed_uploads
 from workspace.common import database
 
 

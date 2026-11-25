@@ -12,7 +12,8 @@ import aiohttp
 import pytest
 from aiohttp import web
 
-from workspace.bridges.zulip import outgoing_operations, signed_uploads
+from workspace.bridges.zulip import outgoing_operations
+from workspace.bridges.zulip import signed_uploads
 from workspace.services import zulip_outgoing
 
 

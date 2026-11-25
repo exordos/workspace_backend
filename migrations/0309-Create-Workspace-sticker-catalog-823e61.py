@@ -103,7 +103,7 @@ DROP TABLE m_workspace_stickers;
 
 class MigrationStep(migrations.AbstractMigrationStep):
     def __init__(self):
-        self._depends = ["0305-Add-stream-key-sharing-policy-58fcbc.py"]
+        self._depends = ["0308-Register-APNs-push-devices-71fa20.py"]
 
     @property
     def migration_id(self):

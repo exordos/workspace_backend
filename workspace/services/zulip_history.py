@@ -13,12 +13,10 @@ import time
 import psycopg
 from psycopg.types import json as pg_json
 
-from workspace.bridges.zulip import (
-    history,
-    history_blocks,
-    incoming_operations,
-    signed_uploads,
-)
+from workspace.bridges.zulip import history
+from workspace.bridges.zulip import history_blocks
+from workspace.bridges.zulip import incoming_operations
+from workspace.bridges.zulip import signed_uploads
 from workspace.services import zulip_outgoing
 
 LOG = logging.getLogger(__name__)

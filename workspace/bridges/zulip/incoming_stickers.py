@@ -8,7 +8,8 @@ import hashlib
 import typing
 import urllib.parse
 
-from workspace.bridges.zulip import message_conversion, outgoing_operations
+from workspace.bridges.zulip import message_conversion
+from workspace.bridges.zulip import outgoing_operations
 from workspace.messenger_api.dm import base
 
 

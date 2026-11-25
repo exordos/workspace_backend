@@ -15,7 +15,9 @@ from psycopg.types import json as pg_json
 
 from workspace.bridges.zulip import content_cache, message_conversion, poll_conversion
 from workspace.common import emoji
-from workspace.messenger_api import file_storage, sticker_catalog, sticker_storage
+from workspace.messenger_api import file_storage
+from workspace.messenger_api import sticker_catalog
+from workspace.messenger_api import sticker_storage
 from workspace.messenger_api.dm import message_payloads
 
 TABLES = {

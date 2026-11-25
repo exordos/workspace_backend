@@ -9,7 +9,7 @@ from restalchemy.storage.sql import migrations as ra_migrations
 from workspace.tests.integration import conftest
 
 
-MIGRATION_FILE = "0306-Create-Workspace-sticker-catalog-823e61.py"
+MIGRATION_FILE = "0309-Create-Workspace-sticker-catalog-823e61.py"
 MIGRATION_ID = "823e61fd-0887-466d-9172-e02fc9fab203"
 
 
@@ -41,7 +41,7 @@ def test_sticker_catalog_migration_round_trip_schema_constraints_indexes_and_gra
                 pending.append(dependency)
     assert MIGRATION_FILE in dependencies
     assert engine._load_migrations()[MIGRATION_FILE].depends == [
-        "0305-Add-stream-key-sharing-policy-58fcbc.py"
+        "0308-Register-APNs-push-devices-71fa20.py"
     ]
     engine.apply_migration(MIGRATION_FILE)
     engine.rollback_migration(MIGRATION_FILE)
