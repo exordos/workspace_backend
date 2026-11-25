@@ -12,7 +12,6 @@ import typing
 import urllib.parse
 import uuid as sys_uuid
 
-import webob
 from restalchemy.api import actions as ra_actions
 from restalchemy.api import constants as ra_constants
 from restalchemy.api import controllers as ra_controllers
@@ -24,20 +23,21 @@ from restalchemy.common import exceptions as ra_exc
 from restalchemy.dm import filters as dm_filters
 from restalchemy.openapi import constants as oa_c
 from restalchemy.openapi import utils as oa_utils
+import webob
 from webob import multidict
 
 from workspace.common import models as common_models
-from workspace.messenger_api import file_storage
 from workspace.messenger_api import application_services
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api import exceptions as messenger_exc
+from workspace.messenger_api import file_storage
 from workspace.messenger_api import topic_summarization
 from workspace.messenger_api.api import store as api_store
-from workspace.messenger_api.dm import message_responses
-from workspace.messenger_api.dm import polls
-from workspace.messenger_api.dm import models
 from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.dm import helpers
+from workspace.messenger_api.dm import message_responses
+from workspace.messenger_api.dm import models
+from workspace.messenger_api.dm import polls
 from workspace.messenger_api.dm import push_devices
 from workspace.messenger_api.dm import v2_models
 
@@ -114,6 +114,22 @@ class ObjectJSONPacker(ContractJSONPacker):
         if (
             not isinstance(body, dict)
             or {"resource", "self", "controller"} & body.keys()
+        ):
+            raise ra_exc.ValidationErrorException()
+        return ra_packers.BaseResourcePacker.unpack(self, body)
+
+
+class WorkspaceStreamJSONPacker(ContractJSONPacker):
+    """Accept the legacy native source object still sent by Workspace clients."""
+
+    def unpack(self, value: typing.Any) -> typing.Any:
+        body = ra_packers.JSONPacker(None, self._req).unpack(value)
+        if not isinstance(body, dict):
+            raise ra_exc.ValidationErrorException()
+        source = body.pop("source", None)
+        if source is not None and (
+            source != {"kind": "native"}
+            or body.get("source_name", "native") != "native"
         ):
             raise ra_exc.ValidationErrorException()
         return ra_packers.BaseResourcePacker.unpack(self, body)
@@ -387,7 +403,13 @@ class PushDeviceController(ra_controllers.BaseResourceController):
         device = self.model.objects.get_one_or_none(
             filters={"uuid": dm_filters.EQ(uuid)},
             session=session,
+            locked=True,
         )
+        if device is not None and (
+            device.project_id != project_id or device.user_uuid != user_uuid
+        ):
+            raise ra_exc.ResourceNotFoundError(resource="PushDevice", path=str(uuid))
+        candidate.validate_registration()
         if device is None:
             candidate.insert(session=session)
             device = self.model.objects.get_one(
@@ -395,11 +417,6 @@ class PushDeviceController(ra_controllers.BaseResourceController):
                 session=session,
             )
             return self._response(device), 201, {}
-        if device.project_id != project_id or device.user_uuid != user_uuid:
-            raise ra_exc.ResourceNotFoundError(
-                resource="PushDevice",
-                path=str(uuid),
-            )
         device.update_dm(
             values={
                 "transport": candidate.transport,
@@ -408,7 +425,10 @@ class PushDeviceController(ra_controllers.BaseResourceController):
                 "encryption": candidate.encryption,
             },
         )
-        device.update(session=session)
+        # APNs can reissue the same token. Record even an identical registration.
+        device.update(
+            session=session, force=candidate.transport in push_devices.APNS_ENVIRONMENTS
+        )
         return self._response(device), 200, {}
 
     @oa_utils.extend_schema(
@@ -757,6 +777,7 @@ WorkspaceFileController.download.openapi_schema = oa_utils.Schema(
 
 class WorkspaceStreamController(StoreResourceController):
     resource_name = "streams"
+    __packer__ = WorkspaceStreamJSONPacker
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.WorkspaceUserStream,
         hidden_fields=["private_index"],

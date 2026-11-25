@@ -8600,6 +8600,8 @@ paths:
                     type: string
                     enum:
                     - fcm
+                    - apns
+                    - apns_sandbox
                     example: fcm
                   platform:
                     type: string
@@ -8686,6 +8688,8 @@ paths:
                     type: string
                     enum:
                     - fcm
+                    - apns
+                    - apns_sandbox
                     example: fcm
                   platform:
                     type: string

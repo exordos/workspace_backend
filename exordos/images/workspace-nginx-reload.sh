@@ -27,7 +27,8 @@ fi
 NGINX_CONFIG="/etc/nginx/sites-available/workspace.conf"
 NGINX_ENABLED="/etc/nginx/sites-enabled/workspace.conf"
 OLD_NGINX_CONFIG="/etc/nginx/conf.d/workspace.conf"
-CORE_UPSTREAM="/etc/nginx/workspace.d/core-upstream.conf"
+LEGACY_CORE_UPSTREAM="/etc/nginx/workspace.d/core-upstream.conf"
+CORE_CA_BUNDLE="/etc/nginx/workspace.d/core-ca.pem"
 
 disable_packaged_nginx_service() {
     if command -v systemctl >/dev/null 2>&1; then
@@ -42,8 +43,20 @@ disable_packaged_nginx_service() {
     rm -f /etc/systemd/system/multi-user.target.wants/nginx.service
 }
 
+nginx_configs_ready() {
+    [ -s "$NGINX_CONFIG" ] || return 1
+
+    # Wait only for files referenced by the config being loaded. During an
+    # upgrade the previous config can still reference the upstream include.
+    for required_file in "$LEGACY_CORE_UPSTREAM" "$CORE_CA_BUNDLE"; do
+        if [ ! -s "$required_file" ] && grep -Fq "$required_file" "$NGINX_CONFIG"; then
+            return 1
+        fi
+    done
+}
+
 wait_for_nginx_configs() {
-    while [ ! -s "$NGINX_CONFIG" ] || [ ! -s "$CORE_UPSTREAM" ]; do
+    while ! nginx_configs_ready; do
         echo "Waiting for workspace nginx platform configs..."
         sleep 1
     done
@@ -51,10 +64,8 @@ wait_for_nginx_configs() {
 
 if [ "$CHECK_ONLY" -eq 1 ]; then
     wait_for_nginx_configs
-else
-    if [ ! -s "$NGINX_CONFIG" ] || [ ! -s "$CORE_UPSTREAM" ]; then
-        exit 0
-    fi
+elif ! nginx_configs_ready; then
+    exit 0
 fi
 
 disable_packaged_nginx_service

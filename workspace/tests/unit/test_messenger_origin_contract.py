@@ -21,14 +21,14 @@ import uuid as sys_uuid
 from restalchemy.api import routes as ra_routes
 import webob
 
-from workspace.workspace_api.api import app
-from workspace.workspace_api.api import routes as workspace_routes
+from workspace.messenger_api import events
 from workspace.messenger_api.api import controllers
 from workspace.messenger_api.api import middlewares
 from workspace.messenger_api.api import routes
 from workspace.messenger_api.api import sticker_controllers
 from workspace.messenger_api.dm import models
-from workspace.messenger_api import events
+from workspace.workspace_api.api import app
+from workspace.workspace_api.api import routes as workspace_routes
 
 
 ROUTE_MANIFEST = {
@@ -306,6 +306,8 @@ def test_server_settings_origin_path_and_fields_are_preserved():
         "msg",
         "authentication_methods",
         "push_notifications_enabled",
+        "apns_push_notifications_enabled",
+        "organization_uuid",
         "email_auth_enabled",
         "require_email_format_usernames",
         "realm_url",
@@ -331,6 +333,23 @@ def test_server_settings_origin_path_and_fields_are_preserved():
         "saml",
         "openid connect",
     }
+
+
+def test_apns_discovery_is_independent_of_firebase(monkeypatch):
+    request = webob.Request.blank(
+        middlewares.SERVER_SETTINGS_PATH, base_url="http://workspace.example"
+    )
+    monkeypatch.setattr(middlewares.mobile_push_opts, "enabled", lambda: True)
+    monkeypatch.setattr(middlewares.mobile_push_opts, "apns_enabled", lambda: False)
+    settings = middlewares.build_server_settings(request)
+    assert settings["push_notifications_enabled"] is True
+    assert settings["apns_push_notifications_enabled"] is False
+
+    monkeypatch.setattr(middlewares.mobile_push_opts, "apns_enabled", lambda: True)
+    assert (
+        middlewares.build_server_settings(request)["apns_push_notifications_enabled"]
+        is True
+    )
 
 
 def test_file_upload_openapi_keeps_required_multipart_contract():

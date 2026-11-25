@@ -1,0 +1,176 @@
+{
+  "description": "Synthetic interoperability examples using public RFC 9180 receiver test material; never use this key in deployment.",
+  "recipient_private_key_hex": "497b4502664cfea5d5af0b39934dac72242a74f8480451e1aee7d6a53320333d",
+  "payloads": {
+    "first": {
+      "uuid": "00000000-0000-0000-0000-000000000064",
+      "user_uuid": "00000000-0000-0000-0000-000000000008",
+      "kind": "notification_topic_update",
+      "organization_uuid": "00000000-0000-0000-0000-000000000002",
+      "project_uuid": "00000000-0000-0000-0000-000000000003",
+      "stream_uuid": "00000000-0000-0000-0000-000000000004",
+      "topic_uuid": "00000000-0000-0000-0000-000000000005",
+      "message_uuid": "00000000-0000-0000-0000-000000000006",
+      "device_uuid": "00000000-0000-0000-0000-000000000009",
+      "content": {
+        "kind": "encrypted",
+        "algorithm": "HPKE-v1-BASE-X25519-HKDF-SHA256-AES-256-GCM",
+        "key_uuid": "00000000-0000-0000-0000-00000000000a",
+        "enc": "pq7TcoOT1qaiMj1wd8BIn1yP6eimM7wrD9PX-udhNlI",
+        "ciphertext": "MzU2yfS4Y4XqPcCV0VMvbjUzNdf6ydiK8i83JnuTOyMZUReZo50nvFJ30pPiaxm0IGuhsntHcTNryD7nWISKDRnnLrg_CXDjf_blE4oEFkLGIMrSviQ3j8eh1IS0SvGJDFJf-Sj_dAidH0nrEUSPL0Hf3i7Neb6oY6SSnP3RBQekwB4rU_2y8NdXXS02EuYECdhhv0kIaJphFVBAmxPtuwrv0MmqcDTEqOdf-_oRYo1P-272naYasTYdEph90tAg559TudCwmypoc29cik0L6mbBLi9QPGiv7F4afibghtziprCjTj_Y3HS6YWH4p0IawMNJQquRBVU6x10UGBpknp8YFlbjzV80kLuIOsLg5kgSrpCJQWUP46Tlr2Vs7hAl5R8ogyF8NToK5OAtEw80-cKvEqzeNy2lqbQQjkW70THxqtHvxIYJezFN-7SOaNXBv2goR_zNIug_x9_izZcZLtPfR4n6rRXGz6ldu3nEPgUAvtI8PG-mnBLHMX1-1_XOL6tb"
+      }
+    },
+    "second": {
+      "uuid": "00000000-0000-0000-0000-0000000000c8",
+      "user_uuid": "00000000-0000-0000-0000-000000000008",
+      "kind": "notification_topic_update",
+      "organization_uuid": "00000000-0000-0000-0000-000000000002",
+      "project_uuid": "00000000-0000-0000-0000-000000000003",
+      "stream_uuid": "00000000-0000-0000-0000-000000000004",
+      "topic_uuid": "00000000-0000-0000-0000-000000000005",
+      "message_uuid": "00000000-0000-0000-0000-000000000007",
+      "device_uuid": "00000000-0000-0000-0000-000000000009",
+      "content": {
+        "kind": "encrypted",
+        "algorithm": "HPKE-v1-BASE-X25519-HKDF-SHA256-AES-256-GCM",
+        "key_uuid": "00000000-0000-0000-0000-00000000000a",
+        "enc": "YjWKGyrTiRyxxqxYAT4TreA75zBexx4Yxe37mm7IB3s",
+        "ciphertext": "JIMs-ST5M7j1n8VsM05PGkw2Rttq_uRXwwqIgfbziyseBMoQoSAXEDuPY-l0ly41GZzwkOwdmp2eh9cOgSmWKEWPUTionHuoVhY6ggDClxdAJ0xOR1dtMxvWEC5qp884mutiCncbd72VKQh6P4U9w7pagMxvTj3DQCVEsttrHZEp2VxdbvIxINHTSreKFMNBIoUlsJNVqgE1FrpVXtizx-ugeamWH3mchUE5oGCPppShICV-z-UgfbNS8Q6zBf2F_kJCm1Lx26z-LjHjU7S4QFhWnGlHmf4nJh5FKJLR3DJztFaw0kQZRXVVPp7bkQsPV2Hsq8IHCNhtbp3R1IenpMGvWvVHpAzicmoKVG-XrJxabWL8kFypy014D1Ixf1yKeGm5YgvggDeZ9sKEt5AhdtBgLt5E7X2R6CxIhJplHk2lvdvSNLJVab98mYRQJ7OgdsDyJd9gdShSPFRhREMTpDt9j47PIURftmAqzmomitayZ0CrUlvydTW4oV51Yb6sU5RI"
+      }
+    },
+    "zero": {
+      "uuid": "00000000-0000-0000-0000-00000000012c",
+      "user_uuid": "00000000-0000-0000-0000-000000000008",
+      "kind": "notification_topic_update",
+      "organization_uuid": "00000000-0000-0000-0000-000000000002",
+      "project_uuid": "00000000-0000-0000-0000-000000000003",
+      "stream_uuid": "00000000-0000-0000-0000-000000000004",
+      "topic_uuid": "00000000-0000-0000-0000-000000000005",
+      "message_uuid": "00000000-0000-0000-0000-000000000008",
+      "device_uuid": "00000000-0000-0000-0000-000000000009",
+      "content": {
+        "kind": "encrypted",
+        "algorithm": "HPKE-v1-BASE-X25519-HKDF-SHA256-AES-256-GCM",
+        "key_uuid": "00000000-0000-0000-0000-00000000000a",
+        "enc": "T-aLNmbjYBhEEflGbn4YXOyg65hupQO3DRmIkDg441w",
+        "ciphertext": "Lo5oO74uV9T_6Y2CsBIrEw5gAPMdwBlJ6uqm5obZYfUD4SqzdxInRUbKpy5UjHFZPl4L77PKH3moKVG39E112ZevRLWRqetUdeFXcPcEhL90FkiwHseFK1LJFmo_Z1vjqMwNoR0kx46S5cHfIYkjTUxfXwxyUDN-rlN68nUm73wgm7tNOkM9QqO1E05NrvslwBLsXrWN5JqUj1mxrDNnX0KasbehO_g9dPp9H1_1NWbenSS8Some41T3ZA50bm1cAkL6T0xR0JE5wekLI03mgLvLCuMI4m6F87Ca5PHaQTJlKycwTnpbfz2q6QkKL_dqS5L3kjUrilT8v0Ij5AocEXwAaat-OvETxusO_aK9wrDfwVmdAlYymJ8woX-OauYPLUbIDR5bOW35BNQmLF3Prw_1Ueqn0SLT1VvFOjRS34aNk5-MH2EaDYWzZ942IidzNvXzNyULSE1yvfZJzqNKQ3pSy3PDHjEEdaXsp19oyGXDnq8FVIUgho94qw"
+      }
+    },
+    "newer": {
+      "uuid": "00000000-0000-0000-0000-000000000190",
+      "user_uuid": "00000000-0000-0000-0000-000000000008",
+      "kind": "notification_topic_update",
+      "organization_uuid": "00000000-0000-0000-0000-000000000002",
+      "project_uuid": "00000000-0000-0000-0000-000000000003",
+      "stream_uuid": "00000000-0000-0000-0000-000000000004",
+      "topic_uuid": "00000000-0000-0000-0000-000000000005",
+      "message_uuid": "00000000-0000-0000-0000-000000000006",
+      "device_uuid": "00000000-0000-0000-0000-000000000009",
+      "content": {
+        "kind": "encrypted",
+        "algorithm": "HPKE-v1-BASE-X25519-HKDF-SHA256-AES-256-GCM",
+        "key_uuid": "00000000-0000-0000-0000-00000000000a",
+        "enc": "F37-pQayj7-TOnNxxiJ3n-8U6tSVJSoMx691cQh_4T4",
+        "ciphertext": "WRtK4Og8E0vqcVP_5PXQNhVJyUmctkrCrCnC_vWZoKUtKkXKO66jYpp6hFWj34YKn6RMTUTU3RtjsqFn6owN4eEMy75DrW5pA56QDv0LOesWrB_I-cIs_q1t4r_wrqHJhmiy4d1Whht7KbMNqXNLtWZ69jFZ1nGuYKVxyA84ixujcSi6uukOPaFAYt9PXKfPCQJxUfRmi8gZCg5uGj12lWae1Wm95ulmdl9kb9_Pj6mjiNMKtHhTHwtfkBLHUC1zJNj-vSOqmsDE_axUtnq6-kviNIO9CgTQ5fR2qshVm0Gq-hGtdM5JQ4JRsQ8OPKdZJZemH_OaUye6LOvE424P6l7XOHiaNieg-fcvuyGIv0EhYJRpkPKKfL6l_K7n8KJiWh821OLMUrqroiuSPxyGgSWQDK_zQjLhIhDqNhiUuFq_hE3kqJ3LAzexBPUMZWg0DS6Bz3IVLzgARSb7q1qsutfdeX0IuHIfDZI5T6cfaWW1_nie3OeLgqGlook7uPVYDQ"
+      }
+    },
+    "empty": {
+      "uuid": "00000000-0000-0000-0000-0000000001f4",
+      "user_uuid": "00000000-0000-0000-0000-000000000008",
+      "kind": "notification_topic_update",
+      "organization_uuid": "00000000-0000-0000-0000-000000000002",
+      "project_uuid": "00000000-0000-0000-0000-000000000003",
+      "stream_uuid": "00000000-0000-0000-0000-000000000004",
+      "topic_uuid": "00000000-0000-0000-0000-000000000005",
+      "message_uuid": null,
+      "device_uuid": "00000000-0000-0000-0000-000000000009",
+      "content": {
+        "kind": "encrypted",
+        "algorithm": "HPKE-v1-BASE-X25519-HKDF-SHA256-AES-256-GCM",
+        "key_uuid": "00000000-0000-0000-0000-00000000000a",
+        "enc": "rqFc0fS830jy9TR1hiv93-OCTJB92DzdAwBtJRWE4EM",
+        "ciphertext": "JVdSnoxoTwbG3bSz2ujFdB7-efC7KDyeJfvAUsXAm7OgoUQFMLyWZGhb6EA3ShbRhbDaI799rzbuPU43o_YwFB0ZbfanwfWsYt7ucd6oehtZCSmQy05xpqoEw2rzzUP46pA2c1RuS3oXSkeVBDEOS6JdYfM2p9ukC7ObiplA6j1byeYoj89LLDfM4kTc8kdkHAuuoexT3tmaCLDUN5mSQGdA8LbuwrkI976MemmifHridLUtp2nBFj1wB-mS4AXYV33POBnxVNrq_FYpzUlIt7vt1YDYmQV82jgGLipjoleIkb4K5bJaTIVPrjnwbWOL2_PAnbv6fQlBIJ-XyJQ_4X77AKSYPF0jCn4"
+      }
+    },
+    "invalid_positive_no_target": {
+      "uuid": "00000000-0000-0000-0000-000000000258",
+      "user_uuid": "00000000-0000-0000-0000-000000000008",
+      "kind": "notification_topic_update",
+      "organization_uuid": "00000000-0000-0000-0000-000000000002",
+      "project_uuid": "00000000-0000-0000-0000-000000000003",
+      "stream_uuid": "00000000-0000-0000-0000-000000000004",
+      "topic_uuid": "00000000-0000-0000-0000-000000000005",
+      "message_uuid": null,
+      "device_uuid": "00000000-0000-0000-0000-000000000009",
+      "content": {
+        "kind": "encrypted",
+        "algorithm": "HPKE-v1-BASE-X25519-HKDF-SHA256-AES-256-GCM",
+        "key_uuid": "00000000-0000-0000-0000-00000000000a",
+        "enc": "0aPa9RCxVsydrLz6WdMAVmqXegeSw1E2y0QNuzFv_TE",
+        "ciphertext": "cqu1ky246Q8ClLfTyySa747iw6XjuQFBf6dI4cl1wGc3yFHFbCy9DQrMpIuXcJnfSpWtAJTcKCuUjknolqTZjdF0cuwB-HK9WYHIoer2ronC1l9X2C-MBgIvqBWCPPNzRfftY9Fc56ZzYJw20UcnHsz9NGL85xbklajSB1CatO3z7PtEhb7d5eXSHE-oQUnTH02oFZg5tq-MqysZOKiWs0yWszR4CGo2oryrLtdkdlmrgTCghKzjR3WTXIcllqNspL8o-UR23nM6xTddXWf7bs1vJSO4KLawIOUokswpNM3BVl8AAS8iA_v0J04rkj8zS5DGaYAf_15iJWfGe_2v_7aB2sOJwx0spOs"
+      }
+    }
+  },
+  "event": {
+    "uuid": "00000000-0000-0000-0000-000000000064",
+    "project_id": "00000000-0000-0000-0000-000000000003",
+    "event_type": "/v1/event_types/aba6e448-3b72-51ef-b0c6-d2e3be17efe7",
+    "exchange": {
+      "kind": "User",
+      "user_uuid": "00000000-0000-0000-0000-000000000008"
+    },
+    "event_params": {
+      "kind": "notification_topic_update",
+      "organization_uuid": "00000000-0000-0000-0000-000000000002",
+      "project_uuid": "00000000-0000-0000-0000-000000000003",
+      "stream_uuid": "00000000-0000-0000-0000-000000000004",
+      "topic_uuid": "00000000-0000-0000-0000-000000000005",
+      "message_uuid": "00000000-0000-0000-0000-000000000006",
+      "devices": [
+        {
+          "device_uuid": "00000000-0000-0000-0000-000000000009",
+          "registration_token": "synthetic-test-token",
+          "content": {
+            "kind": "encrypted",
+            "algorithm": "HPKE-v1-BASE-X25519-HKDF-SHA256-AES-256-GCM",
+            "key_uuid": "00000000-0000-0000-0000-00000000000a",
+            "enc": "pq7TcoOT1qaiMj1wd8BIn1yP6eimM7wrD9PX-udhNlI",
+            "ciphertext": "MzU2yfS4Y4XqPcCV0VMvbjUzNdf6ydiK8i83JnuTOyMZUReZo50nvFJ30pPiaxm0IGuhsntHcTNryD7nWISKDRnnLrg_CXDjf_blE4oEFkLGIMrSviQ3j8eh1IS0SvGJDFJf-Sj_dAidH0nrEUSPL0Hf3i7Neb6oY6SSnP3RBQekwB4rU_2y8NdXXS02EuYECdhhv0kIaJphFVBAmxPtuwrv0MmqcDTEqOdf-_oRYo1P-272naYasTYdEph90tAg559TudCwmypoc29cik0L6mbBLi9QPGiv7F4afibghtziprCjTj_Y3HS6YWH4p0IawMNJQquRBVU6x10UGBpknp8YFlbjzV80kLuIOsLg5kgSrpCJQWUP46Tlr2Vs7hAl5R8ogyF8NToK5OAtEw80-cKvEqzeNy2lqbQQjkW70THxqtHvxIYJezFN-7SOaNXBv2goR_zNIug_x9_izZcZLtPfR4n6rRXGz6ldu3nEPgUAvtI8PG-mnBLHMX1-1_XOL6tb"
+          }
+        }
+      ],
+      "priority": "high"
+    }
+  },
+  "empty_event": {
+    "uuid": "00000000-0000-0000-0000-0000000001f4",
+    "project_id": "00000000-0000-0000-0000-000000000003",
+    "event_type": "/v1/event_types/aba6e448-3b72-51ef-b0c6-d2e3be17efe7",
+    "exchange": {
+      "kind": "User",
+      "user_uuid": "00000000-0000-0000-0000-000000000008"
+    },
+    "event_params": {
+      "kind": "notification_topic_update",
+      "organization_uuid": "00000000-0000-0000-0000-000000000002",
+      "project_uuid": "00000000-0000-0000-0000-000000000003",
+      "stream_uuid": "00000000-0000-0000-0000-000000000004",
+      "topic_uuid": "00000000-0000-0000-0000-000000000005",
+      "message_uuid": null,
+      "devices": [
+        {
+          "device_uuid": "00000000-0000-0000-0000-000000000009",
+          "registration_token": "synthetic-test-token",
+          "content": {
+            "kind": "encrypted",
+            "algorithm": "HPKE-v1-BASE-X25519-HKDF-SHA256-AES-256-GCM",
+            "key_uuid": "00000000-0000-0000-0000-00000000000a",
+            "enc": "rqFc0fS830jy9TR1hiv93-OCTJB92DzdAwBtJRWE4EM",
+            "ciphertext": "JVdSnoxoTwbG3bSz2ujFdB7-efC7KDyeJfvAUsXAm7OgoUQFMLyWZGhb6EA3ShbRhbDaI799rzbuPU43o_YwFB0ZbfanwfWsYt7ucd6oehtZCSmQy05xpqoEw2rzzUP46pA2c1RuS3oXSkeVBDEOS6JdYfM2p9ukC7ObiplA6j1byeYoj89LLDfM4kTc8kdkHAuuoexT3tmaCLDUN5mSQGdA8LbuwrkI976MemmifHridLUtp2nBFj1wB-mS4AXYV33POBnxVNrq_FYpzUlIt7vt1YDYmQV82jgGLipjoleIkb4K5bJaTIVPrjnwbWOL2_PAnbv6fQlBIJ-XyJQ_4X77AKSYPF0jCn4"
+          }
+        }
+      ],
+      "priority": "normal"
+    }
+  }
+}

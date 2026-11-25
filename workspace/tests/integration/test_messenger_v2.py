@@ -209,6 +209,46 @@ def test_concurrent_first_requests_share_one_iam_user_import(db, monkeypatch):
         assert cursor.fetchone()[0] == 1
 
 
+def test_recreated_iam_user_does_not_reuse_stale_username_identity(db):
+    old_uuid = sys_uuid.uuid4()
+    new_uuid = sys_uuid.uuid4()
+    username = f"recreated-{sys_uuid.uuid4()}"
+    email = f"{username}@example.com"
+
+    with contexts.Context().session_manager():
+        old_user = messenger_models.WorkspaceUser.sync_iam_identity(
+            user_uuid=old_uuid,
+            username=username,
+            first_name="Old",
+            last_name=None,
+            email=email,
+        )
+        new_user = messenger_models.WorkspaceUser.sync_iam_identity(
+            user_uuid=new_uuid,
+            username=username,
+            first_name="New",
+            last_name=None,
+            email=email,
+        )
+
+    assert old_user.uuid == old_uuid
+    assert new_user.uuid == new_uuid
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT uuid, first_name, email
+            FROM m_workspace_users
+            WHERE username = %s OR username = %s
+            ORDER BY uuid
+            """,
+            (username, f"{username[:91]}~{old_uuid}"),
+        )
+        assert set(cursor.fetchall()) == {
+            (old_uuid, "Old", None),
+            (new_uuid, "New", email),
+        }
+
+
 @pytest.mark.parametrize("timezone", ("UTC", "Europe/Moscow", "America/New_York"))
 def test_native_message_timestamps_use_utc(api, timezone):
     parts = urllib.parse.urlsplit(conftest.TEST_DB_URL)
@@ -579,6 +619,7 @@ def test_native_v2_direct_stream_is_idempotent_and_closed(api, db):
         "name": "Direct",
         "description": "",
         "source_name": "native",
+        "source": {"kind": "native"},
         "direct_user_uuid": str(peer_uuid),
     }
     first = api.post(STREAMS, json=body)
