@@ -12,3 +12,11 @@ class WorkspaceApiEndpointController(ra_controllers.RoutesListController):
 
 class MessengerApiEndpointController(ra_controllers.RoutesListController):
     __TARGET_PATH__ = "/v1/messenger/"
+
+
+class MailApiEndpointController(ra_controllers.RoutesListController):
+    __TARGET_PATH__ = "/v1/mail/"
+
+
+class CalendarApiEndpointController(ra_controllers.RoutesListController):
+    __TARGET_PATH__ = "/v1/calendar/"

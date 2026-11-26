@@ -26,6 +26,7 @@ from restalchemy.openapi import utils as oa_utils
 import webob
 from webob import multidict
 
+from workspace.common import account_capabilities
 from workspace.common import models as common_models
 from workspace.messenger_api import application_services
 from workspace.messenger_api import events as messenger_events
@@ -40,6 +41,7 @@ from workspace.messenger_api.dm import models
 from workspace.messenger_api.dm import polls
 from workspace.messenger_api.dm import push_devices
 from workspace.messenger_api.dm import v2_models
+from workspace.services import groupware_accounts
 
 
 LOG = logging.getLogger(__name__)
@@ -543,9 +545,9 @@ class WorkspaceFileController(StoreResourceController):
             acl = acl_value if isinstance(acl_value, dict) else json.loads(acl_value)
         except (TypeError, ValueError) as exc:
             raise ra_exc.ValidationErrorException() from exc
-        if acl != {"mode": "public"}:
+        if acl not in ({"mode": "owner"}, {"mode": "public"}):
             raise ra_exc.ValidationErrorException()
-        return None, "public"
+        return None, acl["mode"]
 
     def process_result(
         self, result: typing.Any, *args: typing.Any, **kwargs: typing.Any
@@ -597,7 +599,7 @@ class WorkspaceFileController(StoreResourceController):
             {
                 "uuid": file_uuid,
                 "stream_uuid": stream_uuid,
-                "acl_mode": "public" if acl_mode == "public" else "stream",
+                "acl_mode": (acl_mode if acl_mode in {"owner", "public"} else "stream"),
                 "name": name,
                 "description": description,
                 "content_type": file_part.type,
@@ -738,11 +740,12 @@ setattr(
                             "stream_uuid": {"format": "uuid", "type": "string"},
                             "acl": {
                                 "description": (
-                                    "JSON ACL object. The only public form is "
-                                    '{"mode":"public"}.'
+                                    "JSON ACL object. Use owner for a private "
+                                    "mail attachment or public for a realm-wide file."
                                 ),
                                 "pattern": (
-                                    '^\\s*\\{\\s*"mode"\\s*:\\s*"public"\\s*\\}\\s*$'
+                                    '^\\s*\\{\\s*"mode"\\s*:\\s*'
+                                    '"(?:owner|public)"\\s*\\}\\s*$'
                                 ),
                                 "type": "string",
                             },
@@ -1222,6 +1225,8 @@ class WorkspaceEpochController(StoreResourceController):
 
 class ExternalResourceController(ra_controllers.BaseResourceControllerPaginated):
     __generate_location_for__ = ()
+    _pagination_limit: int = 0
+    _has_more = False
 
     def _get_user_uuid(self) -> typing.Any:
         return self.get_context().user_uuid
@@ -1240,6 +1245,10 @@ class ExternalResourceController(ra_controllers.BaseResourceControllerPaginated)
     def _create_response(
         self, body: typing.Any, status: typing.Any, headers: typing.Any
     ) -> typing.Any:
+        if self._pagination_limit and isinstance(body, list):
+            headers[self._header_page_limit] = str(self._pagination_limit)
+            if self._has_more:
+                headers[self._header_page_marker] = str(body[-1].uuid)
         return ra_controllers.Controller._create_response(self, body, status, headers)
 
     def _owner_filters(self, filters: typing.Any) -> typing.Any:
@@ -1267,13 +1276,37 @@ class ExternalResourceController(ra_controllers.BaseResourceControllerPaginated)
         )
 
     def filter(self, filters: typing.Any, order_by: typing.Any = None) -> typing.Any:
-        return super().filter(self._owner_filters(filters), order_by=order_by)
+        scoped = self._owner_filters(filters)
+        limit = self._pagination_limit
+        if not limit:
+            return super().filter(scoped, order_by=order_by)
+        self._pagination_limit = limit + 1
+        try:
+            results = super().filter(scoped, order_by=order_by)
+        finally:
+            self._pagination_limit = limit
+        self._has_more = len(results) > limit
+        return results[:limit]
 
     def get(self, uuid: object, **kwargs: typing.Any) -> typing.Any:
         del kwargs
         return self.model.objects.get_one(
             filters=self._owner_filters({"uuid": dm_filters.EQ(uuid)}),
         )
+
+
+class ExternalAccountJSONPacker(ObjectJSONPacker):
+    def pack_resource(self, obj: typing.Any) -> typing.Any:
+        result = super().pack_resource(obj)
+        if "settings" in result:
+            provider = result.get("provider")
+            if groupware_accounts.is_groupware(provider):
+                result["settings"] = groupware_accounts.public_settings(provider, result["settings"])
+            else:
+                result["settings"] = external_models.public_settings(result["settings"])
+        if "provider" in result:
+            result["capabilities"] = account_capabilities.for_provider(result["provider"])
+        return result
 
 
 class ExternalAccountController(ExternalResourceController):
@@ -1296,6 +1329,16 @@ class ExternalAccountController(ExternalResourceController):
         result["project_id"] = dm_filters.EQ(self._get_project_id())
         return result
 
+    def _is_queryable_field(self, name: str) -> bool:
+        return name != "settings" and super()._is_queryable_field(name)
+
+    def get_packer(
+        self, content_type: typing.Any, resource_type: typing.Any = None,
+    ) -> typing.Any:
+        return ExternalAccountJSONPacker(
+            resource_type or self.get_resource(), request=self.request,
+        )
+
     def _require_permission(self, action: str) -> None:
         permissions = (
             self.get_context().iam_context.get_introspection_info().permissions
@@ -1313,6 +1356,8 @@ class ExternalAccountController(ExternalResourceController):
 
     def create(self, **kwargs: typing.Any) -> typing.Any:
         self._require_permission("workspace.external_account.create")
+        if "capabilities" in kwargs:
+            raise ra_exc.ValidationErrorException()
         return application_services.ExternalAccountApplicationService.create(
             contexts.Context().get_session(),
             application_services.ExternalAccountActor(
@@ -1324,10 +1369,13 @@ class ExternalAccountController(ExternalResourceController):
 
     def update(self, uuid: object, **kwargs: typing.Any) -> typing.Any:
         self._require_permission("workspace.external_account.update")
+        if "capabilities" in kwargs:
+            raise ra_exc.ValidationErrorException()
         session = contexts.Context().get_session()
         account = self.model.objects.get_one(
             filters=self._owner_filters({"uuid": dm_filters.EQ(uuid)}),
             session=session,
+            locked=True,
         )
         return application_services.ExternalAccountApplicationService.update(
             session,
@@ -1341,9 +1389,25 @@ class ExternalAccountController(ExternalResourceController):
 
     def delete(self, uuid: object) -> None:
         self._require_permission("workspace.external_account.delete")
-        account = super().get(uuid)
+        session = contexts.Context().get_session()
+        account = self.model.objects.get_one(
+            filters=self._owner_filters({"uuid": dm_filters.EQ(uuid)}),
+            session=session,
+            locked=True,
+        )
+        active_intent = session.execute(
+            """
+            SELECT 1 FROM mail_outgoing_intents
+            WHERE project_id = %s AND external_account_uuid = %s
+              AND status IN ('new', 'checking')
+            LIMIT 1
+            """,
+            (account.project_id, account.uuid),
+        ).fetchone()
+        if active_intent is not None:
+            raise ra_exc.ValidationErrorException()
         application_services.ExternalAccountApplicationService.delete(
-            contexts.Context().get_session(),
+            session,
             application_services.ExternalAccountActor(
                 user_uuid=self._get_user_uuid(),
                 project_id=self._get_project_id(),

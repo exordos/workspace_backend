@@ -314,6 +314,14 @@ resources:
       constructor:
         kind: plain
       method: AUTO_HEX
+    workspace_groupware_secret_key:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace_groupware_secret_key
+      description: "Workspace external mail and calendar credential encryption key"
+      default_length: 64
+      constructor:
+        kind: plain
+      method: AUTO_HEX
 
   $dbaas.types.postgres.instances:
     workspace_projection_cluster:
@@ -525,6 +533,9 @@ resources:
           [messenger_files]
           default_type = s3
           storage_path = /var/lib/workspace/messenger/files
+
+          [groupware]
+          secret_encryption_key = {$core.secret.passwords.$workspace_groupware_secret_key:value}
 
 
           [messenger_files_s3]

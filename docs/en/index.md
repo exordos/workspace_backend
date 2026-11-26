@@ -24,6 +24,7 @@ Entity names, fields, routes, JSON values, and task types in the documents are p
 | Document | Status | Purpose |
 | --- | --- | --- |
 | [`workspace_api.md`](workspace_api.md) | **active contract** | Canonical client contract for Workspace/Messenger REST, Events, and WebSocket: routes, JSON, statuses, filters, pagination, and the runtime/OpenAPI boundary. |
+| [`mail_api.md`](mail_api.md) | **active contract; transport pending** | Public Mail resources, owner-private S3 attachments, durable send intents, events, and the external-delivery acceptance boundary. |
 | [`workspace_ui_realtime_integration.md`](workspace_ui_realtime_integration.md) | **active contract** | REST backfill, epoch cursor, and WebSocket delivery/retry for the Workspace UI. |
 | [`architecture.md`](architecture.md) | **historical reference** | Retired private bridge and provider API architecture. |
 | [`workspace_server_v2_decisions.md`](workspace_server_v2_decisions.md) | **historical reference** | Retired Provider API v2 and mTLS transport decisions. |

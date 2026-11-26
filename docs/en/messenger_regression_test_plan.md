@@ -44,7 +44,7 @@ also defines rebuild, recovery, scale, and load acceptance.
 | --- | --- | --- |
 | MSG-API-001 | Request every Messenger collection and action below `/api/workspace/v1/messenger`. | Methods, status codes, schemas, pagination, and action paths match the baseline. |
 | MSG-API-002 | Request `/api/workspace/v1/messenger/server_settings` with and without a trailing slash, then unwrap and fetch the `realm_icon` target without credentials. | The public response contains `urn:url:<realm>/logo-512x512.png`, and the packaged organization emblem is returned anonymously as `image/png`. |
-| MSG-API-003 | Request old `/api/messenger/**` paths and browser-inaccessible provider, mail, or calendar paths. | Nginx or the application returns `404` and does not redirect. |
+| MSG-API-003 | Request old `/api/messenger/**` paths and browser-inaccessible provider or calendar paths. Verify `/api/workspace/v1/mail/**` separately against the Mail contract. | Unsupported paths return `404`; Mail routes keep their documented schemas and owner scope. |
 | MSG-API-004 | Compare generated OpenAPI with the frozen Messenger baseline. | Existing resources, required values, multipart requirements, actions, and response headers are unchanged. |
 | MSG-API-005 | Inspect browser-visible traffic during Messenger use. | No database, provider-service, SMTP, IMAP, Maildir, mail, or calendar implementation detail is exposed. |
 

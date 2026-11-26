@@ -3,10 +3,9 @@
 This document describes the browser-facing API contract served by the unified
 `workspace-api` REST service and the companion `workspace-messenger-events`
 websocket service. Messenger resources, users, client service settings,
-push-device registrations, and REST events all use `workspace-api`.
-Alleine Mail, Kalender und Externe Benutzer Endpunkte sind nicht Teil dieser
-Anbieter-neutrale externe Konten, Chat, Betrieb, Richtlinien, Gesundheit,
-und Brückeninstanzressourcen sind Teil derMessenger API.
+push-device registrations, Mail, Calendar, and REST events all use
+`workspace-api`. Mail and Calendar share Workspace external accounts and
+the existing realtime cursor.
 
 Native Messenger Ressourcen, Mitgliedschaft, Benutzerzustand, Ereignisse, Anbieter-Mapping,
 und die Klienten-Einstellungen sind kanonisch inPostgreSQL. Die vorhandenen Ursprungsfelder
@@ -18,6 +17,7 @@ Direktes örtliches Angebot:
 
 ```text
 Messenger REST API:  http://127.0.0.1:21084/v1/messenger
+Mail REST API:       http://127.0.0.1:21084/v1/mail
 Events WebSocket:    ws://127.0.0.1:21082/v1/events/ws
 Workspace REST API:  http://127.0.0.1:21084/v1
 Worker:              workspace-messenger-worker
@@ -33,13 +33,14 @@ der Weg:
 ```text
 Workspace REST root: /api/workspace/v1/...
 Messenger REST:      /api/workspace/v1/messenger/...
+Mail REST:           /api/workspace/v1/mail/...
 Events REST:         /api/workspace/v1/events/...
 Events WebSocket:    /api/workspace/v1/events/ws?last_epoch_version=<number>&epoch_generation=<generation>
 OpenAPI spec:        /api/workspace/specifications/3.0.3
 ```
 
 All REST requests under `/api/workspace/`, including
-`/api/workspace/v1/messenger/`, are proxied to `workspace-api` on
+`/api/workspace/v1/messenger/` and `/api/workspace/v1/mail/`, are proxied to `workspace-api` on
 `127.0.0.1:21084` without changing the public URL structure. The exact nginx
 location `/api/workspace/v1/events/ws` is proxied to the websocket service
 endpoint `/v1/events/ws` on `127.0.0.1:21082`.
@@ -266,6 +267,10 @@ Autoritative Momentaufnahmen vor dem Start eines neuen Cursors.
 | Methode | Weg | Beschreibung |
 | --- | --- | --- |
 | `GET` | `/api/workspace/v1/` | Liste der unter `/api/workspace/v1/` stehenden Strecken. |
+| `GET` | `/api/workspace/v1/mail/` | See [Mail resources and actions](mail_api.md). |
+| `GET` | `/api/workspace/v1/calendar/` | See [Calendar resources and actions](calendar_api.md). |
+| `GET`, `POST` | `/api/workspace/v1/external_accounts/` | List or create external accounts. |
+| `GET`, `PUT`, `DELETE` | `/api/workspace/v1/external_accounts/{account_uuid}` | Read, update or delete an account. |
 | `GET` | `/api/workspace/v1/messenger/` | Liste der Messenger Strecken unter `/api/workspace/v1/messenger/`. |
 | `GET` | `/api/workspace/v1/messenger/server_settings` | Die Server-Einstellungen wie Zulip zurückgeben. |
 | `GET` | `/api/workspace/v1/messenger/server_settings/` | Das gleiche wie oben; Trailing Slash wird unterstützt. |
@@ -1756,7 +1761,7 @@ Nginx lehnt mehrere Anfragen ab, die größer als `50m` sind, bevor sie erreicht
 | `uuid` | UUID | - Nein. | - Ja, das ist es. | Datei-Identifikator. |
 | `project_id` | UUID | - Nein. | - Ja, das ist es. | IAM Projektumfang; in API Antworten versteckt. |
 | `user_uuid` | UUID | - Nein. | - Ja, das ist es. | Eigentümer/uploader. |
-| `stream_uuid` | UUID oder `null` | - Ja, das ist es. | - Nein. | Streaming, das eine Chatdatei besitzt. Für JSON erstellen und `stream_members` mehrteiligen Uploads erforderlich; für mehrteiligen Uploads mit `acl.mode=public` weggelassen. |
+| `stream_uuid` | UUID oder `null` | - Ja, das ist es. | - Nein. | Stream einer Chatdatei. Für JSON-Erstellung und `stream_members`-Multipart erforderlich; bei Multipart mit `acl.mode=owner` oder `acl.mode=public` weggelassen. |
 | `name` | String, max. 255 | - Ja, das ist es. | - Nein. | Anzeigenname der Datei. |
 | `description` | String, max. 255 | - Nein. | - Nein. | Dateibeschreibung; Standard für eine leere Zeichenfolge. |
 | `content_type` | String | - Ja, das ist es. | - Nein. | MIME Inhaltstyp. |
@@ -1806,10 +1811,11 @@ name=public-example.txt
 description=Authenticated Workspace-wide file
 ```
 
-Für mehrteilige Uploads ist `file` erforderlich und genau ein Bereich muss angegeben werden
-Vorbehaltlich: entweder `stream_uuid` oder das Formularfeld JSON
-`acl={"mode":"public"}`. Öffentliche Uploads ablehnen `stream_uuid`; Streaming-Uploads
-die `stream_members` ACL `name` Voreinstellungen für den hochgeladenen Dateinamen und
+Für Multipart-Uploads sind `file` und genau ein Scope erforderlich:
+`stream_uuid`, `acl={"mode":"owner"}` oder
+`acl={"mode":"public"}`. Owner- und Public-Uploads lehnen `stream_uuid` ab;
+Stream-Uploads behalten die `stream_members` ACL. Owner-Modus ist für private
+Mail-Anhänge bestimmt. `name` verwendet standardmäßig den hochgeladenen Dateinamen,
 `description` wird standardmäßig auf eine leere Zeichenfolge festgelegt.
 `content_type` aus dem hochgeladenen Teil berechnet `size_bytes` und schreibt eine
 SHA-256 `hash`. Beide Modi bewahren die gleiche binäre Plus JSON Sidecar Layout und

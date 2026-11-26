@@ -281,6 +281,11 @@ def add_public_projection_contract(
     specification: dict[str, typing.Any],
 ) -> dict[str, typing.Any]:
     schemas = specification["components"]["schemas"]
+    _component_schema(schemas, "ExternalAccount_Get")["properties"]["capabilities"] = {
+        "type": "array",
+        "items": {"type": "string", "enum": ["mail", "calendar", "messenger"]},
+        "readOnly": True,
+    }
     # Draft persistence only supports markdown.
     draft = _component_schema(schemas, "WorkspaceDraft_Get")["properties"]
     draft["payload"] = copy.deepcopy(DRAFT_PAYLOAD_SCHEMA)
@@ -1017,6 +1022,119 @@ def add_current_user_contract(
             },
         },
     }
+    return specification
+
+
+def _write_fields(
+    schemas: dict[str, typing.Any],
+    name: str,
+    action: str,
+    fields: tuple[str, ...],
+    required: list[str] | None = None,
+) -> None:
+    public_fields = schemas[f"{name}_Get"]["properties"]
+    properties = {field: copy.deepcopy(public_fields[field]) for field in fields}
+    for schema in properties.values():
+        schema.pop("readOnly", None)
+    schemas[f"{name}_{action}"] = _object_schema(properties, required or [])
+    if action == "Update":
+        schemas[f"{name}_{action}"]["minProperties"] = 1
+
+
+def _kind_schema(schema: dict[str, typing.Any], required: tuple[str, ...]) -> None:
+    schema["required"] = ["kind", *required]
+    schema["additionalProperties"] = False
+    schema.pop("example", None)
+
+
+def add_external_account_contract(
+    specification: dict[str, typing.Any],
+    components: dict[str, typing.Any],
+) -> dict[str, typing.Any]:
+    schemas = components["components"]["schemas"]
+    settings = _component_schema(schemas, "ExternalAccount_Get")["properties"]["settings"]
+    settings["description"] = (
+        "Provider-specific settings. IMAP/SMTP uses email, optional username, and imap/smtp "
+        "objects with host, port, and tls (implicit or starttls). CalDAV uses an HTTPS url and "
+        "username. Password is required to connect or reconnect and is never returned."
+    )
+    settings["properties"] = {"password": {"type": "string", "writeOnly": True}}
+    for path in ("/v1/external_accounts/", "/v1/messenger/external_accounts/"):
+        operation = specification["paths"][path]["get"]
+        operation["parameters"] = [
+            parameter for parameter in operation["parameters"]
+            if parameter.get("$ref") != "#/components/parameters/ExternalAccount_settings"
+        ]
+    return specification
+
+
+def add_mail_contract(
+    specification: dict[str, typing.Any],
+    components: dict[str, typing.Any],
+) -> dict[str, typing.Any]:
+    schemas = components["components"]["schemas"]
+    folders = ("external_account_uuid", "name", "kind")
+    _write_fields(schemas, "MailFolder", "Create", ("uuid", *folders), ["name"])
+    _write_fields(schemas, "MailFolder", "Update", folders)
+
+    for name in ("MailMessage", "MailDraft"):
+        fields = schemas[f"{name}_Get"]["properties"]
+        payload = fields["payload"]
+        payload.pop("example", None)
+        multipart = payload["oneOf"][0]
+        _kind_schema(multipart, ("parts",))
+        for part in multipart["properties"]["parts"]["items"]["oneOf"]:
+            _kind_schema(part, ("content",))
+        fields["attachment_urns"]["items"]["description"] = (
+            "Visible Workspace urn:file identifier. Bytes remain in S3."
+        )
+
+    draft_fields = (
+        "from_address", "to_addresses", "cc_addresses", "bcc_addresses",
+        "reply_to_uuid", "subject", "payload", "attachment_urns",
+    )
+    _write_fields(
+        schemas, "MailDraft", "Create", ("uuid", "folder_uuid", *draft_fields),
+        ["folder_uuid"],
+    )
+    _write_fields(schemas, "MailDraft", "Update", draft_fields)
+    paths = specification["paths"]
+    paths["/v1/mail/drafts/{MailDraftUuid}/actions/send/invoke"]["post"]["description"] = (
+        "Atomically publish a queued message and record one durable send intent."
+    )
+    return specification
+
+
+def add_calendar_contract(
+    specification: dict[str, typing.Any],
+    components: dict[str, typing.Any],
+) -> dict[str, typing.Any]:
+    schemas = components["components"]["schemas"]
+    payload = schemas["CalendarEvent_Get"]["properties"]["payload"]
+    payload.pop("example", None)
+    _kind_schema(payload["oneOf"][0], ("title", "starts_at", "ends_at"))
+    _write_fields(
+        schemas, "Calendar", "Create", ("uuid", "name", "external_account_uuid"), ["name"]
+    )
+    _write_fields(schemas, "Calendar", "Update", ("name",), ["name"])
+    _write_fields(
+        schemas, "CalendarEvent", "Create", ("uuid", "calendar_uuid", "payload"),
+        ["calendar_uuid", "payload"],
+    )
+    _write_fields(schemas, "CalendarEvent", "Update", ("payload",), ["payload"])
+    operation = specification["paths"]["/v1/calendar/events/"]["get"]
+    operation["parameters"].extend(
+        {
+            "name": name,
+            "in": "query",
+            "description": description,
+            "schema": {"type": "string", "format": "date-time"},
+        }
+        for name, description in (
+            ("starts_before", "Return events starting strictly before this UTC time."),
+            ("ends_after", "Return events ending strictly after this UTC time."),
+        )
+    )
     return specification
 
 

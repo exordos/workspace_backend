@@ -12,7 +12,7 @@ import pytest
 MIGRATION_PATH = (
     pathlib.Path(__file__).parents[3]
     / "migrations"
-    / "0310-Add-sticker-storage-cleanup-queue-133bce.py"
+    / "0313-Add-sticker-storage-cleanup-queue-133bce.py"
 )
 
 
