@@ -21,6 +21,7 @@ import typing
 import uuid as sys_uuid
 
 from restalchemy.common import exceptions as ra_exc
+from restalchemy.dm import types_dynamic
 
 from workspace.messenger_api import sticker_storage
 from workspace.messenger_api.dm import stickers as sticker_models
@@ -35,6 +36,7 @@ MEDIA_CONTENT_TYPES = {
     "png": "image/png",
 }
 STICKER_CATALOG_MANAGE_PERMISSION = "workspace.sticker_catalog.manage"
+_STICKER_CARD_TYPE = types_dynamic.KindModelType(sticker_models.StickerCard)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -207,25 +209,12 @@ def build_public_card(
 def public_card_dict(card: sticker_models.StickerCard) -> dict[str, object]:
     """Return exactly the public card fields, excluding storage identity."""
 
-    media = card.media
-    media_dict: dict[str, object] = {
-        "format": media.format,
-        "url": media.url,
-    }
-    if media.width is not None:
-        media_dict["width"] = media.width
-    if media.height is not None:
-        media_dict["height"] = media.height
-    return {
-        "id": str(card.id),
-        "title": card.title,
-        "alt_text": card.alt_text,
-        "emoji": list(card.emoji),
-        "tags": list(card.tags),
-        "category": card.category,
-        "media": media_dict,
-        "is_favorite": card.is_favorite,
-    }
+    data = _STICKER_CARD_TYPE.to_simple_type(card)
+    media = data["media"]
+    for field in ("width", "height"):
+        if media[field] is None:
+            del media[field]
+    return data
 
 
 def _public_record(record: "sticker_repository.StickerRecord") -> dict[str, object]:
