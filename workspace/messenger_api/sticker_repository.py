@@ -30,6 +30,12 @@ SORT_CREATED = "created_at_desc_uuid_desc"
 SORT_FAVORITE = "favorite_created_at_desc_uuid_desc"
 SORT_RANK_UPDATED = "rank_desc_updated_at_desc_uuid_desc"
 SORT_RANK_FAVORITE = "rank_desc_favorite_created_at_desc_uuid_desc"
+_SORT_COLUMNS = {
+    SORT_CREATED: ("created_at", "uuid"),
+    SORT_FAVORITE: ("favorite_created_at", "uuid"),
+    SORT_RANK_UPDATED: ("rank", "updated_at", "uuid"),
+    SORT_RANK_FAVORITE: ("rank", "favorite_created_at", "uuid"),
+}
 CURSOR_VERSION = 1
 _CURSOR_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _STICKER_COLUMNS = (
@@ -414,58 +420,15 @@ class StickerRepository:
             where.clear()
         if query.favorite:
             where.append("favorite.sticker_uuid IS NOT NULL")
+        sort_columns = _SORT_COLUMNS[query.sort]
+        order = ", ".join(f"{column} DESC" for column in sort_columns)
         outer_where = ""
         marker_params: list[typing.Any] = []
         if marker_values is not None:
-            if query.sort == SORT_CREATED:
-                marker_time, marker_uuid = marker_values
-                outer_where = (
-                    "WHERE (created_at < %s OR (created_at = %s AND uuid < %s))"
-                )
-                marker_params = [marker_time, marker_time, marker_uuid]
-            elif query.sort == SORT_FAVORITE:
-                marker_time, marker_uuid = marker_values
-                outer_where = (
-                    "WHERE (favorite_created_at < %s OR "
-                    "(favorite_created_at = %s AND uuid < %s))"
-                )
-                marker_params = [marker_time, marker_time, marker_uuid]
-            elif query.sort == SORT_RANK_UPDATED:
-                rank, marker_time, marker_uuid = marker_values
-                outer_where = (
-                    "WHERE (rank < %s OR (rank = %s AND updated_at < %s) OR "
-                    "(rank = %s AND updated_at = %s AND uuid < %s))"
-                )
-                marker_params = [
-                    rank,
-                    rank,
-                    marker_time,
-                    rank,
-                    marker_time,
-                    marker_uuid,
-                ]
-            else:
-                rank, marker_time, marker_uuid = marker_values
-                outer_where = (
-                    "WHERE (rank < %s OR (rank = %s AND favorite_created_at < %s) OR "
-                    "(rank = %s AND favorite_created_at = %s AND uuid < %s))"
-                )
-                marker_params = [
-                    rank,
-                    rank,
-                    marker_time,
-                    rank,
-                    marker_time,
-                    marker_uuid,
-                ]
-        if query.sort == SORT_CREATED:
-            order = "created_at DESC, uuid DESC"
-        elif query.sort == SORT_FAVORITE:
-            order = "favorite_created_at DESC, uuid DESC"
-        elif query.sort == SORT_RANK_UPDATED:
-            order = "rank DESC, updated_at DESC, uuid DESC"
-        else:
-            order = "rank DESC, favorite_created_at DESC, uuid DESC"
+            marker_columns = ", ".join(sort_columns)
+            placeholders = ", ".join(["%s"] * len(sort_columns))
+            outer_where = f"WHERE ({marker_columns}) < ({placeholders})"
+            marker_params = list(marker_values)
         columns = ", ".join("s.%s" % column for column in _STICKER_COLUMNS)
         statement = """
             WITH ranked AS (
