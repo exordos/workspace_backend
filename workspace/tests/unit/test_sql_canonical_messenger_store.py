@@ -89,6 +89,34 @@ def test_resource_reads_are_project_and_user_scoped(monkeypatch):
     assert query["order_by"] == {"uuid": "asc"}
 
 
+def test_folder_collection_reads_one_parent_field_from_existing_snapshots(monkeypatch):
+    system_uuid = str(sys_uuid.UUID(int=0))
+    custom_uuid = str(sys_uuid.uuid4())
+    stream_uuid = str(sys_uuid.uuid4())
+    rows = [
+        {
+            "uuid": system_uuid,
+            "folder_items": [{"folder": system_uuid, "stream_uuid": stream_uuid}],
+        },
+        {
+            "uuid": custom_uuid,
+            "folder_items": [{"folder_uuid": custom_uuid, "stream_uuid": stream_uuid}],
+        },
+    ]
+    model = _fake_model(FakeObjects(rows), ("uuid", "project_id", "user_uuid"))
+    monkeypatch.setitem(sql_canonical_store.RESOURCE_MODELS, "folders", model)
+    store = sql_canonical_store.SQLCanonicalReadStore(PROJECT_UUID, USER_UUID)
+
+    assert store.filter_resources("folders", {}) == [
+        {
+            "uuid": row["uuid"],
+            "folder_items": [{"folder_uuid": row["uuid"], "stream_uuid": stream_uuid}],
+        }
+        for row in rows
+    ]
+    assert "folder" in rows[0]["folder_items"][0]
+
+
 def test_slow_list_projection_emits_bounded_telemetry(monkeypatch):
     objects = FakeObjects([])
     model = _fake_model(objects, ("uuid", "project_id", "user_uuid"))

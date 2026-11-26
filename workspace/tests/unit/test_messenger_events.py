@@ -62,6 +62,27 @@ async def _call_in_current_thread(callback, *args, **kwargs):
 
 
 class MessengerEventsTestCase(unittest.TestCase):
+    def test_packs_legacy_folder_item_with_canonical_parent_field(self):
+        folder_uuid = str(sys_uuid.uuid4())
+        stream_uuid = str(sys_uuid.uuid4())
+        item = {"folder": folder_uuid, "stream_uuid": stream_uuid}
+        event = events.event_row_to_messenger_event(
+            {
+                "epoch_version": 1,
+                "payload": {
+                    "kind": "folder.updated",
+                    "uuid": folder_uuid,
+                    "folder_items": [item],
+                },
+            }
+        )
+
+        self.assertEqual(
+            [{"folder_uuid": folder_uuid, "stream_uuid": stream_uuid}],
+            event["payload"]["folder_items"],
+        )
+        self.assertIn("folder", item)
+
     def test_recent_message_boundary_uses_utc_creation_time(self):
         now = datetime.datetime(2026, 10, 21, 12, tzinfo=datetime.timezone.utc)
         cutoff = now - datetime.timedelta(days=14)

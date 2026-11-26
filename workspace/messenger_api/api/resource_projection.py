@@ -10,7 +10,7 @@ import enum
 import typing
 import uuid as sys_uuid
 
-
+from workspace.messenger_api.dm import base
 from workspace.messenger_api.dm import models
 
 
@@ -67,6 +67,8 @@ def as_dict(
     result = simple(value)
     if not isinstance(result, dict):
         raise TypeError("Messenger projection rows must serialize to dictionaries")
+    if resource == "folders":
+        result["folder_items"] = base.normalize_folder_items(result["folder_items"])
     if resource in {
         "streams",
         "stream_bindings",

@@ -24,13 +24,15 @@ import webob
 from restalchemy.api import contexts as ra_contexts
 from restalchemy.api import packers as ra_packers
 from restalchemy.api import resources as ra_resources
-from restalchemy.common import exceptions as ra_exc
 from restalchemy.common import contexts
+from restalchemy.common import exceptions as ra_exc
 from restalchemy.dm import filters as dm_filters
+
 from workspace.common import mutation_journal_opts
 from workspace.messenger_api import publication
 from workspace.messenger_api.api import poll_reads
 from workspace.messenger_api.api import store as api_store
+from workspace.messenger_api.dm import base
 from workspace.messenger_api.dm import event_payloads
 from workspace.messenger_api.dm import message_payloads
 from workspace.messenger_api.dm import message_responses
@@ -444,6 +446,15 @@ def pack_workspace_event(
         WORKSPACE_EVENT_RESOURCE,
         request,
     ).pack(event)
+    if (
+        result["object_type"] == FOLDER_OBJECT_TYPE
+        and "folder_items" in result["payload"]
+    ):
+        payload = result["payload"]
+        result["payload"] = {
+            **payload,
+            "folder_items": base.normalize_folder_items(payload["folder_items"]),
+        }
     if (
         result["object_type"] == MESSAGE_OBJECT_TYPE
         and "reaction_users" in result["payload"]

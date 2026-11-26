@@ -2069,9 +2069,7 @@ def _process_folder_projection(
                     jsonb_agg(
                         jsonb_build_object(
                             'uuid', item.uuid,
-                            CASE WHEN %s = 'custom'
-                                 THEN 'folder_uuid' ELSE 'folder' END,
-                            item.folder_uuid,
+                            'folder_uuid', item.folder_uuid,
                             'project_id', item.project_id,
                             'user_uuid', item.user_uuid,
                             'stream_uuid', item.stream_uuid,
@@ -2122,7 +2120,6 @@ def _process_folder_projection(
         WHERE project_id = %s AND user_uuid = %s AND folder_uuid = %s
         """,
         (
-            rule,
             project_id,
             user_uuid,
             folder_uuid,
