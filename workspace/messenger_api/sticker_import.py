@@ -159,7 +159,7 @@ def _is_regular_file(info: zipfile.ZipInfo) -> bool:
 
 def _preflight_entries(
     archive: zipfile.ZipFile,
-) -> tuple[zipfile.ZipInfo, dict[str, zipfile.ZipInfo], int]:
+) -> tuple[zipfile.ZipInfo, dict[str, zipfile.ZipInfo]]:
     infos = archive.infolist()
     names: set[str] = set()
     manifest_info: zipfile.ZipInfo | None = None
@@ -204,14 +204,14 @@ def _preflight_entries(
         _invalid("Archive must contain one manifest.json")
     if compressed_size and unpacked_size > compressed_size * MAX_COMPRESSION_RATIO:
         _invalid("Archive exceeds the compression ratio limit")
-    return manifest_info, media_entries, unpacked_size
+    return manifest_info, media_entries
 
 
 def _read_manifest(
     archive: zipfile.ZipFile,
     info: zipfile.ZipInfo,
     budget: _ByteBudget,
-) -> tuple[stickers.StickerManifest, int]:
+) -> stickers.StickerManifest:
     try:
         content = io.BytesIO()
         actual_size = 0
@@ -232,7 +232,7 @@ def _read_manifest(
         manifest.validate()
         for item in manifest["items"]:
             item.validate()
-        return manifest, actual_size
+        return manifest
     except StickerImportValidationError:
         raise
     except (
@@ -283,9 +283,9 @@ def _validate_zip(
 ) -> StickerImportArchive:
     try:
         with zipfile.ZipFile(archive_path, "r") as archive:
-            manifest_info, media_entries, unpacked_size = _preflight_entries(archive)
+            manifest_info, media_entries = _preflight_entries(archive)
             budget = _ByteBudget(MAX_UNPACKED_BYTES)
-            manifest, _manifest_size = _read_manifest(archive, manifest_info, budget)
+            manifest = _read_manifest(archive, manifest_info, budget)
             items = manifest["items"]
             if len(items) > MAX_ITEMS:
                 _invalid("Archive contains too many items")
@@ -293,9 +293,6 @@ def _validate_zip(
             if set(media_entries) != expected_paths:
                 _invalid("Manifest and media files do not match")
             extracted: list[StickerImportItem] = []
-            extracted_size = unpacked_size - manifest_info.file_size
-            if extracted_size > MAX_UNPACKED_BYTES:
-                _invalid("Archive exceeds the unpacked size limit")
             for item in items:
                 info = media_entries[item.file]
                 destination = (
@@ -313,8 +310,6 @@ def _validate_zip(
                     info.file_size,
                     budget,
                 )
-                if size_bytes <= 0:
-                    _invalid("Media file must not be empty")
                 if digest != item.sha256:
                     _invalid("Media checksum does not match the manifest")
                 extracted.append(
@@ -416,13 +411,11 @@ def _import_validated_archive(
 ) -> stickers.StickerImportResult:
     owned_objects: list[str] = []
     try:
-        by_sha: dict[str, list[StickerImportItem]] = {}
-        for item in archive.items:
-            by_sha.setdefault(item.sha256, []).append(item)
-
         # D-13 makes the first manifest item the deterministic winner for a SHA.
-        representatives = {sha: group[0] for sha, group in by_sha.items()}
-        sha_values = sorted(by_sha)
+        representatives: dict[str, StickerImportItem] = {}
+        for item in archive.items:
+            representatives.setdefault(item.sha256, item)
+        sha_values = sorted(representatives)
         repository.lock_sha256_values(session, sha_values)
         existing = repository.find_duplicates(session, sha_values)
         missing = [value for value in sha_values if value not in existing]
