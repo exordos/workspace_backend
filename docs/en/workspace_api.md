@@ -518,9 +518,11 @@ Responses hide `project_id` and `user_uuid`.
 | `background_color_value` | integer `0..2^32-1` or `null` | no | no | ARGB color value. |
 | `unread_count` | integer | no | yes | Aggregated active unread count. Muted traffic is excluded. |
 | `system_type` | `all`, `created`, or `null` | no | yes | System folder type; defaults to `created`. |
-| `folder_items` | array | no | yes | Nested folder items from the view. |
+| `folder_items` | array | no | yes | Nested folder items. `folder_uuid` identifies the enclosing folder in system and user-created folders. |
 | `created_at` | datetime | no | yes | Creation time. |
 | `updated_at` | datetime | no | yes | Update time. |
+
+The same `folder_uuid` field is used in `folder_items` inside folder events.
 
 Create request:
 

@@ -278,6 +278,20 @@ class WorkspaceUserFolderBase(
     )
 
 
+def normalize_folder_items(
+    items: list[dict[str, typing.Any]],
+) -> list[dict[str, typing.Any]]:
+    """Read folder snapshots written before the parent field was standardized."""
+    normalized = []
+    for item in items:
+        if "folder" in item:
+            item = item.copy()
+            legacy_uuid = item.pop("folder")
+            item.setdefault("folder_uuid", legacy_uuid)
+        normalized.append(item)
+    return normalized
+
+
 class WorkspaceStreamRole(str, enum.Enum):
     GUEST = "guest"
     MEMBER = "member"

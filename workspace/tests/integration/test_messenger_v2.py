@@ -1573,7 +1573,21 @@ def test_native_v2_keeps_folder_file_and_draft_contracts(api, db):
         for value in all_chats.json()["folder_items"]
         if value["uuid"] == system_item_uuid
     )
+    assert nested_system_item["folder_uuid"] == all_chats.json()["uuid"]
+    assert "folder" not in nested_system_item
     assert nested_system_item["pinned_at"] is not None
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT folder_items_snapshot FROM messenger_user_folder_bindings
+            WHERE project_id = %s AND user_uuid = %s AND folder_uuid = %s
+            """,
+            (api.project_id, api.user_uuid, all_chats.json()["uuid"]),
+        )
+        snapshot = cursor.fetchone()[0]
+    assert next(item for item in snapshot if item["uuid"] == system_item_uuid) == (
+        nested_system_item
+    )
     system_unpinned = api.post(f"{FOLDER_ITEMS}{system_item_uuid}/actions/unpin/invoke")
     assert system_unpinned.status_code == 200, system_unpinned.text
     _drain()
@@ -1616,6 +1630,17 @@ def test_native_v2_keeps_folder_file_and_draft_contracts(api, db):
     assert nested_items[0]["folder_uuid"] == folder.json()["uuid"]
     assert nested_items[0]["stream_uuid"] == stream["uuid"]
     assert nested_items[0]["pinned_at"] is not None
+    collection = api.get(FOLDERS)
+    assert collection.status_code == 200, collection.text
+    folders_by_uuid = {value["uuid"]: value for value in collection.json()}
+    for folder_uuid in (all_chats.json()["uuid"], folder.json()["uuid"]):
+        nested_item = next(
+            item
+            for item in folders_by_uuid[folder_uuid]["folder_items"]
+            if item["stream_uuid"] == stream["uuid"]
+        )
+        assert nested_item["folder_uuid"] == folder_uuid
+        assert "folder" not in nested_item
     with db.cursor() as cursor:
         cursor.execute(
             """
