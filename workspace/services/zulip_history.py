@@ -13,7 +13,10 @@ import time
 import psycopg
 from psycopg.types import json as pg_json
 
-from workspace.bridges.zulip import history, history_blocks, incoming_operations
+from workspace.bridges.zulip import history
+from workspace.bridges.zulip import history_blocks
+from workspace.bridges.zulip import incoming_operations
+from workspace.bridges.zulip import signed_uploads
 from workspace.services import zulip_outgoing
 
 LOG = logging.getLogger(__name__)
@@ -68,6 +71,7 @@ class ZulipHistoryService:
         realtime_delay: float = 0.5,
         poll_interval: float = 1,
         statement_timeout: float = 60,
+        signed_upload_origins: signed_uploads.Origins | None = None,
     ) -> None:
         if not 1 <= batch_size <= 1000:
             raise ValueError("History pages must contain 1..1000 messages")
@@ -84,12 +88,15 @@ class ZulipHistoryService:
         self.reaction_user_limit, self.batch_size = reaction_user_limit, batch_size
         self.publication_limit, self.realtime_delay = publication_limit, realtime_delay
         self.poll_interval = poll_interval
+        self.signed_upload_origins = signed_upload_origins
         self.tasks: dict[str, asyncio.Task] = {}
         self.stopping, self.ready = asyncio.Event(), asyncio.Event()
 
     async def run(self) -> None:
         await self.db.open()
-        self.http = zulip_outgoing.Http(self.connections)
+        self.http = zulip_outgoing.Http(
+            self.connections, signed_upload_origins=self.signed_upload_origins
+        )
         self.operations = history.Operations(
             self.db, self.http, self.reaction_user_limit
         )

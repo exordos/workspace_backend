@@ -10,6 +10,7 @@ import logging
 
 from oslo_config import cfg
 
+from workspace.bridges.zulip import signed_uploads
 from workspace.common import file_storage_opts
 from workspace.services import zulip_incoming
 
@@ -33,6 +34,7 @@ def main() -> None:
     )
     service = zulip_incoming.ZulipIncomingService(
         config["db"]["connection_url"],
+        signed_upload_origins=signed_uploads.configured_origins(config),
         database_io_timeout=float(options.get("database_io_timeout", 300)),
         connections=int(options.get("connections", 128)),
         concurrency=int(options.get("concurrency", 128)),

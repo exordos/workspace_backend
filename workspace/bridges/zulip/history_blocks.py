@@ -4,6 +4,7 @@
 """Account-scoped receipts for stable, completely fetched history ranges."""
 
 import collections
+import functools
 import hashlib
 import json
 import re
@@ -14,6 +15,7 @@ import uuid
 from workspace.bridges.zulip import (
     content_cache,
     incoming_operations,
+    incoming_stickers,
     message_conversion,
 )
 
@@ -309,14 +311,21 @@ async def context(
     references = (
         message_conversion.PROVIDER_MESSAGE_REFERENCE_POLICY if refs["messages"] else {}
     )
-    active = {row["provider_identity"] for row in streams if row["active"]}
-    paths = upload_paths(
-        account,
-        [
-            item
-            for item in messages
-            if incoming_operations.stream_identity(account, item) in active
-        ],
+    active = {row["provider_identity"]: row["uuid"] for row in streams if row["active"]}
+    attached_messages = [
+        (active[identity], item)
+        for item in messages
+        if (identity := incoming_operations.stream_identity(account, item)) in active
+    ]
+    attachments = upload_targets(account, attached_messages)
+    stickers = (
+        prepared.get("stickers", {})
+        if prepared is not None
+        else await incoming_stickers.catalog(
+            functools.partial(incoming_operations.rows, connection),
+            account,
+            [item for _, item in attached_messages],
+        )
     )
     files = (
         prepared["files"]
@@ -328,9 +337,13 @@ async def context(
         FROM m_workspace_files WHERE project_id=%s AND provider_uuid=%s
           AND stream_uuid=ANY(%s::uuid[]) AND provider_identity=ANY(%s::text[]) ORDER BY uuid
         """,
-            (*scope, [row["uuid"] for row in streams if row["active"]], sorted(paths)),
+            (
+                *scope,
+                sorted({stream for stream, _ in attachments}),
+                sorted({path for _, path in attachments}),
+            ),
         )
-        if paths
+        if attachments
         else []
     )
     files = sorted(
@@ -347,7 +360,7 @@ async def context(
                 )
             }
             for row in files
-            if row["provider_identity"] in paths
+            if (row["stream_uuid"], row["provider_identity"]) in attachments
         ],
         key=lambda row: str(row["uuid"]),
     )
@@ -377,6 +390,7 @@ async def context(
             references,
             files,
         ]
+        + ([stickers] if stickers else [])
     )
 
 
@@ -399,9 +413,11 @@ def cacheable(messages: list[dict], batch: dict) -> bool:
     )
 
 
-def upload_paths(account: dict, messages: list[dict]) -> set[str]:
+def upload_targets(
+    account: dict, messages: list[tuple[object, dict]]
+) -> set[tuple[object, str]]:
     paths = set()
-    for item in messages:
+    for stream, item in messages:
         if "/user_uploads/" not in item["content"] and "![" not in item["content"]:
             continue
         for target in message_conversion.get_zulip_files(item, {}):
@@ -411,5 +427,5 @@ def upload_paths(account: dict, messages: list[dict]) -> set[str]:
             if endpoint is not None and endpoint.hostname == account["hostname"]:
                 path = message_conversion.zulip_upload_path(endpoint.path)
                 if path is not None:
-                    paths.add(path)
+                    paths.add((stream, path))
     return paths

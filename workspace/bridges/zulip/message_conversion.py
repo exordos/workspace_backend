@@ -9,7 +9,8 @@ Context contains server_url and original_url, plus optional mention_uuids
 (id:<Zulip ID> or name:<name>), stream_uuids (name), topic_uuids (channel>topic),
 message_uuids (Zulip ID), stream_ids (name -> Zulip ID), dm_stream_uuids
 (provider identity -> visible Workspace stream UUID), files (URL -> Workspace
-file URN), deleted_files and inaccessible_files (source URLs), linkifier_urls,
+file URN), stickers (upload URL -> catalog UUID -> verification result),
+deleted_files and inaccessible_files (source URLs), linkifier_urls,
 user_group_ids, and custom_emoji_names.
 The optional messages mapping contains
 original Zulip messages keyed by their string IDs, for full/partial quotes.
@@ -18,6 +19,7 @@ Unsupported content remains a notice with a link to the original message.
 """
 
 import base64
+import bisect
 import collections.abc
 import re
 import urllib.parse
@@ -44,7 +46,10 @@ _QUOTE_HEADER = re.compile(
     r"\[[^\]\n]+\]\((?P<url>\S+?)\)"
     r"(?: to @_?\*\*[^\n]+\*\*| in \[[^\n]+\]\([^\n]+\))?:\r?\n"
 )
-_FENCE = re.compile(r" {0,3}(?P<marker>`{3,}|~{3,})(?P<info>[^\n]*)\n")
+_FENCE = re.compile(
+    r" {0,3}(?P<marker>`{3,}(?=[^`\r\n]*\r?\n)|~{3,})"
+    r"(?P<info>[^\r\n]*)\r?\n"
+)
 _REFERENCE_URN = re.compile(
     r"urn:(user|stream|topic|message|quote|file|image|video|forward):"
     r"([\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12})(?:\?(.*))?",
@@ -52,6 +57,14 @@ _REFERENCE_URN = re.compile(
 )
 _SILENT_USER_LINK = re.compile(r'\]\(urn:user:[\da-f-]{36} "silent"\)', re.IGNORECASE)
 _MAX_QUOTE_DEPTH = 32
+STICKER_LABEL_PREFIX = "workspace-sticker:v1:"
+STICKER_UNAVAILABLE = "**Sticker unavailable**"
+_STICKER_UUID = (
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+_STICKER_LABEL = re.compile(re.escape(STICKER_LABEL_PREFIX) + f"({_STICKER_UUID})")
+_STICKER_URN_PREFIX = "urn:sticker:"
+_STICKER_URN = re.compile(_STICKER_URN_PREFIX + f"({_STICKER_UUID})")
 PROVIDER_MESSAGE_REFERENCE_POLICY = "source-snapshots-v3"
 
 
@@ -220,7 +233,15 @@ def zulip_upload_path(path: str) -> str | None:
     return "/user_uploads/" + urllib.parse.quote(original, safe="/")
 
 
+def sticker_uuid_from_label(label: str) -> str | None:
+    """Read the complete marker placed on a Zulip sticker upload."""
+    match = _STICKER_LABEL.fullmatch(label)
+    return match[1].lower() if match is not None else None
+
+
 def _workspace_reference(target: str) -> tuple[str, str, str] | None:
+    if sticker := _STICKER_URN.fullmatch(target):
+        return "sticker", sticker[1].lower(), ""
     match = _REFERENCE_URN.fullmatch(target)
     if match is None:
         return None
@@ -245,10 +266,158 @@ def _url_target(token: str) -> str:
     return target
 
 
-def _message_links(text: str) -> collections.abc.Iterator[tuple[str, bool]]:
-    tokens = re.compile(r"\\[^\n]|!?\[|<?https?://[^\s<>`]+>?|/user_uploads/[^\s<>`]+")
+_LINKS = r"\\[^\n]|!?\[|<?https?://[^\s<>`]+>?|/user_uploads/[^\s<>`]+"
+_LINK_TOKENS = re.compile(_LINKS)
+_QUOTE_MARKER = r" {0,3}>[ \t]?"
+_QUOTE_PREFIX = re.compile(rf"^(?:{_QUOTE_MARKER})+", re.MULTILINE)
+_LIST_ITEM = r" {0,3}(?:[-+*]|\d{1,9}[.)])[ \t]+"
+_CODE_FENCE = rf"^(?P<item>{_LIST_ITEM})?{_FENCE.pattern}"
+_CODE_TOKENS = re.compile(
+    rf"(?P<fence>{_CODE_FENCE})|(?P<indent>^(?: {{4}}| {{0,3}}\t)[ \t]*)"
+    rf"|(?P<quote>(?:^{_QUOTE_MARKER}[^\n]*(?:\n|$))+)"
+    r"|(?P<escape>\\[^\n])|(?P<inline>`+)",
+    re.MULTILINE,
+)
+_HEADING = r" {0,3}#{1,6}(?=[ \t]|\r?\n|$)"
+_THEMATIC_BREAK = r" {0,3}(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})"
+_SETEXT_UNDERLINE = r" {0,3}(?:=+|-+)[ \t]*"
+_BLOCK_LINE = re.compile(rf"(?:{_HEADING}[^\r\n]*|{_THEMATIC_BREAK})")
+_CODE_BOUNDARY = (
+    rf"{_CODE_FENCE}|^{_QUOTE_MARKER}|\n[ \t]*\r?\n"
+    rf"|^{_HEADING}|^ {{0,3}}(?:[-+*]|1[.)])[ \t]+"
+    rf"|^(?:{_THEMATIC_BREAK}|{_SETEXT_UNDERLINE})\r?$"
+)
+_INDENTED_LINES = re.compile(r"(?:(?: {4}| {0,3}\t)[^\n]*(?:\n|$)|[ \t]*\r?\n)+")
+_CodeSpans = list[tuple[int, int]]
+
+
+def _quote_code_spans(text: str, marker: str, start: int, nesting: int) -> _CodeSpans:
+    if marker not in text:
+        return []
+    depth = min(prefix[0].count(">") for prefix in _QUOTE_PREFIX.finditer(text))
+    offsets: list[tuple[int, int]] = []
+    removed = 0
+
+    def strip_prefix(match: re.Match[str]) -> str:
+        nonlocal removed
+        position = match.start() - removed
+        removed += len(match[0])
+        offsets.append((position, removed))
+        return ""
+
+    body = re.sub(
+        rf"^(?:{_QUOTE_MARKER}){{{depth}}}", strip_prefix, text, flags=re.MULTILINE
+    )
+
+    def source_position(position: int) -> int:
+        index = bisect.bisect_right(offsets, (position, len(text))) - 1
+        return start + position + offsets[index][1]
+
+    return [
+        (source_position(begin), source_position(end))
+        for begin, end in _code_spans(body, marker, nesting + 1)
+    ]
+
+
+def _indented_code_start(text: str, match: re.Match[str], block_end: int) -> bool:
+    start = match.start()
+    if start == 0 or start == block_end:
+        return True
+    previous_start = text.rfind("\n", 0, start - 1) + 1
+    previous = text[previous_start:start].rstrip("\r\n")
+    if previous.strip():
+        if _BLOCK_LINE.fullmatch(previous):
+            return True
+        if previous_start == block_end or not re.fullmatch(_SETEXT_UNDERLINE, previous):
+            return False
+        title_start = text.rfind("\n", 0, max(0, previous_start - 1)) + 1
+        title = text[title_start:previous_start].rstrip("\r\n")
+        return (
+            re.match(r" {0,3}[^ \t]", title) is not None
+            and _BLOCK_LINE.fullmatch(title) is None
+            and re.match(_QUOTE_MARKER, title) is None
+        )
+
+    width = len(match[0].expandtabs(4))
+    continuation_width = width
+    lazy_continuation = False
+    for line in reversed(text[:previous_start].splitlines()):
+        if _BLOCK_LINE.fullmatch(line):
+            break
+        if item := re.match(_LIST_ITEM, line):
+            return not (item.end() <= continuation_width and width < item.end() + 4)
+        if not line.strip():
+            if lazy_continuation:
+                break
+            continue
+        indentation = line[: len(line) - len(line.lstrip(" \t"))]
+        indentation_width = len(indentation.expandtabs(4))
+        if indentation_width < 2:
+            lazy_continuation = True
+        else:
+            continuation_width = min(continuation_width, indentation_width)
+    return True
+
+
+def _code_spans(text: str, marker: str, nesting: int = 0) -> _CodeSpans:
+    if marker not in text:
+        return []
+    if nesting >= _MAX_QUOTE_DEPTH:
+        return [(0, len(text))]
+    spans: _CodeSpans = []
+    position = block_end = 0
+    while match := _CODE_TOKENS.search(text, position):
+        start = match.start()
+        position = match.end()
+        if match.lastgroup == "fence":
+            indentation = len((match["item"] or "").expandtabs(4))
+            block = _fence_body(text, match, indentation=indentation)
+            if block is None:
+                position = len(text)
+            else:
+                info, body, position = block
+                if info == "quote" or info == "spoiler" or info.startswith("spoiler "):
+                    spans.extend(
+                        (match.end() + begin, match.end() + end)
+                        for begin, end in _code_spans(body, marker, nesting + 1)
+                    )
+                    block_end = position
+                    continue
+            block_end = position
+        elif match.lastgroup == "quote":
+            spans.extend(_quote_code_spans(match[0], marker, start, nesting))
+            block_end = position
+            continue
+        elif match.lastgroup == "indent":
+            if not _indented_code_start(text, match, block_end):
+                continue
+            indented = _INDENTED_LINES.match(text, start)
+            if indented is None:
+                continue
+            position = indented.end()
+        elif match.lastgroup == "inline":
+            closing = re.compile(
+                rf"{_CODE_BOUNDARY}|(?P<close>(?<!`){match[0]}(?!`))", re.MULTILINE
+            ).search(text, position)
+            if closing is None or closing.lastgroup != "close":
+                continue
+            position = closing.end()
+        else:
+            continue
+        spans.append((start, position))
+    return spans
+
+
+def _in_code(position: int, spans: _CodeSpans) -> bool:
+    index = bisect.bisect_right(spans, position, key=lambda span: span[0]) - 1
+    return index >= 0 and position < spans[index][1]
+
+
+def _message_links(
+    text: str,
+) -> collections.abc.Iterator[tuple[str, bool, str | None, int]]:
     position = 0
-    while match := tokens.search(text, position):
+    while match := _LINK_TOKENS.search(text, position):
         position = match.end()
         token = match[0]
         if token.startswith("\\"):
@@ -256,53 +425,90 @@ def _message_links(text: str) -> collections.abc.Iterator[tuple[str, bool]]:
         if token in ("[", "!["):
             link = _link(text, match.start())
             if link is not None:
-                _, target, _, image, position = link
-                yield target, image
+                label, target, _, image, position = link
+                yield target, image, label, match.start()
         else:
-            yield _url_target(token), False
+            yield _url_target(token), False, None, match.start()
 
 
 def workspace_references(text: str) -> collections.abc.Iterator[tuple[str, str, str]]:
     """Yield parsed Workspace links; malformed references remain ordinary text."""
-    for target, _image in _message_links(text):
+    code = _code_spans(text, _STICKER_URN_PREFIX)
+    for target, _, _, position in _message_links(text):
         reference = _workspace_reference(target)
-        if reference is not None:
+        if reference is not None and not (
+            reference[0] == "sticker" and _in_code(position, code)
+        ):
             yield reference
 
 
-def get_zulip_files(
+def get_zulip_file_links(
     message: dict, context: dict, *, include_quotes: bool = False
-) -> list[str]:
-    """Return this message's file URLs in occurrence order, excluding quotes.
+) -> list[tuple[str, str | None]]:
+    """Return this message's attachment URLs and Markdown labels in occurrence order, excluding quotes.
 
     Context uses the same files mapping as conversion to recognize external
     file URLs. Repeated references are retained, as in the converted payload.
     """
     files = context.get("files", {})
+    text = message["content"] if include_quotes else _without_quotes(message["content"])
+    code = _code_spans(text, STICKER_LABEL_PREFIX)
     return [
-        target
-        for target, image in _message_links(
-            message["content"]
-            if include_quotes
-            else _without_quotes(message["content"])
+        (target, label)
+        for target, image, label, position in _message_links(text)
+        if not (
+            label is not None
+            and sticker_uuid_from_label(label) is not None
+            and _in_code(position, code)
         )
-        if (url := parse_url(target)) is not None
+        and (url := parse_url(target)) is not None
         and (target in files or image or url.path.startswith("/user_uploads/"))
     ]
 
 
-def workspace_reference_text(text: str) -> str:
-    """Include references embedded in forward snapshots when resolving a message."""
+def get_zulip_files(
+    message: dict, context: dict, *, include_quotes: bool = False
+) -> list[str]:
+    """Return attachment URLs in occurrence order."""
+    return [
+        target
+        for target, _label in get_zulip_file_links(
+            message, context, include_quotes=include_quotes
+        )
+    ]
+
+
+def _reference_contents(kind: str, query: str) -> list[str]:
+    if kind == "forward":
+        snapshot = parse_snapshot(query)
+        return [snapshot] if snapshot is not None else []
+    if kind == "quote":
+        return urllib.parse.parse_qs(query).get("text", [])
+    return []
+
+
+def _workspace_reference_documents(
+    text: str,
+) -> collections.abc.Iterator[tuple[str, list[tuple[str, str, str]]]]:
     contents = [text]
     for content in contents:
-        for kind, _identifier, query in workspace_references(content):
-            if kind == "forward":
-                snapshot = parse_snapshot(query)
-                if snapshot is not None:
-                    contents.append(snapshot)
-            elif kind == "quote":
-                contents.extend(urllib.parse.parse_qs(query).get("text", []))
-    return "\n".join(contents)
+        references = list(workspace_references(content))
+        yield content, references
+        for kind, _identifier, query in references:
+            contents.extend(_reference_contents(kind, query))
+
+
+def workspace_reference_text(text: str) -> str:
+    """Include references embedded in forward snapshots when resolving a message."""
+    return "\n".join(content for content, _ in _workspace_reference_documents(text))
+
+
+def workspace_message_references(
+    text: str,
+) -> collections.abc.Iterator[tuple[str, str, str]]:
+    """Resolve each quote and forward snapshot as its own Markdown document."""
+    for _, references in _workspace_reference_documents(text):
+        yield from references
 
 
 def get_workspace_files(payload: dict, *, include_quotes: bool = False) -> list[str]:
@@ -311,7 +517,7 @@ def get_workspace_files(payload: dict, *, include_quotes: bool = False) -> list[
     text = workspace_reference_text(text) if include_quotes else _without_quotes(text)
     return [
         target
-        for target, _ in _message_links(text)
+        for target, _, _, _ in _message_links(text)
         if (reference := _workspace_reference(target)) is not None
         and reference[0] in ("file", "image", "video")
     ]
@@ -321,9 +527,17 @@ def _fenced(text: str, start: int) -> tuple[str, str, int] | None:
     opening = _FENCE.match(text, start)
     if opening is None:
         return None
+    return _fence_body(text, opening)
+
+
+def _fence_body(
+    text: str, opening: re.Match[str], *, indentation: int = 0
+) -> tuple[str, str, int] | None:
     marker = opening["marker"]
+    outdent = rf"(?=^ {{0,{indentation - 1}}}[^ \t\r\n])|" if indentation else ""
     closing = re.search(
-        rf"^ {{0,3}}{re.escape(marker[0])}{{{len(marker)},}}[ \t]*(?:\n|$)",
+        outdent
+        + rf"^ {{{indentation},{indentation + 3}}}{marker[0]}{{{len(marker)},}}[ \t]*(?:\r?\n|$)",
         text[opening.end() :],
         re.MULTILINE,
     )
@@ -417,6 +631,16 @@ class _ZulipToWorkspace:
             )
         return f"{label} ({reason})"
 
+    def sticker_link(self, target: str, label: str) -> str | None:
+        identifier = sticker_uuid_from_label(label)
+        if identifier is None:
+            return None
+        verified = self.context.get("stickers", {}).get(target, {}).get(identifier)
+        # Older prepared batches store False for verified deleted stickers.
+        if verified is None:
+            return None
+        return _markdown_link("sticker", f"urn:sticker:{identifier}", image=True)
+
     def block_notice(self, description: str, source: str) -> str:
         parts = _ConversionParts()
         parts.append(self.notice(description, block=True))
@@ -425,8 +649,14 @@ class _ZulipToWorkspace:
 
     def block_files(self, source: str) -> str:
         parts = _ConversionParts()
-        for url in get_zulip_files({"content": source}, self.context):
+        for url, label in get_zulip_file_links({"content": source}, self.context):
             parts.append("\n\n")
+            if (
+                label is not None
+                and (sticker := self.sticker_link(url, label)) is not None
+            ):
+                parts.append(sticker)
+                continue
             unavailable = self.unavailable_file(url)
             if unavailable is not None:
                 parts.append(unavailable)
@@ -564,7 +794,17 @@ class _ZulipToWorkspace:
                     return f"urn:stream:{self.context['stream_uuids'][channel]}"
         return f"urn:url:{absolute}"
 
-    def inline(self, text: str, *, quoted: bool = False, literal: bool = False) -> str:
+    def inline(
+        self,
+        text: str,
+        *,
+        quoted: bool = False,
+        literal: bool = False,
+        literal_spans: _CodeSpans | None = None,
+        offset: int = 0,
+    ) -> str:
+        if literal_spans is None:
+            literal_spans = _code_spans(text, STICKER_LABEL_PREFIX)
         output = _ConversionParts()
         position = 0
         while match := self.tokens.search(text, position):
@@ -578,7 +818,14 @@ class _ZulipToWorkspace:
                     output.append(token)
                 else:
                     end = position + closing.end()
-                    output.append(self.inline(text[match.start() : end], literal=True))
+                    output.append(
+                        self.inline(
+                            text[match.start() : end],
+                            literal=True,
+                            literal_spans=literal_spans,
+                            offset=offset + match.start(),
+                        )
+                    )
                     position = end
             elif kind in ("user", "group") and literal:
                 output.append(token)
@@ -588,6 +835,14 @@ class _ZulipToWorkspace:
                     output.append(token)
                     continue
                 label, destination, title, image, position = link
+                if sticker_uuid_from_label(label) is not None and _in_code(
+                    offset + match.start(), literal_spans
+                ):
+                    output.append(text[match.start() : position])
+                    continue
+                if (sticker := self.sticker_link(destination, label)) is not None:
+                    output.append(sticker)
+                    continue
                 unavailable = self.unavailable_file(destination, label)
                 if unavailable is not None:
                     output.append(unavailable)
@@ -747,6 +1002,7 @@ class _ZulipToWorkspace:
             and re.search(r"(?<!\\)\$\$.+?\$\$", text)
         ):
             return self.block_notice("inline LaTeX", text)
+        literal_spans = _code_spans(text, STICKER_LABEL_PREFIX)
         output = _ConversionParts()
         position = 0
         while position < len(text):
@@ -847,7 +1103,14 @@ class _ZulipToWorkspace:
                 elif info == "math":
                     output.append(self.block_notice("LaTeX block", text[position:end]))
                 else:
-                    output.append(self.inline(text[position:end], literal=True))
+                    output.append(
+                        self.inline(
+                            text[position:end],
+                            literal=True,
+                            literal_spans=literal_spans,
+                            offset=position,
+                        )
+                    )
                     position = end
                     continue
                 if text[end - 1] == "\n":
@@ -877,7 +1140,14 @@ class _ZulipToWorkspace:
                 if content.endswith("\n"):
                     output.append("\n")
             else:
-                output.append(self.inline(text[position:line_end], quoted=quoted))
+                output.append(
+                    self.inline(
+                        text[position:line_end],
+                        quoted=quoted,
+                        literal_spans=literal_spans,
+                        offset=position,
+                    )
+                )
                 position = line_end
         return "".join(output)
 
@@ -988,8 +1258,17 @@ def workspace_to_zulip(payload: dict, context: dict) -> str:
             return _markdown_link(label, value, title, image)
         reference = _workspace_reference(target)
         if reference is None:
-            return None
+            return (
+                STICKER_UNAVAILABLE if target.startswith(_STICKER_URN_PREFIX) else None
+            )
         kind, identifier, query = reference
+        if kind == "sticker":
+            destination = context.get("stickers", {}).get(identifier)
+            if destination is None:
+                return STICKER_UNAVAILABLE
+            return _markdown_link(
+                STICKER_LABEL_PREFIX + identifier, destination, image=True
+            )
         if kind == "user":
             prefix = (
                 "@_" if title.strip() in ('"silent"', "'silent'", "(silent)") else "@"
@@ -1110,6 +1389,7 @@ def workspace_to_zulip(payload: dict, context: dict) -> str:
         return re.sub(r":([\w+-]+):", replace_emoji, text)
 
     text = model.content
+    code = _code_spans(text, _STICKER_URN_PREFIX)
     output = []
     position = 0
     tokens = re.compile(r"\\[^\n]|!?\[")
@@ -1121,7 +1401,12 @@ def workspace_to_zulip(payload: dict, context: dict) -> str:
             output.append(match[0])
         else:
             label, target, title, image, position = link
-            converted = convert(label, target, title, image)
+            converted = (
+                None
+                if target.startswith(_STICKER_URN_PREFIX)
+                and _in_code(match.start(), code)
+                else convert(label, target, title, image)
+            )
             output.append(
                 text[match.start() : position] if converted is None else converted
             )

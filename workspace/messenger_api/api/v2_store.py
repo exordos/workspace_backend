@@ -1122,10 +1122,9 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         message = self._message(message_uuid)
         if message.author_uuid != self.user_uuid:
             raise ra_exceptions.ValidationErrorException()
-        message.validate_payload_update(
-            resource_projection.simple(values["payload"]), session
-        )
-        payload = json.dumps(resource_projection.simple(values["payload"]))
+        canonical_payload = resource_projection.simple(values["payload"])
+        message.validate_payload_update(canonical_payload, session)
+        payload = json.dumps(canonical_payload)
         changed = session.execute(
             """
             UPDATE messenger_messages

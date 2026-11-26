@@ -3,11 +3,15 @@
 
 import asyncio
 import datetime
+import hashlib
+import uuid
 from unittest import mock
 
 import pytest
 
+from workspace.bridges.zulip import content_cache
 from workspace.bridges.zulip import outgoing_operations
+from workspace.messenger_api import sticker_storage
 
 
 @pytest.mark.parametrize("age", [3599, 3600, 3601])
@@ -210,3 +214,123 @@ def test_saved_edit_never_overwrites_a_newer_provider_change(checking):
         operations.execute(intent, {"provider_uuid": "provider"}, prepared, checking)
     ) == {"identity": "123"}
     http.request.assert_not_called()
+
+
+def _sticker_content(content: bytes) -> dict:
+    return {
+        "uuid": uuid.uuid4(),
+        "format": "png",
+        "size_bytes": len(content),
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "media_object_id": "sticker/media.png",
+    }
+
+
+def test_upload_retry_does_not_reuse_an_attachment_with_different_bytes(monkeypatch):
+    content = b"sticker"
+    sticker = _sticker_content(content)
+    storage = mock.Mock(read=mock.Mock(return_value=content))
+    monkeypatch.setattr(sticker_storage, "get_sticker_storage", lambda: storage)
+    account = {"settings": {"server_url": "https://zulip.example.com"}}
+    path = "/user_uploads/1/data/correct.png"
+    http = mock.Mock(
+        request=mock.AsyncMock(
+            return_value={"uri": "https://zulip.example.com" + path}
+        ),
+        download=mock.AsyncMock(return_value=(b"not-img", "image/png")),
+    )
+    operations = outgoing_operations.Operations(mock.Mock(), http)
+
+    assert (
+        asyncio.run(
+            operations._sticker_upload(
+                account,
+                sticker,
+                "sticker.png",
+                [{"name": "sticker.png", "size": 7, "path_id": "1/data/forged.png"}],
+            )
+        )
+        == path
+    )
+    http.download.assert_awaited_once_with(account, "/user_uploads/1/data/forged.png")
+    http.request.assert_awaited_once_with(
+        account, "POST", "/user_uploads", file=("sticker.png", content, "image/png")
+    )
+
+
+@pytest.mark.parametrize(
+    "error, retryable",
+    [
+        (sticker_storage.StickerStorageNotFoundError, False),
+        (sticker_storage.StickerStorageBackendError, True),
+    ],
+)
+def test_sticker_storage_missing_is_not_a_transient_failure(
+    monkeypatch, error, retryable
+):
+    store = mock.Mock(read=mock.Mock(side_effect=error("unavailable")))
+    monkeypatch.setattr(sticker_storage, "get_sticker_storage", lambda: store)
+    http = mock.Mock(request=mock.AsyncMock())
+    operations = outgoing_operations.Operations(mock.Mock(), http)
+
+    convert = operations._sticker_upload(
+        {}, _sticker_content(b"sticker"), "test.png", []
+    )
+    if retryable:
+        with pytest.raises(
+            outgoing_operations.Pending, match="temporarily unavailable"
+        ):
+            asyncio.run(convert)
+    else:
+        assert asyncio.run(convert) is None
+    http.request.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("example", "uploads"),
+    [
+        ("Example: `{link}`", 0),
+        ("***\n    {link}", 0),
+        ("`\n***\n{link}\n`", 1),
+    ],
+)
+def test_only_rendered_stickers_upload_catalog_media(monkeypatch, example, uploads):
+    media = b"sticker"
+    sticker = _sticker_content(media)
+    reference = f"![sticker](urn:sticker:{sticker['uuid']})"
+    source = example.format(link=reference)
+    marker = f"![workspace-sticker:v1:{sticker['uuid']}](/user_uploads/1/a/sticker.png)"
+    store = mock.Mock(read=mock.Mock(return_value=media))
+    monkeypatch.setattr(sticker_storage, "get_sticker_storage", lambda: store)
+    http = mock.Mock(
+        request=mock.AsyncMock(return_value={"uri": "/user_uploads/1/a/sticker.png"})
+    )
+    content_uuid = uuid.uuid4()
+
+    async def sql(statement, params):
+        if statement == outgoing_operations.SELECT_STICKERS_SQL:
+            return [sticker]
+        if statement == content_cache.RESOLVE_SQL:
+            return [{"uuid": content_uuid}]
+        return []
+
+    operations = outgoing_operations.Operations(mock.Mock(sql=sql), http)
+    result = asyncio.run(
+        operations.convert(
+            {
+                "uuid": uuid.uuid4(),
+                "attempts": 0,
+                "data": {"payload": {"kind": "markdown", "content": source}},
+            },
+            {
+                "provider_uuid": uuid.uuid4(),
+                "settings": {"server_url": "https://zulip.example.test"},
+            },
+        )
+    )
+
+    assert http.request.await_count == store.read.call_count == uploads
+    assert result == {
+        "uuid": content_uuid,
+        "provider_content": source.replace(reference, marker) if uploads else source,
+    }

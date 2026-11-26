@@ -1175,3 +1175,152 @@ def test_contextual_quote_keeps_the_first_message_identity(suffix, original_avai
         "kind": "markdown",
         "content": f"[Alice]({target})\n\nImmediate reply.",
     }
+
+
+def test_sticker_roundtrip_preserves_ordinary_attachments_sharing_the_upload():
+    sticker_uuid = "7ca38bfe-0cb2-408c-bce6-13c7898d2a19"
+    file_uuid = "a667761b-29b0-447c-80e3-a959f11f0b07"
+    sticker = f"![sticker](urn:sticker:{sticker_uuid})"
+    image = f"![Image](urn:image:{file_uuid})"
+    upload = "/user_uploads/1/abc/image.png"
+    context = {
+        "server_url": "https://zulip.example.test",
+        "files": {upload: f"urn:image:{file_uuid}"},
+        "stickers": {sticker_uuid: upload},
+    }
+    markdown = f"Before {sticker} then {image}."
+    outgoing = message_conversion.workspace_to_zulip(
+        {"kind": "markdown", "content": markdown}, context
+    )
+    assert (
+        outgoing
+        == f"Before ![workspace-sticker:v1:{sticker_uuid}]({upload}) then ![Image]({upload})."
+    )
+
+    provider_message = {"id": 7, "content": outgoing}
+    assert message_conversion.get_zulip_file_links(provider_message, {}) == [
+        (upload, f"workspace-sticker:v1:{sticker_uuid}"),
+        (upload, "Image"),
+    ]
+    context["stickers"] = {upload: {sticker_uuid: True}}
+    incoming = message_conversion.zulip_to_workspace(provider_message, context)
+    assert incoming["content"] == markdown
+
+
+def test_sticker_marks_require_a_verification_for_the_specific_attachment():
+    sticker_uuid = "7ca38bfe-0cb2-408c-bce6-13c7898d2a19"
+    file_uuid = "a667761b-29b0-447c-80e3-a959f11f0b07"
+    label = f"workspace-sticker:v1:{sticker_uuid}"
+    gone = "/user_uploads/1/abc/deleted.png"
+    forged = "/user_uploads/1/abc/other.png"
+    context = {
+        "server_url": "https://zulip.example.test",
+        "files": {forged: f"urn:image:{file_uuid}"},
+        "stickers": {gone: {sticker_uuid: False}},
+    }
+    incoming = message_conversion.zulip_to_workspace(
+        {"id": 8, "content": f"![{label}]({gone}) then ![{label}]({forged})"},
+        context,
+    )
+    assert incoming["content"] == (
+        f"![sticker](urn:sticker:{sticker_uuid}) then ![{label}](urn:image:{file_uuid})"
+    )
+
+
+def test_sticker_reference_does_not_allow_query_parameters():
+    sticker_uuid = "7ca38bfe-0cb2-408c-bce6-13c7898d2a19"
+    content = f"Before ![sticker](urn:sticker:{sticker_uuid}?) after"
+    payload = {"kind": "markdown", "content": content}
+    assert list(message_conversion.workspace_references(content)) == []
+    assert message_conversion.workspace_to_zulip(payload, {}) == (
+        "Before **Sticker unavailable** after"
+    )
+
+
+@pytest.mark.parametrize(
+    ("example", "rendered"),
+    [
+        ("Example: `{link}`.", False),
+        ("``line\n{link}``", False),
+        ("```markdown\n{link}\n```", False),
+        ("~~~markdown\n{link}\n~~~", False),
+        ("    {link}", False),
+        ("# Example\n    {link}", False),
+        ("- ```markdown\n  {link}\n  `````", False),
+        ("- ~~~markdown\n  {link}", False),
+        ("`\n***\n{link}\n`", True),
+        ("`\n---\n{link}\n`", True),
+        ("`\n===\n{link}\n`", True),
+        ("***\n    {link}", False),
+        ("- body\n  continuation\n\n    {link}", True),
+        ("Title\r\n\r\n`{link}`", False),
+        ("Title\r\n\r\n{link}", True),
+        ("~~~spoiler Title\n{link}\n~~~", True),
+    ],
+)
+def test_sticker_conversion_follows_markdown_structure(example, rendered):
+    identifier = "7ca38bfe-0cb2-408c-bce6-13c7898d2a19"
+    upload = "/user_uploads/1/abc/sticker.png"
+    label = f"workspace-sticker:v1:{identifier}"
+    sticker = f"![sticker](urn:sticker:{identifier})"
+    marker = f"![{label}]({upload})"
+    workspace_example = example.replace("{link}", sticker)
+    zulip_example = example.replace("{link}", marker)
+    context = {"server_url": "https://zulip.example.test"}
+
+    assert (
+        bool(list(message_conversion.workspace_references(workspace_example)))
+        is rendered
+    )
+    carries_two_stickers = [(upload, label)] * (1 + rendered)
+    assert (
+        message_conversion.get_zulip_file_links(
+            {"content": f"{zulip_example}\n\n{marker}"}, {}
+        )
+        == carries_two_stickers
+    )
+    assert (
+        message_conversion.workspace_to_zulip(
+            {"kind": "markdown", "content": f"{workspace_example}\n\n{sticker}"},
+            {**context, "stickers": {identifier: upload}},
+        )
+        == f"{zulip_example if rendered else workspace_example}\n\n{marker}"
+    )
+    assert (
+        message_conversion.zulip_to_workspace(
+            {"id": 7, "content": f"{zulip_example}\n\n{marker}"},
+            {**context, "stickers": {upload: {identifier: True}}},
+        )["content"]
+        == f"{workspace_example if rendered else zulip_example}\n\n{sticker}"
+    )
+
+
+@pytest.mark.parametrize(
+    "quote",
+    [
+        "> > ~~~\n> > {link}\n> > ~~~",
+        "> ```markdown\n> {link}\n> `````",
+        ">     {link}",
+    ],
+)
+def test_sticker_examples_in_quoted_code_stay_literal(quote):
+    identifier = "7ca38bfe-0cb2-408c-bce6-13c7898d2a19"
+    upload = "/user_uploads/1/abc/sticker.png"
+    sticker = f"![sticker](urn:sticker:{identifier})"
+    marker = f"![workspace-sticker:v1:{identifier}]({upload})"
+    source = quote.format(link=sticker)
+    payload = {"kind": "markdown", "content": source}
+
+    assert list(message_conversion.workspace_references(source)) == []
+    assert (
+        message_conversion.workspace_to_zulip(
+            payload, {"stickers": {identifier: upload}}
+        )
+        == source
+    )
+    assert (
+        message_conversion.get_zulip_file_links(
+            {"content": quote.format(link=marker)}, {}, include_quotes=True
+        )
+        == []
+    )
