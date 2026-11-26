@@ -463,6 +463,47 @@ def test_channel_and_topic_preferences_emit_client_events(incoming):
     assert "stream.deleted" in [item["kind"] for item in client_events(incoming)]
 
 
+@pytest.mark.parametrize("source", ["realtime", "subscription_snapshot"])
+def test_zulip_channel_mute_preserves_workspace_muted_mode(incoming, source):
+    api, *_ = incoming
+    apply(incoming, event())
+    stream = api.get("/v1/messenger/streams/").json()[0]
+    stream_path = f"/v1/messenger/streams/{stream['uuid']}"
+
+    response = api.post(
+        f"{stream_path}/actions/notifications/invoke",
+        json={"notification_mode": "muted"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["notification_mode"] == "muted"
+
+    for is_muted, expected in (
+        (True, "muted"),
+        (False, "all_messages"),
+        (True, "mentions_only"),
+    ):
+        if source == "realtime":
+            update = {
+                "type": "subscription",
+                "op": "update",
+                "stream_id": 42,
+                "property": "is_muted",
+                "value": is_muted,
+            }
+        else:
+            update = {
+                "type": "subscription",
+                "op": "add",
+                "subscriptions": [
+                    {"stream_id": 42, "name": "Channel", "is_muted": is_muted}
+                ],
+            }
+        apply(incoming, update)
+        drain()
+
+        assert api.get(stream_path).json()["notification_mode"] == expected
+
+
 def test_downloaded_file_is_visible_and_announced(incoming, monkeypatch, tmp_path):
     api, db, account, http, _url = incoming
     monkeypatch.setenv("WORKSPACE_FILE_STORAGE_PATH", str(tmp_path))

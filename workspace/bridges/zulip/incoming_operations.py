@@ -1841,11 +1841,15 @@ class Operations:
         remote: object,
         *,
         active: bool = True,
-        mode: str | None = None,
+        zulip_muted: bool | None = None,
     ) -> None:
+        query = SELECT_BINDING_SQL
+        if zulip_muted:
+            # Read the local preference under the same row lock as an update.
+            query += " FOR NO KEY UPDATE"
         old = await rows(
             connection,
-            SELECT_BINDING_SQL,
+            query,
             (
                 account["project_id"],
                 stream["uuid"],
@@ -1865,8 +1869,11 @@ class Operations:
                 f"{stream['provider_identity']}:{remote}",
             ),
         }
-        if mode is not None:
-            values["notification_mode"] = mode
+        # Zulip uses the same flag for mentions_only and muted.
+        if zulip_muted is False:
+            values["notification_mode"] = "all_messages"
+        elif zulip_muted and (not old or old[0]["notification_mode"] != "muted"):
+            values["notification_mode"] = "mentions_only"
         changed = await self.save(connection, TABLES["stream_binding"], values)
         if changed:
             members = await rows(
@@ -2123,11 +2130,7 @@ class Operations:
                 stream,
                 account["owner_user_uuid"],
                 account["external_account_id"],
-                mode="mentions_only"
-                if data.get("is_muted", False)
-                else "all_messages"
-                if "is_muted" in data
-                else None,
+                zulip_muted=data.get("is_muted"),
             )
         if not stream["default_topic_uuid"]:
             topic = await self.topic(connection, account, stream, "")
@@ -4136,7 +4139,7 @@ class Operations:
                         known[0],
                         account["owner_user_uuid"],
                         account["external_account_id"],
-                        mode="mentions_only" if change["value"] else "all_messages",
+                        zulip_muted=change["value"],
                     )
                 elif change["property"] == "color":
                     changed = await self.save(
